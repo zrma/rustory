@@ -14,13 +14,20 @@
   - SQLite 스토리지(ingest_seq cursor, dedup)
   - pull 기반 sync 코어 루프
   - HTTP(디버그) `serve`/`sync`
-  - P2P(단계 1: 수동 multiaddr) `p2p-serve`/`p2p-sync` (문서: `docs/p2p.md`)
+  - P2P `p2p-serve`/`p2p-sync`
+    - 단계 1: 수동 multiaddr
+    - 단계 2: tracker/relay(디스커버리 + 중계) + PSK(pnet) + direct-first + relay fallback (문서: `docs/p2p.md`)
+  - tracker/relay 서버
+    - `tracker-serve` (HTTP)
+    - `relay-serve` (libp2p circuit relay v2)
   - 로컬 기록용 `record` + fzf 기반 `search`
   - bash/zsh hook 스크립트 생성(`hook`)
 
 ## 다음 단계
-- hook 안정화(경계 케이스/중복/성능)
-- P2P 단계 2: tracker/relay(디스커버리/중계)
+- peerbook 캐시(persist) + tracker 다운 시 fallback(마지막으로 본 peer 주소로 direct 시도)
+- NAT traversal(hole punching / dcutr) 도입 검토
+- push 기반 동기화(업로드 최적화) 또는 주기 동기화(스케줄러)
+- 설정/키 관리 UX 개선(PSK fingerprint 출력, 키 배포 문서화 등)
 
 ## 개발
 - 테스트: `cargo test`
@@ -59,3 +66,5 @@ rr --db-path "/tmp/rustory-a.db" p2p-serve --listen /ip4/0.0.0.0/tcp/8845
 # peer B (클라이언트 역할): peer A가 출력한 /p2p/<peer_id> 포함 주소를 그대로 넣는다.
 rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<peer_id>" --limit 1000
 ```
+
+자세한 단계 2(tracker/relay + PSK) 사용법은 `docs/p2p.md` 참고.

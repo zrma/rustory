@@ -155,13 +155,17 @@ LIMIT ?
     }
 
     pub fn get_last_cursor(&self, peer_id: &str) -> Result<i64> {
+        Ok(self.get_last_cursor_opt(peer_id)?.unwrap_or(0))
+    }
+
+    pub fn get_last_cursor_opt(&self, peer_id: &str) -> Result<Option<i64>> {
         match self.conn.query_row(
             "SELECT last_cursor FROM peer_state WHERE peer_id = ?",
             params![peer_id],
             |row| row.get(0),
         ) {
-            Ok(v) => Ok(v),
-            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(err) => Err(err).context("query peer_state"),
         }
     }

@@ -12,14 +12,16 @@ path = "src/main.rs"
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
-libp2p = { version = "0.55", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "yamux", "request-response"] }
+libp2p = { version = "0.55", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "yamux", "request-response", "identify", "ping", "relay", "pnet"] }
 libp2p-request-response = { version = "0.28", features = ["json"] }
+rand = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny_http = "0.12"
 time = { version = "0.3", features = ["serde", "macros"] }
 tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
+toml = "0.8"
 ureq = "2.12"
 uuid = { version = "1.7", features = ["v4", "serde"] }
 
