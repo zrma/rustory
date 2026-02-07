@@ -105,6 +105,7 @@ pub fn sync_push_to_peer<F>(
     local: &LocalStore,
     peer_id: &str,
     limit: usize,
+    source_device_id: Option<&str>,
     mut push: F,
 ) -> Result<usize>
 where
@@ -118,7 +119,10 @@ where
     let mut pushed_total = 0usize;
 
     loop {
-        let batch = local.pull_since_cursor(cursor, limit)?;
+        let batch = match source_device_id {
+            Some(device_id) => local.pull_since_cursor_for_device(cursor, limit, device_id)?,
+            None => local.pull_since_cursor(cursor, limit)?,
+        };
         if batch.entries.is_empty() {
             break;
         }
@@ -145,6 +149,7 @@ pub async fn sync_push_to_peer_async<P>(
     local: &LocalStore,
     peer_id: &str,
     limit: usize,
+    source_device_id: Option<&str>,
     pusher: &mut P,
 ) -> Result<usize>
 where
@@ -158,7 +163,10 @@ where
     let mut pushed_total = 0usize;
 
     loop {
-        let batch = local.pull_since_cursor(cursor, limit)?;
+        let batch = match source_device_id {
+            Some(device_id) => local.pull_since_cursor_for_device(cursor, limit, device_id)?,
+            None => local.pull_since_cursor(cursor, limit)?,
+        };
         if batch.entries.is_empty() {
             break;
         }
@@ -315,7 +323,7 @@ mod tests {
             .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
             .unwrap();
 
-        let a = sync_push_to_peer(&local, "peer-1", 1, |entries| {
+        let a = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries| {
             remote.insert_entries(&entries)?;
             Ok(())
         })
@@ -323,7 +331,7 @@ mod tests {
         assert_eq!(a, 2);
         assert_eq!(remote.list_recent(10).unwrap().len(), 2);
 
-        let b = sync_push_to_peer(&local, "peer-1", 1, |entries| {
+        let b = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries| {
             remote.insert_entries(&entries)?;
             Ok(())
         })
@@ -340,11 +348,40 @@ mod tests {
             .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
             .unwrap();
 
-        let err = sync_push_to_peer(&local, "peer-1", 100, |_entries| {
+        let err = sync_push_to_peer(&local, "peer-1", 100, Some("dev1"), |_entries| {
             anyhow::bail!("network error");
         })
         .unwrap_err();
         assert!(err.to_string().contains("network error"));
         assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn push_filters_by_device_id_and_avoids_gossip() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo local 1");
+        e1.device_id = "dev-local".to_string();
+        let mut e2 = entry("id-2", 2, "echo remote 2");
+        e2.device_id = "dev-remote".to_string();
+        let mut e3 = entry("id-3", 3, "echo local 3");
+        e3.device_id = "dev-local".to_string();
+
+        local.insert_entries(&[e1, e2, e3]).unwrap();
+
+        let pushed = sync_push_to_peer(&local, "peer-1", 100, Some("dev-local"), |entries| {
+            remote.insert_entries(&entries)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(pushed, 2);
+        assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 3);
+
+        let got = remote.list_recent(10).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|e| e.entry_id == "id-1"));
+        assert!(got.iter().any(|e| e.entry_id == "id-3"));
+        assert!(!got.iter().any(|e| e.entry_id == "id-2"));
     }
 }

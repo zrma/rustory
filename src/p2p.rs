@@ -479,6 +479,16 @@ async fn sync_async(
         anyhow::bail!("no peers found");
     }
 
+    let push_device_id = if push {
+        Some(
+            cfg.device_id
+                .as_deref()
+                .context("device_id required for push")?,
+        )
+    } else {
+        None
+    };
+
     let mut any_ok = false;
     let mut last_err: Option<anyhow::Error> = None;
     for t in targets {
@@ -505,10 +515,15 @@ async fn sync_async(
         }
 
         if push {
-            let push_res =
-                crate::sync::sync_push_to_peer_async(&store, &t.peer_key, limit, &mut client)
-                    .await
-                    .with_context(|| format!("p2p push peer: {}", t.peer_key));
+            let push_res = crate::sync::sync_push_to_peer_async(
+                &store,
+                &t.peer_key,
+                limit,
+                push_device_id,
+                &mut client,
+            )
+            .await
+            .with_context(|| format!("p2p push peer: {}", t.peer_key));
 
             match push_res {
                 Ok(pushed) => {

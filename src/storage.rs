@@ -163,6 +163,60 @@ LIMIT ?
         })
     }
 
+    pub fn pull_since_cursor_for_device(
+        &self,
+        cursor: i64,
+        limit: usize,
+        device_id: &str,
+    ) -> Result<PullBatch> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT
+  ingest_seq,
+  entry_id,
+  device_id,
+  user_id,
+  ts,
+  cmd,
+  cwd,
+  exit_code,
+  duration_ms,
+  shell,
+  hostname,
+  version
+FROM entries
+WHERE ingest_seq > ?
+  AND device_id = ?
+ORDER BY ingest_seq ASC
+LIMIT ?
+"#,
+            )
+            .context("prepare pull_since_cursor_for_device")?;
+
+        let rows = stmt
+            .query_map(params![cursor, device_id, limit as i64], |row| {
+                let ingest_seq: i64 = row.get(0)?;
+                let entry = row_to_entry_with_offset(row, 1)?;
+                Ok((ingest_seq, entry))
+            })
+            .context("query pull_since_cursor_for_device")?;
+
+        let mut entries = Vec::new();
+        let mut last_cursor: Option<i64> = None;
+        for item in rows {
+            let (ingest_seq, entry) = item?;
+            last_cursor = Some(ingest_seq);
+            entries.push(entry);
+        }
+
+        Ok(PullBatch {
+            entries,
+            next_cursor: last_cursor,
+        })
+    }
+
     pub fn get_last_cursor(&self, peer_id: &str) -> Result<i64> {
         Ok(self.get_last_cursor_opt(peer_id)?.unwrap_or(0))
     }
@@ -492,6 +546,38 @@ mod tests {
             .unwrap();
         assert!(b3.entries.is_empty());
         assert_eq!(b3.next_cursor, None);
+    }
+
+    #[test]
+    fn pull_by_cursor_can_filter_by_device_id() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo 1");
+        e1.device_id = "dev-local".to_string();
+
+        let mut e2 = entry("id-2", 2, "echo 2");
+        e2.device_id = "dev-remote".to_string();
+
+        let mut e3 = entry("id-3", 3, "echo 3");
+        e3.device_id = "dev-local".to_string();
+
+        store
+            .insert_entries(&[e1.clone(), e2.clone(), e3.clone()])
+            .unwrap();
+
+        let b1 = store
+            .pull_since_cursor_for_device(0, 10, "dev-local")
+            .unwrap();
+        assert_eq!(b1.entries.len(), 2);
+        assert_eq!(b1.entries[0].entry_id, "id-1");
+        assert_eq!(b1.entries[1].entry_id, "id-3");
+        assert_eq!(b1.next_cursor, Some(3));
+
+        let b2 = store
+            .pull_since_cursor_for_device(b1.next_cursor.unwrap(), 10, "dev-local")
+            .unwrap();
+        assert!(b2.entries.is_empty());
+        assert_eq!(b2.next_cursor, None);
     }
 
     #[test]

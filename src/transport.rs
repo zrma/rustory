@@ -8,9 +8,17 @@ pub fn serve(bind: &str, db_path: &str) -> Result<()> {
     serve_http(bind, store)
 }
 
-pub fn sync(peers: &[String], db_path: &str, push: bool) -> Result<()> {
+pub fn sync(
+    peers: &[String],
+    db_path: &str,
+    push: bool,
+    local_device_id: Option<&str>,
+) -> Result<()> {
     if peers.is_empty() {
         anyhow::bail!("no peers provided");
+    }
+    if push && local_device_id.is_none() {
+        anyhow::bail!("local_device_id required for push");
     }
 
     let store = LocalStore::open(db_path)?;
@@ -28,7 +36,7 @@ pub fn sync(peers: &[String], db_path: &str, push: bool) -> Result<()> {
         }
 
         if push {
-            match sync_push_http_peer(&store, peer, 1000)
+            match sync_push_http_peer(&store, peer, 1000, local_device_id)
                 .with_context(|| format!("push peer: {peer}"))
             {
                 Ok(pushed) => {
@@ -82,8 +90,13 @@ fn sync_pull_http_peer(local: &LocalStore, peer_base_url: &str, limit: usize) ->
     })
 }
 
-fn sync_push_http_peer(local: &LocalStore, peer_base_url: &str, limit: usize) -> Result<usize> {
-    sync::sync_push_to_peer(local, peer_base_url, limit, |entries| {
+fn sync_push_http_peer(
+    local: &LocalStore,
+    peer_base_url: &str,
+    limit: usize,
+    local_device_id: Option<&str>,
+) -> Result<usize> {
+    sync::sync_push_to_peer(local, peer_base_url, limit, local_device_id, |entries| {
         http_push_batch(peer_base_url, entries)
     })
 }
@@ -312,9 +325,11 @@ mod tests {
         let local_db = dir.path().join("local.db");
 
         let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
-        remote
-            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
-            .unwrap();
+        let mut r1 = entry("id-1", 1, "echo 1");
+        r1.device_id = "dev-remote".to_string();
+        let mut r2 = entry("id-2", 2, "echo 2");
+        r2.device_id = "dev-remote".to_string();
+        remote.insert_entries(&[r1, r2]).unwrap();
 
         let server = start_test_server(remote_db.to_str().unwrap().to_string());
 
@@ -325,10 +340,12 @@ mod tests {
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
         assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 2);
 
-        local.insert_entries(&[entry("id-3", 3, "echo 3")]).unwrap();
+        let mut local_entry = entry("id-3", 3, "echo 3");
+        local_entry.device_id = "dev-local".to_string();
+        local.insert_entries(&[local_entry]).unwrap();
 
-        let pushed = sync_push_http_peer(&local, &server.base_url, 100).unwrap();
-        assert_eq!(pushed, 3);
+        let pushed = sync_push_http_peer(&local, &server.base_url, 100, Some("dev-local")).unwrap();
+        assert_eq!(pushed, 1);
 
         let got = remote.list_recent(10).unwrap();
         assert_eq!(got.len(), 3);

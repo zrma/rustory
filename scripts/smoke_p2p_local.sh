@@ -90,7 +90,7 @@ RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=b target/debug/rr --db-path "$TMPDIR/b.d
   --relay "$RELAY_ADDR" >"$TMPDIR/p2p-b.log" 2>&1 &
 P2P_B_PID=$!
 
-echo "[5/5] wait tracker has peers and run p2p-sync"
+echo "[5/5] wait tracker has peers"
 READY=0
 for _ in $(seq 1 200); do
   if curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=smoke" 2>/dev/null | python3 -c 'import json,sys
@@ -124,6 +124,29 @@ if [[ "$READY" != "1" ]]; then
   exit 1
 fi
 
+echo "[5/5] record seed entries on peers (a/b)"
+A_ENTRY_ID="$(RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=a target/debug/rr --db-path "$TMPDIR/a.db" record \
+  --cmd "echo smoke-a" \
+  --cwd "/tmp" \
+  --exit-code 0 \
+  --shell zsh \
+  --print-id | tr -d '\r')"
+if [[ -z "$A_ENTRY_ID" ]]; then
+  echo "error: failed to record entry on peer a"
+  exit 1
+fi
+
+B_ENTRY_ID="$(RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=b target/debug/rr --db-path "$TMPDIR/b.db" record \
+  --cmd "echo smoke-b" \
+  --cwd "/tmp" \
+  --exit-code 0 \
+  --shell zsh \
+  --print-id | tr -d '\r')"
+if [[ -z "$B_ENTRY_ID" ]]; then
+  echo "error: failed to record entry on peer b"
+  exit 1
+fi
+
 echo "[5/5] record one entry on client (c)"
 ENTRY_ID="$(RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" record \
   --cmd "echo smoke-push" \
@@ -136,12 +159,15 @@ if [[ -z "$ENTRY_ID" ]]; then
   exit 1
 fi
 
-RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-sync \
-  --swarm-key "$SWARM_KEY" \
-  --trackers "$TRACKER_URL" \
-  --relay "$RELAY_ADDR" \
-  --push \
-  --limit 10
+echo "[5/5] run p2p-sync twice with --push (should not gossip a<->b)"
+for _ in 1 2; do
+  RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-sync \
+    --swarm-key "$SWARM_KEY" \
+    --trackers "$TRACKER_URL" \
+    --relay "$RELAY_ADDR" \
+    --push \
+    --limit 10
+done
 
 echo "[5/5] verify entry was pushed to at least one peer"
 python3 - <<'PY' "$ENTRY_ID" "$TMPDIR/a.db" "$TMPDIR/b.db"
@@ -164,6 +190,29 @@ for db in dbs:
 
 if found == 0:
     sys.stderr.write(f"entry_id not found on any peer: {entry_id}\n")
+    sys.exit(1)
+PY
+
+echo "[5/5] verify no gossip between a and b (push is local-only)"
+python3 - <<'PY' "$A_ENTRY_ID" "$B_ENTRY_ID" "$TMPDIR/a.db" "$TMPDIR/b.db"
+import sqlite3
+import sys
+
+a_entry_id, b_entry_id, a_db, b_db = sys.argv[1:5]
+
+def has_entry(db_path: str, entry_id: str) -> bool:
+    conn = sqlite3.connect(db_path)
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM entries WHERE entry_id = ?", (entry_id,))
+        return cur.fetchone()[0] > 0
+    finally:
+        conn.close()
+
+if has_entry(b_db, a_entry_id):
+    sys.stderr.write(f"unexpected gossip: a entry found in b db: entry_id={a_entry_id}\n")
+    sys.exit(1)
+if has_entry(a_db, b_entry_id):
+    sys.stderr.write(f"unexpected gossip: b entry found in a db: entry_id={b_entry_id}\n")
     sys.exit(1)
 PY
 

@@ -150,7 +150,8 @@ pub fn run() -> Result<()> {
             transport::serve(&bind, &db_path)?;
         }
         Command::Sync { peers, push } => {
-            transport::sync(&peers, &db_path, push)?;
+            let device_id = resolve_device_id(&cfg);
+            transport::sync(&peers, &db_path, push, Some(&device_id))?;
         }
         Command::P2pServe {
             listen,
