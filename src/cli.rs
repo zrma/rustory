@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::{config, hook, p2p, search, storage, tracker, transport};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
@@ -48,6 +49,12 @@ enum Command {
 
         #[arg(long, default_value_t = 1000)]
         limit: usize,
+
+        #[arg(long)]
+        watch: bool,
+
+        #[arg(long, default_value_t = 60)]
+        interval_sec: u64,
 
         #[arg(long)]
         swarm_key: Option<String>,
@@ -170,6 +177,8 @@ pub fn run() -> Result<()> {
         Command::P2pSync {
             peers,
             limit,
+            watch,
+            interval_sec,
             swarm_key,
             relay,
             trackers,
@@ -182,19 +191,27 @@ pub fn run() -> Result<()> {
             let user_id = resolve_user_id(&cfg);
             let device_id = resolve_device_id(&cfg);
 
-            p2p::sync(
-                &peers,
-                limit,
-                &db_path,
-                p2p::SyncConfig {
-                    psk,
-                    relay_addr,
-                    trackers,
-                    tracker_token,
-                    user_id: Some(user_id),
-                    device_id: Some(device_id),
-                },
-            )?;
+            let sync_cfg = p2p::SyncConfig {
+                psk,
+                relay_addr,
+                trackers,
+                tracker_token,
+                user_id: Some(user_id),
+                device_id: Some(device_id),
+            };
+
+            if watch {
+                let interval = Duration::from_secs(interval_sec.max(1));
+                eprintln!("p2p-sync watch: interval={:?}", interval);
+                loop {
+                    if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone()) {
+                        eprintln!("warn: p2p-sync failed: {err:#}");
+                    }
+                    std::thread::sleep(interval);
+                }
+            } else {
+                p2p::sync(&peers, limit, &db_path, sync_cfg)?;
+            }
         }
         Command::SwarmKey { swarm_key } => {
             let path = resolve_swarm_key_path(swarm_key, &cfg);
@@ -466,5 +483,21 @@ mod tests {
         assert!(!is_self_rr_command("echo rr"));
         assert!(!is_self_rr_command("rrr search"));
         assert!(!is_self_rr_command("cargo run --bin rr -- serve"));
+    }
+
+    #[test]
+    fn p2p_sync_watch_parses_flags() {
+        let app = App::parse_from(["rr", "p2p-sync", "--watch", "--interval-sec", "5"]);
+        match app.cmd {
+            Command::P2pSync {
+                watch,
+                interval_sec,
+                ..
+            } => {
+                assert!(watch);
+                assert_eq!(interval_sec, 5);
+            }
+            _ => panic!("expected p2p-sync"),
+        }
     }
 }

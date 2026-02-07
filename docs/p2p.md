@@ -52,6 +52,8 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
 이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
 
+주기적으로 동기화를 계속 돌리려면 `--watch --interval-sec 60` 옵션을 사용한다.
+
 `rr p2p-serve`는 listen 주소뿐 아니라 libp2p가 발견한 **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)도 tracker에 같이 등록한다.
 따라서 같은 LAN/같은 네트워크 등에서 direct-first 성공 확률이 올라간다.
 
