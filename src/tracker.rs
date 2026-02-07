@@ -130,7 +130,14 @@ fn route_http_request(
             respond_json(200, &RegisterResponse { ok: true, ttl_sec })
         }
         ("GET", "/api/v1/peers") => {
-            let user_id = query.and_then(|q| query_get(q, "user_id"));
+            let user_id = match query.and_then(|q| query_get(q, "user_id")) {
+                Some(v) => Some(
+                    urlencoding::decode(v)
+                        .context("decode user_id query")?
+                        .into_owned(),
+                ),
+                None => None,
+            };
             let now = OffsetDateTime::now_utc();
 
             let peers = {
@@ -139,7 +146,7 @@ fn route_http_request(
                 locked
                     .peers
                     .iter()
-                    .filter(|(_, rec)| match (user_id, &rec.meta) {
+                    .filter(|(_, rec)| match (user_id.as_deref(), &rec.meta) {
                         (None, _) => true,
                         (Some(want), Some(meta)) => meta.user_id.as_deref() == Some(want),
                         (Some(_), None) => false,
@@ -248,7 +255,8 @@ impl TrackerClient {
     pub fn list(&self, user_id: Option<&str>) -> Result<ListResponse> {
         let mut url = format!("{}/api/v1/peers", self.base_url);
         if let Some(user_id) = user_id {
-            url = format!("{url}?user_id={user_id}");
+            let encoded = urlencoding::encode(user_id);
+            url = format!("{url}?user_id={encoded}");
         }
 
         let agent = ureq::AgentBuilder::new()
@@ -360,11 +368,12 @@ mod tests {
         let server = start_test_server(60, None);
         let client = TrackerClient::new(server.base_url.clone(), None);
 
+        let user_id = "u 1/2";
         let req = RegisterRequest {
             peer_id: "peer-a".to_string(),
             addrs: vec!["/ip4/127.0.0.1/tcp/1234".to_string()],
             meta: Some(PeerMeta {
-                user_id: Some("u1".to_string()),
+                user_id: Some(user_id.to_string()),
                 device_id: Some("d1".to_string()),
                 hostname: None,
                 version: Some("0.1.0".to_string()),
@@ -373,7 +382,7 @@ mod tests {
         let resp = client.register(&req).unwrap();
         assert!(resp.ok);
 
-        let list = client.list(Some("u1")).unwrap();
+        let list = client.list(Some(user_id)).unwrap();
         assert_eq!(list.peers.len(), 1);
         assert_eq!(list.peers[0].peer_id, "peer-a");
 
