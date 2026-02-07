@@ -2,7 +2,10 @@ use crate::core::Entry;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use time::OffsetDateTime;
+
+pub const DEFAULT_DB_PATH: &str = "~/.rustory/history.db";
 
 pub struct PullBatch {
     pub entries: Vec<Entry>,
@@ -19,6 +22,8 @@ impl LocalStore {
         ensure_parent_dir(&path)?;
 
         let conn = Connection::open(path).context("open sqlite db")?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("set sqlite busy_timeout")?;
         init_schema(&conn).context("init schema")?;
         Ok(Self { conn })
     }

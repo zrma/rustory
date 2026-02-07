@@ -14,12 +14,46 @@
   - SQLite 스토리지(ingest_seq cursor, dedup)
   - pull 기반 sync 코어 루프
   - HTTP(디버그) `serve`/`sync`
+  - P2P(단계 1: 수동 multiaddr) `p2p-serve`/`p2p-sync` (문서: `docs/p2p.md`)
+  - 로컬 기록용 `record` + fzf 기반 `search`
+  - bash/zsh hook 스크립트 생성(`hook`)
 
 ## 다음 단계
-- hook으로 엔트리 수집(로컬 insert)
-- ctrl+r + fzf UI
-- P2P(tracker/relay) transport로 이식
+- hook 안정화(경계 케이스/중복/성능)
+- P2P 단계 2: tracker/relay(디스커버리/중계)
 
 ## 개발
 - 테스트: `cargo test`
 - 로컬 실행: `cargo run --bin rr -- --help`
+
+## 사용(로컬 PoC)
+### zsh
+```sh
+source <(rr hook --shell zsh)
+```
+
+### bash
+```sh
+source <(rr hook --shell bash)
+```
+
+### 수동 기록/검색
+```sh
+rr record --cmd "echo hello" --cwd "$PWD" --exit-code 0 --shell zsh
+rr search --limit 100000
+```
+
+### DB 경로 오버라이드(옵션)
+```sh
+rr --db-path "/tmp/rustory.db" record --cmd "echo hello" --cwd "$PWD" --shell zsh
+rr --db-path "/tmp/rustory.db" search --limit 10
+```
+
+### P2P 동기화(단계 1: 수동 multiaddr)
+```sh
+# peer A (서버 역할)
+rr --db-path "/tmp/rustory-a.db" p2p-serve --listen /ip4/0.0.0.0/tcp/8845
+
+# peer B (클라이언트 역할): peer A가 출력한 /p2p/<peer_id> 포함 주소를 그대로 넣는다.
+rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<peer_id>" --limit 1000
+```
