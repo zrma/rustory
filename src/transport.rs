@@ -9,13 +9,29 @@ pub fn serve(bind: &str, db_path: &str) -> Result<()> {
 }
 
 pub fn sync(peers: &[String], db_path: &str) -> Result<()> {
+    if peers.is_empty() {
+        anyhow::bail!("no peers provided");
+    }
+
     let store = LocalStore::open(db_path)?;
+    let mut any_ok = false;
+    let mut last_err: Option<anyhow::Error> = None;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
-        let _pulled = sync_pull_http_peer(&store, peer, 1000)
-            .with_context(|| format!("sync peer: {peer}"))?;
+        match sync_pull_http_peer(&store, peer, 1000).with_context(|| format!("sync peer: {peer}"))
+        {
+            Ok(_) => any_ok = true,
+            Err(err) => {
+                eprintln!("warn: http sync failed: {peer}: {err:#}");
+                last_err = Some(err);
+            }
+        }
     }
-    Ok(())
+    if any_ok {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("http sync failed")))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

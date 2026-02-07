@@ -351,15 +351,39 @@ async fn sync_async(peers: &[String], limit: usize, db_path: &str, cfg: SyncConf
         discover_targets(&store, &cfg)?
     };
 
-    for t in targets {
-        let mut client = P2pClient::new(t.peer_id, t.direct_addrs, t.relay_addr, cfg.psk)?;
-        let _pulled =
-            crate::sync::sync_pull_from_peer_async(&store, &t.peer_key, limit, &mut client)
-                .await
-                .with_context(|| format!("p2p sync peer: {}", t.peer_key))?;
+    if targets.is_empty() {
+        anyhow::bail!("no peers found");
     }
 
-    Ok(())
+    let mut any_ok = false;
+    let mut last_err: Option<anyhow::Error> = None;
+    for t in targets {
+        let mut client = match P2pClient::new(t.peer_id, t.direct_addrs, t.relay_addr, cfg.psk) {
+            Ok(v) => v,
+            Err(err) => {
+                eprintln!("warn: p2p client init failed: {}: {err:#}", t.peer_key);
+                last_err = Some(err);
+                continue;
+            }
+        };
+
+        match crate::sync::sync_pull_from_peer_async(&store, &t.peer_key, limit, &mut client)
+            .await
+            .with_context(|| format!("p2p sync peer: {}", t.peer_key))
+        {
+            Ok(_) => any_ok = true,
+            Err(err) => {
+                eprintln!("warn: p2p sync failed: {}: {err:#}", t.peer_key);
+                last_err = Some(err);
+            }
+        }
+    }
+
+    if any_ok {
+        Ok(())
+    } else {
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p sync failed")))
+    }
 }
 
 fn build_manual_targets(
@@ -511,6 +535,14 @@ fn direct_candidate_addrs_from_tracker(addrs: &[String]) -> Vec<Multiaddr> {
         let Ok(mut addr) = raw.parse::<Multiaddr>() else {
             continue;
         };
+
+        // 0.0.0.0/:: 리슨 주소는 상대가 dial 가능한 direct 후보가 아니다.
+        if addr.iter().any(|p| {
+            matches!(p, Protocol::Ip4(ip) if ip.is_unspecified())
+                || matches!(p, Protocol::Ip6(ip) if ip.is_unspecified())
+        }) {
+            continue;
+        }
 
         // relay 주소는 direct 후보에서 제외한다.
         if addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {

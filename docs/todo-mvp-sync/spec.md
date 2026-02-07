@@ -66,7 +66,7 @@
 ### P2P (PoC 기본)
 - libp2p 기반의 peer-to-peer 통신
 - k8s 서버는 tracker(디스커버리) + relay(중계) 역할을 수행
-- PoC에서는 NAT traversal/hole punching은 제외하고 “relay 우선”으로 단순화
+- PoC는 “relay 우선”으로 단순화하되, relay 경유 연결이 수립된 경우에는 dcutr(DCUtR)로 direct 업그레이드(hole punching)를 시도한다(실패해도 relay로 계속 진행).
 - 동기화 메시지(개념):
   - `SyncPull { cursor, limit } -> SyncBatch { entries, next_cursor }`
   - `EntriesPush { entries } -> PushAck { inserted, ignored }` (옵션)

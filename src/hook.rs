@@ -68,6 +68,7 @@ case ";$PROMPT_COMMAND;" in
 esac
 
 __rustory_ctrl_r() {
+  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
   local limit="${RUSTORY_SEARCH_LIMIT:-100000}"
   local selected
   selected="$(rr search --limit "$limit")" || return 0
@@ -142,6 +143,7 @@ add-zsh-hook preexec __rustory_preexec
 add-zsh-hook precmd __rustory_precmd
 
 __rustory_widget_ctrl_r() {
+  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
   local limit="${RUSTORY_SEARCH_LIMIT:-100000}"
   local selected
   selected="$(rr search --limit "$limit")" || return 0
