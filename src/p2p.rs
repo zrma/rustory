@@ -263,6 +263,46 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), meta.clone());
                         }
                     }
+                    SwarmEvent::NewExternalAddrCandidate { address } => {
+                        let Some(full) =
+                            dialable_tracker_addr_from_external_candidate(address, local_peer_id)
+                        else {
+                            continue;
+                        };
+                        if !known_addrs.insert(full.clone()) {
+                            continue;
+                        }
+
+                        eprintln!("p2p external addr candidate: {full}");
+                        if !trackers.is_empty() {
+                            spawn_register_all(
+                                trackers.clone(),
+                                local_peer_id,
+                                known_addrs.iter().cloned().collect(),
+                                meta.clone(),
+                            );
+                        }
+                    }
+                    SwarmEvent::ExternalAddrConfirmed { address } => {
+                        let Some(full) =
+                            dialable_tracker_addr_from_external_candidate(address, local_peer_id)
+                        else {
+                            continue;
+                        };
+                        if !known_addrs.insert(full.clone()) {
+                            continue;
+                        }
+
+                        eprintln!("p2p external addr confirmed: {full}");
+                        if !trackers.is_empty() {
+                            spawn_register_all(
+                                trackers.clone(),
+                                local_peer_id,
+                                known_addrs.iter().cloned().collect(),
+                                meta.clone(),
+                            );
+                        }
+                    }
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
                         libp2p_request_response::Event::Message { message, .. } => match message {
                             libp2p_request_response::Message::Request { request, channel, .. } => {
@@ -324,14 +364,31 @@ fn spawn_register_all(
 }
 
 fn ensure_p2p_suffix(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
-    let has_p2p = addr
-        .iter()
-        .last()
-        .is_some_and(|p| matches!(p, Protocol::P2p(_)));
-    if !has_p2p {
-        addr.push(Protocol::P2p(peer_id));
+    match addr.iter().last() {
+        Some(Protocol::P2p(got)) if got == peer_id => {}
+        Some(Protocol::P2p(_)) => {
+            let _ = addr.pop();
+            addr.push(Protocol::P2p(peer_id));
+        }
+        _ => addr.push(Protocol::P2p(peer_id)),
     }
     addr
+}
+
+fn dialable_tracker_addr_from_external_candidate(
+    addr: Multiaddr,
+    peer_id: PeerId,
+) -> Option<String> {
+    // `0.0.0.0/::` 및 relay circuit 주소는 direct dial 후보로 의미가 없다.
+    if addr.iter().any(|p| {
+        matches!(p, Protocol::Ip4(ip) if ip.is_unspecified())
+            || matches!(p, Protocol::Ip6(ip) if ip.is_unspecified())
+            || matches!(p, Protocol::P2pCircuit)
+    }) {
+        return None;
+    }
+
+    Some(ensure_p2p_suffix(addr, peer_id).to_string())
 }
 
 pub fn sync(peers: &[String], limit: usize, db_path: &str, cfg: SyncConfig) -> Result<()> {
@@ -847,6 +904,33 @@ mod tests {
 
         let got = direct_candidate_addrs_from_tracker(&[direct, relay, invalid]);
         assert_eq!(got, vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]);
+    }
+
+    #[test]
+    fn dialable_tracker_addr_from_external_candidate_filters_unspecified_and_relay() {
+        let peer_id = PeerId::random();
+
+        let ok: Multiaddr = "/ip4/192.0.2.10/tcp/4001".parse().unwrap();
+        let out = dialable_tracker_addr_from_external_candidate(ok, peer_id).unwrap();
+        assert!(out.ends_with(&format!("/p2p/{}", peer_id)));
+
+        let unspecified: Multiaddr = "/ip4/0.0.0.0/tcp/4001".parse().unwrap();
+        assert!(dialable_tracker_addr_from_external_candidate(unspecified, peer_id).is_none());
+
+        let relay: Multiaddr = "/ip4/192.0.2.10/tcp/4001/p2p-circuit".parse().unwrap();
+        assert!(dialable_tracker_addr_from_external_candidate(relay, peer_id).is_none());
+    }
+
+    #[test]
+    fn dialable_tracker_addr_from_external_candidate_overwrites_wrong_p2p_suffix() {
+        let peer_id = PeerId::random();
+        let other = PeerId::random();
+
+        let addr: Multiaddr = format!("/ip4/192.0.2.10/tcp/4001/p2p/{other}")
+            .parse()
+            .unwrap();
+        let out = dialable_tracker_addr_from_external_candidate(addr, peer_id).unwrap();
+        assert!(out.ends_with(&format!("/p2p/{}", peer_id)));
     }
 
     #[test]
