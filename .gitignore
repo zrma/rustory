@@ -416,3 +416,13 @@ $RECYCLE.BIN/
 # Added by cargo
 
 target
+
+# Jujutsu repository metadata (do not commit)
+.jj/
+
+# Rustory local artifacts (avoid accidental secret/data commits)
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
