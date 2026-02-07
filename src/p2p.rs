@@ -54,8 +54,17 @@ struct SyncBatch {
 struct RustoryBehaviour {
     relay: libp2p::relay::client::Behaviour,
     identify: libp2p::identify::Behaviour,
+    dcutr: libp2p::dcutr::Behaviour,
     ping: libp2p::ping::Behaviour,
     sync: libp2p_request_response::json::Behaviour<SyncPull, SyncBatch>,
+}
+
+#[derive(libp2p::swarm::NetworkBehaviour)]
+#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+struct RelayServerBehaviour {
+    relay: libp2p::relay::Behaviour,
+    identify: libp2p::identify::Behaviour,
+    ping: libp2p::ping::Behaviour,
 }
 
 fn build_rustory_swarm(psk: libp2p::pnet::PreSharedKey) -> Result<Swarm<RustoryBehaviour>> {
@@ -101,6 +110,7 @@ fn build_rustory_swarm_with_identity(
     let behaviour = RustoryBehaviour {
         relay: relay_behaviour,
         identify: libp2p::identify::Behaviour::new(identify_cfg),
+        dcutr: libp2p::dcutr::Behaviour::new(local_peer_id),
         ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
         sync: rr,
     };
@@ -113,8 +123,9 @@ fn build_rustory_swarm_with_identity(
     ))
 }
 
-fn build_relay_swarm(psk: libp2p::pnet::PreSharedKey) -> Result<Swarm<libp2p::relay::Behaviour>> {
+fn build_relay_swarm(psk: libp2p::pnet::PreSharedKey) -> Result<Swarm<RelayServerBehaviour>> {
     let identity = libp2p::identity::Keypair::generate_ed25519();
+    let local_public_key = identity.public();
     let local_peer_id = identity.public().to_peer_id();
 
     let tcp_transport = libp2p::tcp::tokio::Transport::default();
@@ -131,7 +142,15 @@ fn build_relay_swarm(psk: libp2p::pnet::PreSharedKey) -> Result<Swarm<libp2p::re
         .multiplex(libp2p::yamux::Config::default())
         .boxed();
 
-    let behaviour = libp2p::relay::Behaviour::new(local_peer_id, libp2p::relay::Config::default());
+    let identify_cfg =
+        libp2p::identify::Config::new("rustory-relay/0.1.0".to_string(), local_public_key)
+            .with_agent_version(format!("rustory/{}", env!("CARGO_PKG_VERSION")));
+
+    let behaviour = RelayServerBehaviour {
+        relay: libp2p::relay::Behaviour::new(local_peer_id, libp2p::relay::Config::default()),
+        identify: libp2p::identify::Behaviour::new(identify_cfg),
+        ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
+    };
 
     Ok(Swarm::new(
         transport,
@@ -162,13 +181,15 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
                 println!("relay listen: {}/p2p/{}", address, local_peer_id);
             }
             SwarmEvent::Behaviour(event) => match event {
-                libp2p::relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                RelayServerBehaviourEvent::Relay(
+                    libp2p::relay::Event::ReservationReqAccepted { src_peer_id, .. },
+                ) => {
                     eprintln!("relay: reservation accepted: {src_peer_id}");
                 }
-                libp2p::relay::Event::CircuitReqAccepted {
+                RelayServerBehaviourEvent::Relay(libp2p::relay::Event::CircuitReqAccepted {
                     src_peer_id,
                     dst_peer_id,
-                } => {
+                }) => {
                     eprintln!("relay: circuit accepted: {src_peer_id} -> {dst_peer_id}");
                 }
                 _ => {}
@@ -245,6 +266,22 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         libp2p_request_response::Event::InboundFailure { .. } => {}
                         libp2p_request_response::Event::ResponseSent { .. } => {}
                     },
+                    SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
+                        match &event.result {
+                            Ok(connection_id) => {
+                                eprintln!(
+                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                                    event.remote_peer_id
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    event.remote_peer_id
+                                );
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -607,6 +644,22 @@ impl P2pClient {
                     {
                         return Ok(());
                     }
+                    SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
+                        match &event.result {
+                            Ok(connection_id) => {
+                                eprintln!(
+                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                                    event.remote_peer_id
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    event.remote_peer_id
+                                );
+                            }
+                        }
+                    }
                     SwarmEvent::OutgoingConnectionError {
                         connection_id: got,
                         peer_id,
@@ -642,36 +695,49 @@ impl P2pClient {
 
         loop {
             let event = self.swarm.select_next_some().await;
-            let SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) = event else {
-                continue;
-            };
-
             match event {
-                libp2p_request_response::Event::Message { message, .. } => match message {
-                    libp2p_request_response::Message::Response {
+                SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
+                    libp2p_request_response::Event::Message { message, .. } => match message {
+                        libp2p_request_response::Message::Response {
+                            request_id: got_id,
+                            response,
+                        } => {
+                            if got_id == request_id {
+                                return Ok(PullBatch {
+                                    entries: response.entries,
+                                    next_cursor: response.next_cursor,
+                                });
+                            }
+                        }
+                        libp2p_request_response::Message::Request { .. } => {}
+                    },
+                    libp2p_request_response::Event::OutboundFailure {
                         request_id: got_id,
-                        response,
+                        error,
+                        ..
                     } => {
                         if got_id == request_id {
-                            return Ok(PullBatch {
-                                entries: response.entries,
-                                next_cursor: response.next_cursor,
-                            });
+                            anyhow::bail!("p2p outbound request failed: {error}");
                         }
                     }
-                    libp2p_request_response::Message::Request { .. } => {}
+                    libp2p_request_response::Event::InboundFailure { .. } => {}
+                    libp2p_request_response::Event::ResponseSent { .. } => {}
                 },
-                libp2p_request_response::Event::OutboundFailure {
-                    request_id: got_id,
-                    error,
-                    ..
-                } => {
-                    if got_id == request_id {
-                        anyhow::bail!("p2p outbound request failed: {error}");
+                SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
+                    Ok(connection_id) => {
+                        eprintln!(
+                            "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                            event.remote_peer_id
+                        );
                     }
-                }
-                libp2p_request_response::Event::InboundFailure { .. } => {}
-                libp2p_request_response::Event::ResponseSent { .. } => {}
+                    Err(err) => {
+                        eprintln!(
+                            "dcutr: upgrade failed: peer={} error={err}",
+                            event.remote_peer_id
+                        );
+                    }
+                },
+                _ => {}
             }
         }
     }
