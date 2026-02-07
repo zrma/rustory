@@ -193,6 +193,36 @@ ON CONFLICT(peer_id) DO UPDATE SET last_cursor = excluded.last_cursor
         Ok(())
     }
 
+    pub fn get_last_pushed_seq(&self, peer_id: &str) -> Result<i64> {
+        Ok(self.get_last_pushed_seq_opt(peer_id)?.unwrap_or(0))
+    }
+
+    pub fn get_last_pushed_seq_opt(&self, peer_id: &str) -> Result<Option<i64>> {
+        match self.conn.query_row(
+            "SELECT last_pushed_seq FROM peer_push_state WHERE peer_id = ?",
+            params![peer_id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err).context("query peer_push_state"),
+        }
+    }
+
+    pub fn set_last_pushed_seq(&self, peer_id: &str, seq: i64) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO peer_push_state(peer_id, last_pushed_seq)
+VALUES (?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET last_pushed_seq = excluded.last_pushed_seq
+"#,
+                params![peer_id, seq],
+            )
+            .context("upsert peer_push_state")?;
+        Ok(())
+    }
+
     pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
         let addrs_json = serde_json::to_string(&peer.addrs).context("serialize peer_book addrs")?;
         self.conn
@@ -340,6 +370,11 @@ CREATE TABLE IF NOT EXISTS peer_state (
   last_cursor INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS peer_push_state (
+  peer_id TEXT PRIMARY KEY,
+  last_pushed_seq INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS peer_book (
   peer_id TEXT PRIMARY KEY,
   addrs_json TEXT NOT NULL,
@@ -425,6 +460,8 @@ mod tests {
 
         assert!(names.iter().any(|n| n == "entries"));
         assert!(names.iter().any(|n| n == "peer_state"));
+        assert!(names.iter().any(|n| n == "peer_push_state"));
+        assert!(names.iter().any(|n| n == "peer_book"));
     }
 
     #[test]
@@ -478,6 +515,15 @@ mod tests {
         assert_eq!(store.get_last_cursor("peer-a").unwrap(), 0);
         store.set_last_cursor("peer-a", 42).unwrap();
         assert_eq!(store.get_last_cursor("peer-a").unwrap(), 42);
+    }
+
+    #[test]
+    fn peer_push_state_roundtrip() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 0);
+        store.set_last_pushed_seq("peer-a", 7).unwrap();
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 7);
     }
 
     #[test]

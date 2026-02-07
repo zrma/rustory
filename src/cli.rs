@@ -23,6 +23,9 @@ enum Command {
     Sync {
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
+
+        #[arg(long)]
+        push: bool,
     },
     P2pServe {
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
@@ -49,6 +52,9 @@ enum Command {
 
         #[arg(long, default_value_t = 1000)]
         limit: usize,
+
+        #[arg(long)]
+        push: bool,
 
         #[arg(long)]
         watch: bool,
@@ -143,8 +149,8 @@ pub fn run() -> Result<()> {
         Command::Serve { bind } => {
             transport::serve(&bind, &db_path)?;
         }
-        Command::Sync { peers } => {
-            transport::sync(&peers, &db_path)?;
+        Command::Sync { peers, push } => {
+            transport::sync(&peers, &db_path, push)?;
         }
         Command::P2pServe {
             listen,
@@ -177,6 +183,7 @@ pub fn run() -> Result<()> {
         Command::P2pSync {
             peers,
             limit,
+            push,
             watch,
             interval_sec,
             swarm_key,
@@ -204,13 +211,13 @@ pub fn run() -> Result<()> {
                 let interval = Duration::from_secs(interval_sec.max(1));
                 eprintln!("p2p-sync watch: interval={:?}", interval);
                 loop {
-                    if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone()) {
+                    if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone(), push) {
                         eprintln!("warn: p2p-sync failed: {err:#}");
                     }
                     std::thread::sleep(interval);
                 }
             } else {
-                p2p::sync(&peers, limit, &db_path, sync_cfg)?;
+                p2p::sync(&peers, limit, &db_path, sync_cfg, push)?;
             }
         }
         Command::SwarmKey { swarm_key } => {

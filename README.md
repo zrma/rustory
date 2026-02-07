@@ -13,7 +13,7 @@
 - PoC 구현 진행 중:
   - SQLite 스토리지(ingest_seq cursor, dedup)
   - pull 기반 sync 코어 루프
-  - HTTP(디버그) `serve`/`sync`
+  - HTTP(디버그) `serve`/`sync` (pull + optional push: `rr sync --push`)
   - P2P `p2p-serve`/`p2p-sync`
     - 단계 1: 수동 multiaddr
     - 단계 2: tracker/relay(디스커버리 + 중계) + PSK(pnet) + direct-first + relay fallback + hole punching(DCUtR) (문서: `docs/p2p.md`)
@@ -24,7 +24,8 @@
   - bash/zsh hook 스크립트 생성(`hook`)
 
 ## 다음 단계
-- push 기반 동기화(업로드 최적화) 또는 주기 동기화(스케줄러)
+- push 기반 동기화(옵션: `p2p-sync --push`) 고도화(필터링/압축/배치 튜닝 등)
+- 주기 동기화(옵션: `p2p-sync --watch`)를 데몬/스케줄러로 정식화(launchd/systemd 등)
 - 설정/키 관리 UX 개선(PSK fingerprint 출력, 키 배포 문서화 등)
 - 로컬/CI 수용 테스트(스모크) 정비
 

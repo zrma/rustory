@@ -12,6 +12,7 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 const SYNC_PULL_PROTOCOL: &str = "/rustory/sync-pull/1.0.0";
+const ENTRIES_PUSH_PROTOCOL: &str = "/rustory/entries-push/1.0.0";
 
 #[derive(Clone)]
 pub struct ServeConfig {
@@ -51,6 +52,16 @@ struct SyncBatch {
     next_cursor: Option<i64>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EntriesPush {
+    entries: Vec<crate::core::Entry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct PushAck {
+    ok: bool,
+}
+
 #[derive(libp2p::swarm::NetworkBehaviour)]
 #[behaviour(prelude = "libp2p::swarm::derive_prelude")]
 struct RustoryBehaviour {
@@ -59,6 +70,7 @@ struct RustoryBehaviour {
     dcutr: libp2p::dcutr::Behaviour,
     ping: libp2p::ping::Behaviour,
     sync: libp2p_request_response::json::Behaviour<SyncPull, SyncBatch>,
+    push: libp2p_request_response::json::Behaviour<EntriesPush, PushAck>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -91,6 +103,17 @@ fn build_rustory_swarm_with_identity(
     let rr =
         libp2p_request_response::json::Behaviour::<SyncPull, SyncBatch>::new(protocols, rr_cfg);
 
+    let push_protocols = [(
+        StreamProtocol::new(ENTRIES_PUSH_PROTOCOL),
+        ProtocolSupport::Full,
+    )];
+    let push_cfg =
+        libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
+    let push_rr = libp2p_request_response::json::Behaviour::<EntriesPush, PushAck>::new(
+        push_protocols,
+        push_cfg,
+    );
+
     let (relay_transport, relay_behaviour) = libp2p::relay::client::new(local_peer_id);
     let tcp_transport = libp2p::tcp::tokio::Transport::default();
     let transport = OrTransport::new(relay_transport, tcp_transport);
@@ -115,6 +138,7 @@ fn build_rustory_swarm_with_identity(
         dcutr: libp2p::dcutr::Behaviour::new(local_peer_id),
         ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
         sync: rr,
+        push: push_rr,
     };
 
     Ok(Swarm::new(
@@ -319,6 +343,24 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         libp2p_request_response::Event::InboundFailure { .. } => {}
                         libp2p_request_response::Event::ResponseSent { .. } => {}
                     },
+                    SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
+                        libp2p_request_response::Event::Message { message, .. } => match message {
+                            libp2p_request_response::Message::Request { request, channel, .. } => {
+                                let ok = store.insert_entries(&request.entries).is_ok();
+                                if !ok {
+                                    eprintln!("warn: p2p push insert failed");
+                                }
+                                let _ = swarm
+                                    .behaviour_mut()
+                                    .push
+                                    .send_response(channel, PushAck { ok });
+                            }
+                            libp2p_request_response::Message::Response { .. } => {}
+                        },
+                        libp2p_request_response::Event::OutboundFailure { .. } => {}
+                        libp2p_request_response::Event::InboundFailure { .. } => {}
+                        libp2p_request_response::Event::ResponseSent { .. } => {}
+                    },
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
                         match &event.result {
                             Ok(connection_id) => {
@@ -391,13 +433,19 @@ fn dialable_tracker_addr_from_external_candidate(
     Some(ensure_p2p_suffix(addr, peer_id).to_string())
 }
 
-pub fn sync(peers: &[String], limit: usize, db_path: &str, cfg: SyncConfig) -> Result<()> {
+pub fn sync(
+    peers: &[String],
+    limit: usize,
+    db_path: &str,
+    cfg: SyncConfig,
+    push: bool,
+) -> Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build tokio runtime")?;
 
-    rt.block_on(async move { sync_async(peers, limit, db_path, cfg).await })
+    rt.block_on(async move { sync_async(peers, limit, db_path, cfg, push).await })
 }
 
 #[derive(Debug, Clone)]
@@ -408,7 +456,13 @@ struct SyncTarget {
     relay_addr: Option<Multiaddr>,
 }
 
-async fn sync_async(peers: &[String], limit: usize, db_path: &str, cfg: SyncConfig) -> Result<()> {
+async fn sync_async(
+    peers: &[String],
+    limit: usize,
+    db_path: &str,
+    cfg: SyncConfig,
+    push: bool,
+) -> Result<()> {
     if limit == 0 {
         return Ok(());
     }
@@ -437,14 +491,35 @@ async fn sync_async(peers: &[String], limit: usize, db_path: &str, cfg: SyncConf
             }
         };
 
-        match crate::sync::sync_pull_from_peer_async(&store, &t.peer_key, limit, &mut client)
-            .await
-            .with_context(|| format!("p2p sync peer: {}", t.peer_key))
-        {
+        let pull_res =
+            crate::sync::sync_pull_from_peer_async(&store, &t.peer_key, limit, &mut client)
+                .await
+                .with_context(|| format!("p2p pull peer: {}", t.peer_key));
+
+        match pull_res {
             Ok(_) => any_ok = true,
             Err(err) => {
-                eprintln!("warn: p2p sync failed: {}: {err:#}", t.peer_key);
+                eprintln!("warn: p2p pull failed: {}: {err:#}", t.peer_key);
                 last_err = Some(err);
+            }
+        }
+
+        if push {
+            let push_res =
+                crate::sync::sync_push_to_peer_async(&store, &t.peer_key, limit, &mut client)
+                    .await
+                    .with_context(|| format!("p2p push peer: {}", t.peer_key));
+
+            match push_res {
+                Ok(pushed) => {
+                    if pushed > 0 {
+                        any_ok = true;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("warn: p2p push failed: {}: {err:#}", t.peer_key);
+                    last_err = Some(err);
+                }
             }
         }
     }
@@ -844,6 +919,69 @@ impl P2pClient {
             }
         }
     }
+
+    async fn push_batch(&mut self, entries: Vec<crate::core::Entry>) -> Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        self.ensure_connected().await?;
+
+        let req = EntriesPush { entries };
+        let request_id = self
+            .swarm
+            .behaviour_mut()
+            .push
+            .send_request(&self.peer_id, req);
+
+        loop {
+            let event = self.swarm.select_next_some().await;
+            match event {
+                SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
+                    libp2p_request_response::Event::Message { message, .. } => match message {
+                        libp2p_request_response::Message::Response {
+                            request_id: got_id,
+                            response,
+                        } => {
+                            if got_id == request_id {
+                                if response.ok {
+                                    return Ok(());
+                                }
+                                anyhow::bail!("p2p push rejected");
+                            }
+                        }
+                        libp2p_request_response::Message::Request { .. } => {}
+                    },
+                    libp2p_request_response::Event::OutboundFailure {
+                        request_id: got_id,
+                        error,
+                        ..
+                    } => {
+                        if got_id == request_id {
+                            anyhow::bail!("p2p outbound request failed: {error}");
+                        }
+                    }
+                    libp2p_request_response::Event::InboundFailure { .. } => {}
+                    libp2p_request_response::Event::ResponseSent { .. } => {}
+                },
+                SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
+                    Ok(connection_id) => {
+                        eprintln!(
+                            "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                            event.remote_peer_id
+                        );
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "dcutr: upgrade failed: peer={} error={err}",
+                            event.remote_peer_id
+                        );
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
 }
 
 impl crate::sync::Puller for P2pClient {
@@ -853,6 +991,15 @@ impl crate::sync::Puller for P2pClient {
         limit: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PullBatch>> + 'a>> {
         Box::pin(self.pull_batch(cursor, limit))
+    }
+}
+
+impl crate::sync::Pusher for P2pClient {
+    fn push<'a>(
+        &'a mut self,
+        entries: Vec<crate::core::Entry>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
+        Box::pin(self.push_batch(entries))
     }
 }
 
@@ -1049,5 +1196,75 @@ mod tests {
         assert_eq!(result.next_cursor, Some(2));
         assert_eq!(result.entries[0].entry_id, "id-1");
         assert_eq!(result.entries[1].entry_id, "id-2");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_entries_push_roundtrip_on_loopback() {
+        let psk = libp2p::pnet::PreSharedKey::new([0; 32]);
+
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+
+        let mut server = build_rustory_swarm(psk).unwrap();
+        server
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let server_peer = *server.local_peer_id();
+
+        // 서버가 listen 주소를 얻을 때까지 진행.
+        let listen_addr = loop {
+            let event = server.select_next_some().await;
+            if let SwarmEvent::NewListenAddr { address, .. } = event {
+                break address;
+            }
+        };
+
+        let mut client = build_rustory_swarm(psk).unwrap();
+        client
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        client.add_peer_address(server_peer, listen_addr.clone());
+
+        let entry = entry("id-1", 1, "echo 1");
+        let req_id = client.behaviour_mut().push.send_request(
+            &server_peer,
+            EntriesPush {
+                entries: vec![entry.clone()],
+            },
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    e = server.select_next_some() => {
+                        if let SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) = e
+                            && let libp2p_request_response::Event::Message { message, .. } = event
+                            && let libp2p_request_response::Message::Request { request, channel, .. } = message
+                        {
+                            remote.insert_entries(&request.entries).unwrap();
+                            let _ = server.behaviour_mut().push.send_response(channel, PushAck { ok: true });
+                        }
+                    }
+                    e = client.select_next_some() => {
+                        if let SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) = e
+                            && let libp2p_request_response::Event::Message { message, .. } = event
+                            && let libp2p_request_response::Message::Response { request_id, response } = message
+                            && request_id == req_id
+                        {
+                            break response;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("timeout");
+
+        assert!(result.ok);
+        let got = remote.list_recent(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].entry_id, entry.entry_id);
+        assert_eq!(got[0].cmd, entry.cmd);
     }
 }

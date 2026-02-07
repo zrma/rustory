@@ -124,10 +124,47 @@ if [[ "$READY" != "1" ]]; then
   exit 1
 fi
 
+echo "[5/5] record one entry on client (c)"
+ENTRY_ID="$(RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" record \
+  --cmd "echo smoke-push" \
+  --cwd "/tmp" \
+  --exit-code 0 \
+  --shell zsh \
+  --print-id | tr -d '\r')"
+if [[ -z "$ENTRY_ID" ]]; then
+  echo "error: failed to record entry on client"
+  exit 1
+fi
+
 RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-sync \
   --swarm-key "$SWARM_KEY" \
   --trackers "$TRACKER_URL" \
   --relay "$RELAY_ADDR" \
+  --push \
   --limit 10
+
+echo "[5/5] verify entry was pushed to at least one peer"
+python3 - <<'PY' "$ENTRY_ID" "$TMPDIR/a.db" "$TMPDIR/b.db"
+import sqlite3
+import sys
+
+entry_id = sys.argv[1]
+dbs = sys.argv[2:]
+
+found = 0
+for db in dbs:
+    conn = sqlite3.connect(db)
+    try:
+        cur = conn.execute("SELECT COUNT(*) FROM entries WHERE entry_id = ?", (entry_id,))
+        n = cur.fetchone()[0]
+    finally:
+        conn.close()
+    if n:
+        found += 1
+
+if found == 0:
+    sys.stderr.write(f"entry_id not found on any peer: {entry_id}\n")
+    sys.exit(1)
+PY
 
 echo "ok"
