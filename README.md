@@ -37,6 +37,8 @@ source <(rr hook --shell zsh)
 source <(rr hook --shell bash)
 ```
 
+추가 옵션/환경 변수는 `docs/hook.md` 참고.
+
 ### 수동 기록/검색
 ```sh
 rr record --cmd "echo hello" --cwd "$PWD" --exit-code 0 --shell zsh

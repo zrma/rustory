@@ -74,8 +74,9 @@ enum Command {
 
 pub fn run() -> Result<()> {
     let app = App::parse();
-    let db_path =
-        normalize_opt_string(app.db_path).unwrap_or_else(|| storage::DEFAULT_DB_PATH.to_string());
+    let db_path = normalize_opt_string(app.db_path)
+        .or_else(|| env_nonempty("RUSTORY_DB_PATH"))
+        .unwrap_or_else(|| storage::DEFAULT_DB_PATH.to_string());
 
     match app.cmd {
         Command::Serve { bind } => {
@@ -101,7 +102,11 @@ pub fn run() -> Result<()> {
             device_id,
             print_id,
         } => {
-            if cmd.trim().is_empty() {
+            let cmd = cmd.trim();
+            if cmd.is_empty() {
+                return Ok(());
+            }
+            if is_self_rr_command(cmd) {
                 return Ok(());
             }
 
@@ -129,7 +134,7 @@ pub fn run() -> Result<()> {
                 device_id,
                 user_id,
                 ts: time::OffsetDateTime::now_utc(),
-                cmd,
+                cmd: cmd.to_string(),
                 cwd,
                 exit_code,
                 duration_ms,
@@ -187,4 +192,28 @@ fn normalize_opt_string(value: Option<String>) -> Option<String> {
 
 fn env_nonempty(key: &str) -> Option<String> {
     normalize_opt_string(std::env::var(key).ok())
+}
+
+fn is_self_rr_command(cmd: &str) -> bool {
+    let Some(first) = cmd.split_whitespace().next() else {
+        return false;
+    };
+    first == "rr"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_self_rr_command_detects_rr_invocation() {
+        assert!(is_self_rr_command("rr"));
+        assert!(is_self_rr_command("rr serve --bind 0.0.0.0:8844"));
+        assert!(is_self_rr_command("  rr  search"));
+
+        assert!(!is_self_rr_command(""));
+        assert!(!is_self_rr_command("echo rr"));
+        assert!(!is_self_rr_command("rrr search"));
+        assert!(!is_self_rr_command("cargo run --bin rr -- serve"));
+    }
 }

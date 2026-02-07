@@ -54,9 +54,9 @@ __rustory_precmd() {
   __rustory_last_histnum="$histnum"
 
   # rr 자체는 기록하지 않는다.
-  if [[ "$cmd" == rr\ * ]]; then
-    return 0
-  fi
+  case "$cmd" in
+    rr|rr\ *) return 0 ;;
+  esac
 
   ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --shell "bash" >/dev/null 2>&1 ) &
 }
@@ -68,8 +68,9 @@ case ";$PROMPT_COMMAND;" in
 esac
 
 __rustory_ctrl_r() {
+  local limit="${RUSTORY_SEARCH_LIMIT:-100000}"
   local selected
-  selected="$(rr search --limit 100000)" || return 0
+  selected="$(rr search --limit "$limit")" || return 0
   [[ -z "$selected" ]] && return 0
 
   READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}$selected${READLINE_LINE:$READLINE_POINT}"
@@ -109,16 +110,19 @@ __rustory_precmd() {
   [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
 
   local cmd="$__rustory_last_cmd"
+  cmd="${cmd#"${cmd%%[![:space:]]*}"}"
   if [[ -z "$cmd" ]]; then
     return 0
   fi
 
   # rr 자체는 기록하지 않는다.
-  if [[ "$cmd" == rr\ * ]]; then
+  case "$cmd" in
+  rr|rr\ *)
     __rustory_last_cmd=""
     __rustory_last_start_us=""
     return 0
-  fi
+  ;;
+  esac
 
   local duration_ms=0
   if [[ -n "$__rustory_last_start_us" && -n "${EPOCHREALTIME:-}" ]]; then
@@ -138,8 +142,9 @@ add-zsh-hook preexec __rustory_preexec
 add-zsh-hook precmd __rustory_precmd
 
 __rustory_widget_ctrl_r() {
+  local limit="${RUSTORY_SEARCH_LIMIT:-100000}"
   local selected
-  selected="$(rr search --limit 100000)" || return 0
+  selected="$(rr search --limit "$limit")" || return 0
   if [[ -n "$selected" ]]; then
     LBUFFER+="$selected"
   fi
@@ -150,4 +155,33 @@ zle -N __rustory_ctrl_r_widget __rustory_widget_ctrl_r
 bindkey '^R' __rustory_ctrl_r_widget
 "#
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bash_hook_contains_disable_and_ctrl_r_and_rr_filter() {
+        let got = render_hook(Shell::Bash);
+        assert!(got.contains("RUSTORY_HOOK_DISABLE"));
+        assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
+        assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
+
+        // ensure we skip both `rr` and `rr ...`
+        assert!(got.contains("case \"$cmd\" in"));
+        assert!(got.contains("rr|rr\\ *)"));
+    }
+
+    #[test]
+    fn zsh_hook_contains_disable_and_ctrl_r_and_rr_filter() {
+        let got = render_hook(Shell::Zsh);
+        assert!(got.contains("RUSTORY_HOOK_DISABLE"));
+        assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
+        assert!(got.contains("bindkey '^R'"));
+
+        // ensure we skip both `rr` and `rr ...`
+        assert!(got.contains("case \"$cmd\" in"));
+        assert!(got.contains("rr|rr\\ *)"));
+    }
 }
