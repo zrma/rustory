@@ -1,5 +1,7 @@
 # Rustory MVP Spec (append + dedup + fzf)
 
+이 문서는 Rustory의 MVP 범위/가정/결정 사항을 정리한다.
+
 ## 배경/동기
 - atuin: 기능이 많고 무거워서 운영/관리 부담이 큼
 - hishtory: 동기화 안정성이 떨어져 신뢰가 어렵다고 판단
@@ -44,7 +46,7 @@
 ## 아키텍처 개요
 - 클라이언트는 로컬 DB에 append-only 저장
 - peer는 tracker에 등록하고, tracker에서 peer 목록을 받아 여러 peer와 연결한다
-- direct 연결이 가능하면 direct를 시도하고, 불가하면 relay 경유로 통신한다 (PoC는 relay 우선)
+- direct 연결을 우선 시도하고, 불가하면 relay 경유로 통신한다(direct-first, relay fallback)
 - 저장소는 entry_id 유니크 인덱스로 dedup
 - peer 간 동기화는 “append + dedup + cursor”로 점진적으로 수렴한다
 
@@ -66,7 +68,8 @@
 ### P2P (PoC 기본)
 - libp2p 기반의 peer-to-peer 통신
 - k8s 서버는 tracker(디스커버리) + relay(중계) 역할을 수행
-- PoC는 “relay 우선”으로 단순화하되, relay 경유 연결이 수립된 경우에는 dcutr(DCUtR)로 direct 업그레이드(hole punching)를 시도한다(실패해도 relay로 계속 진행).
+- 동기화는 direct-first로 시도하되, direct 실패 시 relay 경유 dial로 fallback 한다.
+- relay 경유 연결이 수립되면, 가능하면 dcutr(DCUtR)로 direct 업그레이드(hole punching)를 시도한다(실패해도 relay로 계속 진행).
 - 동기화 메시지(개념):
   - `SyncPull { cursor, limit } -> SyncBatch { entries, next_cursor }`
   - `EntriesPush { entries } -> PushAck { inserted, ignored }` (옵션)
@@ -104,7 +107,7 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 
 ## bash/zsh 훅
 - precmd/PROMPT_COMMAND로 마지막 커맨드 캡처
-- 비동기 업로드(네트워크 실패 시 큐 유지)
+- 비동기 업로드(네트워크 실패 시 큐 유지)는 후속 단계에서 다룬다
 
 ## 비기능 요구사항
 - 오프라인 동작
@@ -114,7 +117,7 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 ## 구현 원칙
 - 통신/스토리지/CLI 등은 가능한 한 라이브러리로 해결
 - 동기화 프로토콜(append+dedup)과 데이터 모델은 직접 구현
-- Transport 레이어를 추상화하여 향후 P2P 확장 가능하게 설계
+- Transport 레이어를 추상화하여 향후 확장 가능하게 설계
 
 ## 모듈 구조 (초안)
 - core: 데이터 모델, entry_id 생성, 정렬/병합, dedup
@@ -157,10 +160,12 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
   - `db_path`
   - `device_id`
   - `user_id`
-  - `trackers = ["<multiaddr-or-host:port>", ...]`
+  - `trackers = ["http://<host>:<port>", ...]`
+  - `relay_addr = "/ip4/<ip>/tcp/<port>/p2p/<relay_peer_id>"`
   - `swarm_key_path` (private network 사용 시)
   - `search_limit_default`
 
 ## 결정: entry_id 생성
 - `entry_id`는 클라이언트에서 UUIDv4로 생성한다
 - 목적: 전역 유니크 키로 dedup/idempotency를 보장
+
