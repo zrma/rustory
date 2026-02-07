@@ -79,6 +79,14 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 - 서로 다른 머신에서 통신하려면 **같은 키 파일을 공유**해야 한다.
 - 오버라이드는 `--swarm-key <path>` 또는 `RUSTORY_SWARM_KEY_PATH`로 한다.
 
+## Identity Keypair(PeerId)
+- `rr p2p-serve`는 libp2p identity keypair를 디스크에 영속화하여 **재시작해도 PeerId가 유지**되게 한다.
+  - 기본 경로: `~/.config/rustory/identity.key`
+  - 오버라이드: `--identity-key <path>`, `RUSTORY_P2P_IDENTITY_KEY_PATH`, `config.toml`의 `p2p_identity_key_path`
+- `rr relay-serve`도 relay 전용 identity keypair를 별도로 영속화한다.
+  - 기본 경로: `~/.config/rustory/relay.key`
+  - 오버라이드: `--identity-key <path>`, `RUSTORY_RELAY_IDENTITY_KEY_PATH`, `config.toml`의 `relay_identity_key_path`
+
 ## 커서 저장
 - 동기화 커서는 `peer_state.last_cursor`에 저장한다.
 - key(`peer_state.peer_id`)는 **상대 피어의 `PeerId` 문자열**을 사용한다.
@@ -94,6 +102,8 @@ device_id = "macbook"
 trackers = ["http://127.0.0.1:8850"]
 relay_addr = "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>"
 swarm_key_path = "~/.config/rustory/swarm.key"
+p2p_identity_key_path = "~/.config/rustory/identity.key"
+relay_identity_key_path = "~/.config/rustory/relay.key"
 tracker_token = "secret"
 ```
 

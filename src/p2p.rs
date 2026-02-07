@@ -15,6 +15,7 @@ const SYNC_PULL_PROTOCOL: &str = "/rustory/sync-pull/1.0.0";
 
 #[derive(Clone)]
 pub struct ServeConfig {
+    pub identity: libp2p::identity::Keypair,
     pub psk: libp2p::pnet::PreSharedKey,
     pub relay_addr: Option<Multiaddr>,
     pub trackers: Vec<String>,
@@ -34,6 +35,7 @@ pub struct SyncConfig {
 
 #[derive(Clone)]
 pub struct RelayServeConfig {
+    pub identity: libp2p::identity::Keypair,
     pub psk: libp2p::pnet::PreSharedKey,
 }
 
@@ -123,8 +125,10 @@ fn build_rustory_swarm_with_identity(
     ))
 }
 
-fn build_relay_swarm(psk: libp2p::pnet::PreSharedKey) -> Result<Swarm<RelayServerBehaviour>> {
-    let identity = libp2p::identity::Keypair::generate_ed25519();
+fn build_relay_swarm_with_identity(
+    identity: libp2p::identity::Keypair,
+    psk: libp2p::pnet::PreSharedKey,
+) -> Result<Swarm<RelayServerBehaviour>> {
     let local_public_key = identity.public();
     let local_peer_id = identity.public().to_peer_id();
 
@@ -171,7 +175,8 @@ pub fn relay_serve(listen: &str, cfg: RelayServeConfig) -> Result<()> {
 }
 
 async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<()> {
-    let mut swarm = build_relay_swarm(cfg.psk)?;
+    let RelayServeConfig { identity, psk } = cfg;
+    let mut swarm = build_relay_swarm_with_identity(identity, psk)?;
     swarm.listen_on(listen).context("listen_on")?;
     let local_peer_id = *swarm.local_peer_id();
 
@@ -210,22 +215,30 @@ pub fn serve(listen: &str, db_path: &str, cfg: ServeConfig) -> Result<()> {
 }
 
 async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Result<()> {
+    let ServeConfig {
+        identity,
+        psk,
+        relay_addr,
+        trackers,
+        tracker_token,
+        meta,
+    } = cfg;
+
     let store = LocalStore::open(db_path)?;
-    let mut swarm = build_rustory_swarm(cfg.psk)?;
+    let mut swarm = build_rustory_swarm_with_identity(identity, psk)?;
 
     swarm.listen_on(listen).context("listen_on")?;
 
-    if let Some(relay_addr) = cfg.relay_addr.clone() {
+    if let Some(relay_addr) = relay_addr.clone() {
         let relay_listen = relay_addr.with(Protocol::P2pCircuit);
         swarm.listen_on(relay_listen).context("listen_on relay")?;
     }
 
     let local_peer_id = *swarm.local_peer_id();
 
-    let trackers = cfg
-        .trackers
+    let trackers = trackers
         .into_iter()
-        .map(|base_url| crate::tracker::TrackerClient::new(base_url, cfg.tracker_token.clone()))
+        .map(|base_url| crate::tracker::TrackerClient::new(base_url, tracker_token.clone()))
         .collect::<Vec<_>>();
 
     let mut known_addrs: HashSet<String> = HashSet::new();
@@ -235,7 +248,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
         tokio::select! {
             _ = next_register.tick() => {
                 if !trackers.is_empty() && !known_addrs.is_empty() {
-                    spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), cfg.meta.clone());
+                    spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), meta.clone());
                 }
             }
             event = swarm.select_next_some() => {
@@ -247,7 +260,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
                         // 주소를 1개 이상 확보한 시점에 tracker에 즉시 등록한다.
                         if !trackers.is_empty() {
-                            spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), cfg.meta.clone());
+                            spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), meta.clone());
                         }
                     }
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
