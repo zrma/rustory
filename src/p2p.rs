@@ -14,6 +14,13 @@ use time::OffsetDateTime;
 const SYNC_PULL_PROTOCOL: &str = "/rustory/sync-pull/1.0.0";
 const ENTRIES_PUSH_PROTOCOL: &str = "/rustory/entries-push/1.0.0";
 
+// request-response는 stream EOF까지 읽기 때문에, 크기 상한을 너무 작게 잡으면 “잘린 JSON 파싱 실패”로 보이기 쉽다.
+// PoC/MVP 범위에서는 "상한을 넉넉히" + "명확한 too-large 에러"를 우선한다.
+const PULL_REQ_MAX_BYTES: u64 = 64 * 1024;
+const PULL_RESP_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const PUSH_REQ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const PUSH_RESP_MAX_BYTES: u64 = 64 * 1024;
+
 #[derive(Clone)]
 pub struct ServeConfig {
     pub identity: libp2p::identity::Keypair,
@@ -69,8 +76,8 @@ struct RustoryBehaviour {
     identify: libp2p::identify::Behaviour,
     dcutr: libp2p::dcutr::Behaviour,
     ping: libp2p::ping::Behaviour,
-    sync: libp2p_request_response::json::Behaviour<SyncPull, SyncBatch>,
-    push: libp2p_request_response::json::Behaviour<EntriesPush, PushAck>,
+    sync: libp2p_request_response::Behaviour<crate::p2p_codec::JsonCodec<SyncPull, SyncBatch>>,
+    push: libp2p_request_response::Behaviour<crate::p2p_codec::JsonCodec<EntriesPush, PushAck>>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -100,8 +107,11 @@ fn build_rustory_swarm_with_identity(
 
     let rr_cfg =
         libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
-    let rr =
-        libp2p_request_response::json::Behaviour::<SyncPull, SyncBatch>::new(protocols, rr_cfg);
+    let rr_codec = crate::p2p_codec::JsonCodec::<SyncPull, SyncBatch>::new(
+        PULL_REQ_MAX_BYTES,
+        PULL_RESP_MAX_BYTES,
+    );
+    let rr = libp2p_request_response::Behaviour::with_codec(rr_codec, protocols, rr_cfg);
 
     let push_protocols = [(
         StreamProtocol::new(ENTRIES_PUSH_PROTOCOL),
@@ -109,10 +119,12 @@ fn build_rustory_swarm_with_identity(
     )];
     let push_cfg =
         libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
-    let push_rr = libp2p_request_response::json::Behaviour::<EntriesPush, PushAck>::new(
-        push_protocols,
-        push_cfg,
+    let push_codec = crate::p2p_codec::JsonCodec::<EntriesPush, PushAck>::new(
+        PUSH_REQ_MAX_BYTES,
+        PUSH_RESP_MAX_BYTES,
     );
+    let push_rr =
+        libp2p_request_response::Behaviour::with_codec(push_codec, push_protocols, push_cfg);
 
     let (relay_transport, relay_behaviour) = libp2p::relay::client::new(local_peer_id);
     let tcp_transport = libp2p::tcp::tokio::Transport::default();

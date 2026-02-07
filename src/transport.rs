@@ -1,6 +1,7 @@
 use crate::{core::Entry, storage::LocalStore, sync};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 
 pub fn serve(bind: &str, db_path: &str) -> Result<()> {
     let store = LocalStore::open(db_path)?;
@@ -172,9 +173,14 @@ fn route_http_request(
         }
         ("POST", "/api/v1/entries") => {
             let mut buf = Vec::new();
+            let max = max_request_body_bytes();
             req.as_reader()
+                .take((max as u64).saturating_add(1))
                 .read_to_end(&mut buf)
                 .context("read request body")?;
+            if buf.len() > max {
+                return Ok(respond_text(413, "payload too large\n"));
+            }
 
             let req_body: EntriesRequest =
                 serde_json::from_slice(&buf).context("parse entries request json")?;
@@ -188,6 +194,16 @@ fn route_http_request(
         }
         _ => Ok(respond_text(404, "not found\n")),
     }
+}
+
+#[cfg(test)]
+fn max_request_body_bytes() -> usize {
+    8 * 1024
+}
+
+#[cfg(not(test))]
+fn max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, usize)> {

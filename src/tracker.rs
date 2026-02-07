@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
@@ -98,9 +99,14 @@ fn route_http_request(
         ("GET", "/api/v1/ping") => Ok(respond_text(200, "ok\n")),
         ("POST", "/api/v1/peers/register") => {
             let mut buf = Vec::new();
+            let max = max_request_body_bytes();
             req.as_reader()
+                .take((max as u64).saturating_add(1))
                 .read_to_end(&mut buf)
                 .context("read request body")?;
+            if buf.len() > max {
+                return Ok(respond_text(413, "payload too large\n"));
+            }
 
             let reg: RegisterRequest =
                 serde_json::from_slice(&buf).context("parse register request json")?;
@@ -165,6 +171,16 @@ fn route_http_request(
         }
         _ => Ok(respond_text(404, "not found\n")),
     }
+}
+
+#[cfg(test)]
+fn max_request_body_bytes() -> usize {
+    8 * 1024
+}
+
+#[cfg(not(test))]
+fn max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn prune_expired(state: &mut TrackerState, now: OffsetDateTime, ttl_sec: u64) {
