@@ -125,3 +125,4 @@ tracker_token = "secret"
 - tracker가 일시적으로 다운되거나 결과가 비어 있으면, 최근에 본 peer 캐시를 기반으로 동기화를 시도한다.
   - 기본 보존 기간: `7d`
   - `user_id`가 설정된 경우 같은 user의 peer만 사용한다.
+- tracker 조회/등록은 일시적인 네트워크 오류(transport error) 및 5xx/429/408에 대해 최대 3회 재시도한다(connect/read timeout은 attempt마다 지수 증가).

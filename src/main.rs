@@ -2,6 +2,7 @@ mod cli;
 mod config;
 mod core;
 mod hook;
+mod http_retry;
 mod p2p;
 mod search;
 mod storage;

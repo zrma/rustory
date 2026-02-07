@@ -1,7 +1,6 @@
 use crate::{core::Entry, storage::LocalStore, sync};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 
 pub fn serve(bind: &str, db_path: &str) -> Result<()> {
     let store = LocalStore::open(db_path)?;
@@ -113,15 +112,11 @@ fn http_pull_batch(
         limit
     );
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
-    let resp = agent
-        .get(&url)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
+    let resp = crate::http_retry::request_with_retry(
+        crate::http_retry::RetryPolicy::transport(),
+        |agent| agent.get(&url).call(),
+    )
+    .with_context(|| format!("GET {url}"))?;
     let body = resp.into_string().context("read response body")?;
     let parsed: EntriesResponse =
         serde_json::from_str(&body).context("parse entries response json")?;
@@ -135,17 +130,17 @@ fn http_pull_batch(
 fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>) -> Result<()> {
     let url = format!("{}/api/v1/entries", peer_base_url.trim_end_matches('/'));
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
     let body = serde_json::to_vec(&entries).context("serialize entries json")?;
-    let resp = agent
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_bytes(&body)
-        .with_context(|| format!("POST {url}"))?;
+    let resp = crate::http_retry::request_with_retry(
+        crate::http_retry::RetryPolicy::transport(),
+        |agent| {
+            agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .send_bytes(&body)
+        },
+    )
+    .with_context(|| format!("POST {url}"))?;
     let _ = resp.into_string().context("read response body")?;
     Ok(())
 }
