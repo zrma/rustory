@@ -1,4 +1,4 @@
-use crate::storage::{LocalStore, PullBatch};
+use crate::storage::{LocalStore, PeerBookPeer, PullBatch};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::core::transport::choice::OrTransport;
@@ -9,6 +9,7 @@ use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
 use libp2p_request_response::ProtocolSupport;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use time::OffsetDateTime;
 
 const SYNC_PULL_PROTOCOL: &str = "/rustory/sync-pull/1.0.0";
 
@@ -310,7 +311,7 @@ async fn sync_async(peers: &[String], limit: usize, db_path: &str, cfg: SyncConf
     let targets = if !peers.is_empty() {
         build_manual_targets(&store, peers, cfg.relay_addr.clone())?
     } else {
-        discover_targets(&cfg)?
+        discover_targets(&store, &cfg)?
     };
 
     for t in targets {
@@ -346,6 +347,15 @@ fn build_manual_targets(
             store.set_last_cursor(&peer_key, old_cursor)?;
         }
 
+        // 수동 입력도 peerbook 캐시에 기록해 tracker 다운 시 fallback 후보로 활용한다.
+        store.upsert_peer_book(&PeerBookPeer {
+            peer_id: peer_key.clone(),
+            addrs: vec![peer_key_old.clone()],
+            user_id: None,
+            device_id: None,
+            last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
+        })?;
+
         out.push(SyncTarget {
             peer_id,
             peer_key,
@@ -356,7 +366,10 @@ fn build_manual_targets(
     Ok(out)
 }
 
-fn discover_targets(cfg: &SyncConfig) -> Result<Vec<SyncTarget>> {
+fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarget>> {
+    const PEER_BOOK_MAX_AGE_SECS: i64 = 60 * 60 * 24 * 7;
+    const PEER_BOOK_LIMIT: usize = 1000;
+
     if cfg.trackers.is_empty() {
         anyhow::bail!("no peers provided and no trackers configured");
     }
@@ -370,9 +383,65 @@ fn discover_targets(cfg: &SyncConfig) -> Result<Vec<SyncTarget>> {
     for base_url in &cfg.trackers {
         let client =
             crate::tracker::TrackerClient::new(base_url.clone(), cfg.tracker_token.clone());
-        let list = client.list(cfg.user_id.as_deref())?;
-        for p in list.peers {
-            by_peer.entry(p.peer_id.clone()).or_insert(p);
+        match client.list(cfg.user_id.as_deref()) {
+            Ok(list) => {
+                for p in list.peers {
+                    // self는 제외한다.
+                    if let Some(my_device) = cfg.device_id.as_deref()
+                        && p.meta.as_ref().and_then(|m| m.device_id.as_deref()) == Some(my_device)
+                    {
+                        continue;
+                    }
+
+                    // 성공한 tracker 결과는 peerbook 캐시로 저장한다.
+                    store.upsert_peer_book(&PeerBookPeer {
+                        peer_id: p.peer_id.clone(),
+                        addrs: p.addrs.clone(),
+                        user_id: p.meta.as_ref().and_then(|m| m.user_id.clone()),
+                        device_id: p.meta.as_ref().and_then(|m| m.device_id.clone()),
+                        last_seen_unix: p.last_seen_unix,
+                    })?;
+
+                    by_peer.entry(p.peer_id.clone()).or_insert(p);
+                }
+            }
+            Err(err) => {
+                eprintln!("warn: tracker list failed: {base_url}: {err:#}");
+            }
+        }
+    }
+
+    if by_peer.is_empty() {
+        let now_ts = OffsetDateTime::now_utc().unix_timestamp();
+        let min_last_seen = now_ts - PEER_BOOK_MAX_AGE_SECS;
+        let cached =
+            store.list_peer_book(cfg.user_id.as_deref(), min_last_seen, PEER_BOOK_LIMIT)?;
+        for peer in cached {
+            // self는 제외한다.
+            if let Some(my_device) = cfg.device_id.as_deref()
+                && peer.device_id.as_deref() == Some(my_device)
+            {
+                continue;
+            }
+
+            by_peer.insert(
+                peer.peer_id.clone(),
+                crate::tracker::PeerInfo {
+                    peer_id: peer.peer_id,
+                    addrs: peer.addrs,
+                    meta: Some(crate::tracker::PeerMeta {
+                        device_id: peer.device_id,
+                        hostname: None,
+                        user_id: peer.user_id,
+                        version: None,
+                    }),
+                    last_seen_unix: peer.last_seen_unix,
+                },
+            );
+        }
+
+        if by_peer.is_empty() {
+            anyhow::bail!("no peers found from trackers and peer_book cache is empty");
         }
     }
 
@@ -667,6 +736,45 @@ mod tests {
 
         let got = direct_candidate_addrs_from_tracker(&[direct, relay, invalid]);
         assert_eq!(got, vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]);
+    }
+
+    #[test]
+    fn discover_targets_falls_back_to_peer_book_when_trackers_fail() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let peer_id = PeerId::random().to_string();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: peer_id.clone(),
+                addrs: vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+                user_id: Some("u1".to_string()),
+                device_id: Some("dev-remote".to_string()),
+                last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            })
+            .unwrap();
+
+        let relay_id = PeerId::random();
+        let cfg = SyncConfig {
+            psk: libp2p::pnet::PreSharedKey::new([0; 32]),
+            relay_addr: Some(
+                format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
+                    .parse()
+                    .unwrap(),
+            ),
+            // connection refused should fail fast on loopback.
+            trackers: vec!["http://127.0.0.1:1".to_string()],
+            tracker_token: None,
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+        };
+
+        let got = discover_targets(&store, &cfg).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peer_key, peer_id);
+        assert_eq!(
+            got[0].direct_addrs,
+            vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

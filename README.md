@@ -24,7 +24,6 @@
   - bash/zsh hook 스크립트 생성(`hook`)
 
 ## 다음 단계
-- peerbook 캐시(persist) + tracker 다운 시 fallback(마지막으로 본 peer 주소로 direct 시도)
 - NAT traversal(hole punching / dcutr) 도입 검토
 - push 기반 동기화(업로드 최적화) 또는 주기 동기화(스케줄러)
 - 설정/키 관리 UX 개선(PSK fingerprint 출력, 키 배포 문서화 등)

@@ -89,3 +89,9 @@ relay_addr = "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>"
 swarm_key_path = "~/.config/rustory/swarm.key"
 tracker_token = "secret"
 ```
+
+## peerbook 캐시(tracker fallback)
+- `rr p2p-sync`는 tracker 조회가 성공하면, 받은 peer 목록을 로컬 DB에 캐시한다(`peer_book`).
+- tracker가 일시적으로 다운되거나 결과가 비어 있으면, 최근에 본 peer 캐시를 기반으로 동기화를 시도한다.
+  - 기본 보존 기간: `7d`
+  - `user_id`가 설정된 경우 같은 user의 peer만 사용한다.

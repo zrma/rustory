@@ -16,6 +16,15 @@ pub struct LocalStore {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerBookPeer {
+    pub peer_id: String,
+    pub addrs: Vec<String>,
+    pub user_id: Option<String>,
+    pub device_id: Option<String>,
+    pub last_seen_unix: i64,
+}
+
 impl LocalStore {
     pub fn open(path: &str) -> Result<Self> {
         let path = expand_home(path)?;
@@ -183,6 +192,98 @@ ON CONFLICT(peer_id) DO UPDATE SET last_cursor = excluded.last_cursor
             .context("upsert peer_state")?;
         Ok(())
     }
+
+    pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
+        let addrs_json = serde_json::to_string(&peer.addrs).context("serialize peer_book addrs")?;
+        self.conn
+            .execute(
+                r#"
+INSERT INTO peer_book(peer_id, addrs_json, user_id, device_id, last_seen)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET
+  addrs_json = excluded.addrs_json,
+  user_id = excluded.user_id,
+  device_id = excluded.device_id,
+  last_seen = excluded.last_seen
+"#,
+                params![
+                    peer.peer_id,
+                    addrs_json,
+                    peer.user_id,
+                    peer.device_id,
+                    peer.last_seen_unix,
+                ],
+            )
+            .context("upsert peer_book")?;
+        Ok(())
+    }
+
+    pub fn list_peer_book(
+        &self,
+        user_id: Option<&str>,
+        min_last_seen_unix: i64,
+        limit: usize,
+    ) -> Result<Vec<PeerBookPeer>> {
+        let mut out = Vec::new();
+
+        let sql = if user_id.is_some() {
+            r#"
+SELECT peer_id, addrs_json, user_id, device_id, last_seen
+FROM peer_book
+WHERE user_id = ?1
+  AND last_seen >= ?2
+ORDER BY last_seen DESC, peer_id ASC
+LIMIT ?3
+"#
+        } else {
+            r#"
+SELECT peer_id, addrs_json, user_id, device_id, last_seen
+FROM peer_book
+WHERE last_seen >= ?1
+ORDER BY last_seen DESC, peer_id ASC
+LIMIT ?2
+"#
+        };
+
+        let mut stmt = self.conn.prepare(sql).context("prepare list_peer_book")?;
+        let rows = if let Some(user_id) = user_id {
+            stmt.query_map(
+                params![user_id, min_last_seen_unix, limit as i64],
+                row_to_peer_book_peer,
+            )
+            .context("query list_peer_book(user)")?
+        } else {
+            stmt.query_map(
+                params![min_last_seen_unix, limit as i64],
+                row_to_peer_book_peer,
+            )
+            .context("query list_peer_book(all)")?
+        };
+
+        for item in rows {
+            out.push(item?);
+        }
+
+        Ok(out)
+    }
+}
+
+fn row_to_peer_book_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerBookPeer> {
+    let peer_id: String = row.get(0)?;
+    let addrs_json: String = row.get(1)?;
+    let user_id: Option<String> = row.get(2)?;
+    let device_id: Option<String> = row.get(3)?;
+    let last_seen_unix: i64 = row.get(4)?;
+    let addrs: Vec<String> = serde_json::from_str(&addrs_json).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
+    })?;
+    Ok(PeerBookPeer {
+        peer_id,
+        addrs,
+        user_id,
+        device_id,
+        last_seen_unix,
+    })
 }
 
 fn expand_home(path: &str) -> Result<PathBuf> {
@@ -238,6 +339,16 @@ CREATE TABLE IF NOT EXISTS peer_state (
   peer_id TEXT PRIMARY KEY,
   last_cursor INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS peer_book (
+  peer_id TEXT PRIMARY KEY,
+  addrs_json TEXT NOT NULL,
+  user_id TEXT,
+  device_id TEXT,
+  last_seen INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_peer_book_last_seen ON peer_book(last_seen);
 "#,
     )
     .context("execute schema batch")?;
@@ -367,5 +478,38 @@ mod tests {
         assert_eq!(store.get_last_cursor("peer-a").unwrap(), 0);
         store.set_last_cursor("peer-a", 42).unwrap();
         assert_eq!(store.get_last_cursor("peer-a").unwrap(), 42);
+    }
+
+    #[test]
+    fn peer_book_upsert_and_list_filters_by_user_and_age() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("d1".to_string()),
+                last_seen_unix: 100,
+            })
+            .unwrap();
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-b".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/2/p2p/peer-b".to_string()],
+                user_id: Some("u2".to_string()),
+                device_id: Some("d2".to_string()),
+                last_seen_unix: 200,
+            })
+            .unwrap();
+
+        let got = store.list_peer_book(Some("u1"), 0, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peer_id, "peer-a");
+
+        let got = store.list_peer_book(None, 150, 10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peer_id, "peer-b");
     }
 }
