@@ -61,6 +61,10 @@ enum Command {
         #[arg(long)]
         tracker_token: Option<String>,
     },
+    SwarmKey {
+        #[arg(long)]
+        swarm_key: Option<String>,
+    },
     Record {
         #[arg(long)]
         cmd: String,
@@ -191,6 +195,14 @@ pub fn run() -> Result<()> {
                     device_id: Some(device_id),
                 },
             )?;
+        }
+        Command::SwarmKey { swarm_key } => {
+            let path = resolve_swarm_key_path(swarm_key, &cfg);
+            let psk = config::load_or_generate_swarm_key(&path)?;
+            let expanded = config::expand_home_path(&path)?;
+
+            println!("swarm key path: {}", expanded.display());
+            println!("swarm key fingerprint: {}", psk.fingerprint());
         }
         Command::Record {
             cmd,
@@ -338,11 +350,15 @@ fn resolve_swarm_psk(
     cli_path: Option<String>,
     cfg: &config::FileConfig,
 ) -> Result<libp2p::pnet::PreSharedKey> {
-    let path = normalize_opt_string(cli_path)
+    let path = resolve_swarm_key_path(cli_path, cfg);
+    config::load_or_generate_swarm_key(&path)
+}
+
+fn resolve_swarm_key_path(cli_path: Option<String>, cfg: &config::FileConfig) -> String {
+    normalize_opt_string(cli_path)
         .or_else(|| env_nonempty("RUSTORY_SWARM_KEY_PATH"))
         .or_else(|| normalize_opt_string(cfg.swarm_key_path.clone()))
-        .unwrap_or_else(|| config::DEFAULT_SWARM_KEY_PATH.to_string());
-    config::load_or_generate_swarm_key(&path)
+        .unwrap_or_else(|| config::DEFAULT_SWARM_KEY_PATH.to_string())
 }
 
 fn resolve_p2p_identity(

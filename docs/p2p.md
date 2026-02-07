@@ -81,6 +81,7 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 - 기본 경로는 `~/.config/rustory/swarm.key` 이고, 없으면 자동 생성된다.
 - 서로 다른 머신에서 통신하려면 **같은 키 파일을 공유**해야 한다.
 - 오버라이드는 `--swarm-key <path>` 또는 `RUSTORY_SWARM_KEY_PATH`로 한다.
+- 키가 동일한지 빠르게 확인하려면 `rr swarm-key`로 fingerprint를 비교한다.
 
 ## Identity Keypair(PeerId)
 - `rr p2p-serve`는 libp2p identity keypair를 디스크에 영속화하여 **재시작해도 PeerId가 유지**되게 한다.
