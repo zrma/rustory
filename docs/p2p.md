@@ -117,6 +117,7 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 
 ## 설정 파일(config.toml)
 - `~/.config/rustory/config.toml`로 기본값을 설정할 수 있다(없으면 CLI/env 폴백).
+- 신규 디바이스에서는 `rr init`로 템플릿/키 파일을 먼저 준비하는 것을 권장한다.
 - 예시:
 ```toml
 db_path = "~/.rustory/history.db"

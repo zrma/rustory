@@ -138,6 +138,25 @@ enum Command {
         #[arg(long)]
         swarm_key: Option<String>,
     },
+    Init {
+        #[arg(long)]
+        force: bool,
+
+        #[arg(long)]
+        user_id: Option<String>,
+
+        #[arg(long)]
+        device_id: Option<String>,
+
+        #[arg(long, value_delimiter = ',')]
+        trackers: Vec<String>,
+
+        #[arg(long)]
+        relay: Option<String>,
+
+        #[arg(long)]
+        tracker_token: Option<String>,
+    },
     Doctor {},
 }
 
@@ -359,9 +378,196 @@ pub fn run() -> Result<()> {
             let identity = resolve_relay_identity(identity_key, &cfg)?;
             p2p::relay_serve(&listen, p2p::RelayServeConfig { identity, psk })?;
         }
+        Command::Init {
+            force,
+            user_id,
+            device_id,
+            trackers,
+            relay,
+            tracker_token,
+        } => {
+            run_init(
+                InitArgs {
+                    force,
+                    user_id,
+                    device_id,
+                    trackers,
+                    relay,
+                    tracker_token,
+                },
+                &cfg,
+                &db_path,
+            )?;
+        }
         Command::Doctor {} => {
             run_doctor(&cfg, &db_path)?;
         }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct InitArgs {
+    force: bool,
+    user_id: Option<String>,
+    device_id: Option<String>,
+    trackers: Vec<String>,
+    relay: Option<String>,
+    tracker_token: Option<String>,
+}
+
+fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<()> {
+    let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+    let cfg_exists = std::fs::metadata(&cfg_path).is_ok();
+
+    if cfg_exists && !args.force {
+        println!(
+            "config already exists: {} (use --force to overwrite)",
+            cfg_path.display()
+        );
+    } else {
+        let rendered = render_config_toml(&args, cfg, db_path)?;
+        if let Some(parent) = cfg_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create dir: {}", parent.display()))?;
+        }
+        std::fs::write(&cfg_path, rendered)
+            .with_context(|| format!("write config: {}", cfg_path.display()))?;
+        restrict_permissions_0600(&cfg_path)?;
+        println!("wrote config: {}", cfg_path.display());
+    }
+
+    // 키는 config/env/CLI 우선순위를 그대로 따른다. (p2p 커맨드와 동일한 규칙)
+    let swarm_key_path = resolve_swarm_key_path(None, cfg);
+    let swarm_key_abs = config::expand_home_path(&swarm_key_path)?;
+    let swarm_existed = std::fs::metadata(&swarm_key_abs).is_ok();
+    let psk = config::load_or_generate_swarm_key(&swarm_key_path)?;
+    println!("swarm key path: {}", swarm_key_abs.display());
+    println!("swarm key fingerprint: {}", psk.fingerprint());
+    if !swarm_existed {
+        println!(
+            "note: 기존 swarm에 붙이는 신규 디바이스라면, 다른 디바이스의 swarm.key를 이 경로로 복사해야 한다."
+        );
+    }
+
+    let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
+    let p2p_identity_abs = config::expand_home_path(&p2p_identity_key_path)?;
+    let id_existed = std::fs::metadata(&p2p_identity_abs).is_ok();
+    let identity = config::load_or_generate_identity_keypair(&p2p_identity_key_path)?;
+    let peer_id = identity.public().to_peer_id();
+    println!("p2p identity key path: {}", p2p_identity_abs.display());
+    println!("p2p peer id: {peer_id}");
+    if !id_existed {
+        println!("note: p2p identity key는 디바이스별로 고유해야 한다(공유하지 않음).");
+    }
+
+    println!("next:");
+    println!("- 설정 확인: rr doctor");
+    println!("- p2p 동기화: rr p2p-sync --trackers <tracker> --relay <relay> --watch --push");
+
+    Ok(())
+}
+
+fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<String> {
+    // 값 결정(가능하면 기존 config/입력값을 반영).
+    let user_id = normalize_opt_string(args.user_id.clone())
+        .or_else(|| normalize_opt_string(cfg.user_id.clone()))
+        .or_else(|| env_nonempty("USER"));
+
+    let device_id = normalize_opt_string(args.device_id.clone())
+        .or_else(|| normalize_opt_string(cfg.device_id.clone()))
+        .or_else(|| env_nonempty("HOSTNAME"))
+        .or_else(|| env_nonempty("HOST"));
+
+    let trackers = resolve_trackers(args.trackers.clone(), cfg)?;
+
+    let relay_addr = normalize_opt_string(args.relay.clone())
+        .or_else(|| normalize_opt_string(cfg.relay_addr.clone()))
+        .or_else(|| env_nonempty("RUSTORY_RELAY_ADDR"));
+
+    if let Some(relay) = relay_addr.as_deref() {
+        // 잘못된 값을 config에 쓰지 않도록 미리 파싱 검증한다.
+        let _: libp2p::Multiaddr = relay.parse().context("parse relay multiaddr")?;
+    }
+
+    let tracker_token = normalize_opt_string(args.tracker_token.clone())
+        .or_else(|| normalize_opt_string(cfg.tracker_token.clone()))
+        .or_else(|| env_nonempty("RUSTORY_TRACKER_TOKEN"));
+
+    let swarm_key_path = normalize_opt_string(cfg.swarm_key_path.clone())
+        .unwrap_or_else(|| config::DEFAULT_SWARM_KEY_PATH.to_string());
+    let p2p_identity_key_path = normalize_opt_string(cfg.p2p_identity_key_path.clone())
+        .unwrap_or_else(|| config::DEFAULT_P2P_IDENTITY_KEY_PATH.to_string());
+    let relay_identity_key_path = normalize_opt_string(cfg.relay_identity_key_path.clone())
+        .unwrap_or_else(|| config::DEFAULT_RELAY_IDENTITY_KEY_PATH.to_string());
+
+    let mut out = String::new();
+    out.push_str("# rustory config.toml\n");
+    out.push_str("# generated by `rr init`\n\n");
+
+    out.push_str(&format!("db_path = {db_path:?}\n"));
+
+    if let Some(v) = user_id.as_deref() {
+        out.push_str(&format!("user_id = {v:?}\n"));
+    } else {
+        out.push_str("# user_id = \"your-user\"\n");
+    }
+
+    if let Some(v) = device_id.as_deref() {
+        out.push_str(&format!("device_id = {v:?}\n"));
+    } else {
+        out.push_str("# device_id = \"your-device\"\n");
+    }
+    out.push('\n');
+
+    if !trackers.is_empty() {
+        out.push_str("trackers = [\n");
+        for t in trackers {
+            out.push_str(&format!("  {t:?},\n"));
+        }
+        out.push_str("]\n");
+    } else {
+        out.push_str("# trackers = [\"http://127.0.0.1:8850\"]\n");
+    }
+
+    if let Some(v) = relay_addr.as_deref() {
+        out.push_str(&format!("relay_addr = {v:?}\n"));
+    } else {
+        out.push_str("# relay_addr = \"/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>\"\n");
+    }
+
+    if let Some(v) = tracker_token.as_deref() {
+        out.push_str(&format!("tracker_token = {v:?}\n"));
+    } else {
+        out.push_str("# tracker_token = \"secret\" # optional\n");
+    }
+    out.push('\n');
+
+    out.push_str(&format!("swarm_key_path = {swarm_key_path:?}\n"));
+    out.push_str(&format!(
+        "p2p_identity_key_path = {p2p_identity_key_path:?}\n"
+    ));
+    out.push_str(&format!(
+        "relay_identity_key_path = {relay_identity_key_path:?}\n"
+    ));
+    out.push('\n');
+
+    out.push_str("# p2p_watch_start_jitter_sec = 10 # optional\n");
+    out.push_str("# search_limit_default = 100000 # optional\n");
+
+    Ok(out)
+}
+
+fn restrict_permissions_0600(path: &std::path::Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(path, perms)
+            .with_context(|| format!("chmod 0600: {}", path.display()))?;
     }
 
     Ok(())
@@ -688,7 +894,11 @@ fn resolve_user_id(cfg: &config::FileConfig) -> String {
 fn resolve_device_id(cfg: &config::FileConfig) -> String {
     env_nonempty("RUSTORY_DEVICE_ID")
         .or_else(|| normalize_opt_string(cfg.device_id.clone()))
-        .unwrap_or_else(|| env_nonempty("HOSTNAME").unwrap_or_else(|| "unknown".to_string()))
+        .unwrap_or_else(|| {
+            env_nonempty("HOSTNAME")
+                .or_else(|| env_nonempty("HOST"))
+                .unwrap_or_else(|| "unknown".to_string())
+        })
 }
 
 fn is_self_rr_command(cmd: &str) -> bool {
@@ -765,5 +975,68 @@ mod tests {
             Command::Doctor {} => {}
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn init_parses_flags() {
+        let app = App::parse_from([
+            "rr",
+            "init",
+            "--force",
+            "--user-id",
+            "u1",
+            "--device-id",
+            "d1",
+            "--trackers",
+            "http://127.0.0.1:8850,http://127.0.0.1:8851",
+            "--relay",
+            "/ip4/127.0.0.1/tcp/4001",
+            "--tracker-token",
+            "t1",
+        ]);
+
+        match app.cmd {
+            Command::Init {
+                force,
+                user_id,
+                device_id,
+                trackers,
+                relay,
+                tracker_token,
+            } => {
+                assert!(force);
+                assert_eq!(user_id.as_deref(), Some("u1"));
+                assert_eq!(device_id.as_deref(), Some("d1"));
+                assert_eq!(trackers.len(), 2);
+                assert_eq!(relay.as_deref(), Some("/ip4/127.0.0.1/tcp/4001"));
+                assert_eq!(tracker_token.as_deref(), Some("t1"));
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn render_config_toml_includes_values() {
+        let peer_id = libp2p::PeerId::random().to_string();
+        let relay = format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer_id}");
+
+        let args = InitArgs {
+            force: false,
+            user_id: Some("u1".to_string()),
+            device_id: Some("d1".to_string()),
+            trackers: vec!["http://127.0.0.1:8850".to_string()],
+            relay: Some(relay.clone()),
+            tracker_token: Some("t1".to_string()),
+        };
+
+        let text = render_config_toml(&args, &config::FileConfig::default(), "/tmp/x.db").unwrap();
+        assert!(text.contains("db_path"));
+        assert!(text.contains("user_id = \"u1\""));
+        assert!(text.contains("device_id = \"d1\""));
+        assert!(text.contains("http://127.0.0.1:8850"));
+        assert!(text.contains(&format!("relay_addr = {relay:?}")));
+        assert!(text.contains("tracker_token = \"t1\""));
+        assert!(text.contains("swarm_key_path"));
+        assert!(text.contains("p2p_identity_key_path"));
     }
 }
