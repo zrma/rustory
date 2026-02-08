@@ -621,11 +621,19 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
 
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
+    let request_retry_policy = resolve_p2p_request_retry_policy(None, None, None, None, cfg)?;
 
     println!("config path: {} (exists: {cfg_exists})", cfg_path.display());
     println!("db path: {}", db_path_expanded.display());
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
+    println!(
+        "p2p request retry: attempts={} timeout_base={:?} timeout_cap={:?} backoff_base={:?}",
+        request_retry_policy.attempts,
+        request_retry_policy.timeout_base,
+        request_retry_policy.timeout_cap,
+        request_retry_policy.backoff_base
+    );
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
     let swarm_fp = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
