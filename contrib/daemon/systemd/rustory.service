@@ -1,0 +1,19 @@
+[Unit]
+Description=Rustory p2p-sync watch
+
+[Service]
+# 기본은 config.toml(기본 경로: ~/.config/rustory/config.toml)을 사용한다.
+ExecStart=%h/.cargo/bin/rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
+Restart=always
+RestartSec=5
+
+# token/키 등 민감 값은 EnvironmentFile로 분리해 0600 권한을 권장한다.
+# 예: ~/.config/rustory/rustory.env (chmod 0600)
+# EnvironmentFile=%h/.config/rustory/rustory.env
+
+Environment=RUSTORY_USER_ID=YOUR_USER
+Environment=RUSTORY_DEVICE_ID=YOUR_DEVICE
+
+[Install]
+WantedBy=default.target
+
