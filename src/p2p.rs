@@ -30,6 +30,12 @@ const PULL_RESP_DECODED_MAX_BYTES: u64 = PULL_RESP_MAX_BYTES * DECODED_MAX_MULTI
 const PUSH_REQ_DECODED_MAX_BYTES: u64 = PUSH_REQ_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 const PUSH_RESP_DECODED_MAX_BYTES: u64 = PUSH_RESP_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 
+// request-response behaviour 내부 timeout은 request 상태 추적/정리를 위한 용도다.
+// pull/push는 attempt별 timeout을 별도로 구현하므로, 여기서 너무 작은 값을 두면
+// 사용자가 `--req-timeout-cap-sec` 등을 크게 잡았을 때 내부 Timeout이 먼저 터질 수 있다.
+// 따라서 "충분히 큰 값"으로 두고, 실제 attempt timeout은 클라이언트 로직에서 결정한다.
+const REQUEST_RESPONSE_INTERNAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Clone)]
 pub struct ServeConfig {
     pub identity: libp2p::identity::Keypair,
@@ -143,8 +149,8 @@ fn build_rustory_swarm_with_identity(
         ),
     ];
 
-    let rr_cfg =
-        libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
+    let rr_cfg = libp2p_request_response::Config::default()
+        .with_request_timeout(REQUEST_RESPONSE_INTERNAL_TIMEOUT);
     let rr_codec = crate::p2p_codec::JsonCodec::<SyncPull, SyncBatch>::new(
         PULL_REQ_MAX_BYTES,
         PULL_RESP_MAX_BYTES,
@@ -163,8 +169,8 @@ fn build_rustory_swarm_with_identity(
             ProtocolSupport::Full,
         ),
     ];
-    let push_cfg =
-        libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
+    let push_cfg = libp2p_request_response::Config::default()
+        .with_request_timeout(REQUEST_RESPONSE_INTERNAL_TIMEOUT);
     let push_codec = crate::p2p_codec::JsonCodec::<EntriesPush, PushAck>::new(
         PUSH_REQ_MAX_BYTES,
         PUSH_RESP_MAX_BYTES,
