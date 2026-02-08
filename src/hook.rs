@@ -33,10 +33,38 @@ fi
 __RUSTORY_HOOK_INSTALLED=1
 
 __rustory_last_histnum=""
+__rustory_last_start_histnum=""
+__rustory_last_start_us=""
+__rustory_last_start_sec=""
+__rustory_in_hook=""
+
+__rustory_preexec() {
+  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  [[ -n "$__rustory_in_hook" ]] && return 0
+
+  local histnum="${HISTCMD:-}"
+  if [[ -z "$histnum" ]]; then
+    return 0
+  fi
+  if [[ "$histnum" == "$__rustory_last_start_histnum" || "$histnum" == "$__rustory_last_histnum" ]]; then
+    return 0
+  fi
+  __rustory_last_start_histnum="$histnum"
+
+  if [[ -n "${EPOCHREALTIME:-}" ]]; then
+    __rustory_last_start_us="${EPOCHREALTIME/./}"
+  else
+    __rustory_last_start_us=""
+    __rustory_last_start_sec="${SECONDS:-0}"
+  fi
+}
+
+trap '__rustory_preexec' DEBUG
 
 __rustory_precmd() {
   local exit_code=$?
   [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  __rustory_in_hook=1
 
   local line
   line="$(HISTTIMEFORMAT= builtin history 1 | sed -e 's/^ *//')"
@@ -46,19 +74,37 @@ __rustory_precmd() {
   cmd="${cmd#"${cmd%%[![:space:]]*}"}"
 
   if [[ -z "$histnum" || -z "$cmd" ]]; then
+    __rustory_in_hook=""
     return 0
   fi
   if [[ "$histnum" == "$__rustory_last_histnum" ]]; then
+    __rustory_in_hook=""
     return 0
   fi
   __rustory_last_histnum="$histnum"
 
   # rr 자체는 기록하지 않는다.
   case "$cmd" in
-    rr|rr\ *) return 0 ;;
+    rr|rr\ *) __rustory_in_hook=""; return 0 ;;
   esac
 
-  ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --shell "bash" >/dev/null 2>&1 ) &
+  local duration_ms=0
+  if [[ -n "$__rustory_last_start_us" && -n "${EPOCHREALTIME:-}" ]]; then
+    local end_us="${EPOCHREALTIME/./}"
+    if [[ "$end_us" -ge "$__rustory_last_start_us" ]]; then
+      duration_ms=$(( (end_us - __rustory_last_start_us) / 1000 ))
+    fi
+  elif [[ -n "$__rustory_last_start_sec" ]]; then
+    local end_sec="${SECONDS:-0}"
+    if [[ "$end_sec" -ge "$__rustory_last_start_sec" ]]; then
+      duration_ms=$(( (end_sec - __rustory_last_start_sec) * 1000 ))
+    fi
+  fi
+  __rustory_last_start_us=""
+  __rustory_last_start_sec=""
+  __rustory_in_hook=""
+
+  ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "bash" --hostname "${HOSTNAME:-}" >/dev/null 2>&1 ) &
 }
 
 # PROMPT_COMMAND에 1회만 주입
@@ -169,6 +215,8 @@ mod tests {
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
+        assert!(got.contains("trap '__rustory_preexec' DEBUG"));
+        assert!(got.contains("--duration-ms"));
 
         // ensure we skip both `rr` and `rr ...`
         assert!(got.contains("case \"$cmd\" in"));

@@ -23,3 +23,7 @@ source <(rr hook --shell bash)
 ## 동작 개요
 - 기록: 커맨드 종료 시 `rr record`를 백그라운드로 호출해 SQLite에 append-only 저장
 - 검색: `ctrl+r`에서 `rr search`(fzf)로 선택한 커맨드를 현재 입력 버퍼에 삽입
+
+### duration_ms(소요 시간)
+- zsh: `EPOCHREALTIME` 기반으로 `duration_ms`를 기록한다.
+- bash: 가능하면(`EPOCHREALTIME` 또는 `SECONDS`) best-effort로 `duration_ms`를 기록한다.
