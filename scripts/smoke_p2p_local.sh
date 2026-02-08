@@ -14,6 +14,24 @@ s.close()
 PY
 }
 
+wait_p2p_peer_id() {
+  local log_path="$1"
+  local peer_id=""
+
+  for _ in $(seq 1 200); do
+    if [[ -s "$log_path" ]]; then
+      peer_id="$(sed -n 's#^p2p listen: .*/p2p/##p' "$log_path" | tail -n 1 | tr -d '\r')"
+      if [[ -n "$peer_id" ]]; then
+        echo "$peer_id"
+        return 0
+      fi
+    fi
+    sleep 0.05
+  done
+
+  return 1
+}
+
 cleanup() {
   set +e
   if [[ -n "${P2P_A_PID:-}" ]]; then kill "$P2P_A_PID" 2>/dev/null; fi
@@ -76,19 +94,75 @@ if [[ -z "$RELAY_ADDR" ]]; then
 fi
 
 echo "[4/5] start p2p peers (serve)"
+P2P_A_LOG="$TMPDIR/p2p-a.log"
+P2P_B_LOG="$TMPDIR/p2p-b.log"
+
 RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=a target/debug/rr --db-path "$TMPDIR/a.db" p2p-serve \
   --swarm-key "$SWARM_KEY" \
   --identity-key "$TMPDIR/p2p-a.key" \
   --trackers "$TRACKER_URL" \
-  --relay "$RELAY_ADDR" >"$TMPDIR/p2p-a.log" 2>&1 &
+  --relay "$RELAY_ADDR" >"$P2P_A_LOG" 2>&1 &
 P2P_A_PID=$!
 
 RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=b target/debug/rr --db-path "$TMPDIR/b.db" p2p-serve \
   --swarm-key "$SWARM_KEY" \
   --identity-key "$TMPDIR/p2p-b.key" \
   --trackers "$TRACKER_URL" \
-  --relay "$RELAY_ADDR" >"$TMPDIR/p2p-b.log" 2>&1 &
+  --relay "$RELAY_ADDR" >"$P2P_B_LOG" 2>&1 &
 P2P_B_PID=$!
+
+echo "[4/5] verify PeerId persists across restart (identity key persistence)"
+PEER_A_ID_1="$(wait_p2p_peer_id "$P2P_A_LOG" || true)"
+PEER_B_ID_1="$(wait_p2p_peer_id "$P2P_B_LOG" || true)"
+if [[ -z "$PEER_A_ID_1" || -z "$PEER_B_ID_1" ]]; then
+  echo "error: failed to parse peer id from p2p listen logs"
+  echo "--- p2p-a log ---"
+  tail -n 80 "$P2P_A_LOG" || true
+  echo "--- p2p-b log ---"
+  tail -n 80 "$P2P_B_LOG" || true
+  exit 1
+fi
+
+kill "$P2P_A_PID" 2>/dev/null || true
+kill "$P2P_B_PID" 2>/dev/null || true
+wait "$P2P_A_PID" 2>/dev/null || true
+wait "$P2P_B_PID" 2>/dev/null || true
+
+P2P_A_LOG2="$TMPDIR/p2p-a.restart.log"
+P2P_B_LOG2="$TMPDIR/p2p-b.restart.log"
+
+RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=a target/debug/rr --db-path "$TMPDIR/a.db" p2p-serve \
+  --swarm-key "$SWARM_KEY" \
+  --identity-key "$TMPDIR/p2p-a.key" \
+  --trackers "$TRACKER_URL" \
+  --relay "$RELAY_ADDR" >"$P2P_A_LOG2" 2>&1 &
+P2P_A_PID=$!
+
+RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=b target/debug/rr --db-path "$TMPDIR/b.db" p2p-serve \
+  --swarm-key "$SWARM_KEY" \
+  --identity-key "$TMPDIR/p2p-b.key" \
+  --trackers "$TRACKER_URL" \
+  --relay "$RELAY_ADDR" >"$P2P_B_LOG2" 2>&1 &
+P2P_B_PID=$!
+
+PEER_A_ID_2="$(wait_p2p_peer_id "$P2P_A_LOG2" || true)"
+PEER_B_ID_2="$(wait_p2p_peer_id "$P2P_B_LOG2" || true)"
+if [[ "$PEER_A_ID_1" != "$PEER_A_ID_2" ]]; then
+  echo "error: peer a id changed after restart: $PEER_A_ID_1 -> $PEER_A_ID_2"
+  echo "--- p2p-a initial log ---"
+  tail -n 80 "$P2P_A_LOG" || true
+  echo "--- p2p-a restart log ---"
+  tail -n 80 "$P2P_A_LOG2" || true
+  exit 1
+fi
+if [[ "$PEER_B_ID_1" != "$PEER_B_ID_2" ]]; then
+  echo "error: peer b id changed after restart: $PEER_B_ID_1 -> $PEER_B_ID_2"
+  echo "--- p2p-b initial log ---"
+  tail -n 80 "$P2P_B_LOG" || true
+  echo "--- p2p-b restart log ---"
+  tail -n 80 "$P2P_B_LOG2" || true
+  exit 1
+fi
 
 echo "[5/5] wait tracker has peers"
 READY=0
@@ -118,9 +192,9 @@ if [[ "$READY" != "1" ]]; then
   echo "--- relay log ---"
   tail -n 50 "$TMPDIR/relay.log" || true
   echo "--- p2p-a log ---"
-  tail -n 50 "$TMPDIR/p2p-a.log" || true
+  tail -n 50 "$P2P_A_LOG2" || true
   echo "--- p2p-b log ---"
-  tail -n 50 "$TMPDIR/p2p-b.log" || true
+  tail -n 50 "$P2P_B_LOG2" || true
   exit 1
 fi
 
