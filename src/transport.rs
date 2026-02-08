@@ -64,6 +64,13 @@ struct EntriesResponse {
     next_cursor: Option<i64>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PushResponse {
+    ok: bool,
+    inserted: usize,
+    ignored: usize,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum EntriesRequest {
@@ -198,9 +205,15 @@ fn route_http_request(
                 EntriesRequest::Array(entries) => entries,
                 EntriesRequest::Object { entries } => entries,
             };
-            store.insert_entries(&entries)?;
-
-            Ok(respond_text(200, "ok\n"))
+            let stats = store.insert_entries_with_stats(&entries)?;
+            respond_json(
+                200,
+                &PushResponse {
+                    ok: true,
+                    inserted: stats.inserted,
+                    ignored: stats.ignored,
+                },
+            )
         }
         _ => Ok(respond_text(404, "not found\n")),
     }
@@ -396,6 +409,32 @@ mod tests {
         // cursor는 normalize된 key(끝의 / 제거)로 저장된다.
         assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 1);
         assert_eq!(local.get_last_cursor(&peer_with_slash).unwrap(), 0);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_push_returns_insert_stats() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let server = start_test_server(remote_db.to_str().unwrap().to_string());
+
+        let e1 = entry("id-1", 1, "echo 1");
+        let e2 = entry("id-2", 2, "echo 2");
+        let body = serde_json::to_vec(&[e1.clone(), e2.clone(), e1]).unwrap();
+
+        let url = format!("{}/api/v1/entries", server.base_url);
+        let resp = ureq::post(&url)
+            .set("Content-Type", "application/json")
+            .send_bytes(&body)
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+
+        let text = resp.into_string().unwrap();
+        let parsed: PushResponse = serde_json::from_str(&text).unwrap();
+        assert!(parsed.ok);
+        assert_eq!(parsed.inserted, 2);
+        assert_eq!(parsed.ignored, 1);
 
         server.shutdown();
     }
