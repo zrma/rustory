@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use rand::Rng;
 
 use crate::{config, hook, p2p, search, storage, tracker, transport};
 use std::time::Duration;
@@ -61,6 +62,9 @@ enum Command {
 
         #[arg(long, default_value_t = 60)]
         interval_sec: u64,
+
+        #[arg(long)]
+        start_jitter_sec: Option<u64>,
 
         #[arg(long)]
         swarm_key: Option<String>,
@@ -187,6 +191,7 @@ pub fn run() -> Result<()> {
             push,
             watch,
             interval_sec,
+            start_jitter_sec,
             swarm_key,
             relay,
             trackers,
@@ -210,7 +215,11 @@ pub fn run() -> Result<()> {
 
             if watch {
                 let interval = Duration::from_secs(interval_sec.max(1));
-                eprintln!("p2p-sync watch: interval={:?}", interval);
+                let start_jitter_sec = resolve_p2p_watch_start_jitter_sec(start_jitter_sec, &cfg)?;
+                eprintln!(
+                    "p2p-sync watch: interval={:?} start_jitter_sec={}",
+                    interval, start_jitter_sec
+                );
                 let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
                 {
                     let stop = stop.clone();
@@ -220,18 +229,30 @@ pub fn run() -> Result<()> {
                     .context("set Ctrl-C/SIGTERM handler")?;
                 }
 
-                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone(), push) {
-                        eprintln!("warn: p2p-sync failed: {err:#}");
-                    }
-
+                let sleep_with_stop = |duration: Duration, stop: &std::sync::atomic::AtomicBool| {
                     // 중지 신호에 빠르게 반응하기 위해 sleep을 1초 단위로 쪼갠다.
-                    for _ in 0..interval.as_secs() {
+                    for _ in 0..duration.as_secs() {
                         if stop.load(std::sync::atomic::Ordering::SeqCst) {
                             break;
                         }
                         std::thread::sleep(Duration::from_secs(1));
                     }
+                };
+
+                if start_jitter_sec > 0 {
+                    let delay = rand::thread_rng().gen_range(0..=start_jitter_sec);
+                    if delay > 0 {
+                        eprintln!("p2p-sync watch: start jitter={delay}s");
+                        sleep_with_stop(Duration::from_secs(delay), stop.as_ref());
+                    }
+                }
+
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone(), push) {
+                        eprintln!("warn: p2p-sync failed: {err:#}");
+                    }
+
+                    sleep_with_stop(interval, stop.as_ref());
                 }
 
                 eprintln!("p2p-sync watch: shutting down");
@@ -390,6 +411,28 @@ fn resolve_search_limit(cli: Option<usize>, cfg: &config::FileConfig) -> Result<
     Ok(100000)
 }
 
+fn resolve_p2p_watch_start_jitter_sec(cli: Option<u64>, cfg: &config::FileConfig) -> Result<u64> {
+    if let Some(v) = cli {
+        return Ok(v);
+    }
+
+    if let Some(v) = env_nonempty("RUSTORY_P2P_WATCH_START_JITTER_SEC") {
+        let parsed: u64 = v.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid RUSTORY_P2P_WATCH_START_JITTER_SEC={:?}: {e}",
+                v.trim()
+            )
+        })?;
+        return Ok(parsed);
+    }
+
+    if let Some(v) = cfg.p2p_watch_start_jitter_sec {
+        return Ok(v);
+    }
+
+    Ok(0)
+}
+
 fn resolve_swarm_psk(
     cli_path: Option<String>,
     cfg: &config::FileConfig,
@@ -519,10 +562,38 @@ mod tests {
             Command::P2pSync {
                 watch,
                 interval_sec,
+                start_jitter_sec,
                 ..
             } => {
                 assert!(watch);
                 assert_eq!(interval_sec, 5);
+                assert!(start_jitter_sec.is_none());
+            }
+            _ => panic!("expected p2p-sync"),
+        }
+    }
+
+    #[test]
+    fn p2p_sync_watch_parses_start_jitter() {
+        let app = App::parse_from([
+            "rr",
+            "p2p-sync",
+            "--watch",
+            "--interval-sec",
+            "5",
+            "--start-jitter-sec",
+            "3",
+        ]);
+        match app.cmd {
+            Command::P2pSync {
+                watch,
+                interval_sec,
+                start_jitter_sec,
+                ..
+            } => {
+                assert!(watch);
+                assert_eq!(interval_sec, 5);
+                assert_eq!(start_jitter_sec, Some(3));
             }
             _ => panic!("expected p2p-sync"),
         }

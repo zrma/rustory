@@ -57,6 +57,8 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
 
 주기적으로 동기화를 계속 돌리려면 `--watch --interval-sec 60` 옵션을 사용한다.
+여러 디바이스에서 같은 `--interval-sec`으로 동시에 데몬을 띄우면 요청이 몰릴 수 있으니,
+시작 시점을 흩뿌리려면 `--start-jitter-sec 10` 같은 옵션을 함께 쓰는 것을 권장한다.
 
 pull뿐 아니라 로컬 신규 엔트리를 peer로 업로드(push)하려면 `--push`를 켠다.
 이때 push는 **현재 디바이스의 엔트리만** 전송한다(`entry.device_id == local_device_id`).
@@ -119,6 +121,7 @@ swarm_key_path = "~/.config/rustory/swarm.key"
 p2p_identity_key_path = "~/.config/rustory/identity.key"
 relay_identity_key_path = "~/.config/rustory/relay.key"
 tracker_token = "secret"
+p2p_watch_start_jitter_sec = 10
 ```
 
 ## peerbook 캐시(tracker fallback)

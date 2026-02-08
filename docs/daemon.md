@@ -9,12 +9,13 @@
 - `user_id`, `device_id`는 고정값을 사용한다(환경변수 또는 config).
 - `--push`는 **로컬 디바이스 엔트리만** 전송한다(`entry.device_id == local_device_id`).
 - `--watch` 실행 중 중지(SIGTERM/Ctrl-C)를 받으면 빠르게 종료한다(서비스 매니저 stop에 정상 반응).
+- 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.
 
 ## 기본 실행 커맨드(예시)
 설정 파일을 이미 채워뒀다면:
 
 ```sh
-rr p2p-sync --watch --interval-sec 60 --push
+rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
 ```
 
 CLI로 다 넣는 형태(예시):
@@ -22,6 +23,7 @@ CLI로 다 넣는 형태(예시):
 ```sh
 rr --db-path "$HOME/.rustory/history.db" p2p-sync \
   --watch --interval-sec 60 \
+  --start-jitter-sec 10 \
   --push \
   --swarm-key "$HOME/.config/rustory/swarm.key" \
   --trackers "http://<tracker-host>:8850" \

@@ -23,6 +23,8 @@ pub struct FileConfig {
     pub p2p_identity_key_path: Option<String>,
     pub relay_identity_key_path: Option<String>,
 
+    pub p2p_watch_start_jitter_sec: Option<u64>,
+
     pub search_limit_default: Option<usize>,
 }
 
@@ -153,6 +155,7 @@ db_path = "~/.rustory/history.db"
 user_id = "user1"
 device_id = "dev1"
 trackers = ["http://127.0.0.1:8850"]
+p2p_watch_start_jitter_sec = 5
 "#,
         )
         .unwrap();
@@ -160,6 +163,7 @@ trackers = ["http://127.0.0.1:8850"]
         let cfg = load_from_path(path.to_str().unwrap()).unwrap();
         assert_eq!(cfg.user_id.as_deref(), Some("user1"));
         assert_eq!(cfg.trackers.as_ref().unwrap().len(), 1);
+        assert_eq!(cfg.p2p_watch_start_jitter_sec, Some(5));
     }
 
     #[test]
