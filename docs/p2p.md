@@ -6,6 +6,10 @@
   - direct 연결을 우선 시도하고(direct-first),
   - 실패 시 relay로 fallback 한다.
 
+## 운영 가이드(PoC vs 안정화)
+- PoC 단계에서는 tracker/relay를 로컬/임시로 띄워도 된다. 내려가면 동기화가 지연될 뿐이고, 로컬 DB가 source of truth라 데이터 유실은 없다.
+- 안정화 이후에는 tracker/relay를 상시 실행하는 것을 권장한다(예: self-hosted k8s 1 replica). relay는 PeerId 고정을 위해 identity key(`~/.config/rustory/relay.key`)를 영속화(PV/Secret 마운트)하는 편이 안전하다.
+
 ## 프로토콜
 - pull protocol id:
   - `/rustory/sync-pull/1.0.1` (zstd 압축 JSON, 우선)
