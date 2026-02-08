@@ -2,6 +2,8 @@
 
 분산/동기화 기반 셸 히스토리 관리 도구 (MVP 설계 단계)
 
+빠른 시작: `docs/quickstart.md`
+
 ## 목표 (MVP)
 - append-only 기반 히스토리 수집
 - entry_id 기반 dedup 동기화
@@ -24,13 +26,14 @@
   - bash/zsh hook 스크립트 생성(`hook`)
 
 ## 다음 단계
-- push 기반 동기화(옵션: `p2p-sync --push`, 로컬 device_id 엔트리만 전송) 고도화(압축/배치 튜닝 등)
-- 주기 동기화(옵션: `p2p-sync --watch`)를 데몬/스케줄러로 정식화(launchd/systemd 등)
-- 설정/키 관리 UX 개선(PSK fingerprint 출력, 키 배포 문서화 등)
-- 로컬/CI 수용 테스트(스모크) 정비
+- 기존 bash/zsh history import(초기 seed)
+- hook 안정화(예: bash duration 등) 및 운영 옵션 보강
+- push 기반 동기화(옵션: `p2p-sync --push`, 로컬 device_id 엔트리만 전송) 고도화(배치/튜닝/관측성)
+- 실사용 수용 테스트(다른 머신/다른 네트워크, NAT/relay 환경) 정비
 
 ## 개발
 - 테스트: `cargo test`
+- CI와 같은 검증(권장): `scripts/check.sh` (빠르게: `scripts/check.sh --fast`)
 - 로컬 실행: `cargo run --bin rr -- --help`
 - 로컬 P2P 스모크: `scripts/smoke_p2p_local.sh`
 - 백그라운드 실행(launchd/systemd): `docs/daemon.md`
@@ -40,6 +43,8 @@
 rr init --user-id "<user>" --device-id "<device>"
 rr doctor
 ```
+
+자세한 온보딩/실사용 흐름은 `docs/quickstart.md` 참고.
 
 - `rr init`는 `~/.config/rustory/config.toml` 템플릿과 key 파일들을 준비하고(fingerprint/PeerId 출력), 다음 단계를 안내한다.
 - **중요:** `swarm.key`는 같은 swarm(같은 사용자/클러스터) 내의 디바이스들이 **동일한 파일을 공유**해야 한다.
