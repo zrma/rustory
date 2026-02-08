@@ -7,15 +7,22 @@
   - 실패 시 relay로 fallback 한다.
 
 ## 프로토콜
-- protocol id: `/rustory/sync-pull/1.0.0`
+- pull protocol id:
+  - `/rustory/sync-pull/1.0.1` (zstd 압축 JSON, 우선)
+  - `/rustory/sync-pull/1.0.0` (plain JSON, 폴백)
 - request: `SyncPull { cursor, limit }`
 - response: `SyncBatch { entries, next_cursor }`
-- push protocol id: `/rustory/entries-push/1.0.0`
+- push protocol id:
+  - `/rustory/entries-push/1.0.1` (zstd 압축 JSON, 우선)
+  - `/rustory/entries-push/1.0.0` (plain JSON, 폴백)
 - request: `EntriesPush { entries }`
 - response: `PushAck { ok }`
-- 직렬화: JSON(serde_json)
+- 직렬화: JSON(serde_json). `1.0.1` 프로토콜은 “JSON bytes를 zstd로 압축”해서 전송한다(양쪽이 지원하면 자동 선택).
 - 전송: libp2p tcp + Noise + Yamux (+ pnet/relay)
-- 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB. 초과 시 `message/request too large` 에러가 날 수 있으며, 이 경우 sync는 `limit`을 자동으로 줄여 재시도한다(단, 단일 엔트리가 너무 큰 경우는 실패할 수 있으니 필요하면 `--limit`을 조정한다).
+- 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB.
+  - `1.0.1`은 zstd 압축을 적용한 “wire bytes” 기준으로 상한을 체크한다.
+  - 압축 해제 후 JSON bytes는 별도 상한(현재 wire의 4배)을 두며, 초과 시 `too large` 에러가 날 수 있다.
+  - 이런 경우 sync는 `limit`을 자동으로 줄여 재시도한다(단, 단일 엔트리가 너무 큰 경우는 실패할 수 있으니 필요하면 `--limit`을 조정한다).
 
 ## 사용 예시
 ### 단계 2: tracker/relay + PSK(pnet) 기반
