@@ -580,6 +580,10 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push('\n');
 
     out.push_str("# p2p_watch_start_jitter_sec = 10 # optional\n");
+    out.push_str("# p2p_request_attempts = 3 # optional\n");
+    out.push_str("# p2p_request_timeout_base_sec = 5 # optional\n");
+    out.push_str("# p2p_request_timeout_cap_sec = 30 # optional\n");
+    out.push_str("# p2p_request_backoff_base_ms = 200 # optional\n");
     out.push_str("# search_limit_default = 100000 # optional\n");
 
     Ok(out)
@@ -621,19 +625,23 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
 
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
-    let request_retry_policy = resolve_p2p_request_retry_policy(None, None, None, None, cfg)?;
 
     println!("config path: {} (exists: {cfg_exists})", cfg_path.display());
     println!("db path: {}", db_path_expanded.display());
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
-    println!(
-        "p2p request retry: attempts={} timeout_base={:?} timeout_cap={:?} backoff_base={:?}",
-        request_retry_policy.attempts,
-        request_retry_policy.timeout_base,
-        request_retry_policy.timeout_cap,
-        request_retry_policy.backoff_base
-    );
+    match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
+        Ok(request_retry_policy) => {
+            println!(
+                "p2p request retry: attempts={} timeout_base={:?} timeout_cap={:?} backoff_base={:?}",
+                request_retry_policy.attempts,
+                request_retry_policy.timeout_base,
+                request_retry_policy.timeout_cap,
+                request_retry_policy.backoff_base
+            );
+        }
+        Err(err) => println!("p2p request retry: invalid: {err:#}"),
+    }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
     let swarm_fp = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
@@ -1183,5 +1191,6 @@ mod tests {
         assert!(text.contains("tracker_token = \"t1\""));
         assert!(text.contains("swarm_key_path"));
         assert!(text.contains("p2p_identity_key_path"));
+        assert!(text.contains("p2p_request_attempts"));
     }
 }
