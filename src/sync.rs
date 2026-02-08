@@ -2,6 +2,13 @@ use crate::storage::{LocalStore, PullBatch};
 use anyhow::{Context, Result};
 use std::{future::Future, pin::Pin};
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PullStats {
+    pub received: usize,
+    pub inserted: usize,
+    pub ignored: usize,
+}
+
 /// peer로부터 pull 기반으로 cursor를 따라잡는다.
 ///
 /// - cursor는 local의 `peer_state.last_cursor(peer_id)`를 사용한다.
@@ -11,16 +18,18 @@ pub fn sync_pull_from_peer<F>(
     peer_id: &str,
     limit: usize,
     mut pull: F,
-) -> Result<usize>
+) -> Result<PullStats>
 where
     F: FnMut(i64, usize) -> Result<PullBatch>,
 {
     if limit == 0 {
-        return Ok(0);
+        return Ok(PullStats::default());
     }
 
     let mut cursor = local.get_last_cursor(peer_id)?;
-    let mut pulled_total = 0usize;
+    let mut received_total = 0usize;
+    let mut inserted_total = 0usize;
+    let mut ignored_total = 0usize;
     let mut batch_limit = limit;
 
     loop {
@@ -41,8 +50,10 @@ where
             break;
         }
 
-        local.insert_entries(&batch.entries)?;
-        pulled_total += batch.entries.len();
+        let stats = local.insert_entries_with_stats(&batch.entries)?;
+        received_total += batch.entries.len();
+        inserted_total += stats.inserted;
+        ignored_total += stats.ignored;
 
         let Some(next_cursor) = batch.next_cursor else {
             anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
@@ -54,7 +65,11 @@ where
         local.set_last_cursor(peer_id, cursor)?;
     }
 
-    Ok(pulled_total)
+    Ok(PullStats {
+        received: received_total,
+        inserted: inserted_total,
+        ignored: ignored_total,
+    })
 }
 
 pub trait Puller {
@@ -77,16 +92,18 @@ pub async fn sync_pull_from_peer_async<P>(
     peer_id: &str,
     limit: usize,
     puller: &mut P,
-) -> Result<usize>
+) -> Result<PullStats>
 where
     P: Puller,
 {
     if limit == 0 {
-        return Ok(0);
+        return Ok(PullStats::default());
     }
 
     let mut cursor = local.get_last_cursor(peer_id)?;
-    let mut pulled_total = 0usize;
+    let mut received_total = 0usize;
+    let mut inserted_total = 0usize;
+    let mut ignored_total = 0usize;
     let mut batch_limit = limit;
 
     loop {
@@ -107,8 +124,10 @@ where
             break;
         }
 
-        local.insert_entries(&batch.entries)?;
-        pulled_total += batch.entries.len();
+        let stats = local.insert_entries_with_stats(&batch.entries)?;
+        received_total += batch.entries.len();
+        inserted_total += stats.inserted;
+        ignored_total += stats.ignored;
 
         let Some(next_cursor) = batch.next_cursor else {
             anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
@@ -120,7 +139,11 @@ where
         local.set_last_cursor(peer_id, cursor)?;
     }
 
-    Ok(pulled_total)
+    Ok(PullStats {
+        received: received_total,
+        inserted: inserted_total,
+        ignored: ignored_total,
+    })
 }
 
 /// local에서 peer로 push 기반으로 cursor를 따라잡는다.
@@ -326,7 +349,9 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(pulled, 2);
+        assert_eq!(pulled.received, 2);
+        assert_eq!(pulled.inserted, 2);
+        assert_eq!(pulled.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
         assert_eq!(local.get_last_cursor("peer-1").unwrap(), 2);
     }
@@ -344,14 +369,18 @@ mod tests {
             remote.pull_since_cursor(cursor, limit)
         })
         .unwrap();
-        assert_eq!(a, 2);
+        assert_eq!(a.received, 2);
+        assert_eq!(a.inserted, 2);
+        assert_eq!(a.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
 
         let b = sync_pull_from_peer(&local, "peer-1", 1, |cursor, limit| {
             remote.pull_since_cursor(cursor, limit)
         })
         .unwrap();
-        assert_eq!(b, 0);
+        assert_eq!(b.received, 0);
+        assert_eq!(b.inserted, 0);
+        assert_eq!(b.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
     }
 
@@ -373,7 +402,9 @@ mod tests {
         ))
         .unwrap();
 
-        assert_eq!(pulled, 2);
+        assert_eq!(pulled.received, 2);
+        assert_eq!(pulled.inserted, 2);
+        assert_eq!(pulled.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
         assert_eq!(local.get_last_cursor("peer-1").unwrap(), 2);
     }
@@ -390,12 +421,16 @@ mod tests {
         let mut puller = StorePuller { remote: &remote };
         let a = executor::block_on(sync_pull_from_peer_async(&local, "peer-1", 1, &mut puller))
             .unwrap();
-        assert_eq!(a, 2);
+        assert_eq!(a.received, 2);
+        assert_eq!(a.inserted, 2);
+        assert_eq!(a.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
 
         let b = executor::block_on(sync_pull_from_peer_async(&local, "peer-1", 1, &mut puller))
             .unwrap();
-        assert_eq!(b, 0);
+        assert_eq!(b.received, 0);
+        assert_eq!(b.inserted, 0);
+        assert_eq!(b.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
     }
 
@@ -493,7 +528,9 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(pulled, 3);
+        assert_eq!(pulled.received, 3);
+        assert_eq!(pulled.inserted, 3);
+        assert_eq!(pulled.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 3);
         assert_eq!(local.get_last_cursor("peer-1").unwrap(), 3);
 
