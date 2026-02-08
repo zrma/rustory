@@ -1,5 +1,5 @@
 use crate::storage::{LocalStore, PullBatch};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::{future::Future, pin::Pin};
 
 /// peer로부터 pull 기반으로 cursor를 따라잡는다.
@@ -21,9 +21,22 @@ where
 
     let mut cursor = local.get_last_cursor(peer_id)?;
     let mut pulled_total = 0usize;
+    let mut batch_limit = limit;
 
     loop {
-        let batch = pull(cursor, limit)?;
+        let batch = match pull(cursor, batch_limit) {
+            Ok(v) => v,
+            Err(err) => {
+                if is_payload_too_large_error(&err) {
+                    if batch_limit <= 1 {
+                        return Err(err).context("pull batch too large even with limit=1");
+                    }
+                    batch_limit = (batch_limit / 2).max(1);
+                    continue;
+                }
+                return Err(err);
+            }
+        };
         if batch.entries.is_empty() {
             break;
         }
@@ -74,9 +87,22 @@ where
 
     let mut cursor = local.get_last_cursor(peer_id)?;
     let mut pulled_total = 0usize;
+    let mut batch_limit = limit;
 
     loop {
-        let batch = puller.pull(cursor, limit).await?;
+        let batch = match puller.pull(cursor, batch_limit).await {
+            Ok(v) => v,
+            Err(err) => {
+                if is_payload_too_large_error(&err) {
+                    if batch_limit <= 1 {
+                        return Err(err).context("pull batch too large even with limit=1");
+                    }
+                    batch_limit = (batch_limit / 2).max(1);
+                    continue;
+                }
+                return Err(err);
+            }
+        };
         if batch.entries.is_empty() {
             break;
         }
@@ -117,11 +143,14 @@ where
 
     let mut cursor = local.get_last_pushed_seq(peer_id)?;
     let mut pushed_total = 0usize;
+    let mut batch_limit = limit;
 
     loop {
         let batch = match source_device_id {
-            Some(device_id) => local.pull_since_cursor_for_device(cursor, limit, device_id)?,
-            None => local.pull_since_cursor(cursor, limit)?,
+            Some(device_id) => {
+                local.pull_since_cursor_for_device(cursor, batch_limit, device_id)?
+            }
+            None => local.pull_since_cursor(cursor, batch_limit)?,
         };
         if batch.entries.is_empty() {
             break;
@@ -129,7 +158,19 @@ where
 
         let entries = batch.entries;
         let entries_len = entries.len();
-        push(entries)?;
+        match push(entries) {
+            Ok(()) => {}
+            Err(err) => {
+                if is_payload_too_large_error(&err) {
+                    if batch_limit <= 1 {
+                        return Err(err).context("push batch too large even with limit=1");
+                    }
+                    batch_limit = (batch_limit / 2).max(1);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
         pushed_total += entries_len;
 
         let Some(next_cursor) = batch.next_cursor else {
@@ -161,11 +202,14 @@ where
 
     let mut cursor = local.get_last_pushed_seq(peer_id)?;
     let mut pushed_total = 0usize;
+    let mut batch_limit = limit;
 
     loop {
         let batch = match source_device_id {
-            Some(device_id) => local.pull_since_cursor_for_device(cursor, limit, device_id)?,
-            None => local.pull_since_cursor(cursor, limit)?,
+            Some(device_id) => {
+                local.pull_since_cursor_for_device(cursor, batch_limit, device_id)?
+            }
+            None => local.pull_since_cursor(cursor, batch_limit)?,
         };
         if batch.entries.is_empty() {
             break;
@@ -173,7 +217,19 @@ where
 
         let entries = batch.entries;
         let entries_len = entries.len();
-        pusher.push(entries).await?;
+        match pusher.push(entries).await {
+            Ok(()) => {}
+            Err(err) => {
+                if is_payload_too_large_error(&err) {
+                    if batch_limit <= 1 {
+                        return Err(err).context("push batch too large even with limit=1");
+                    }
+                    batch_limit = (batch_limit / 2).max(1);
+                    continue;
+                }
+                return Err(err);
+            }
+        }
         pushed_total += entries_len;
 
         let Some(next_cursor) = batch.next_cursor else {
@@ -189,11 +245,32 @@ where
     Ok(pushed_total)
 }
 
+fn is_payload_too_large_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        if let Some(e) = cause.downcast_ref::<ureq::Error>() {
+            return matches!(e, ureq::Error::Status(413, _));
+        }
+
+        if let Some(libp2p_request_response::OutboundFailure::Io(ioe)) =
+            cause.downcast_ref::<libp2p_request_response::OutboundFailure>()
+        {
+            return ioe.to_string().contains("too large");
+        }
+
+        // fallback: error text 기반(transport 레이어가 string-only로 감싸는 경우를 대비)
+        let s = cause.to_string();
+        s.contains("message too large")
+            || s.contains("request too large")
+            || s.contains("payload too large")
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::Entry;
     use futures::executor;
+    use libp2p_request_response::OutboundFailure;
     use time::OffsetDateTime;
 
     struct StorePuller<'a> {
@@ -225,6 +302,14 @@ mod tests {
             hostname: "host".to_string(),
             version: "0.1.0".to_string(),
         }
+    }
+
+    fn payload_too_large_err() -> anyhow::Error {
+        let ioe = std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "request too large: 100 > 10 bytes",
+        );
+        anyhow::Error::new(OutboundFailure::Io(ioe))
     }
 
     #[test]
@@ -383,5 +468,69 @@ mod tests {
         assert!(got.iter().any(|e| e.entry_id == "id-1"));
         assert!(got.iter().any(|e| e.entry_id == "id-3"));
         assert!(!got.iter().any(|e| e.entry_id == "id-2"));
+    }
+
+    #[test]
+    fn pull_adapts_limit_when_payload_too_large() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        remote
+            .insert_entries(&[
+                entry("id-1", 1, "echo 1"),
+                entry("id-2", 2, "echo 2"),
+                entry("id-3", 3, "echo 3"),
+            ])
+            .unwrap();
+
+        let mut call_limits: Vec<usize> = Vec::new();
+        let pulled = sync_pull_from_peer(&local, "peer-1", 8, |cursor, limit| {
+            call_limits.push(limit);
+            if limit > 1 {
+                return Err(payload_too_large_err());
+            }
+            remote.pull_since_cursor(cursor, limit)
+        })
+        .unwrap();
+
+        assert_eq!(pulled, 3);
+        assert_eq!(local.list_recent(10).unwrap().len(), 3);
+        assert_eq!(local.get_last_cursor("peer-1").unwrap(), 3);
+
+        assert!(call_limits.contains(&1));
+        assert!(call_limits.first().copied().unwrap_or(0) > 1);
+    }
+
+    #[test]
+    fn push_adapts_limit_when_payload_too_large() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo 1");
+        e1.device_id = "dev-local".to_string();
+        let mut e2 = entry("id-2", 2, "echo 2");
+        e2.device_id = "dev-local".to_string();
+        let mut e3 = entry("id-3", 3, "echo 3");
+        e3.device_id = "dev-local".to_string();
+
+        local.insert_entries(&[e1, e2, e3]).unwrap();
+
+        let mut call_sizes: Vec<usize> = Vec::new();
+        let pushed = sync_push_to_peer(&local, "peer-1", 8, Some("dev-local"), |entries| {
+            call_sizes.push(entries.len());
+            if entries.len() > 1 {
+                return Err(payload_too_large_err());
+            }
+            remote.insert_entries(&entries)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(pushed, 3);
+        assert_eq!(remote.list_recent(10).unwrap().len(), 3);
+        assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 3);
+
+        assert!(call_sizes.contains(&1));
+        assert!(call_sizes.first().copied().unwrap_or(0) > 1);
     }
 }

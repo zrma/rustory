@@ -15,7 +15,7 @@
 - response: `PushAck { ok }`
 - 직렬화: JSON(serde_json)
 - 전송: libp2p tcp + Noise + Yamux (+ pnet/relay)
-- 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB. 초과 시 `message too large` 에러가 발생할 수 있으니 `--limit`으로 배치 크기를 줄인다.
+- 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB. 초과 시 `message/request too large` 에러가 날 수 있으며, 이 경우 sync는 `limit`을 자동으로 줄여 재시도한다(단, 단일 엔트리가 너무 큰 경우는 실패할 수 있으니 필요하면 `--limit`을 조정한다).
 
 ## 사용 예시
 ### 단계 2: tracker/relay + PSK(pnet) 기반

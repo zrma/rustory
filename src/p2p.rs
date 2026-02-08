@@ -922,7 +922,8 @@ impl P2pClient {
                         ..
                     } => {
                         if got_id == request_id {
-                            anyhow::bail!("p2p outbound request failed: {error}");
+                            return Err(anyhow::Error::new(error))
+                                .context("p2p outbound request failed");
                         }
                     }
                     libp2p_request_response::Event::InboundFailure { .. } => {}
@@ -985,7 +986,8 @@ impl P2pClient {
                         ..
                     } => {
                         if got_id == request_id {
-                            anyhow::bail!("p2p outbound request failed: {error}");
+                            return Err(anyhow::Error::new(error))
+                                .context("p2p outbound request failed");
                         }
                     }
                     libp2p_request_response::Event::InboundFailure { .. } => {}

@@ -85,8 +85,9 @@ fn serve_http(bind: &str, store: LocalStore) -> Result<()> {
 }
 
 fn sync_pull_http_peer(local: &LocalStore, peer_base_url: &str, limit: usize) -> Result<usize> {
-    sync::sync_pull_from_peer(local, peer_base_url, limit, |cursor, limit| {
-        http_pull_batch(peer_base_url, cursor, limit)
+    let peer_key = normalize_peer_base_url(peer_base_url)?;
+    sync::sync_pull_from_peer(local, &peer_key, limit, |cursor, limit| {
+        http_pull_batch(&peer_key, cursor, limit)
     })
 }
 
@@ -96,9 +97,18 @@ fn sync_push_http_peer(
     limit: usize,
     local_device_id: Option<&str>,
 ) -> Result<usize> {
-    sync::sync_push_to_peer(local, peer_base_url, limit, local_device_id, |entries| {
-        http_push_batch(peer_base_url, entries)
+    let peer_key = normalize_peer_base_url(peer_base_url)?;
+    sync::sync_push_to_peer(local, &peer_key, limit, local_device_id, |entries| {
+        http_push_batch(&peer_key, entries)
     })
+}
+
+fn normalize_peer_base_url(value: &str) -> Result<String> {
+    let v = value.trim().trim_end_matches('/');
+    if v.is_empty() {
+        anyhow::bail!("peer url is empty");
+    }
+    Ok(v.to_string())
 }
 
 fn http_pull_batch(
@@ -361,6 +371,31 @@ mod tests {
         let got = remote.list_recent(10).unwrap();
         assert_eq!(got.len(), 3);
         assert!(got.iter().any(|e| e.entry_id == "id-3"));
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_sync_normalizes_peer_url_key() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let local_db = dir.path().join("local.db");
+
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+        let mut r1 = entry("id-1", 1, "echo 1");
+        r1.device_id = "dev-remote".to_string();
+        remote.insert_entries(&[r1]).unwrap();
+
+        let server = start_test_server(remote_db.to_str().unwrap().to_string());
+
+        let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
+        let peer_with_slash = format!("{}/", server.base_url);
+        let pulled = sync_pull_http_peer(&local, &peer_with_slash, 100).unwrap();
+        assert_eq!(pulled, 1);
+
+        // cursor는 normalize된 key(끝의 / 제거)로 저장된다.
+        assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 1);
+        assert_eq!(local.get_last_cursor(&peer_with_slash).unwrap(), 0);
 
         server.shutdown();
     }
