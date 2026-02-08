@@ -48,6 +48,26 @@ pub struct SyncConfig {
     pub tracker_token: Option<String>,
     pub user_id: Option<String>,
     pub device_id: Option<String>,
+    pub request_retry_policy: RequestRetryPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestRetryPolicy {
+    pub attempts: usize,
+    pub timeout_base: Duration,
+    pub timeout_cap: Duration,
+    pub backoff_base: Duration,
+}
+
+impl Default for RequestRetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            timeout_base: Duration::from_secs(5),
+            timeout_cap: Duration::from_secs(30),
+            backoff_base: Duration::from_millis(200),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -529,7 +549,13 @@ async fn sync_async(
     let mut any_ok = false;
     let mut last_err: Option<anyhow::Error> = None;
     for t in targets {
-        let mut client = match P2pClient::new(t.peer_id, t.direct_addrs, t.relay_addr, cfg.psk) {
+        let mut client = match P2pClient::new(
+            t.peer_id,
+            t.direct_addrs,
+            t.relay_addr,
+            cfg.psk,
+            cfg.request_retry_policy.clone(),
+        ) {
             Ok(v) => v,
             Err(err) => {
                 eprintln!("warn: p2p client init failed: {}: {err:#}", t.peer_key);
@@ -775,6 +801,7 @@ struct P2pClient {
     peer_id: PeerId,
     direct_addrs: Vec<Multiaddr>,
     relay_addr: Option<Multiaddr>,
+    request_retry_policy: RequestRetryPolicy,
     swarm: Swarm<RustoryBehaviour>,
 }
 
@@ -784,6 +811,7 @@ impl P2pClient {
         direct_addrs: Vec<Multiaddr>,
         relay_addr: Option<Multiaddr>,
         psk: libp2p::pnet::PreSharedKey,
+        request_retry_policy: RequestRetryPolicy,
     ) -> Result<Self> {
         let mut swarm = build_rustory_swarm(psk)?;
         let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0"
@@ -795,6 +823,7 @@ impl P2pClient {
             peer_id,
             direct_addrs,
             relay_addr,
+            request_retry_policy,
             swarm,
         })
     }
@@ -914,19 +943,20 @@ impl P2pClient {
     }
 
     async fn pull_batch_with_retries(&mut self, cursor: i64, limit: usize) -> Result<PullBatch> {
-        const ATTEMPTS: usize = 3;
-        const TIMEOUT_BASE: Duration = Duration::from_secs(5);
-        const TIMEOUT_CAP: Duration = Duration::from_secs(30);
-        const BACKOFF_BASE: Duration = Duration::from_millis(200);
+        // mutable borrow(&mut self) 중에도 policy 값을 쓰기 위해 복사해 둔다.
+        let attempts = self.request_retry_policy.attempts;
+        let timeout_base = self.request_retry_policy.timeout_base;
+        let timeout_cap = self.request_retry_policy.timeout_cap;
+        let backoff_base = self.request_retry_policy.backoff_base;
 
         let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..ATTEMPTS {
-            let timeout = exp_duration(TIMEOUT_BASE, attempt as u32, Some(TIMEOUT_CAP));
+        for attempt in 0..attempts {
+            let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
 
             match self.pull_batch_once(cursor, limit, timeout).await {
                 Ok(v) => return Ok(v),
                 Err(err) => {
-                    if !is_retryable_p2p_request_error(&err) || attempt + 1 >= ATTEMPTS {
+                    if !is_retryable_p2p_request_error(&err) || attempt + 1 >= attempts {
                         return Err(err);
                     }
                     last_err = Some(err);
@@ -936,7 +966,7 @@ impl P2pClient {
             // pending 상태를 정리하기 위해 best-effort disconnect를 시도한다.
             let _ = self.swarm.disconnect_peer_id(self.peer_id);
 
-            let backoff = exp_duration(BACKOFF_BASE, attempt as u32, None);
+            let backoff = exp_duration(backoff_base, attempt as u32, None);
             if backoff > Duration::from_millis(0) {
                 tokio::time::sleep(backoff).await;
             }
@@ -1024,19 +1054,20 @@ impl P2pClient {
             return Ok(());
         }
 
-        const ATTEMPTS: usize = 3;
-        const TIMEOUT_BASE: Duration = Duration::from_secs(5);
-        const TIMEOUT_CAP: Duration = Duration::from_secs(30);
-        const BACKOFF_BASE: Duration = Duration::from_millis(200);
+        // mutable borrow(&mut self) 중에도 policy 값을 쓰기 위해 복사해 둔다.
+        let attempts = self.request_retry_policy.attempts;
+        let timeout_base = self.request_retry_policy.timeout_base;
+        let timeout_cap = self.request_retry_policy.timeout_cap;
+        let backoff_base = self.request_retry_policy.backoff_base;
 
         let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..ATTEMPTS {
-            let timeout = exp_duration(TIMEOUT_BASE, attempt as u32, Some(TIMEOUT_CAP));
+        for attempt in 0..attempts {
+            let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
 
             match self.push_batch_once(entries.clone(), timeout).await {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    if !is_retryable_p2p_request_error(&err) || attempt + 1 >= ATTEMPTS {
+                    if !is_retryable_p2p_request_error(&err) || attempt + 1 >= attempts {
                         return Err(err);
                     }
                     last_err = Some(err);
@@ -1045,7 +1076,7 @@ impl P2pClient {
 
             let _ = self.swarm.disconnect_peer_id(self.peer_id);
 
-            let backoff = exp_duration(BACKOFF_BASE, attempt as u32, None);
+            let backoff = exp_duration(backoff_base, attempt as u32, None);
             if backoff > Duration::from_millis(0) {
                 tokio::time::sleep(backoff).await;
             }
@@ -1284,6 +1315,7 @@ mod tests {
             tracker_token: None,
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
+            request_retry_policy: RequestRetryPolicy::default(),
         };
 
         let got = discover_targets(&store, &cfg).unwrap();

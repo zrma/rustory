@@ -67,6 +67,18 @@ enum Command {
         start_jitter_sec: Option<u64>,
 
         #[arg(long)]
+        req_attempts: Option<u64>,
+
+        #[arg(long)]
+        req_timeout_base_sec: Option<u64>,
+
+        #[arg(long)]
+        req_timeout_cap_sec: Option<u64>,
+
+        #[arg(long)]
+        req_backoff_base_ms: Option<u64>,
+
+        #[arg(long)]
         swarm_key: Option<String>,
 
         #[arg(long)]
@@ -212,6 +224,10 @@ pub fn run() -> Result<()> {
             watch,
             interval_sec,
             start_jitter_sec,
+            req_attempts,
+            req_timeout_base_sec,
+            req_timeout_cap_sec,
+            req_backoff_base_ms,
             swarm_key,
             relay,
             trackers,
@@ -223,6 +239,13 @@ pub fn run() -> Result<()> {
             let tracker_token = resolve_tracker_token(tracker_token, &cfg)?;
             let user_id = resolve_user_id(&cfg);
             let device_id = resolve_device_id(&cfg);
+            let request_retry_policy = resolve_p2p_request_retry_policy(
+                req_attempts,
+                req_timeout_base_sec,
+                req_timeout_cap_sec,
+                req_backoff_base_ms,
+                &cfg,
+            )?;
 
             let sync_cfg = p2p::SyncConfig {
                 psk,
@@ -231,6 +254,7 @@ pub fn run() -> Result<()> {
                 tracker_token,
                 user_id: Some(user_id),
                 device_id: Some(device_id),
+                request_retry_policy,
             };
 
             if watch {
@@ -790,6 +814,83 @@ fn resolve_p2p_watch_start_jitter_sec(cli: Option<u64>, cfg: &config::FileConfig
     Ok(0)
 }
 
+fn resolve_p2p_request_retry_policy(
+    cli_attempts: Option<u64>,
+    cli_timeout_base_sec: Option<u64>,
+    cli_timeout_cap_sec: Option<u64>,
+    cli_backoff_base_ms: Option<u64>,
+    cfg: &config::FileConfig,
+) -> Result<p2p::RequestRetryPolicy> {
+    let mut out = p2p::RequestRetryPolicy::default();
+
+    if let Some(v) = cli_attempts {
+        out.attempts = parse_attempts(v, "req-attempts")?;
+    } else if let Some(v) = env_nonempty("RUSTORY_P2P_REQUEST_ATTEMPTS") {
+        let parsed: u64 = v.parse().map_err(|e| {
+            anyhow::anyhow!("invalid RUSTORY_P2P_REQUEST_ATTEMPTS={:?}: {e}", v.trim())
+        })?;
+        out.attempts = parse_attempts(parsed, "RUSTORY_P2P_REQUEST_ATTEMPTS")?;
+    } else if let Some(v) = cfg.p2p_request_attempts {
+        out.attempts = parse_attempts(v, "p2p_request_attempts")?;
+    }
+
+    if let Some(v) = cli_timeout_base_sec {
+        out.timeout_base = Duration::from_secs(v);
+    } else if let Some(v) = env_nonempty("RUSTORY_P2P_REQUEST_TIMEOUT_BASE_SEC") {
+        let parsed: u64 = v.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid RUSTORY_P2P_REQUEST_TIMEOUT_BASE_SEC={:?}: {e}",
+                v.trim()
+            )
+        })?;
+        out.timeout_base = Duration::from_secs(parsed);
+    } else if let Some(v) = cfg.p2p_request_timeout_base_sec {
+        out.timeout_base = Duration::from_secs(v);
+    }
+
+    if let Some(v) = cli_timeout_cap_sec {
+        out.timeout_cap = Duration::from_secs(v);
+    } else if let Some(v) = env_nonempty("RUSTORY_P2P_REQUEST_TIMEOUT_CAP_SEC") {
+        let parsed: u64 = v.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid RUSTORY_P2P_REQUEST_TIMEOUT_CAP_SEC={:?}: {e}",
+                v.trim()
+            )
+        })?;
+        out.timeout_cap = Duration::from_secs(parsed);
+    } else if let Some(v) = cfg.p2p_request_timeout_cap_sec {
+        out.timeout_cap = Duration::from_secs(v);
+    }
+
+    if out.timeout_cap < out.timeout_base {
+        out.timeout_cap = out.timeout_base;
+    }
+
+    if let Some(v) = cli_backoff_base_ms {
+        out.backoff_base = Duration::from_millis(v);
+    } else if let Some(v) = env_nonempty("RUSTORY_P2P_REQUEST_BACKOFF_BASE_MS") {
+        let parsed: u64 = v.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid RUSTORY_P2P_REQUEST_BACKOFF_BASE_MS={:?}: {e}",
+                v.trim()
+            )
+        })?;
+        out.backoff_base = Duration::from_millis(parsed);
+    } else if let Some(v) = cfg.p2p_request_backoff_base_ms {
+        out.backoff_base = Duration::from_millis(v);
+    }
+
+    Ok(out)
+}
+
+fn parse_attempts(value: u64, label: &str) -> Result<usize> {
+    if value == 0 {
+        anyhow::bail!("{label} must be >= 1");
+    }
+
+    usize::try_from(value).map_err(|_| anyhow::anyhow!("{label} is too large"))
+}
+
 fn resolve_swarm_psk(
     cli_path: Option<String>,
     cfg: &config::FileConfig,
@@ -963,6 +1064,42 @@ mod tests {
                 assert!(watch);
                 assert_eq!(interval_sec, 5);
                 assert_eq!(start_jitter_sec, Some(3));
+            }
+            _ => panic!("expected p2p-sync"),
+        }
+    }
+
+    #[test]
+    fn p2p_sync_parses_request_retry_flags() {
+        let app = App::parse_from([
+            "rr",
+            "p2p-sync",
+            "--limit",
+            "10",
+            "--req-attempts",
+            "4",
+            "--req-timeout-base-sec",
+            "7",
+            "--req-timeout-cap-sec",
+            "33",
+            "--req-backoff-base-ms",
+            "250",
+        ]);
+
+        match app.cmd {
+            Command::P2pSync {
+                limit,
+                req_attempts,
+                req_timeout_base_sec,
+                req_timeout_cap_sec,
+                req_backoff_base_ms,
+                ..
+            } => {
+                assert_eq!(limit, 10);
+                assert_eq!(req_attempts, Some(4));
+                assert_eq!(req_timeout_base_sec, Some(7));
+                assert_eq!(req_timeout_cap_sec, Some(33));
+                assert_eq!(req_backoff_base_ms, Some(250));
             }
             _ => panic!("expected p2p-sync"),
         }

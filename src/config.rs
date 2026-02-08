@@ -24,6 +24,10 @@ pub struct FileConfig {
     pub relay_identity_key_path: Option<String>,
 
     pub p2p_watch_start_jitter_sec: Option<u64>,
+    pub p2p_request_attempts: Option<u64>,
+    pub p2p_request_timeout_base_sec: Option<u64>,
+    pub p2p_request_timeout_cap_sec: Option<u64>,
+    pub p2p_request_backoff_base_ms: Option<u64>,
 
     pub search_limit_default: Option<usize>,
 }
@@ -190,6 +194,10 @@ user_id = "user1"
 device_id = "dev1"
 trackers = ["http://127.0.0.1:8850"]
 p2p_watch_start_jitter_sec = 5
+p2p_request_attempts = 4
+p2p_request_timeout_base_sec = 6
+p2p_request_timeout_cap_sec = 40
+p2p_request_backoff_base_ms = 250
 "#,
         )
         .unwrap();
@@ -198,6 +206,10 @@ p2p_watch_start_jitter_sec = 5
         assert_eq!(cfg.user_id.as_deref(), Some("user1"));
         assert_eq!(cfg.trackers.as_ref().unwrap().len(), 1);
         assert_eq!(cfg.p2p_watch_start_jitter_sec, Some(5));
+        assert_eq!(cfg.p2p_request_attempts, Some(4));
+        assert_eq!(cfg.p2p_request_timeout_base_sec, Some(6));
+        assert_eq!(cfg.p2p_request_timeout_cap_sec, Some(40));
+        assert_eq!(cfg.p2p_request_backoff_base_ms, Some(250));
     }
 
     #[test]

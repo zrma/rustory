@@ -63,6 +63,10 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
 이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
 pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 최대 3회 재시도한다(타임아웃/백오프는 attempt마다 지수 증가).
+재시도 정책은 환경에 맞게 튜닝할 수 있다(기본값: attempts=3, timeout base/cap=5s/30s, backoff base=200ms).
+- CLI: `--req-attempts`, `--req-timeout-base-sec`, `--req-timeout-cap-sec`, `--req-backoff-base-ms`
+- config.toml: `p2p_request_attempts`, `p2p_request_timeout_base_sec`, `p2p_request_timeout_cap_sec`, `p2p_request_backoff_base_ms`
+- env: `RUSTORY_P2P_REQUEST_ATTEMPTS`, `RUSTORY_P2P_REQUEST_TIMEOUT_BASE_SEC`, `RUSTORY_P2P_REQUEST_TIMEOUT_CAP_SEC`, `RUSTORY_P2P_REQUEST_BACKOFF_BASE_MS`
 
 주기적으로 동기화를 계속 돌리려면 `--watch --interval-sec 60` 옵션을 사용한다.
 여러 디바이스에서 같은 `--interval-sec`으로 동시에 데몬을 띄우면 요청이 몰릴 수 있으니,
