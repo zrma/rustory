@@ -331,6 +331,19 @@ pub fn run() -> Result<()> {
             if is_self_rr_command(cmd) {
                 return Ok(());
             }
+            if let Some(pattern) = resolve_record_ignore_regex(&cfg) {
+                match should_ignore_record_command(cmd, &pattern) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(err) => {
+                        // 훅은 stderr를 버릴 수 있으므로, 실패 시에도 안전하게(= 기록 스킵) 동작한다.
+                        eprintln!(
+                            "warn: invalid record ignore regex: {err} (skipping record for safety)"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
 
             let store = storage::LocalStore::open(&db_path)?;
             let cwd = normalize_opt_string(cwd).unwrap_or_else(default_cwd);
@@ -585,6 +598,7 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push_str("# p2p_request_timeout_cap_sec = 30 # optional\n");
     out.push_str("# p2p_request_backoff_base_ms = 200 # optional\n");
     out.push_str("# search_limit_default = 100000 # optional\n");
+    out.push_str("# record_ignore_regex = \"(?i)(password|token|secret)\" # optional\n");
 
     Ok(out)
 }
@@ -641,6 +655,15 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
             );
         }
         Err(err) => println!("p2p request retry: invalid: {err:#}"),
+    }
+    match resolve_record_ignore_regex(cfg) {
+        Some(pattern) => match regex::Regex::new(&pattern) {
+            Ok(_) => println!("record ignore regex: {pattern}"),
+            Err(err) => {
+                println!("record ignore regex: invalid: {err} (skipping record for safety)")
+            }
+        },
+        None => println!("record ignore regex: (none)"),
     }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
@@ -1018,6 +1041,19 @@ fn resolve_device_id(cfg: &config::FileConfig) -> String {
         })
 }
 
+fn resolve_record_ignore_regex(cfg: &config::FileConfig) -> Option<String> {
+    env_nonempty("RUSTORY_RECORD_IGNORE_REGEX")
+        .or_else(|| normalize_opt_string(cfg.record_ignore_regex.clone()))
+}
+
+fn should_ignore_record_command(
+    cmd: &str,
+    pattern: &str,
+) -> std::result::Result<bool, regex::Error> {
+    let re = regex::Regex::new(pattern)?;
+    Ok(re.is_match(cmd))
+}
+
 fn is_self_rr_command(cmd: &str) -> bool {
     let Some(first) = cmd.split_whitespace().next() else {
         return false;
@@ -1192,5 +1228,17 @@ mod tests {
         assert!(text.contains("swarm_key_path"));
         assert!(text.contains("p2p_identity_key_path"));
         assert!(text.contains("p2p_request_attempts"));
+        assert!(text.contains("record_ignore_regex"));
+    }
+
+    #[test]
+    fn record_ignore_regex_matches_command() {
+        assert!(should_ignore_record_command("echo token=abc", "(?i)token").unwrap());
+        assert!(!should_ignore_record_command("echo hello", "(?i)token").unwrap());
+    }
+
+    #[test]
+    fn record_ignore_regex_invalid_pattern_is_error() {
+        assert!(should_ignore_record_command("echo hello", "(").is_err());
     }
 }

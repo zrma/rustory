@@ -17,6 +17,7 @@ futures = "0.3"
 libp2p = { version = "0.55", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "yamux", "request-response", "identify", "ping", "relay", "dcutr", "pnet"] }
 libp2p-request-response = { version = "0.28", features = ["json"] }
 rand = "0.8"
+regex = "1.11"
 rusqlite = { version = "0.31", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
