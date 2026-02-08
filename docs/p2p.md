@@ -137,3 +137,6 @@ p2p_watch_start_jitter_sec = 10
   - 기본 보존 기간: `7d`
   - `user_id`가 설정된 경우 같은 user의 peer만 사용한다.
 - tracker 조회/등록은 일시적인 네트워크 오류(transport error) 및 5xx/429/408에 대해 최대 3회 재시도한다(connect/read timeout은 attempt마다 지수 증가).
+
+## 트러블슈팅
+- `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.

@@ -138,6 +138,7 @@ enum Command {
         #[arg(long)]
         swarm_key: Option<String>,
     },
+    Doctor {},
 }
 
 pub fn run() -> Result<()> {
@@ -358,9 +359,159 @@ pub fn run() -> Result<()> {
             let identity = resolve_relay_identity(identity_key, &cfg)?;
             p2p::relay_serve(&listen, p2p::RelayServeConfig { identity, psk })?;
         }
+        Command::Doctor {} => {
+            run_doctor(&cfg, &db_path)?;
+        }
     }
 
     Ok(())
+}
+
+fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
+    use std::path::Path;
+
+    let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+    let cfg_exists = match std::fs::metadata(&cfg_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            eprintln!(
+                "warn: cannot stat config path {}: {err}",
+                cfg_path.display()
+            );
+            false
+        }
+    };
+
+    let db_path_expanded = if db_path == ":memory:" {
+        Path::new(":memory:").to_path_buf()
+    } else {
+        config::expand_home_path(db_path)?
+    };
+
+    let user_id = resolve_user_id(cfg);
+    let device_id = resolve_device_id(cfg);
+
+    println!("config path: {} (exists: {cfg_exists})", cfg_path.display());
+    println!("db path: {}", db_path_expanded.display());
+    println!("user_id: {user_id}");
+    println!("device_id: {device_id}");
+
+    let swarm_key_path = resolve_swarm_key_path(None, cfg);
+    let swarm_fp = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
+    print_key_status("swarm key", &swarm_key_path, swarm_fp.as_deref())?;
+
+    let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
+    let p2p_peer_id = config::load_identity_keypair(&p2p_identity_key_path)?
+        .map(|kp| kp.public().to_peer_id().to_string());
+    print_key_status(
+        "p2p identity key",
+        &p2p_identity_key_path,
+        p2p_peer_id.as_deref(),
+    )?;
+
+    let relay_identity_key_path = resolve_relay_identity_key_path(None, cfg);
+    let relay_peer_id = config::load_identity_keypair(&relay_identity_key_path)?
+        .map(|kp| kp.public().to_peer_id().to_string());
+    print_key_status(
+        "relay identity key",
+        &relay_identity_key_path,
+        relay_peer_id.as_deref(),
+    )?;
+
+    match resolve_relay_addr(None, cfg) {
+        Ok(Some(addr)) => println!("relay addr: {addr}"),
+        Ok(None) => println!("relay addr: (none)"),
+        Err(err) => println!("relay addr: invalid: {err:#}"),
+    }
+
+    let trackers = resolve_trackers(Vec::new(), cfg)?;
+    if trackers.is_empty() {
+        println!("trackers: (none)");
+        return Ok(());
+    }
+
+    let token = resolve_tracker_token(None, cfg)?;
+    println!("trackers:");
+    for base_url in trackers {
+        let ping = tracker_ping(&base_url, token.as_deref());
+        match ping {
+            Ok(()) => println!("- {base_url} (ping: ok)"),
+            Err(err) => println!("- {base_url} (ping: fail: {err})"),
+        }
+    }
+
+    Ok(())
+}
+
+fn print_key_status(label: &str, path: &str, extra: Option<&str>) -> Result<()> {
+    let expanded = config::expand_home_path(path)?;
+    let exists = match std::fs::metadata(&expanded) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            println!("{label}: {} (stat error: {err})", expanded.display());
+            return Ok(());
+        }
+    };
+
+    if !exists {
+        println!("{label}: {} (missing)", expanded.display());
+        return Ok(());
+    }
+
+    let mut suffix = String::new();
+    if let Some(extra) = extra {
+        suffix.push_str(&format!(" {extra}"));
+    }
+
+    if let Some(mode) = file_mode_777(&expanded)
+        && mode != 0o600
+    {
+        suffix.push_str(&format!(" (warn: mode={mode:03o}, want 600)"));
+    }
+
+    println!("{label}: {} (exists){suffix}", expanded.display());
+    Ok(())
+}
+
+fn file_mode_777(path: &std::path::Path) -> Option<u32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let md = std::fs::metadata(path).ok()?;
+        Some(md.permissions().mode() & 0o777)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<(), String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(1))
+        .timeout_read(Duration::from_secs(1))
+        .timeout_write(Duration::from_secs(1))
+        .build();
+
+    let url = format!("{}/api/v1/ping", base_url.trim_end_matches('/'));
+    let mut req = agent.get(&url);
+    if let Some(token) = token {
+        req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+    }
+
+    match req.call() {
+        Ok(resp) => {
+            if resp.status() == 200 {
+                Ok(())
+            } else {
+                Err(format!("status {}", resp.status()))
+            }
+        }
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 fn default_cwd() -> String {
@@ -452,22 +603,30 @@ fn resolve_p2p_identity(
     cli_path: Option<String>,
     cfg: &config::FileConfig,
 ) -> Result<libp2p::identity::Keypair> {
-    let path = normalize_opt_string(cli_path)
+    let path = resolve_p2p_identity_key_path(cli_path, cfg);
+    config::load_or_generate_identity_keypair(&path)
+}
+
+fn resolve_p2p_identity_key_path(cli_path: Option<String>, cfg: &config::FileConfig) -> String {
+    normalize_opt_string(cli_path)
         .or_else(|| env_nonempty("RUSTORY_P2P_IDENTITY_KEY_PATH"))
         .or_else(|| normalize_opt_string(cfg.p2p_identity_key_path.clone()))
-        .unwrap_or_else(|| config::DEFAULT_P2P_IDENTITY_KEY_PATH.to_string());
-    config::load_or_generate_identity_keypair(&path)
+        .unwrap_or_else(|| config::DEFAULT_P2P_IDENTITY_KEY_PATH.to_string())
 }
 
 fn resolve_relay_identity(
     cli_path: Option<String>,
     cfg: &config::FileConfig,
 ) -> Result<libp2p::identity::Keypair> {
-    let path = normalize_opt_string(cli_path)
+    let path = resolve_relay_identity_key_path(cli_path, cfg);
+    config::load_or_generate_identity_keypair(&path)
+}
+
+fn resolve_relay_identity_key_path(cli_path: Option<String>, cfg: &config::FileConfig) -> String {
+    normalize_opt_string(cli_path)
         .or_else(|| env_nonempty("RUSTORY_RELAY_IDENTITY_KEY_PATH"))
         .or_else(|| normalize_opt_string(cfg.relay_identity_key_path.clone()))
-        .unwrap_or_else(|| config::DEFAULT_RELAY_IDENTITY_KEY_PATH.to_string());
-    config::load_or_generate_identity_keypair(&path)
+        .unwrap_or_else(|| config::DEFAULT_RELAY_IDENTITY_KEY_PATH.to_string())
 }
 
 fn resolve_relay_addr(
@@ -596,6 +755,15 @@ mod tests {
                 assert_eq!(start_jitter_sec, Some(3));
             }
             _ => panic!("expected p2p-sync"),
+        }
+    }
+
+    #[test]
+    fn doctor_parses() {
+        let app = App::parse_from(["rr", "doctor"]);
+        match app.cmd {
+            Command::Doctor {} => {}
+            _ => panic!("expected doctor"),
         }
     }
 }
