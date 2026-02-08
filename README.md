@@ -22,11 +22,11 @@
   - tracker/relay 서버
     - `tracker-serve` (HTTP)
     - `relay-serve` (libp2p circuit relay v2)
+  - 기존 셸 히스토리 seed: `import`
   - 로컬 기록용 `record` + fzf 기반 `search`
   - bash/zsh hook 스크립트 생성(`hook`)
 
 ## 다음 단계
-- 기존 bash/zsh history import(초기 seed)
 - hook 안정화(예: bash duration 등) 및 운영 옵션 보강
 - push 기반 동기화(옵션: `p2p-sync --push`, 로컬 device_id 엔트리만 전송) 고도화(배치/튜닝/관측성)
 - 실사용 수용 테스트(다른 머신/다른 네트워크, NAT/relay 환경) 정비

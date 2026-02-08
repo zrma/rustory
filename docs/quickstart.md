@@ -59,6 +59,23 @@ rr doctor
 - `~/.config/rustory/swarm.key` (PSK, 같은 swarm 내 디바이스는 동일 파일 공유)
 - `~/.config/rustory/identity.key` (PeerId, 디바이스별 고유)
 
+### 2-2-1) (선택) 기존 히스토리 seed(import)
+기존 셸 히스토리 파일을 DB로 가져오려면:
+
+```sh
+# zsh
+rr import --shell zsh
+
+# bash
+rr import --shell bash
+```
+
+필요하면:
+- 다른 파일을 지정: `rr import --shell zsh --path /path/to/file`
+- 마지막 N개만: `rr import --shell zsh --limit 100000`
+
+import는 `RUSTORY_RECORD_IGNORE_REGEX` / `record_ignore_regex`를 존중한다.
+
 ### 2-3) 주기 동기화 실행(추천: 데몬/스케줄러)
 ```sh
 rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
@@ -85,4 +102,3 @@ export RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|be
 - P2P 상세/트러블슈팅: `docs/p2p.md`
 - 데몬/스케줄러: `docs/daemon.md`
 - 훅: `docs/hook.md`
-

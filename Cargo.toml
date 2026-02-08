@@ -27,7 +27,7 @@ tokio = { version = "1", features = ["rt", "macros", "time", "sync"] }
 toml = "0.8"
 ureq = "2.12"
 urlencoding = "2.1"
-uuid = { version = "1.7", features = ["v4", "serde"] }
+uuid = { version = "1.7", features = ["v4", "v5", "serde"] }
 zstd = "0.13"
 
 [dev-dependencies]
