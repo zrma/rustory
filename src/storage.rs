@@ -12,6 +12,12 @@ pub struct PullBatch {
     pub next_cursor: Option<i64>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InsertStats {
+    pub inserted: usize,
+    pub ignored: usize,
+}
+
 pub struct LocalStore {
     conn: Connection,
 }
@@ -38,8 +44,21 @@ impl LocalStore {
     }
 
     pub fn insert_entries(&self, entries: &[Entry]) -> Result<()> {
+        let _ = self.insert_entries_with_stats(entries)?;
+        Ok(())
+    }
+
+    pub fn insert_entries_with_stats(&self, entries: &[Entry]) -> Result<InsertStats> {
+        if entries.is_empty() {
+            return Ok(InsertStats {
+                inserted: 0,
+                ignored: 0,
+            });
+        }
+
         let tx = self.conn.unchecked_transaction().context("begin tx")?;
 
+        let mut inserted = 0usize;
         {
             let mut stmt = tx
                 .prepare(
@@ -63,25 +82,30 @@ INSERT OR IGNORE INTO entries (
 
             for e in entries {
                 let ts = e.ts.unix_timestamp();
-                stmt.execute(params![
-                    e.entry_id,
-                    e.device_id,
-                    e.user_id,
-                    ts,
-                    e.cmd,
-                    e.cwd,
-                    e.exit_code,
-                    e.duration_ms,
-                    e.shell,
-                    e.hostname,
-                    e.version,
-                ])
-                .context("insert entry")?;
+                inserted += stmt
+                    .execute(params![
+                        e.entry_id,
+                        e.device_id,
+                        e.user_id,
+                        ts,
+                        e.cmd,
+                        e.cwd,
+                        e.exit_code,
+                        e.duration_ms,
+                        e.shell,
+                        e.hostname,
+                        e.version,
+                    ])
+                    .context("insert entry")?;
             }
         }
 
         tx.commit().context("commit tx")?;
-        Ok(())
+
+        Ok(InsertStats {
+            inserted,
+            ignored: entries.len().saturating_sub(inserted),
+        })
     }
 
     pub fn list_recent(&self, limit: usize) -> Result<Vec<Entry>> {
@@ -546,6 +570,36 @@ mod tests {
             .unwrap();
         assert!(b3.entries.is_empty());
         assert_eq!(b3.next_cursor, None);
+    }
+
+    #[test]
+    fn insert_entries_with_stats_counts_inserted_and_ignored() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let e1 = entry("id-1", 1, "echo 1");
+        let e2 = entry("id-2", 2, "echo 2");
+
+        let stats = store
+            .insert_entries_with_stats(&[e1.clone(), e2.clone()])
+            .unwrap();
+        assert_eq!(
+            stats,
+            InsertStats {
+                inserted: 2,
+                ignored: 0
+            }
+        );
+
+        let stats = store
+            .insert_entries_with_stats(std::slice::from_ref(&e1))
+            .unwrap();
+        assert_eq!(
+            stats,
+            InsertStats {
+                inserted: 0,
+                ignored: 1
+            }
+        );
     }
 
     #[test]

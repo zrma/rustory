@@ -96,6 +96,8 @@ struct EntriesPush {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PushAck {
     ok: bool,
+    inserted: Option<usize>,
+    ignored: Option<usize>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -403,14 +405,23 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
                         libp2p_request_response::Event::Message { message, .. } => match message {
                             libp2p_request_response::Message::Request { request, channel, .. } => {
-                                let ok = store.insert_entries(&request.entries).is_ok();
-                                if !ok {
-                                    eprintln!("warn: p2p push insert failed");
-                                }
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .push
-                                    .send_response(channel, PushAck { ok });
+                                let resp = match store.insert_entries_with_stats(&request.entries) {
+                                    Ok(stats) => PushAck {
+                                        ok: true,
+                                        inserted: Some(stats.inserted),
+                                        ignored: Some(stats.ignored),
+                                    },
+                                    Err(err) => {
+                                        eprintln!("warn: p2p push insert failed: {err:#}");
+                                        PushAck {
+                                            ok: false,
+                                            inserted: None,
+                                            ignored: None,
+                                        }
+                                    }
+                                };
+
+                                let _ = swarm.behaviour_mut().push.send_response(channel, resp);
                             }
                             libp2p_request_response::Message::Response { .. } => {}
                         },
@@ -1092,6 +1103,7 @@ impl P2pClient {
     ) -> Result<()> {
         self.ensure_connected().await?;
 
+        let entries_len = entries.len();
         let req = EntriesPush { entries };
         let request_id = self
             .swarm
@@ -1117,6 +1129,14 @@ impl P2pClient {
                                 } => {
                                     if got_id == request_id {
                                         if response.ok {
+                                            if let (Some(inserted), Some(ignored)) =
+                                                (response.inserted, response.ignored)
+                                                && (ignored > 0 || inserted != entries_len)
+                                            {
+                                                eprintln!(
+                                                    "p2p push ack: inserted={inserted} ignored={ignored}"
+                                                );
+                                            }
                                             return Ok(());
                                         }
                                         anyhow::bail!("p2p push rejected");
@@ -1450,7 +1470,7 @@ mod tests {
                             && let libp2p_request_response::Message::Request { request, channel, .. } = message
                         {
                             remote.insert_entries(&request.entries).unwrap();
-                            let _ = server.behaviour_mut().push.send_response(channel, PushAck { ok: true });
+                            let _ = server.behaviour_mut().push.send_response(channel, PushAck { ok: true, inserted: None, ignored: None });
                         }
                     }
                     e = client.select_next_some() => {
