@@ -50,6 +50,11 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - spec에 결정 사항이 반영되고, `open-questions.md`는 비어 있어야 한다.
 - 문서(`docs/`)에 사용법/제약이 반영돼야 한다.
 
+### 원커맨드 점검(권장)
+- CI와 같은 검증을 한 번에 돌리려면:
+  - `scripts/check.sh`
+  - 빠르게 돌리려면: `scripts/check.sh --fast` (smoke 생략)
+
 ## 커밋 메시지 규칙(요약)
 - 형식: `<type>: <summary>`
 - scope 괄호는 사용하지 않는다. 예: `feat(sync): ...` 형태 금지
