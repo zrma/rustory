@@ -1,0 +1,69 @@
+services:
+  tracker:
+    build:
+      context: ../../..
+      dockerfile: contrib/docker/acceptance/Dockerfile
+    command:
+      - rr
+      - tracker-serve
+      - --bind
+      - 0.0.0.0:8850
+      - --ttl-sec
+      - "60"
+      - --token
+      - ${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}
+    ports:
+      - "${RUSTORY_ACCEPTANCE_TRACKER_PORT:-8850}:8850"
+
+  relay:
+    build:
+      context: ../../..
+      dockerfile: contrib/docker/acceptance/Dockerfile
+    command:
+      - rr
+      - relay-serve
+      - --listen
+      - /ip4/0.0.0.0/tcp/4001
+      - --swarm-key
+      - /data/swarm.key
+      - --identity-key
+      - /data/relay.key
+    volumes:
+      - ${RUSTORY_ACCEPTANCE_DIR:-./data}:/data
+    ports:
+      - "${RUSTORY_ACCEPTANCE_RELAY_PORT:-4001}:4001"
+
+  linux-peer:
+    build:
+      context: ../../..
+      dockerfile: contrib/docker/acceptance/Dockerfile
+    depends_on:
+      - tracker
+      - relay
+    environment:
+      RUSTORY_USER_ID: ${RUSTORY_ACCEPTANCE_USER_ID:-acceptance}
+      RUSTORY_DEVICE_ID: ${RUSTORY_ACCEPTANCE_LINUX_DEVICE_ID:-linux}
+      RUSTORY_TRACKER_TOKEN: ${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}
+    volumes:
+      - ${RUSTORY_ACCEPTANCE_DIR:-./data}:/data
+    command:
+      - sh
+      - -lc
+      - |
+        set -eu
+
+        # seed (host가 pull로 받아와서 검증할 수 있게 최소 1개를 넣는다)
+        rr --db-path /data/linux.db record \
+          --cmd "echo acceptance-from-linux" \
+          --cwd "/tmp" \
+          --exit-code 0 \
+          --shell "bash" \
+          --hostname "linux" \
+          --print-id >/dev/null
+
+        rr --db-path /data/linux.db p2p-serve \
+          --listen /ip4/0.0.0.0/tcp/0 \
+          --swarm-key /data/swarm.key \
+          --identity-key /data/linux.identity.key \
+          --trackers http://tracker:8850 \
+          --relay "/dns4/relay/tcp/4001/p2p/${RELAY_PEER_ID:-}"
