@@ -8,6 +8,7 @@
   - `trackers`, `relay_addr`, `swarm_key_path`, `p2p_identity_key_path`, `tracker_token` 등
 - `user_id`, `device_id`는 고정값을 사용한다(환경변수 또는 config).
 - `--push`는 **로컬 디바이스 엔트리만** 전송한다(`entry.device_id == local_device_id`).
+- `--watch` 실행 중 중지(SIGTERM/Ctrl-C)를 받으면 빠르게 종료한다(서비스 매니저 stop에 정상 반응).
 
 ## 기본 실행 커맨드(예시)
 설정 파일을 이미 채워뒀다면:
@@ -121,4 +122,3 @@ journalctl --user -u rustory.service -f
 systemctl --user restart rustory.service
 systemctl --user stop rustory.service
 ```
-

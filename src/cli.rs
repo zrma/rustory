@@ -211,12 +211,31 @@ pub fn run() -> Result<()> {
             if watch {
                 let interval = Duration::from_secs(interval_sec.max(1));
                 eprintln!("p2p-sync watch: interval={:?}", interval);
-                loop {
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                {
+                    let stop = stop.clone();
+                    ctrlc::set_handler(move || {
+                        stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    })
+                    .context("set Ctrl-C/SIGTERM handler")?;
+                }
+
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                     if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone(), push) {
                         eprintln!("warn: p2p-sync failed: {err:#}");
                     }
-                    std::thread::sleep(interval);
+
+                    // 중지 신호에 빠르게 반응하기 위해 sleep을 1초 단위로 쪼갠다.
+                    for _ in 0..interval.as_secs() {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
                 }
+
+                eprintln!("p2p-sync watch: shutting down");
+                return Ok(());
             } else {
                 p2p::sync(&peers, limit, &db_path, sync_cfg, push)?;
             }

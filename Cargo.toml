@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
 futures = "0.3"
 libp2p = { version = "0.55", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "yamux", "request-response", "identify", "ping", "relay", "dcutr", "pnet"] }
 libp2p-request-response = { version = "0.28", features = ["json"] }
