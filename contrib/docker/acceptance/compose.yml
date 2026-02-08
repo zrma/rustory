@@ -53,7 +53,12 @@ services:
         set -eu
 
         # seed (host가 pull로 받아와서 검증할 수 있게 최소 1개를 넣는다)
-        rr --db-path /data/linux.db record \
+        #
+        # NOTE: DB를 bind-mount(/data) 아래에 두면 Docker Desktop(macOS) 환경에서
+        # SQLite WAL 동작이 불안정해질 수 있다(특히 장기 실행 프로세스).
+        # acceptance에서는 컨테이너 내부 FS(/tmp)에 DB를 두고, 필요하면 스크립트가
+        # 종료 시점에 docker cp로 DB를 꺼내 검증한다.
+        rr --db-path /tmp/linux.db record \
           --cmd "echo acceptance-from-linux" \
           --cwd "/tmp" \
           --exit-code 0 \
@@ -61,7 +66,7 @@ services:
           --hostname "linux" \
           --print-id >/dev/null
 
-        rr --db-path /data/linux.db p2p-serve \
+        rr --db-path /tmp/linux.db p2p-serve \
           --listen /ip4/0.0.0.0/tcp/0 \
           --swarm-key /data/swarm.key \
           --identity-key /data/linux.identity.key \

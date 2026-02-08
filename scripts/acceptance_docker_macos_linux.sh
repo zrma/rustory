@@ -197,6 +197,20 @@ echo "[8/8] run p2p-sync on macOS host"
 cargo build --bin rr >/dev/null
 
 MAC_DB="$ACC_DIR/mac.db"
+MAC_ENTRY_ID="$(RUSTORY_USER_ID="$USER_ID" \
+  RUSTORY_DEVICE_ID="mac" \
+  target/debug/rr --db-path "$MAC_DB" record \
+    --cmd "echo acceptance-from-mac" \
+    --cwd "/tmp" \
+    --exit-code 0 \
+    --shell "zsh" \
+    --hostname "mac" \
+    --print-id | tr -d '\r')"
+if [[ -z "$MAC_ENTRY_ID" ]]; then
+  echo "error: failed to record entry on mac" >&2
+  exit 1
+fi
+
 RUSTORY_USER_ID="$USER_ID" \
 RUSTORY_DEVICE_ID="mac" \
 RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
@@ -204,9 +218,10 @@ RUSTORY_TRACKER_TOKEN="$TOKEN" \
 target/debug/rr --db-path "$MAC_DB" p2p-sync \
   --trackers "$TRACKER_URL" \
   --relay "$RELAY_ADDR" \
+  --push \
   --limit 1000
 
-echo "[verify] mac db has entries"
+echo "[verify] mac db pulled linux seed entry"
 python3 - <<'PY' "$MAC_DB"
 import sqlite3
 import sys
@@ -214,14 +229,57 @@ import sys
 db = sys.argv[1]
 conn = sqlite3.connect(db)
 try:
-    n = conn.execute("SELECT COUNT(*) FROM entries").fetchone()[0]
+    n = conn.execute(
+        "SELECT COUNT(*) FROM entries WHERE cmd LIKE '%acceptance-from-linux%'"
+    ).fetchone()[0]
 finally:
     conn.close()
 
 if n <= 0:
-    sys.stderr.write("error: expected >= 1 entries in mac db\n")
+    sys.stderr.write("error: expected linux seed entry in mac db\n")
     sys.exit(1)
-print(f"entries={n}")
+print(f"linux_seed_entries={n}")
+PY
+
+echo "[export] copy linux peer db snapshot"
+LINUX_CID="$(docker compose -f "$COMPOSE_FILE" -p "$PROJECT" ps -q linux-peer | tr -d '\r')"
+if [[ -z "$LINUX_CID" ]]; then
+  echo "error: linux-peer container id not found" >&2
+  exit 1
+fi
+
+LINUX_DB="$ACC_DIR/linux.db"
+
+# Docker Desktop(macOS) + bind-mount 환경에서는 SQLite WAL 동기화/가시성이 깨질 수 있어
+# linux peer DB는 컨테이너 내부 FS(/tmp)에 두고, 여기서 snapshot을 꺼내 검증한다.
+#
+# KEEP=1(디버깅)에서는 컨테이너를 멈추지 않고(db/wal/shm best-effort copy),
+# 기본 모드에서는 stop 후 snapshot을 복사해 일관성을 높인다.
+if [[ "$KEEP" != "1" ]]; then
+  docker compose -f "$COMPOSE_FILE" -p "$PROJECT" stop linux-peer >/dev/null 2>&1 || true
+fi
+
+docker cp "${LINUX_CID}:/tmp/linux.db" "$LINUX_DB" >/dev/null
+docker cp "${LINUX_CID}:/tmp/linux.db-wal" "${LINUX_DB}-wal" >/dev/null 2>&1 || true
+docker cp "${LINUX_CID}:/tmp/linux.db-shm" "${LINUX_DB}-shm" >/dev/null 2>&1 || true
+
+echo "[verify] linux db received mac pushed entry"
+python3 - <<'PY' "$MAC_ENTRY_ID" "$LINUX_DB"
+import sqlite3
+import sys
+
+entry_id = sys.argv[1]
+db = sys.argv[2]
+conn = sqlite3.connect(db)
+try:
+    n = conn.execute("SELECT COUNT(*) FROM entries WHERE entry_id = ?", (entry_id,)).fetchone()[0]
+finally:
+    conn.close()
+
+if n <= 0:
+    sys.stderr.write(f"error: expected mac pushed entry in linux db: entry_id={entry_id}\n")
+    sys.exit(1)
+print("ok")
 PY
 
 echo "[verify] relay fallback was used (circuit accepted)"
