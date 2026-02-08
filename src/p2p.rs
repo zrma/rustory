@@ -595,6 +595,8 @@ async fn sync_async(
         }
 
         if push {
+            client.reset_push_ack_stats();
+
             let push_res = crate::sync::sync_push_to_peer_async(
                 &store,
                 &t.peer_key,
@@ -610,8 +612,20 @@ async fn sync_async(
                     if pushed > 0 {
                         any_ok = true;
                     }
+                    if let Some((inserted, ignored)) = client.take_push_ack_stats() {
+                        eprintln!(
+                            "p2p push summary: {}: sent={pushed} inserted={inserted} ignored={ignored}",
+                            t.peer_key
+                        );
+                    }
                 }
                 Err(err) => {
+                    if let Some((inserted, ignored)) = client.take_push_ack_stats() {
+                        eprintln!(
+                            "warn: p2p push partial: {}: inserted={inserted} ignored={ignored}",
+                            t.peer_key
+                        );
+                    }
                     eprintln!("warn: p2p push failed: {}: {err:#}", t.peer_key);
                     last_err = Some(err);
                 }
@@ -819,6 +833,9 @@ struct P2pClient {
     direct_addrs: Vec<Multiaddr>,
     relay_addr: Option<Multiaddr>,
     request_retry_policy: RequestRetryPolicy,
+    push_ack_stats_known: bool,
+    push_ack_inserted_total: usize,
+    push_ack_ignored_total: usize,
     swarm: Swarm<RustoryBehaviour>,
 }
 
@@ -841,8 +858,26 @@ impl P2pClient {
             direct_addrs,
             relay_addr,
             request_retry_policy,
+            push_ack_stats_known: false,
+            push_ack_inserted_total: 0,
+            push_ack_ignored_total: 0,
             swarm,
         })
+    }
+
+    fn reset_push_ack_stats(&mut self) {
+        self.push_ack_stats_known = false;
+        self.push_ack_inserted_total = 0;
+        self.push_ack_ignored_total = 0;
+    }
+
+    fn take_push_ack_stats(&mut self) -> Option<(usize, usize)> {
+        if !self.push_ack_stats_known {
+            return None;
+        }
+        let out = (self.push_ack_inserted_total, self.push_ack_ignored_total);
+        self.reset_push_ack_stats();
+        Some(out)
     }
 
     async fn ensure_connected(&mut self) -> Result<()> {
@@ -1139,9 +1174,18 @@ impl P2pClient {
                                                 (response.inserted, response.ignored)
                                                 && (ignored > 0 || inserted != entries_len)
                                             {
+                                                self.push_ack_stats_known = true;
+                                                self.push_ack_inserted_total += inserted;
+                                                self.push_ack_ignored_total += ignored;
                                                 eprintln!(
                                                     "p2p push ack: inserted={inserted} ignored={ignored}"
                                                 );
+                                            } else if let (Some(inserted), Some(ignored)) =
+                                                (response.inserted, response.ignored)
+                                            {
+                                                self.push_ack_stats_known = true;
+                                                self.push_ack_inserted_total += inserted;
+                                                self.push_ack_ignored_total += ignored;
                                             }
                                             return Ok(());
                                         }
