@@ -157,6 +157,7 @@ p2p_watch_start_jitter_sec = 10
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬 ingest head, peer별 pull/push cursor, 로컬 디바이스 기준 pending push 건수와 peerbook 기준 `last_seen` 정보를 출력한다.
   - `--with-tracker`를 주면 설정된 tracker 목록에 `/api/v1/ping`을 호출해 reachable/error 상태를 같이 출력한다.
+  - `peer_state`/`peer_push_state`가 아직 없는 peer라도 `peer_book` 캐시에 있으면 `pull_cursor=0`, `push_cursor=0`으로 표시된다.
   - 예시:
     - `rr sync-status`
     - `rr sync-status --peer 12D3KooW...`

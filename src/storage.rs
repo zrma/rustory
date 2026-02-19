@@ -332,6 +332,8 @@ FROM (
   SELECT peer_id FROM peer_state
   UNION
   SELECT peer_id FROM peer_push_state
+  UNION
+  SELECT peer_id FROM peer_book
 ) ids
 LEFT JOIN peer_state ps ON ps.peer_id = ids.peer_id
 LEFT JOIN peer_push_state pps ON pps.peer_id = ids.peer_id
@@ -800,6 +802,24 @@ mod tests {
         store.set_last_pushed_seq("peer-a", 7).unwrap();
         store.set_last_cursor("peer-b", 3).unwrap();
         store.set_last_pushed_seq("peer-c", 9).unwrap();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("d1".to_string()),
+                last_seen_unix: 111,
+            })
+            .unwrap();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-d".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/4/p2p/peer-d".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("d4".to_string()),
+                last_seen_unix: 222,
+            })
+            .unwrap();
 
         let got = store.list_peer_sync_status().unwrap();
 
@@ -820,6 +840,11 @@ mod tests {
                     peer_id: "peer-c".to_string(),
                     last_cursor: 0,
                     last_pushed_seq: 9,
+                },
+                PeerSyncStatus {
+                    peer_id: "peer-d".to_string(),
+                    last_cursor: 0,
+                    last_pushed_seq: 0,
                 },
             ]
         );
