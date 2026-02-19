@@ -129,6 +129,9 @@ enum Command {
     SyncStatus {
         #[arg(long)]
         peer: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     Hook {
         #[arg(long, default_value = "zsh")]
@@ -417,21 +420,24 @@ pub fn run() -> Result<()> {
                 println!("{cmd}");
             }
         }
-        Command::SyncStatus { peer } => {
+        Command::SyncStatus { peer, json } => {
             let peer = normalize_opt_string(peer);
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
-            let local_head = store.latest_ingest_seq()?;
+            let report = build_sync_status_report(&store, &local_device_id, peer.as_deref())?;
 
-            println!("local ingest head: {local_head}");
-            println!("local device id: {local_device_id}");
-
-            let mut statuses = store.list_peer_sync_status()?;
-            if let Some(peer_id) = peer.as_deref() {
-                statuses.retain(|status| status.peer_id == peer_id);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).context("serialize sync-status json")?
+                );
+                return Ok(());
             }
 
-            if statuses.is_empty() {
+            println!("local ingest head: {}", report.local_head);
+            println!("local device id: {}", report.local_device_id);
+
+            if report.peers.is_empty() {
                 if let Some(peer_id) = peer.as_deref() {
                     println!("peer sync state: no state for peer '{peer_id}'");
                 } else {
@@ -440,12 +446,10 @@ pub fn run() -> Result<()> {
                 return Ok(());
             }
 
-            for status in statuses {
-                let pending_push =
-                    store.count_pending_push_entries(&status.peer_id, Some(&local_device_id))?;
+            for status in report.peers {
                 println!(
                     "peer={} pull_cursor={} push_cursor={} pending_push={}",
-                    status.peer_id, status.last_cursor, status.last_pushed_seq, pending_push
+                    status.peer_id, status.pull_cursor, status.push_cursor, status.pending_push
                 );
             }
         }
@@ -904,6 +908,51 @@ fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<(), 
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct SyncStatusPeerReport {
+    peer_id: String,
+    pull_cursor: i64,
+    push_cursor: i64,
+    pending_push: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct SyncStatusReport {
+    local_head: i64,
+    local_device_id: String,
+    peers: Vec<SyncStatusPeerReport>,
+}
+
+fn build_sync_status_report(
+    store: &storage::LocalStore,
+    local_device_id: &str,
+    peer_filter: Option<&str>,
+) -> Result<SyncStatusReport> {
+    let local_head = store.latest_ingest_seq()?;
+    let mut statuses = store.list_peer_sync_status()?;
+    if let Some(peer_id) = peer_filter {
+        statuses.retain(|status| status.peer_id == peer_id);
+    }
+
+    let mut peers = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        let pending_push =
+            store.count_pending_push_entries(&status.peer_id, Some(local_device_id))?;
+        peers.push(SyncStatusPeerReport {
+            peer_id: status.peer_id,
+            pull_cursor: status.last_cursor,
+            push_cursor: status.last_pushed_seq,
+            pending_push,
+        });
+    }
+
+    Ok(SyncStatusReport {
+        local_head,
+        local_device_id: local_device_id.to_string(),
+        peers,
+    })
+}
+
 fn default_cwd() -> String {
     std::env::current_dir()
         .ok()
@@ -1291,11 +1340,88 @@ mod tests {
     fn sync_status_parses_peer_filter() {
         let app = App::parse_from(["rr", "sync-status", "--peer", "peer-a"]);
         match app.cmd {
-            Command::SyncStatus { peer } => {
+            Command::SyncStatus { peer, json } => {
                 assert_eq!(peer.as_deref(), Some("peer-a"));
+                assert!(!json);
             }
             _ => panic!("expected sync-status"),
         }
+    }
+
+    #[test]
+    fn sync_status_parses_json_flag() {
+        let app = App::parse_from(["rr", "sync-status", "--json"]);
+        match app.cmd {
+            Command::SyncStatus { peer, json } => {
+                assert!(peer.is_none());
+                assert!(json);
+            }
+            _ => panic!("expected sync-status"),
+        }
+    }
+
+    #[test]
+    fn sync_status_report_includes_pending_push_and_filter() {
+        use time::OffsetDateTime;
+
+        fn entry(entry_id: &str, ts: i64, device_id: &str) -> crate::core::Entry {
+            crate::core::Entry {
+                entry_id: entry_id.to_string(),
+                device_id: device_id.to_string(),
+                user_id: "user1".to_string(),
+                ts: OffsetDateTime::from_unix_timestamp(ts).unwrap(),
+                cmd: "echo test".to_string(),
+                cwd: "/tmp".to_string(),
+                exit_code: 0,
+                duration_ms: 10,
+                shell: "zsh".to_string(),
+                hostname: "host".to_string(),
+                version: "0.1.0".to_string(),
+            }
+        }
+
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store
+            .insert_entries(&[
+                entry("id-1", 1, "dev-local"),
+                entry("id-2", 2, "dev-remote"),
+                entry("id-3", 3, "dev-local"),
+            ])
+            .unwrap();
+        store.set_last_cursor("peer-a", 2).unwrap();
+        store.set_last_pushed_seq("peer-a", 1).unwrap();
+        store.set_last_cursor("peer-b", 3).unwrap();
+        store.set_last_pushed_seq("peer-b", 3).unwrap();
+
+        let report = build_sync_status_report(&store, "dev-local", None).unwrap();
+        assert_eq!(report.local_head, 3);
+        assert_eq!(report.local_device_id, "dev-local");
+        assert_eq!(report.peers.len(), 2);
+
+        let peer_a = report
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer-a")
+            .unwrap();
+        assert_eq!(peer_a.pull_cursor, 2);
+        assert_eq!(peer_a.push_cursor, 1);
+        assert_eq!(peer_a.pending_push, 1);
+
+        let peer_b = report
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer-b")
+            .unwrap();
+        assert_eq!(peer_b.pending_push, 0);
+
+        let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a")).unwrap();
+        assert_eq!(filtered.peers.len(), 1);
+        assert_eq!(filtered.peers[0].peer_id, "peer-a");
+
+        let json = serde_json::to_string(&filtered).unwrap();
+        assert!(json.contains("\"local_head\""));
+        assert!(json.contains("\"local_device_id\""));
+        assert!(json.contains("\"pending_push\""));
     }
 
     #[test]
