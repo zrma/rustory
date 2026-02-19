@@ -471,13 +471,18 @@ pub fn run() -> Result<()> {
                         .last_seen_unix
                         .map(|ts| ts.to_string())
                         .unwrap_or_else(|| "-".to_string());
+                    let last_seen_age = status
+                        .last_seen_age_sec
+                        .map(|age| age.to_string())
+                        .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={}",
+                        "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={} last_seen_age_sec={}",
                         status.peer_id,
                         status.pull_cursor,
                         status.push_cursor,
                         status.pending_push,
-                        last_seen
+                        last_seen,
+                        last_seen_age
                     );
                 }
             }
@@ -971,6 +976,7 @@ struct SyncStatusPeerReport {
     push_cursor: i64,
     pending_push: usize,
     last_seen_unix: Option<i64>,
+    last_seen_age_sec: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -990,6 +996,10 @@ struct SyncStatusReport {
     tracker_status: Option<Vec<SyncStatusTrackerReport>>,
 }
 
+fn compute_last_seen_age_sec(now_unix: i64, last_seen_unix: Option<i64>) -> Option<i64> {
+    last_seen_unix.map(|ts| now_unix.saturating_sub(ts).max(0))
+}
+
 fn build_sync_status_report(
     store: &storage::LocalStore,
     local_device_id: &str,
@@ -998,6 +1008,7 @@ fn build_sync_status_report(
 ) -> Result<SyncStatusReport> {
     let local_head = store.latest_ingest_seq()?;
     let peer_last_seen = store.list_peer_book_last_seen_map()?;
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut statuses = store.list_peer_sync_status()?;
     if let Some(peer_id) = peer_filter {
         statuses.retain(|status| status.peer_id == peer_id);
@@ -1008,12 +1019,14 @@ fn build_sync_status_report(
         let peer_id = status.peer_id;
         let pending_push = store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
         let last_seen_unix = peer_last_seen.get(&peer_id).copied();
+        let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
         peers.push(SyncStatusPeerReport {
             peer_id,
             pull_cursor: status.last_cursor,
             push_cursor: status.last_pushed_seq,
             pending_push,
             last_seen_unix,
+            last_seen_age_sec,
         });
     }
 
@@ -1539,6 +1552,7 @@ mod tests {
         assert_eq!(peer_a.push_cursor, 1);
         assert_eq!(peer_a.pending_push, 1);
         assert_eq!(peer_a.last_seen_unix, Some(99));
+        assert!(peer_a.last_seen_age_sec.is_some());
 
         let peer_b = report
             .peers
@@ -1547,6 +1561,7 @@ mod tests {
             .unwrap();
         assert_eq!(peer_b.pending_push, 0);
         assert_eq!(peer_b.last_seen_unix, None);
+        assert_eq!(peer_b.last_seen_age_sec, None);
 
         let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a"), None).unwrap();
         assert_eq!(filtered.peers.len(), 1);
@@ -1557,6 +1572,15 @@ mod tests {
         assert!(json.contains("\"local_device_id\""));
         assert!(json.contains("\"pending_push\""));
         assert!(json.contains("\"last_seen_unix\""));
+        assert!(json.contains("\"last_seen_age_sec\""));
+    }
+
+    #[test]
+    fn compute_last_seen_age_sec_handles_past_and_future() {
+        assert_eq!(compute_last_seen_age_sec(100, Some(90)), Some(10));
+        assert_eq!(compute_last_seen_age_sec(100, Some(100)), Some(0));
+        assert_eq!(compute_last_seen_age_sec(100, Some(110)), Some(0));
+        assert_eq!(compute_last_seen_age_sec(100, None), None);
     }
 
     #[test]
