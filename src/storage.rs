@@ -31,6 +31,13 @@ pub struct PeerBookPeer {
     pub last_seen_unix: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerSyncStatus {
+    pub peer_id: String,
+    pub last_cursor: i64,
+    pub last_pushed_seq: i64,
+}
+
 impl LocalStore {
     pub fn open(path: &str) -> Result<Self> {
         let path = expand_home(path)?;
@@ -299,6 +306,94 @@ ON CONFLICT(peer_id) DO UPDATE SET last_pushed_seq = excluded.last_pushed_seq
             )
             .context("upsert peer_push_state")?;
         Ok(())
+    }
+
+    pub fn latest_ingest_seq(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE(MAX(ingest_seq), 0) FROM entries",
+                [],
+                |row| row.get(0),
+            )
+            .context("query latest ingest_seq")
+    }
+
+    pub fn list_peer_sync_status(&self) -> Result<Vec<PeerSyncStatus>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT
+  ids.peer_id,
+  COALESCE(ps.last_cursor, 0) AS last_cursor,
+  COALESCE(pps.last_pushed_seq, 0) AS last_pushed_seq
+FROM (
+  SELECT peer_id FROM peer_state
+  UNION
+  SELECT peer_id FROM peer_push_state
+) ids
+LEFT JOIN peer_state ps ON ps.peer_id = ids.peer_id
+LEFT JOIN peer_push_state pps ON pps.peer_id = ids.peer_id
+ORDER BY ids.peer_id ASC
+"#,
+            )
+            .context("prepare list_peer_sync_status")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(PeerSyncStatus {
+                    peer_id: row.get(0)?,
+                    last_cursor: row.get(1)?,
+                    last_pushed_seq: row.get(2)?,
+                })
+            })
+            .context("query list_peer_sync_status")?;
+
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn count_entries_after_seq(
+        &self,
+        seq: i64,
+        source_device_id: Option<&str>,
+    ) -> Result<usize> {
+        let count: i64 = if let Some(device_id) = source_device_id {
+            self.conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entries
+WHERE ingest_seq > ?
+  AND device_id = ?
+"#,
+                    params![seq, device_id],
+                    |row| row.get(0),
+                )
+                .context("count entries after seq for device")?
+        } else {
+            self.conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entries
+WHERE ingest_seq > ?
+"#,
+                    params![seq],
+                    |row| row.get(0),
+                )
+                .context("count entries after seq")?
+        };
+
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn count_pending_push_entries(
+        &self,
+        peer_id: &str,
+        source_device_id: Option<&str>,
+    ) -> Result<usize> {
+        let last_pushed_seq = self.get_last_pushed_seq(peer_id)?;
+        self.count_entries_after_seq(last_pushed_seq, source_device_id)
     }
 
     pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
@@ -664,6 +759,77 @@ mod tests {
         assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 0);
         store.set_last_pushed_seq("peer-a", 7).unwrap();
         assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 7);
+    }
+
+    #[test]
+    fn latest_ingest_seq_returns_zero_for_empty_store() {
+        let store = LocalStore::open(":memory:").unwrap();
+        assert_eq!(store.latest_ingest_seq().unwrap(), 0);
+    }
+
+    #[test]
+    fn list_peer_sync_status_merges_pull_and_push_state() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store.set_last_cursor("peer-a", 10).unwrap();
+        store.set_last_pushed_seq("peer-a", 7).unwrap();
+        store.set_last_cursor("peer-b", 3).unwrap();
+        store.set_last_pushed_seq("peer-c", 9).unwrap();
+
+        let got = store.list_peer_sync_status().unwrap();
+
+        assert_eq!(
+            got,
+            vec![
+                PeerSyncStatus {
+                    peer_id: "peer-a".to_string(),
+                    last_cursor: 10,
+                    last_pushed_seq: 7,
+                },
+                PeerSyncStatus {
+                    peer_id: "peer-b".to_string(),
+                    last_cursor: 3,
+                    last_pushed_seq: 0,
+                },
+                PeerSyncStatus {
+                    peer_id: "peer-c".to_string(),
+                    last_cursor: 0,
+                    last_pushed_seq: 9,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn count_pending_push_entries_tracks_cursor_and_device_filter() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo 1");
+        e1.device_id = "dev-local".to_string();
+        let mut e2 = entry("id-2", 2, "echo 2");
+        e2.device_id = "dev-remote".to_string();
+        let mut e3 = entry("id-3", 3, "echo 3");
+        e3.device_id = "dev-local".to_string();
+
+        store.insert_entries(&[e1, e2, e3]).unwrap();
+        store.set_last_pushed_seq("peer-a", 1).unwrap();
+
+        assert_eq!(
+            store
+                .count_pending_push_entries("peer-a", Some("dev-local"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.count_pending_push_entries("peer-a", None).unwrap(), 2);
+
+        // ingest_seq 3까지 올리면 더 이상 pending 없음
+        store.set_last_pushed_seq("peer-a", 3).unwrap();
+        assert_eq!(
+            store
+                .count_pending_push_entries("peer-a", Some("dev-local"))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

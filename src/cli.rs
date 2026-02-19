@@ -126,6 +126,10 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    SyncStatus {
+        #[arg(long)]
+        peer: Option<String>,
+    },
     Hook {
         #[arg(long, default_value = "zsh")]
         shell: String,
@@ -411,6 +415,38 @@ pub fn run() -> Result<()> {
             let entries = store.list_recent(limit)?;
             if let Some(cmd) = search::select_command(&entries)? {
                 println!("{cmd}");
+            }
+        }
+        Command::SyncStatus { peer } => {
+            let peer = normalize_opt_string(peer);
+            let store = storage::LocalStore::open(&db_path)?;
+            let local_device_id = resolve_device_id(&cfg);
+            let local_head = store.latest_ingest_seq()?;
+
+            println!("local ingest head: {local_head}");
+            println!("local device id: {local_device_id}");
+
+            let mut statuses = store.list_peer_sync_status()?;
+            if let Some(peer_id) = peer.as_deref() {
+                statuses.retain(|status| status.peer_id == peer_id);
+            }
+
+            if statuses.is_empty() {
+                if let Some(peer_id) = peer.as_deref() {
+                    println!("peer sync state: no state for peer '{peer_id}'");
+                } else {
+                    println!("peer sync state: (empty)");
+                }
+                return Ok(());
+            }
+
+            for status in statuses {
+                let pending_push =
+                    store.count_pending_push_entries(&status.peer_id, Some(&local_device_id))?;
+                println!(
+                    "peer={} pull_cursor={} push_cursor={} pending_push={}",
+                    status.peer_id, status.last_cursor, status.last_pushed_seq, pending_push
+                );
             }
         }
         Command::Hook { shell } => {
@@ -1248,6 +1284,17 @@ mod tests {
         match app.cmd {
             Command::Doctor {} => {}
             _ => panic!("expected doctor"),
+        }
+    }
+
+    #[test]
+    fn sync_status_parses_peer_filter() {
+        let app = App::parse_from(["rr", "sync-status", "--peer", "peer-a"]);
+        match app.cmd {
+            Command::SyncStatus { peer } => {
+                assert_eq!(peer.as_deref(), Some("peer-a"));
+            }
+            _ => panic!("expected sync-status"),
         }
     }
 
