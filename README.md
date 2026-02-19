@@ -1,88 +1,36 @@
 # Rustory
 
-분산/동기화 기반 셸 히스토리 관리 도구 (MVP 설계 단계)
+분산/동기화 기반 셸 히스토리 관리 도구.
 
-빠른 시작: `docs/quickstart.md`
+## Quick Start
 
-## 목표 (MVP)
-- append-only 기반 히스토리 수집
-- entry_id 기반 dedup 동기화
-- fzf 기반 로컬 검색 UI
-- bash/zsh 후킹
+- 빠른 시작: `docs/quickstart.md`
+- 로컬 검증(권장): `scripts/check.sh`
+- 빠른 검증(smoke 생략): `scripts/check.sh --fast`
 
-## 현재 상태
-- 설계 문서: `docs/mvp.md`
-- PoC 구현 진행 중:
-  - SQLite 스토리지(ingest_seq cursor, dedup)
-  - pull 기반 sync 코어 루프
-  - HTTP(디버그) `serve`/`sync` (pull + optional push: `rr sync --push`, push는 로컬 device_id 엔트리만 전송)
-  - P2P `p2p-serve`/`p2p-sync`
-    - 단계 1: 수동 multiaddr
-    - 단계 2: tracker/relay(디스커버리 + 중계) + PSK(pnet) + direct-first + relay fallback + hole punching(DCUtR) (문서: `docs/p2p.md`)
-  - tracker/relay 서버
-    - `tracker-serve` (HTTP)
-    - `relay-serve` (libp2p circuit relay v2)
-  - 기존 셸 히스토리 seed: `import`
-  - 로컬 기록용 `record` + fzf 기반 `search`
-  - bash/zsh hook 스크립트 생성(`hook`)
+## Agent Navigation
 
-## 다음 단계
-- hook 안정화(예: bash duration 등) 및 운영 옵션 보강
-- push 기반 동기화(옵션: `p2p-sync --push`, 로컬 device_id 엔트리만 전송) 고도화(배치/튜닝/관측성)
-- 실사용 수용 테스트(다른 머신/다른 네트워크, NAT/relay 환경) 정비
+- 작업 시작: `docs/HANDOFF.md`
+- 문서 역할 경계: `docs/README_OPERATING_POLICY.md`
+- 실행 방법론: `docs/EXECUTION_LOOP.md`
+- 운영 모델: `docs/OPERATING_MODEL.md`
+- 출고 절차: `docs/CHANGE_CONTROL.md`
+- 지속 개선: `docs/IMPROVEMENT_LOOP.md`
+- 에스컬레이션: `docs/ESCALATION_POLICY.md`
+- 교훈 로그: `docs/LESSONS_LOG.md`
+- 메타/검증 맵: `docs/REPO_MANIFEST.yaml`
+- 에이전트 실행 규칙: `AGENTS.md`
 
-## 개발
-- 테스트: `cargo test`
-- CI와 같은 검증(권장): `scripts/check.sh` (빠르게: `scripts/check.sh --fast`)
-- 로컬 실행: `cargo run --bin rr -- --help`
+## Product Docs
+
+- P2P 상세/트러블슈팅: `docs/p2p.md`
+- 데몬/스케줄러: `docs/daemon.md`
+- hook 설정: `docs/hook.md`
+- 수용 테스트 문서: `docs/acceptance/docker-macos-linux.md`
+
+## Development
+
+- 테스트: `cargo test --workspace`
+- 린트/포맷: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
 - 로컬 P2P 스모크: `scripts/smoke_p2p_local.sh`
-- 백그라운드 실행(launchd/systemd): `docs/daemon.md`
-
-## 신규 디바이스 온보딩(권장)
-```sh
-rr init --user-id "<user>" --device-id "<device>"
-rr doctor
-```
-
-자세한 온보딩/실사용 흐름은 `docs/quickstart.md` 참고.
-
-- `rr init`는 `~/.config/rustory/config.toml` 템플릿과 key 파일들을 준비하고(fingerprint/PeerId 출력), 다음 단계를 안내한다.
-- **중요:** `swarm.key`는 같은 swarm(같은 사용자/클러스터) 내의 디바이스들이 **동일한 파일을 공유**해야 한다.
-  - 신규 디바이스를 기존 swarm에 붙이는 경우, 기존 디바이스의 `~/.config/rustory/swarm.key`를 복사한다.
-  - `identity.key`는 디바이스별로 고유해야 한다(공유하지 않음).
-
-## 사용(로컬 PoC)
-### zsh
-```sh
-source <(rr hook --shell zsh)
-```
-
-### bash
-```sh
-source <(rr hook --shell bash)
-```
-
-추가 옵션/환경 변수는 `docs/hook.md` 참고.
-
-### 수동 기록/검색
-```sh
-rr record --cmd "echo hello" --cwd "$PWD" --exit-code 0 --shell zsh
-rr search --limit 100000
-```
-
-### DB 경로 오버라이드(옵션)
-```sh
-rr --db-path "/tmp/rustory.db" record --cmd "echo hello" --cwd "$PWD" --shell zsh
-rr --db-path "/tmp/rustory.db" search --limit 10
-```
-
-### P2P 동기화(단계 1: 수동 multiaddr)
-```sh
-# peer A (서버 역할)
-rr --db-path "/tmp/rustory-a.db" p2p-serve --listen /ip4/0.0.0.0/tcp/8845
-
-# peer B (클라이언트 역할): peer A가 출력한 /p2p/<peer_id> 포함 주소를 그대로 넣는다.
-rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<peer_id>" --limit 1000
-```
-
-자세한 단계 2(tracker/relay + PSK) 사용법은 `docs/p2p.md` 참고.
+- 보안 점검(권장): `scripts/secret_scan.sh`

@@ -1,0 +1,35 @@
+pre-commit:
+  parallel: true
+  commands:
+    # docs/todo-* 변경은 commit 전에 readiness를 선검증
+    todo-readiness:
+      glob: "docs/todo-*/**"
+      run: |
+        todo_dirs=$(printf '%s\n' {staged_files} | awk -F/ '/^docs\/todo-[^/]+\// {print $1"/"$2}' | sort -u)
+        if [ -z "$todo_dirs" ]; then
+          exit 0
+        fi
+        for dir in $todo_dirs; do
+          scripts/check-todo-readiness.sh "$dir"
+        done
+
+    # docs 변경 시 완료 todo 정리/참조 누락 여부를 선검증
+    todo-closure:
+      glob: "docs/**"
+      run: scripts/check-todo-closure.sh
+
+    lessons-log-enforcement:
+      glob: "docs/LESSONS_LOG.md"
+      run: scripts/check-lessons-log-enforcement.sh
+
+commit-msg:
+  commands:
+    jj-root-git-commit-guard:
+      run: scripts/check-jj-root-git-commit.sh
+
+pre-push:
+  commands:
+    release-gates:
+      run: scripts/check-release-gates.sh --manifest-mode full
+    lessons-log-range:
+      run: scripts/check-lessons-log-range.sh --remote origin --bookmark main

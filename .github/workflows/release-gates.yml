@@ -1,0 +1,81 @@
+name: Release Gates
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "lefthook.yml"
+      - ".github/workflows/release-gates.yml"
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/**"
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "lefthook.yml"
+      - ".github/workflows/release-gates.yml"
+  workflow_dispatch:
+
+jobs:
+  release-gates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@9710f9012180ecfb08dcfc878269be6dc6f1d80e # 1.89.0
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Python dependencies
+        run: python -m pip install --upgrade pip pyyaml
+
+      - name: Run lessons-log enforcement (CI parity)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            RANGE="${{ github.event.pull_request.base.sha }}...${{ github.sha }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            BEFORE="${{ github.event.before }}"
+            if [[ -z "$BEFORE" || "$BEFORE" =~ ^0+$ ]]; then
+              echo "Skip range-based lessons-log enforcement on initial push."
+              exit 0
+            fi
+            RANGE="$BEFORE...${{ github.sha }}"
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+              RANGE="$(git rev-parse HEAD~1)...$(git rev-parse HEAD)"
+            else
+              echo "Skip range-based lessons-log enforcement on workflow_dispatch (no previous commit)."
+              exit 0
+            fi
+          else
+            echo "Skip range-based lessons-log enforcement on event: ${GITHUB_EVENT_NAME}"
+            exit 0
+          fi
+          scripts/check-lessons-log-enforcement.sh --range "$RANGE"
+
+      - name: Run release gates (full manifest mode)
+        run: scripts/check-release-gates.sh --manifest-mode full
