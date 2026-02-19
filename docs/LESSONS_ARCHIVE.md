@@ -5,3 +5,4 @@
 ## Todo Closure Tokens
 
 - 2026-02-19: `todo-main-sync-status`
+- 2026-02-19: `todo-main-sync-status-json`
