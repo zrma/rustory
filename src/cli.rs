@@ -132,6 +132,9 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         json: bool,
+
+        #[arg(long = "with-tracker", default_value_t = false)]
+        with_tracker: bool,
     },
     Hook {
         #[arg(long, default_value = "zsh")]
@@ -420,11 +423,30 @@ pub fn run() -> Result<()> {
                 println!("{cmd}");
             }
         }
-        Command::SyncStatus { peer, json } => {
+        Command::SyncStatus {
+            peer,
+            json,
+            with_tracker,
+        } => {
             let peer = normalize_opt_string(peer);
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
-            let report = build_sync_status_report(&store, &local_device_id, peer.as_deref())?;
+            let tracker_status = if with_tracker {
+                let trackers = resolve_trackers(Vec::new(), &cfg)?;
+                let tracker_token = resolve_tracker_token(None, &cfg)?;
+                Some(build_tracker_status_report(
+                    &trackers,
+                    tracker_token.as_deref(),
+                ))
+            } else {
+                None
+            };
+            let report = build_sync_status_report(
+                &store,
+                &local_device_id,
+                peer.as_deref(),
+                tracker_status,
+            )?;
 
             if json {
                 println!(
@@ -443,22 +465,41 @@ pub fn run() -> Result<()> {
                 } else {
                     println!("peer sync state: (empty)");
                 }
-                return Ok(());
+            } else {
+                for status in report.peers {
+                    let last_seen = status
+                        .last_seen_unix
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={}",
+                        status.peer_id,
+                        status.pull_cursor,
+                        status.push_cursor,
+                        status.pending_push,
+                        last_seen
+                    );
+                }
             }
 
-            for status in report.peers {
-                let last_seen = status
-                    .last_seen_unix
-                    .map(|ts| ts.to_string())
-                    .unwrap_or_else(|| "-".to_string());
-                println!(
-                    "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={}",
-                    status.peer_id,
-                    status.pull_cursor,
-                    status.push_cursor,
-                    status.pending_push,
-                    last_seen
-                );
+            if let Some(trackers) = report.tracker_status {
+                if trackers.is_empty() {
+                    println!("tracker status: (none)");
+                } else {
+                    for tracker in trackers {
+                        if let Some(error) = tracker.error {
+                            println!(
+                                "tracker={} reachable={} error={error}",
+                                tracker.base_url, tracker.reachable
+                            );
+                        } else {
+                            println!(
+                                "tracker={} reachable={}",
+                                tracker.base_url, tracker.reachable
+                            );
+                        }
+                    }
+                }
             }
         }
         Command::Hook { shell } => {
@@ -926,16 +967,26 @@ struct SyncStatusPeerReport {
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct SyncStatusTrackerReport {
+    base_url: String,
+    reachable: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct SyncStatusReport {
     local_head: i64,
     local_device_id: String,
     peers: Vec<SyncStatusPeerReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_status: Option<Vec<SyncStatusTrackerReport>>,
 }
 
 fn build_sync_status_report(
     store: &storage::LocalStore,
     local_device_id: &str,
     peer_filter: Option<&str>,
+    tracker_status: Option<Vec<SyncStatusTrackerReport>>,
 ) -> Result<SyncStatusReport> {
     let local_head = store.latest_ingest_seq()?;
     let peer_last_seen = store.list_peer_book_last_seen_map()?;
@@ -962,7 +1013,29 @@ fn build_sync_status_report(
         local_head,
         local_device_id: local_device_id.to_string(),
         peers,
+        tracker_status,
     })
+}
+
+fn build_tracker_status_report(
+    trackers: &[String],
+    tracker_token: Option<&str>,
+) -> Vec<SyncStatusTrackerReport> {
+    trackers
+        .iter()
+        .map(|base_url| match tracker_ping(base_url, tracker_token) {
+            Ok(()) => SyncStatusTrackerReport {
+                base_url: base_url.clone(),
+                reachable: true,
+                error: None,
+            },
+            Err(err) => SyncStatusTrackerReport {
+                base_url: base_url.clone(),
+                reachable: false,
+                error: Some(err),
+            },
+        })
+        .collect()
 }
 
 fn default_cwd() -> String {
@@ -1352,9 +1425,14 @@ mod tests {
     fn sync_status_parses_peer_filter() {
         let app = App::parse_from(["rr", "sync-status", "--peer", "peer-a"]);
         match app.cmd {
-            Command::SyncStatus { peer, json } => {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+            } => {
                 assert_eq!(peer.as_deref(), Some("peer-a"));
                 assert!(!json);
+                assert!(!with_tracker);
             }
             _ => panic!("expected sync-status"),
         }
@@ -1364,9 +1442,31 @@ mod tests {
     fn sync_status_parses_json_flag() {
         let app = App::parse_from(["rr", "sync-status", "--json"]);
         match app.cmd {
-            Command::SyncStatus { peer, json } => {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+            } => {
                 assert!(peer.is_none());
                 assert!(json);
+                assert!(!with_tracker);
+            }
+            _ => panic!("expected sync-status"),
+        }
+    }
+
+    #[test]
+    fn sync_status_parses_with_tracker_flag() {
+        let app = App::parse_from(["rr", "sync-status", "--with-tracker"]);
+        match app.cmd {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+            } => {
+                assert!(peer.is_none());
+                assert!(!json);
+                assert!(with_tracker);
             }
             _ => panic!("expected sync-status"),
         }
@@ -1414,10 +1514,11 @@ mod tests {
             })
             .unwrap();
 
-        let report = build_sync_status_report(&store, "dev-local", None).unwrap();
+        let report = build_sync_status_report(&store, "dev-local", None, None).unwrap();
         assert_eq!(report.local_head, 3);
         assert_eq!(report.local_device_id, "dev-local");
         assert_eq!(report.peers.len(), 2);
+        assert!(report.tracker_status.is_none());
 
         let peer_a = report
             .peers
@@ -1437,7 +1538,7 @@ mod tests {
         assert_eq!(peer_b.pending_push, 0);
         assert_eq!(peer_b.last_seen_unix, None);
 
-        let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a")).unwrap();
+        let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a"), None).unwrap();
         assert_eq!(filtered.peers.len(), 1);
         assert_eq!(filtered.peers[0].peer_id, "peer-a");
 
@@ -1446,6 +1547,14 @@ mod tests {
         assert!(json.contains("\"local_device_id\""));
         assert!(json.contains("\"pending_push\""));
         assert!(json.contains("\"last_seen_unix\""));
+    }
+
+    #[test]
+    fn tracker_status_report_marks_unreachable_on_ping_error() {
+        let reports = build_tracker_status_report(&["http://127.0.0.1:0".to_string()], None);
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].reachable);
+        assert!(reports[0].error.is_some());
     }
 
     #[test]

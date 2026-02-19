@@ -20,7 +20,7 @@
 
 ## 완료/미완료/다음 액션
 
-- 완료: `src/cli.rs`에 `rr sync-status --json` 플래그를 추가하고, `SyncStatusReport` 빌더를 도입해 텍스트/JSON 출력 경로를 공통화했다. 파싱 테스트(`--json`)와 리포트 단위 테스트(필터 + pending_push 계산 + JSON 직렬화)를 추가했고 `docs/p2p.md` 사용 예시/스키마를 갱신했다. 후속 확장으로 `last_seen_unix`(peerbook 기반)를 JSON/텍스트 출력에 반영했고, `src/storage.rs`에 peerbook `last_seen` 조회 API 및 관련 테스트를 추가했다.
-- 미완료: tracker live 상태(`reachable`, `last_error`) 같은 네트워크 런타임 지표를 `sync-status`와 결합할지 결정 필요.
-- 다음 액션: `sync-status` 런타임 상태 결합 범위를 별도 work-id로 분리해(옵션 플래그/타임아웃 정책 포함) 요구사항을 확정한다.
+- 완료: `src/cli.rs`에 `rr sync-status --json` 플래그를 추가하고, `SyncStatusReport` 빌더를 도입해 텍스트/JSON 출력 경로를 공통화했다. 파싱 테스트(`--json`)와 리포트 단위 테스트(필터 + pending_push 계산 + JSON 직렬화)를 추가했고 `docs/p2p.md` 사용 예시/스키마를 갱신했다. 후속 확장으로 `last_seen_unix`(peerbook 기반)를 JSON/텍스트 출력에 반영했고, `src/storage.rs`에 peerbook `last_seen` 조회 API 및 관련 테스트를 추가했다. 추가로 `--with-tracker` 플래그를 도입해 tracker ping 기반 `tracker_status`(`base_url`, `reachable`, `error|null`)를 선택적으로 포함하도록 확장했다.
+- 미완료: `main-sync-status`/`main-sync-status-json` todo 워크스페이스 마감(LESSONS 반영 + 폴더 삭제) 정리.
+- 다음 액션: 다음 커밋에서 두 todo를 closure 규칙대로 정리하고, 후속 메인 기능 work-id를 신규로 연다.
 - 검증 증거: `cargo fmt --all --check`, `cargo test --workspace`, `scripts/check-todo-readiness.sh docs/todo-main-sync-status-json`, `scripts/check-open-questions-schema.sh --require-closed docs/todo-main-sync-status-json/open-questions.md`, `scripts/run-manifest-checks.sh --mode quick --work-id main-sync-status-json`.
