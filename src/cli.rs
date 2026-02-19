@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use rand::Rng;
 
 use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
@@ -487,15 +487,19 @@ pub fn run() -> Result<()> {
                     println!("tracker status: (none)");
                 } else {
                     for tracker in trackers {
+                        let latency = tracker
+                            .latency_ms
+                            .map(|ms| ms.to_string())
+                            .unwrap_or_else(|| "-".to_string());
                         if let Some(error) = tracker.error {
                             println!(
-                                "tracker={} reachable={} error={error}",
-                                tracker.base_url, tracker.reachable
+                                "tracker={} reachable={} latency_ms={} error={error}",
+                                tracker.base_url, tracker.reachable, latency
                             );
                         } else {
                             println!(
-                                "tracker={} reachable={}",
-                                tracker.base_url, tracker.reachable
+                                "tracker={} reachable={} latency_ms={}",
+                                tracker.base_url, tracker.reachable, latency
                             );
                         }
                     }
@@ -879,7 +883,7 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
     for base_url in trackers {
         let ping = tracker_ping(&base_url, token.as_deref());
         match ping {
-            Ok(()) => println!("- {base_url} (ping: ok)"),
+            Ok(latency_ms) => println!("- {base_url} (ping: ok, latency_ms={latency_ms})"),
             Err(err) => println!("- {base_url} (ping: fail: {err})"),
         }
     }
@@ -932,7 +936,7 @@ fn file_mode_777(path: &std::path::Path) -> Option<u32> {
     }
 }
 
-fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<(), String> {
+fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<u64, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(1))
         .timeout_read(Duration::from_secs(1))
@@ -945,10 +949,13 @@ fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<(), 
         req = req.set("Authorization", &format!("Bearer {}", token.trim()));
     }
 
+    let started = Instant::now();
     match req.call() {
         Ok(resp) => {
             if resp.status() == 200 {
-                Ok(())
+                let elapsed_ms = started.elapsed().as_millis();
+                let latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+                Ok(latency_ms)
             } else {
                 Err(format!("status {}", resp.status()))
             }
@@ -970,6 +977,7 @@ struct SyncStatusPeerReport {
 struct SyncStatusTrackerReport {
     base_url: String,
     reachable: bool,
+    latency_ms: Option<u64>,
     error: Option<String>,
 }
 
@@ -1024,14 +1032,16 @@ fn build_tracker_status_report(
     trackers
         .iter()
         .map(|base_url| match tracker_ping(base_url, tracker_token) {
-            Ok(()) => SyncStatusTrackerReport {
+            Ok(latency_ms) => SyncStatusTrackerReport {
                 base_url: base_url.clone(),
                 reachable: true,
+                latency_ms: Some(latency_ms),
                 error: None,
             },
             Err(err) => SyncStatusTrackerReport {
                 base_url: base_url.clone(),
                 reachable: false,
+                latency_ms: None,
                 error: Some(err),
             },
         })
@@ -1554,7 +1564,37 @@ mod tests {
         let reports = build_tracker_status_report(&["http://127.0.0.1:0".to_string()], None);
         assert_eq!(reports.len(), 1);
         assert!(!reports[0].reachable);
+        assert!(reports[0].latency_ms.is_none());
         assert!(reports[0].error.is_some());
+    }
+
+    #[test]
+    fn tracker_status_report_includes_latency_on_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = tiny_http::Server::http(addr).unwrap();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let path = req.url().split('?').next().unwrap_or(req.url());
+            let status = if path == "/api/v1/ping" { 200 } else { 404 };
+            let response = tiny_http::Response::empty(tiny_http::StatusCode(status));
+            req.respond(response).unwrap();
+        });
+
+        let reports = build_tracker_status_report(&[format!("http://{addr}")], None);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].reachable);
+        assert!(reports[0].latency_ms.is_some());
+        assert!(reports[0].error.is_none());
+        assert!(
+            serde_json::to_string(&reports[0])
+                .unwrap()
+                .contains("\"latency_ms\"")
+        );
+
+        handle.join().unwrap();
     }
 
     #[test]
