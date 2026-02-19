@@ -1,6 +1,7 @@
 use crate::core::Entry;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, params};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -350,6 +351,30 @@ ORDER BY ids.peer_id ASC
             .context("query list_peer_sync_status")?;
 
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_peer_book_last_seen_map(&self) -> Result<HashMap<String, i64>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT peer_id, last_seen
+FROM peer_book
+"#,
+            )
+            .context("prepare list_peer_book_last_seen_map")?;
+
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .context("query list_peer_book_last_seen_map")?;
+
+        let mut out = HashMap::new();
+        for item in rows {
+            let (peer_id, last_seen_unix): (String, i64) = item?;
+            out.insert(peer_id, last_seen_unix);
+        }
+
+        Ok(out)
     }
 
     pub fn count_entries_after_seq(
@@ -798,6 +823,35 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn list_peer_book_last_seen_map_returns_known_peers() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("d1".to_string()),
+                last_seen_unix: 100,
+            })
+            .unwrap();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-b".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/2/p2p/peer-b".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("d2".to_string()),
+                last_seen_unix: 200,
+            })
+            .unwrap();
+
+        let got = store.list_peer_book_last_seen_map().unwrap();
+        assert_eq!(got.get("peer-a"), Some(&100));
+        assert_eq!(got.get("peer-b"), Some(&200));
+        assert_eq!(got.get("peer-c"), None);
     }
 
     #[test]

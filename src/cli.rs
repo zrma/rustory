@@ -447,9 +447,17 @@ pub fn run() -> Result<()> {
             }
 
             for status in report.peers {
+                let last_seen = status
+                    .last_seen_unix
+                    .map(|ts| ts.to_string())
+                    .unwrap_or_else(|| "-".to_string());
                 println!(
-                    "peer={} pull_cursor={} push_cursor={} pending_push={}",
-                    status.peer_id, status.pull_cursor, status.push_cursor, status.pending_push
+                    "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={}",
+                    status.peer_id,
+                    status.pull_cursor,
+                    status.push_cursor,
+                    status.pending_push,
+                    last_seen
                 );
             }
         }
@@ -914,6 +922,7 @@ struct SyncStatusPeerReport {
     pull_cursor: i64,
     push_cursor: i64,
     pending_push: usize,
+    last_seen_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -929,6 +938,7 @@ fn build_sync_status_report(
     peer_filter: Option<&str>,
 ) -> Result<SyncStatusReport> {
     let local_head = store.latest_ingest_seq()?;
+    let peer_last_seen = store.list_peer_book_last_seen_map()?;
     let mut statuses = store.list_peer_sync_status()?;
     if let Some(peer_id) = peer_filter {
         statuses.retain(|status| status.peer_id == peer_id);
@@ -936,13 +946,15 @@ fn build_sync_status_report(
 
     let mut peers = Vec::with_capacity(statuses.len());
     for status in statuses {
-        let pending_push =
-            store.count_pending_push_entries(&status.peer_id, Some(local_device_id))?;
+        let peer_id = status.peer_id;
+        let pending_push = store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
+        let last_seen_unix = peer_last_seen.get(&peer_id).copied();
         peers.push(SyncStatusPeerReport {
-            peer_id: status.peer_id,
+            peer_id,
             pull_cursor: status.last_cursor,
             push_cursor: status.last_pushed_seq,
             pending_push,
+            last_seen_unix,
         });
     }
 
@@ -1392,6 +1404,15 @@ mod tests {
         store.set_last_pushed_seq("peer-a", 1).unwrap();
         store.set_last_cursor("peer-b", 3).unwrap();
         store.set_last_pushed_seq("peer-b", 3).unwrap();
+        store
+            .upsert_peer_book(&storage::PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some("dev-remote".to_string()),
+                last_seen_unix: 99,
+            })
+            .unwrap();
 
         let report = build_sync_status_report(&store, "dev-local", None).unwrap();
         assert_eq!(report.local_head, 3);
@@ -1406,6 +1427,7 @@ mod tests {
         assert_eq!(peer_a.pull_cursor, 2);
         assert_eq!(peer_a.push_cursor, 1);
         assert_eq!(peer_a.pending_push, 1);
+        assert_eq!(peer_a.last_seen_unix, Some(99));
 
         let peer_b = report
             .peers
@@ -1413,6 +1435,7 @@ mod tests {
             .find(|peer| peer.peer_id == "peer-b")
             .unwrap();
         assert_eq!(peer_b.pending_push, 0);
+        assert_eq!(peer_b.last_seen_unix, None);
 
         let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a")).unwrap();
         assert_eq!(filtered.peers.len(), 1);
@@ -1422,6 +1445,7 @@ mod tests {
         assert!(json.contains("\"local_head\""));
         assert!(json.contains("\"local_device_id\""));
         assert!(json.contains("\"pending_push\""));
+        assert!(json.contains("\"last_seen_unix\""));
     }
 
     #[test]

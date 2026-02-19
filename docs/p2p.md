@@ -155,12 +155,12 @@ p2p_watch_start_jitter_sec = 10
 
 ## 트러블슈팅
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
-- `rr sync-status [--peer <peer_id>] [--json]`: 로컬 ingest head, peer별 pull/push cursor, 로컬 디바이스 기준 pending push 건수를 출력한다.
+- `rr sync-status [--peer <peer_id>] [--json]`: 로컬 ingest head, peer별 pull/push cursor, 로컬 디바이스 기준 pending push 건수와 peerbook 기준 `last_seen` 정보를 출력한다.
   - 예시:
     - `rr sync-status`
     - `rr sync-status --peer 12D3KooW...`
     - `rr sync-status --json`
-  - `--json` 출력 스키마: `local_head`, `local_device_id`, `peers[]` (`peer_id`, `pull_cursor`, `push_cursor`, `pending_push`)
+  - `--json` 출력 스키마: `local_head`, `local_device_id`, `peers[]` (`peer_id`, `pull_cursor`, `push_cursor`, `pending_push`, `last_seen_unix|null`)
 
 ## Docker 기반 수용 테스트(macOS host + Linux container)
 루프백만으로는 NAT/프로세스 경계 이슈(특히 relay fallback)가 잘 안 잡힐 수 있어,

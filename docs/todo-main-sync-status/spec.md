@@ -20,7 +20,7 @@
 
 ## 완료/미완료/다음 액션
 
-- 완료: `src/storage.rs`에 sync 상태 조회 API(`latest_ingest_seq`, `list_peer_sync_status`, `count_pending_push_entries`)를 추가했고, `src/cli.rs`에 `sync-status` 서브커맨드를 연결했다. `docs/p2p.md`에 운영 진단 명령을 문서화했다.
-- 미완료: `sync-status` 출력 포맷(JSON/추가 필터) 확장 여부 결정 및 다음 메인 기능 작업으로의 인계 정리.
-- 다음 액션: 현재 변경을 커밋/푸시하고, 후속 메인 기능 work-id를 열어 `sync-status` 확장 여부를 질문 카드로 확정한다.
+- 완료: `src/storage.rs`에 sync 상태 조회 API(`latest_ingest_seq`, `list_peer_sync_status`, `count_pending_push_entries`)를 추가했고, `src/cli.rs`에 `sync-status` 서브커맨드를 연결했다. 이후 후속 work-id(`main-sync-status-json`)에서 JSON 출력과 `last_seen_unix` 확장까지 반영했다.
+- 미완료: 초기 `main-sync-status` work-id 자체 마감(todo 삭제 + 교훈 로그 반영) 정리.
+- 다음 액션: `main-sync-status-json` 마감 시점에 `main-sync-status`와 함께 closure 커밋으로 정리한다.
 - 검증 증거: `cargo fmt --all --check`, `cargo test --workspace`, `scripts/check-todo-readiness.sh docs/todo-main-sync-status`, `scripts/check-open-questions-schema.sh --require-closed docs/todo-main-sync-status/open-questions.md`, `scripts/run-manifest-checks.sh --mode quick --work-id main-sync-status`.
