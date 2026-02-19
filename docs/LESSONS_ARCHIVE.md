@@ -6,3 +6,4 @@
 
 - 2026-02-19: `todo-main-sync-status`
 - 2026-02-19: `todo-main-sync-status-json`
+- 2026-02-19: `todo-main-sync-status-peerbook`
