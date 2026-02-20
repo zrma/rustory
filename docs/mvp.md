@@ -108,7 +108,8 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 
 ## bash/zsh 훅
 - precmd/PROMPT_COMMAND로 마지막 커맨드 캡처
-- 비동기 업로드(네트워크 실패 시 큐 유지)는 후속 단계에서 다룬다
+- `RUSTORY_ASYNC_UPLOAD=1`일 때 `rr record` 성공 후 백그라운드 `p2p-sync --push` 트리거를 실행한다.
+- 네트워크 실패 시 `pending_push` 큐는 로컬에 유지되고, 다음 트리거에서 재시도한다.
 
 ## 비기능 요구사항
 - 오프라인 동작

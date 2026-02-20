@@ -19,9 +19,13 @@ source <(rr hook --shell bash)
   - 예: `RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|bearer )'`
   - env가 있으면 config.toml의 `record_ignore_regex`보다 우선한다.
   - 정규식이 잘못된 경우는 안전을 위해 기록을 스킵한다(`rr doctor`에서 상태 확인).
+- `RUSTORY_ASYNC_UPLOAD=1`: `rr record` 성공 후 백그라운드 `rr p2p-sync --push` 트리거를 활성화한다.
+- `RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC=15`: 비동기 업로드 트리거 최소 간격(초). 기본값은 `15`.
+- `RUSTORY_ASYNC_UPLOAD_LIMIT=200`: 비동기 업로드 1회 실행 시 push 배치 크기(`--limit`). 기본값은 `200`.
 
 ## 동작 개요
 - 기록: 커맨드 종료 시 `rr record`를 백그라운드로 호출해 SQLite에 append-only 저장
+- 업로드(선택): `RUSTORY_ASYNC_UPLOAD=1`이면 `rr record`가 주기 제한(`RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC`)을 적용해 백그라운드 push를 트리거한다.
 - 검색: `ctrl+r`에서 `rr search`(fzf)로 선택한 커맨드를 현재 입력 버퍼에 삽입
 
 ### duration_ms(소요 시간)
