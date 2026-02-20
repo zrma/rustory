@@ -8,6 +8,9 @@ use std::time::{Duration, Instant};
 const DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC: u64 = 15;
 const DEFAULT_ASYNC_UPLOAD_LIMIT: usize = 200;
 const DEFAULT_ASYNC_UPLOAD_MARKER_PATH: &str = "~/.config/rustory/async-upload.last";
+const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
+const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
+const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
 
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
@@ -428,6 +431,11 @@ pub fn run() -> Result<()> {
             if let Err(err) = maybe_spawn_async_upload(&db_path) {
                 // 기록 성공을 우선하고, 비동기 업로드 트리거 실패는 경고로만 남긴다.
                 eprintln!("warn: async upload trigger failed: {err:#}");
+            }
+
+            if let Err(err) = maybe_run_auto_prune(&store) {
+                // 기록 성공을 우선하고, 자동 보관 실패는 경고로만 남긴다.
+                eprintln!("warn: auto prune failed: {err:#}");
             }
         }
         Command::Search { limit } => {
@@ -1137,11 +1145,11 @@ fn maybe_spawn_async_upload(db_path: &str) -> Result<()> {
     let marker_path = config::expand_home_path(&resolve_async_upload_marker_path())?;
 
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-    let last_trigger_unix = read_async_upload_marker(&marker_path)?;
-    if !should_trigger_async_upload(now_unix, last_trigger_unix, min_interval_sec) {
+    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
+    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
         return Ok(());
     }
-    write_async_upload_marker(&marker_path, now_unix)?;
+    write_rate_limit_marker(&marker_path, now_unix)?;
 
     let exe = std::env::current_exe().context("resolve current executable for async upload")?;
     let mut cmd = std::process::Command::new(exe);
@@ -1156,6 +1164,35 @@ fn maybe_spawn_async_upload(db_path: &str) -> Result<()> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
     cmd.spawn().context("spawn async upload p2p-sync")?;
+
+    Ok(())
+}
+
+fn maybe_run_auto_prune(store: &storage::LocalStore) -> Result<()> {
+    if !resolve_auto_prune_enabled()? {
+        return Ok(());
+    }
+
+    let older_than_days = resolve_auto_prune_days()?;
+    let min_interval_sec = resolve_auto_prune_interval_sec()?;
+    let marker_path = config::expand_home_path(&resolve_auto_prune_marker_path())?;
+
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
+    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
+        return Ok(());
+    }
+
+    let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
+    let stats = store.prune_entries_older_than(cutoff_unix, false)?;
+    write_rate_limit_marker(&marker_path, now_unix)?;
+
+    if stats.deleted > 0 {
+        eprintln!(
+            "info: auto prune deleted={} older_than_days={} cutoff_unix={}",
+            stats.deleted, older_than_days, cutoff_unix
+        );
+    }
 
     Ok(())
 }
@@ -1205,6 +1242,51 @@ fn resolve_async_upload_marker_path() -> String {
         .unwrap_or_else(|| DEFAULT_ASYNC_UPLOAD_MARKER_PATH.to_string())
 }
 
+fn resolve_auto_prune_enabled() -> Result<bool> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE") else {
+        return Ok(false);
+    };
+    parse_env_bool(&raw, "RUSTORY_AUTO_PRUNE")
+}
+
+fn resolve_auto_prune_days() -> Result<u64> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_DAYS") else {
+        return Ok(DEFAULT_AUTO_PRUNE_DAYS);
+    };
+
+    let parsed: u64 = raw
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid RUSTORY_AUTO_PRUNE_DAYS={:?}: {e}", raw.trim()))?;
+    if parsed == 0 {
+        anyhow::bail!("RUSTORY_AUTO_PRUNE_DAYS must be >= 1");
+    }
+
+    Ok(parsed)
+}
+
+fn resolve_auto_prune_interval_sec() -> Result<u64> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_INTERVAL_SEC") else {
+        return Ok(DEFAULT_AUTO_PRUNE_INTERVAL_SEC);
+    };
+
+    let parsed: u64 = raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid RUSTORY_AUTO_PRUNE_INTERVAL_SEC={:?}: {e}",
+            raw.trim()
+        )
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("RUSTORY_AUTO_PRUNE_INTERVAL_SEC must be >= 1");
+    }
+
+    Ok(parsed)
+}
+
+fn resolve_auto_prune_marker_path() -> String {
+    env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH")
+        .unwrap_or_else(|| DEFAULT_AUTO_PRUNE_MARKER_PATH.to_string())
+}
+
 fn parse_env_bool(value: &str, label: &str) -> Result<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Ok(true),
@@ -1215,13 +1297,12 @@ fn parse_env_bool(value: &str, label: &str) -> Result<bool> {
     }
 }
 
-fn read_async_upload_marker(path: &std::path::Path) -> Result<Option<i64>> {
+fn read_rate_limit_marker(path: &std::path::Path) -> Result<Option<i64>> {
     let content = match std::fs::read_to_string(path) {
         Ok(content) => content,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(err) => {
-            return Err(err)
-                .with_context(|| format!("read async upload marker: {}", path.display()));
+            return Err(err).with_context(|| format!("read rate limit marker: {}", path.display()));
         }
     };
 
@@ -1232,23 +1313,23 @@ fn read_async_upload_marker(path: &std::path::Path) -> Result<Option<i64>> {
 
     let parsed = trimmed
         .parse::<i64>()
-        .map_err(|e| anyhow::anyhow!("invalid async upload marker {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("invalid rate limit marker {}: {e}", path.display()))?;
     Ok(Some(parsed))
 }
 
-fn write_async_upload_marker(path: &std::path::Path, now_unix: i64) -> Result<()> {
+fn write_rate_limit_marker(path: &std::path::Path, now_unix: i64) -> Result<()> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("create async upload marker dir: {}", parent.display()))?;
+            .with_context(|| format!("create rate limit marker dir: {}", parent.display()))?;
     }
     std::fs::write(path, format!("{now_unix}\n"))
-        .with_context(|| format!("write async upload marker: {}", path.display()))?;
+        .with_context(|| format!("write rate limit marker: {}", path.display()))?;
     Ok(())
 }
 
-fn should_trigger_async_upload(
+fn should_trigger_interval(
     now_unix: i64,
     last_trigger_unix: Option<i64>,
     min_interval_sec: u64,
@@ -1809,22 +1890,22 @@ mod tests {
     }
 
     #[test]
-    fn should_trigger_async_upload_respects_interval() {
-        assert!(should_trigger_async_upload(100, None, 15));
-        assert!(should_trigger_async_upload(100, Some(80), 15));
-        assert!(!should_trigger_async_upload(100, Some(90), 15));
-        assert!(!should_trigger_async_upload(100, Some(110), 15));
+    fn should_trigger_interval_respects_interval() {
+        assert!(should_trigger_interval(100, None, 15));
+        assert!(should_trigger_interval(100, Some(80), 15));
+        assert!(!should_trigger_interval(100, Some(90), 15));
+        assert!(!should_trigger_interval(100, Some(110), 15));
     }
 
     #[test]
-    fn async_upload_marker_roundtrip() {
+    fn rate_limit_marker_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("async-upload.last");
 
-        assert_eq!(read_async_upload_marker(&marker).unwrap(), None);
+        assert_eq!(read_rate_limit_marker(&marker).unwrap(), None);
 
-        write_async_upload_marker(&marker, 1234).unwrap();
-        assert_eq!(read_async_upload_marker(&marker).unwrap(), Some(1234));
+        write_rate_limit_marker(&marker, 1234).unwrap();
+        assert_eq!(read_rate_limit_marker(&marker).unwrap(), Some(1234));
     }
 
     #[test]
