@@ -12,3 +12,4 @@
 - 2026-02-20: `todo-retention-prune`
 - 2026-02-20: `todo-async-upload-queue`
 - 2026-02-20: `todo-retention-auto-prune-scheduler`
+- 2026-02-20: `todo-retention-keep-recent-policy`
