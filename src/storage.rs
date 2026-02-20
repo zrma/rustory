@@ -19,6 +19,12 @@ pub struct InsertStats {
     pub ignored: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    pub matched: usize,
+    pub deleted: usize,
+}
+
 pub struct LocalStore {
     conn: Connection,
 }
@@ -421,6 +427,44 @@ WHERE ingest_seq > ?
     ) -> Result<usize> {
         let last_pushed_seq = self.get_last_pushed_seq(peer_id)?;
         self.count_entries_after_seq(last_pushed_seq, source_device_id)
+    }
+
+    pub fn prune_entries_older_than(&self, cutoff_unix: i64, dry_run: bool) -> Result<PruneStats> {
+        let matched: i64 = self
+            .conn
+            .query_row(
+                r#"
+SELECT COUNT(*)
+FROM entries
+WHERE ts < ?
+"#,
+                params![cutoff_unix],
+                |row| row.get(0),
+            )
+            .context("count prune candidates")?;
+
+        if dry_run || matched <= 0 {
+            return Ok(PruneStats {
+                matched: matched.max(0) as usize,
+                deleted: 0,
+            });
+        }
+
+        let deleted = self
+            .conn
+            .execute(
+                r#"
+DELETE FROM entries
+WHERE ts < ?
+"#,
+                params![cutoff_unix],
+            )
+            .context("delete pruned entries")?;
+
+        Ok(PruneStats {
+            matched: matched as usize,
+            deleted,
+        })
     }
 
     pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
@@ -909,6 +953,38 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn prune_entries_older_than_supports_dry_run_and_apply() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let e1 = entry("id-1", 10, "echo 1");
+        let e2 = entry("id-2", 20, "echo 2");
+        let e3 = entry("id-3", 30, "echo 3");
+        store.insert_entries(&[e1, e2, e3]).unwrap();
+
+        let dry = store.prune_entries_older_than(30, true).unwrap();
+        assert_eq!(
+            dry,
+            PruneStats {
+                matched: 2,
+                deleted: 0
+            }
+        );
+        assert_eq!(store.list_recent(10).unwrap().len(), 3);
+
+        let applied = store.prune_entries_older_than(30, false).unwrap();
+        assert_eq!(
+            applied,
+            PruneStats {
+                matched: 2,
+                deleted: 2
+            }
+        );
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-3");
     }
 
     #[test]

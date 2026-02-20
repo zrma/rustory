@@ -105,6 +105,17 @@ export RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|be
 
 이 옵션은 hook이 호출하는 `rr record`에도 적용된다. 상세는 `docs/hook.md` 참고.
 
+### 2-6) (선택) 오래된 로컬 히스토리 정리
+먼저 영향 범위를 확인한다.
+```sh
+rr prune --older-than-days 180 --dry-run
+```
+
+결과가 의도와 같으면 실제 삭제를 수행한다.
+```sh
+rr prune --older-than-days 180
+```
+
 ## 다음 문서
 - P2P 상세/트러블슈팅: `docs/p2p.md`
 - 데몬/스케줄러: `docs/daemon.md`

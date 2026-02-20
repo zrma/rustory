@@ -126,6 +126,13 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    Prune {
+        #[arg(long)]
+        older_than_days: u64,
+
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     SyncStatus {
         #[arg(long)]
         peer: Option<String>,
@@ -421,6 +428,27 @@ pub fn run() -> Result<()> {
             let entries = store.list_recent(limit)?;
             if let Some(cmd) = search::select_command(&entries)? {
                 println!("{cmd}");
+            }
+        }
+        Command::Prune {
+            older_than_days,
+            dry_run,
+        } => {
+            let store = storage::LocalStore::open(&db_path)?;
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
+            let stats = store.prune_entries_older_than(cutoff_unix, dry_run)?;
+
+            if dry_run {
+                println!(
+                    "prune dry-run: older_than_days={} cutoff_unix={} matched={} deleted={}",
+                    older_than_days, cutoff_unix, stats.matched, stats.deleted
+                );
+            } else {
+                println!(
+                    "prune: older_than_days={} cutoff_unix={} matched={} deleted={}",
+                    older_than_days, cutoff_unix, stats.matched, stats.deleted
+                );
             }
         }
         Command::SyncStatus {
@@ -1109,6 +1137,21 @@ fn resolve_search_limit(cli: Option<usize>, cfg: &config::FileConfig) -> Result<
     Ok(100000)
 }
 
+fn compute_prune_cutoff_unix(now_unix: i64, older_than_days: u64) -> Result<i64> {
+    if older_than_days == 0 {
+        anyhow::bail!("--older-than-days must be >= 1");
+    }
+
+    let retention_sec = i64::try_from(older_than_days)
+        .context("older-than-days is too large")?
+        .checked_mul(86_400)
+        .context("older-than-days is too large")?;
+
+    now_unix
+        .checked_sub(retention_sec)
+        .context("failed to compute prune cutoff")
+}
+
 fn resolve_p2p_watch_start_jitter_sec(cli: Option<u64>, cfg: &config::FileConfig) -> Result<u64> {
     if let Some(v) = cli {
         return Ok(v);
@@ -1496,6 +1539,21 @@ mod tests {
     }
 
     #[test]
+    fn prune_parses_flags() {
+        let app = App::parse_from(["rr", "prune", "--older-than-days", "30", "--dry-run"]);
+        match app.cmd {
+            Command::Prune {
+                older_than_days,
+                dry_run,
+            } => {
+                assert_eq!(older_than_days, 30);
+                assert!(dry_run);
+            }
+            _ => panic!("expected prune"),
+        }
+    }
+
+    #[test]
     fn sync_status_report_includes_pending_push_and_filter() {
         use time::OffsetDateTime;
 
@@ -1581,6 +1639,13 @@ mod tests {
         assert_eq!(compute_last_seen_age_sec(100, Some(100)), Some(0));
         assert_eq!(compute_last_seen_age_sec(100, Some(110)), Some(0));
         assert_eq!(compute_last_seen_age_sec(100, None), None);
+    }
+
+    #[test]
+    fn compute_prune_cutoff_unix_validates_and_calculates() {
+        assert_eq!(compute_prune_cutoff_unix(900_000, 2).unwrap(), 727_200);
+        assert!(compute_prune_cutoff_unix(900_000, 0).is_err());
+        assert!(compute_prune_cutoff_unix(900_000, u64::MAX).is_err());
     }
 
     #[test]

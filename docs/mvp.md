@@ -31,7 +31,7 @@
 ## 범위 (MVP)
 - 피어: 단순 저장/조회 API
 - 클라이언트: 로컬 큐 + 피어 동기화 + fzf UI
-- 삭제/정리: MVP에서는 제외 (후속)
+- 삭제/정리: 수동 정리 명령(`rr prune --older-than-days <n>`) 제공, 자동 보관 정책/스케줄링은 후속
 - 정확한 글로벌 순서: 보장하지 않음 (timestamp 정렬)
 
 ## 배포 모드 (PoC/MVP)
@@ -98,6 +98,7 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 - entries 테이블은 “피어 기준 ingest_seq(단조 증가)” 컬럼을 가진다
 - 인덱스: entry_id (unique), ts, device_id, ingest_seq
 - peer_state 테이블에 peer별 last_cursor를 저장한다
+- 운영자가 수동으로 오래된 엔트리를 정리할 수 있도록 `rr prune --older-than-days <n> [--dry-run]`를 제공한다
 
 ## fzf UI (ctrl+r)
 - ctrl+r에서 fzf UI 호출
@@ -168,4 +169,3 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 ## 결정: entry_id 생성
 - `entry_id`는 클라이언트에서 UUIDv4로 생성한다
 - 목적: 전역 유니크 키로 dedup/idempotency를 보장
-
