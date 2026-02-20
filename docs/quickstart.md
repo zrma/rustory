@@ -121,19 +121,20 @@ export RUSTORY_ASYNC_UPLOAD_LIMIT=200
 export RUSTORY_AUTO_PRUNE=1
 export RUSTORY_AUTO_PRUNE_DAYS=180
 export RUSTORY_AUTO_PRUNE_INTERVAL_SEC=86400
+export RUSTORY_AUTO_PRUNE_KEEP_RECENT=5000
 ```
 
-`rr record` 성공 후 주기 제한에 맞춰 자동 prune이 실행되며, 자동 보관 실패 시에도 기록 자체는 유지된다.
+`rr record` 성공 후 주기 제한에 맞춰 자동 prune이 실행되며, `RUSTORY_AUTO_PRUNE_KEEP_RECENT`를 지정하면 최신 N개는 삭제 대상에서 제외된다. 자동 보관 실패 시에도 기록 자체는 유지된다.
 
 ### 2-6) (선택) 오래된 로컬 히스토리 수동 정리
 먼저 영향 범위를 확인한다.
 ```sh
-rr prune --older-than-days 180 --dry-run
+rr prune --older-than-days 180 --keep-recent 5000 --dry-run
 ```
 
 결과가 의도와 같으면 실제 삭제를 수행한다.
 ```sh
-rr prune --older-than-days 180
+rr prune --older-than-days 180 --keep-recent 5000
 ```
 
 ## 다음 문서

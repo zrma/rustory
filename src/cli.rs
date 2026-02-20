@@ -10,6 +10,7 @@ const DEFAULT_ASYNC_UPLOAD_LIMIT: usize = 200;
 const DEFAULT_ASYNC_UPLOAD_MARKER_PATH: &str = "~/.config/rustory/async-upload.last";
 const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
 const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
+const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
 const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
 
 #[derive(Parser)]
@@ -136,6 +137,9 @@ enum Command {
     Prune {
         #[arg(long)]
         older_than_days: u64,
+
+        #[arg(long)]
+        keep_recent: Option<usize>,
 
         #[arg(long, default_value_t = false)]
         dry_run: bool,
@@ -449,22 +453,24 @@ pub fn run() -> Result<()> {
         }
         Command::Prune {
             older_than_days,
+            keep_recent,
             dry_run,
         } => {
+            let keep_recent = keep_recent.unwrap_or(0);
             let store = storage::LocalStore::open(&db_path)?;
             let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
             let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
-            let stats = store.prune_entries_older_than(cutoff_unix, dry_run)?;
+            let stats = store.prune_entries_older_than(cutoff_unix, keep_recent, dry_run)?;
 
             if dry_run {
                 println!(
-                    "prune dry-run: older_than_days={} cutoff_unix={} matched={} deleted={}",
-                    older_than_days, cutoff_unix, stats.matched, stats.deleted
+                    "prune dry-run: older_than_days={} keep_recent={} cutoff_unix={} matched={} deleted={}",
+                    older_than_days, keep_recent, cutoff_unix, stats.matched, stats.deleted
                 );
             } else {
                 println!(
-                    "prune: older_than_days={} cutoff_unix={} matched={} deleted={}",
-                    older_than_days, cutoff_unix, stats.matched, stats.deleted
+                    "prune: older_than_days={} keep_recent={} cutoff_unix={} matched={} deleted={}",
+                    older_than_days, keep_recent, cutoff_unix, stats.matched, stats.deleted
                 );
             }
         }
@@ -1174,6 +1180,7 @@ fn maybe_run_auto_prune(store: &storage::LocalStore) -> Result<()> {
     }
 
     let older_than_days = resolve_auto_prune_days()?;
+    let keep_recent = resolve_auto_prune_keep_recent()?;
     let min_interval_sec = resolve_auto_prune_interval_sec()?;
     let marker_path = config::expand_home_path(&resolve_auto_prune_marker_path())?;
 
@@ -1184,13 +1191,13 @@ fn maybe_run_auto_prune(store: &storage::LocalStore) -> Result<()> {
     }
 
     let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
-    let stats = store.prune_entries_older_than(cutoff_unix, false)?;
+    let stats = store.prune_entries_older_than(cutoff_unix, keep_recent, false)?;
     write_rate_limit_marker(&marker_path, now_unix)?;
 
     if stats.deleted > 0 {
         eprintln!(
-            "info: auto prune deleted={} older_than_days={} cutoff_unix={}",
-            stats.deleted, older_than_days, cutoff_unix
+            "info: auto prune deleted={} older_than_days={} keep_recent={} cutoff_unix={}",
+            stats.deleted, older_than_days, keep_recent, cutoff_unix
         );
     }
 
@@ -1280,6 +1287,19 @@ fn resolve_auto_prune_interval_sec() -> Result<u64> {
     }
 
     Ok(parsed)
+}
+
+fn resolve_auto_prune_keep_recent() -> Result<usize> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_KEEP_RECENT") else {
+        return Ok(DEFAULT_AUTO_PRUNE_KEEP_RECENT);
+    };
+
+    raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid RUSTORY_AUTO_PRUNE_KEEP_RECENT={:?}: {e}",
+            raw.trim()
+        )
+    })
 }
 
 fn resolve_auto_prune_marker_path() -> String {
@@ -1763,13 +1783,23 @@ mod tests {
 
     #[test]
     fn prune_parses_flags() {
-        let app = App::parse_from(["rr", "prune", "--older-than-days", "30", "--dry-run"]);
+        let app = App::parse_from([
+            "rr",
+            "prune",
+            "--older-than-days",
+            "30",
+            "--keep-recent",
+            "200",
+            "--dry-run",
+        ]);
         match app.cmd {
             Command::Prune {
                 older_than_days,
+                keep_recent,
                 dry_run,
             } => {
                 assert_eq!(older_than_days, 30);
+                assert_eq!(keep_recent, Some(200));
                 assert!(dry_run);
             }
             _ => panic!("expected prune"),

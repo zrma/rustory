@@ -429,19 +429,40 @@ WHERE ingest_seq > ?
         self.count_entries_after_seq(last_pushed_seq, source_device_id)
     }
 
-    pub fn prune_entries_older_than(&self, cutoff_unix: i64, dry_run: bool) -> Result<PruneStats> {
-        let matched: i64 = self
-            .conn
-            .query_row(
-                r#"
+    pub fn prune_entries_older_than(
+        &self,
+        cutoff_unix: i64,
+        keep_recent: usize,
+        dry_run: bool,
+    ) -> Result<PruneStats> {
+        let keep_floor_seq = self.prune_keep_floor_seq(keep_recent)?;
+
+        let matched: i64 = if let Some(floor_seq) = keep_floor_seq {
+            self.conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entries
+WHERE ts < ?
+  AND ingest_seq < ?
+"#,
+                    params![cutoff_unix, floor_seq],
+                    |row| row.get(0),
+                )
+                .context("count prune candidates with keep_recent")?
+        } else {
+            self.conn
+                .query_row(
+                    r#"
 SELECT COUNT(*)
 FROM entries
 WHERE ts < ?
 "#,
-                params![cutoff_unix],
-                |row| row.get(0),
-            )
-            .context("count prune candidates")?;
+                    params![cutoff_unix],
+                    |row| row.get(0),
+                )
+                .context("count prune candidates")?
+        };
 
         if dry_run || matched <= 0 {
             return Ok(PruneStats {
@@ -450,21 +471,55 @@ WHERE ts < ?
             });
         }
 
-        let deleted = self
-            .conn
-            .execute(
-                r#"
+        let deleted = if let Some(floor_seq) = keep_floor_seq {
+            self.conn
+                .execute(
+                    r#"
+DELETE FROM entries
+WHERE ts < ?
+  AND ingest_seq < ?
+"#,
+                    params![cutoff_unix, floor_seq],
+                )
+                .context("delete pruned entries with keep_recent")?
+        } else {
+            self.conn
+                .execute(
+                    r#"
 DELETE FROM entries
 WHERE ts < ?
 "#,
-                params![cutoff_unix],
-            )
-            .context("delete pruned entries")?;
+                    params![cutoff_unix],
+                )
+                .context("delete pruned entries")?
+        };
 
         Ok(PruneStats {
             matched: matched as usize,
             deleted,
         })
+    }
+
+    fn prune_keep_floor_seq(&self, keep_recent: usize) -> Result<Option<i64>> {
+        if keep_recent == 0 {
+            return Ok(None);
+        }
+
+        self.conn
+            .query_row(
+                r#"
+SELECT MIN(ingest_seq)
+FROM (
+  SELECT ingest_seq
+  FROM entries
+  ORDER BY ingest_seq DESC
+  LIMIT ?
+)
+"#,
+                params![keep_recent as i64],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .context("resolve prune keep_recent floor seq")
     }
 
     pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
@@ -964,7 +1019,7 @@ mod tests {
         let e3 = entry("id-3", 30, "echo 3");
         store.insert_entries(&[e1, e2, e3]).unwrap();
 
-        let dry = store.prune_entries_older_than(30, true).unwrap();
+        let dry = store.prune_entries_older_than(30, 0, true).unwrap();
         assert_eq!(
             dry,
             PruneStats {
@@ -974,7 +1029,7 @@ mod tests {
         );
         assert_eq!(store.list_recent(10).unwrap().len(), 3);
 
-        let applied = store.prune_entries_older_than(30, false).unwrap();
+        let applied = store.prune_entries_older_than(30, 0, false).unwrap();
         assert_eq!(
             applied,
             PruneStats {
@@ -985,6 +1040,39 @@ mod tests {
         let remaining = store.list_recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].entry_id, "id-3");
+    }
+
+    #[test]
+    fn prune_entries_older_than_respects_keep_recent() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let e1 = entry("id-1", 10, "echo 1");
+        let e2 = entry("id-2", 20, "echo 2");
+        let e3 = entry("id-3", 30, "echo 3");
+        store.insert_entries(&[e1, e2, e3]).unwrap();
+
+        let stats = store.prune_entries_older_than(40, 2, false).unwrap();
+        assert_eq!(
+            stats,
+            PruneStats {
+                matched: 1,
+                deleted: 1
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].entry_id, "id-3");
+        assert_eq!(remaining[1].entry_id, "id-2");
+
+        let stats_keep_all = store.prune_entries_older_than(40, 10, false).unwrap();
+        assert_eq!(
+            stats_keep_all,
+            PruneStats {
+                matched: 0,
+                deleted: 0
+            }
+        );
     }
 
     #[test]
