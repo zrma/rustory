@@ -15,3 +15,4 @@
 - 2026-02-20: `todo-retention-keep-recent-policy`
 - 2026-02-20: `todo-doctor-runtime-status-report`
 - 2026-02-20: `todo-doctor-json-output`
+- 2026-02-20: `todo-doctor-key-error-resilience`
