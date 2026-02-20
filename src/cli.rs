@@ -1035,6 +1035,7 @@ struct DoctorKeyStatusReport {
     path: String,
     exists: bool,
     value: Option<String>,
+    load_error: Option<String>,
     mode: Option<u32>,
     warning: Option<String>,
     stat_error: Option<String>,
@@ -1155,19 +1156,44 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
     };
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
-    let swarm_value = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
-    let swarm_key = build_key_status_report(&swarm_key_path, swarm_value)?;
+    let (swarm_value, swarm_load_error) = match config::load_swarm_key(&swarm_key_path) {
+        Ok(value) => (
+            value.map(|key| key.fingerprint().to_string()),
+            None::<String>,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    let swarm_key = build_key_status_report(&swarm_key_path, swarm_value, swarm_load_error)?;
 
     let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
-    let p2p_identity_value = config::load_identity_keypair(&p2p_identity_key_path)?
-        .map(|kp| kp.public().to_peer_id().to_string());
-    let p2p_identity_key = build_key_status_report(&p2p_identity_key_path, p2p_identity_value)?;
+    let (p2p_identity_value, p2p_identity_load_error) =
+        match config::load_identity_keypair(&p2p_identity_key_path) {
+            Ok(value) => (
+                value.map(|key| key.public().to_peer_id().to_string()),
+                None::<String>,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
+    let p2p_identity_key = build_key_status_report(
+        &p2p_identity_key_path,
+        p2p_identity_value,
+        p2p_identity_load_error,
+    )?;
 
     let relay_identity_key_path = resolve_relay_identity_key_path(None, cfg);
-    let relay_identity_value = config::load_identity_keypair(&relay_identity_key_path)?
-        .map(|kp| kp.public().to_peer_id().to_string());
-    let relay_identity_key =
-        build_key_status_report(&relay_identity_key_path, relay_identity_value)?;
+    let (relay_identity_value, relay_identity_load_error) =
+        match config::load_identity_keypair(&relay_identity_key_path) {
+            Ok(value) => (
+                value.map(|key| key.public().to_peer_id().to_string()),
+                None::<String>,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
+    let relay_identity_key = build_key_status_report(
+        &relay_identity_key_path,
+        relay_identity_value,
+        relay_identity_load_error,
+    )?;
 
     let relay_addr = match resolve_relay_addr(None, cfg) {
         Ok(Some(addr)) => DoctorRelayAddrReport {
@@ -1206,7 +1232,11 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
     })
 }
 
-fn build_key_status_report(path: &str, value: Option<String>) -> Result<DoctorKeyStatusReport> {
+fn build_key_status_report(
+    path: &str,
+    value: Option<String>,
+    load_error: Option<String>,
+) -> Result<DoctorKeyStatusReport> {
     let expanded = config::expand_home_path(path)?;
     let path_str = expanded.display().to_string();
 
@@ -1233,6 +1263,7 @@ fn build_key_status_report(path: &str, value: Option<String>) -> Result<DoctorKe
         path: path_str,
         exists,
         value,
+        load_error,
         mode,
         warning,
         stat_error,
@@ -1340,25 +1371,50 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
     }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
-    let swarm_fp = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
-    print_key_status("swarm key", &swarm_key_path, swarm_fp.as_deref())?;
+    let (swarm_fp, swarm_load_error) = match config::load_swarm_key(&swarm_key_path) {
+        Ok(value) => (
+            value.map(|key| key.fingerprint().to_string()),
+            None::<String>,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    print_key_status(
+        "swarm key",
+        &swarm_key_path,
+        swarm_fp.as_deref(),
+        swarm_load_error.as_deref(),
+    )?;
 
     let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
-    let p2p_peer_id = config::load_identity_keypair(&p2p_identity_key_path)?
-        .map(|kp| kp.public().to_peer_id().to_string());
+    let (p2p_peer_id, p2p_load_error) = match config::load_identity_keypair(&p2p_identity_key_path)
+    {
+        Ok(value) => (
+            value.map(|key| key.public().to_peer_id().to_string()),
+            None::<String>,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
     print_key_status(
         "p2p identity key",
         &p2p_identity_key_path,
         p2p_peer_id.as_deref(),
+        p2p_load_error.as_deref(),
     )?;
 
     let relay_identity_key_path = resolve_relay_identity_key_path(None, cfg);
-    let relay_peer_id = config::load_identity_keypair(&relay_identity_key_path)?
-        .map(|kp| kp.public().to_peer_id().to_string());
+    let (relay_peer_id, relay_load_error) =
+        match config::load_identity_keypair(&relay_identity_key_path) {
+            Ok(value) => (
+                value.map(|key| key.public().to_peer_id().to_string()),
+                None::<String>,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
     print_key_status(
         "relay identity key",
         &relay_identity_key_path,
         relay_peer_id.as_deref(),
+        relay_load_error.as_deref(),
     )?;
 
     match resolve_relay_addr(None, cfg) {
@@ -1386,7 +1442,12 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
     Ok(())
 }
 
-fn print_key_status(label: &str, path: &str, extra: Option<&str>) -> Result<()> {
+fn print_key_status(
+    label: &str,
+    path: &str,
+    value: Option<&str>,
+    load_error: Option<&str>,
+) -> Result<()> {
     let expanded = config::expand_home_path(path)?;
     let exists = match std::fs::metadata(&expanded) {
         Ok(_) => true,
@@ -1402,18 +1463,29 @@ fn print_key_status(label: &str, path: &str, extra: Option<&str>) -> Result<()> 
         return Ok(());
     }
 
-    let mut suffix = String::new();
-    if let Some(extra) = extra {
-        suffix.push_str(&format!(" {extra}"));
+    let mut details = Vec::new();
+    if let Some(value) = value {
+        details.push(value.to_string());
+    }
+    if let Some(load_error) = load_error {
+        details.push(format!("invalid: {load_error}"));
     }
 
     if let Some(mode) = file_mode_777(&expanded)
         && mode != 0o600
     {
-        suffix.push_str(&format!(" (warn: mode={mode:03o}, want 600)"));
+        details.push(format!("warn: mode={mode:03o}, want 600"));
     }
 
-    println!("{label}: {} (exists){suffix}", expanded.display());
+    if details.is_empty() {
+        println!("{label}: {} (exists)", expanded.display());
+    } else {
+        println!(
+            "{label}: {} (exists) {}",
+            expanded.display(),
+            details.join(" | ")
+        );
+    }
     Ok(())
 }
 
@@ -2193,6 +2265,45 @@ mod tests {
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
         assert!(json.contains("\"relay_addr\""));
+    }
+
+    #[test]
+    fn doctor_report_keeps_running_when_swarm_key_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_swarm_key = dir.path().join("swarm-invalid.key");
+        std::fs::write(&invalid_swarm_key, "invalid-swarm-key").unwrap();
+
+        let cfg = config::FileConfig {
+            swarm_key_path: Some(invalid_swarm_key.display().to_string()),
+            ..Default::default()
+        };
+
+        let report = build_doctor_report(&cfg, ":memory:").unwrap();
+        assert!(report.swarm_key.exists);
+        assert!(report.swarm_key.value.is_none());
+        assert!(report.swarm_key.load_error.is_some());
+        assert!(
+            report
+                .swarm_key
+                .load_error
+                .as_deref()
+                .unwrap()
+                .contains("parse swarm key")
+        );
+    }
+
+    #[test]
+    fn doctor_text_output_keeps_running_when_swarm_key_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_swarm_key = dir.path().join("swarm-invalid.key");
+        std::fs::write(&invalid_swarm_key, "invalid-swarm-key").unwrap();
+
+        let cfg = config::FileConfig {
+            swarm_key_path: Some(invalid_swarm_key.display().to_string()),
+            ..Default::default()
+        };
+
+        assert!(run_doctor(&cfg, ":memory:", false).is_ok());
     }
 
     #[test]

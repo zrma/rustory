@@ -157,6 +157,7 @@ p2p_watch_start_jitter_sec = 10
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
   - `async upload`/`auto prune`가 활성화된 환경이면 각 기능의 `enabled`, `interval`, `limit/retention`, `marker_path`, `last_trigger_unix`, `next_due_in_sec`도 함께 출력해 실행 타이밍을 점검할 수 있다.
   - 관련 env 값이 잘못됐으면 해당 섹션을 `invalid: ...`로 표시한다.
+  - key 파일이 손상/파싱 실패 상태여도 doctor 전체는 종료하지 않고, key 라인에 `invalid: ...`를 표시해 원인을 확인할 수 있다.
   - `rr doctor --json`을 사용하면 같은 정보를 JSON으로 출력해 자동 점검 스크립트에서 파싱할 수 있다.
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬 ingest head, peer별 pull/push cursor, 로컬 디바이스 기준 pending push 건수와 peerbook 기준 `last_seen`/`last_seen_age_sec` 정보를 출력한다.
   - `--with-tracker`를 주면 설정된 tracker 목록에 `/api/v1/ping`을 호출해 reachable/error 상태를 같이 출력한다.
