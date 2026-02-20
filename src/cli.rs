@@ -849,6 +849,127 @@ fn restrict_permissions_0600(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsyncUploadRuntimeSettings {
+    enabled: bool,
+    interval_sec: u64,
+    limit: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoPruneRuntimeSettings {
+    enabled: bool,
+    older_than_days: u64,
+    interval_sec: u64,
+    keep_recent: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsyncUploadDoctorReport {
+    enabled: bool,
+    interval_sec: u64,
+    limit: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoPruneDoctorReport {
+    enabled: bool,
+    older_than_days: u64,
+    interval_sec: u64,
+    keep_recent: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: u64,
+}
+
+fn load_async_upload_runtime_settings() -> Result<AsyncUploadRuntimeSettings> {
+    let marker_path_raw = resolve_async_upload_marker_path();
+    let marker_path = config::expand_home_path(&marker_path_raw)
+        .with_context(|| format!("expand async upload marker path: {marker_path_raw}"))?;
+
+    Ok(AsyncUploadRuntimeSettings {
+        enabled: resolve_async_upload_enabled()?,
+        interval_sec: resolve_async_upload_interval_sec()?,
+        limit: resolve_async_upload_limit()?,
+        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
+        marker_path,
+    })
+}
+
+fn summarize_async_upload_runtime(
+    settings: AsyncUploadRuntimeSettings,
+    now_unix: i64,
+) -> AsyncUploadDoctorReport {
+    AsyncUploadDoctorReport {
+        enabled: settings.enabled,
+        interval_sec: settings.interval_sec,
+        limit: settings.limit,
+        marker_path: settings.marker_path,
+        last_trigger_unix: settings.last_trigger_unix,
+        next_due_in_sec: compute_next_due_in_sec(
+            now_unix,
+            settings.last_trigger_unix,
+            settings.interval_sec,
+        ),
+    }
+}
+
+fn load_auto_prune_runtime_settings() -> Result<AutoPruneRuntimeSettings> {
+    let marker_path_raw = resolve_auto_prune_marker_path();
+    let marker_path = config::expand_home_path(&marker_path_raw)
+        .with_context(|| format!("expand auto prune marker path: {marker_path_raw}"))?;
+
+    Ok(AutoPruneRuntimeSettings {
+        enabled: resolve_auto_prune_enabled()?,
+        older_than_days: resolve_auto_prune_days()?,
+        interval_sec: resolve_auto_prune_interval_sec()?,
+        keep_recent: resolve_auto_prune_keep_recent()?,
+        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
+        marker_path,
+    })
+}
+
+fn summarize_auto_prune_runtime(
+    settings: AutoPruneRuntimeSettings,
+    now_unix: i64,
+) -> AutoPruneDoctorReport {
+    AutoPruneDoctorReport {
+        enabled: settings.enabled,
+        older_than_days: settings.older_than_days,
+        interval_sec: settings.interval_sec,
+        keep_recent: settings.keep_recent,
+        marker_path: settings.marker_path,
+        last_trigger_unix: settings.last_trigger_unix,
+        next_due_in_sec: compute_next_due_in_sec(
+            now_unix,
+            settings.last_trigger_unix,
+            settings.interval_sec,
+        ),
+    }
+}
+
+fn compute_next_due_in_sec(
+    now_unix: i64,
+    last_trigger_unix: Option<i64>,
+    interval_sec: u64,
+) -> u64 {
+    let Some(last) = last_trigger_unix else {
+        return 0;
+    };
+
+    let interval_i64 = i64::try_from(interval_sec).unwrap_or(i64::MAX);
+    let elapsed_i64 = now_unix.saturating_sub(last).max(0);
+    let remaining_i64 = interval_i64.saturating_sub(elapsed_i64).max(0);
+    u64::try_from(remaining_i64).unwrap_or(0)
+}
+
 fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
     use std::path::Path;
 
@@ -898,6 +1019,46 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
             }
         },
         None => println!("record ignore regex: (none)"),
+    }
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    match load_async_upload_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_async_upload_runtime(settings, now_unix);
+            let last_trigger = report
+                .last_trigger_unix
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "async upload: enabled={} interval_sec={} limit={} marker_path={} last_trigger_unix={} next_due_in_sec={}",
+                report.enabled,
+                report.interval_sec,
+                report.limit,
+                report.marker_path.display(),
+                last_trigger,
+                report.next_due_in_sec,
+            );
+        }
+        Err(err) => println!("async upload: invalid: {err:#}"),
+    }
+    match load_auto_prune_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_auto_prune_runtime(settings, now_unix);
+            let last_trigger = report
+                .last_trigger_unix
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "auto prune: enabled={} older_than_days={} interval_sec={} keep_recent={} marker_path={} last_trigger_unix={} next_due_in_sec={}",
+                report.enabled,
+                report.older_than_days,
+                report.interval_sec,
+                report.keep_recent,
+                report.marker_path.display(),
+                last_trigger,
+                report.next_due_in_sec,
+            );
+        }
+        Err(err) => println!("auto prune: invalid: {err:#}"),
     }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
@@ -1925,6 +2086,56 @@ mod tests {
         assert!(should_trigger_interval(100, Some(80), 15));
         assert!(!should_trigger_interval(100, Some(90), 15));
         assert!(!should_trigger_interval(100, Some(110), 15));
+    }
+
+    #[test]
+    fn compute_next_due_in_sec_handles_missing_and_elapsed_markers() {
+        assert_eq!(compute_next_due_in_sec(100, None, 15), 0);
+        assert_eq!(compute_next_due_in_sec(100, Some(80), 15), 0);
+        assert_eq!(compute_next_due_in_sec(100, Some(90), 15), 5);
+        assert_eq!(compute_next_due_in_sec(100, Some(110), 15), 15);
+    }
+
+    #[test]
+    fn summarize_async_upload_runtime_reports_marker_and_next_due() {
+        let report = summarize_async_upload_runtime(
+            AsyncUploadRuntimeSettings {
+                enabled: true,
+                interval_sec: 15,
+                limit: 200,
+                marker_path: std::path::PathBuf::from("/tmp/async-upload.last"),
+                last_trigger_unix: Some(95),
+            },
+            100,
+        );
+
+        assert!(report.enabled);
+        assert_eq!(report.interval_sec, 15);
+        assert_eq!(report.limit, 200);
+        assert_eq!(report.last_trigger_unix, Some(95));
+        assert_eq!(report.next_due_in_sec, 10);
+    }
+
+    #[test]
+    fn summarize_auto_prune_runtime_reports_marker_and_next_due() {
+        let report = summarize_auto_prune_runtime(
+            AutoPruneRuntimeSettings {
+                enabled: true,
+                older_than_days: 180,
+                interval_sec: 86_400,
+                keep_recent: 5000,
+                marker_path: std::path::PathBuf::from("/tmp/auto-prune.last"),
+                last_trigger_unix: Some(1_000_000),
+            },
+            1_000_300,
+        );
+
+        assert!(report.enabled);
+        assert_eq!(report.older_than_days, 180);
+        assert_eq!(report.interval_sec, 86_400);
+        assert_eq!(report.keep_recent, 5000);
+        assert_eq!(report.last_trigger_unix, Some(1_000_000));
+        assert_eq!(report.next_due_in_sec, 86_100);
     }
 
     #[test]

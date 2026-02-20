@@ -114,6 +114,7 @@ export RUSTORY_ASYNC_UPLOAD_LIMIT=200
 ```
 
 업로드 실패 시에도 로컬 기록은 유지되며, 다음 트리거에서 `pending_push` 큐가 다시 전송된다.
+설정 해석/주기 상태는 `rr doctor`의 `async upload` 라인에서 즉시 확인할 수 있다.
 
 ### 2-5-2) (선택) 기록 시 자동 보관(prune) 스케줄링
 오래된 로컬 엔트리를 주기적으로 자동 정리하려면:
@@ -125,6 +126,7 @@ export RUSTORY_AUTO_PRUNE_KEEP_RECENT=5000
 ```
 
 `rr record` 성공 후 주기 제한에 맞춰 자동 prune이 실행되며, `RUSTORY_AUTO_PRUNE_KEEP_RECENT`를 지정하면 최신 N개는 삭제 대상에서 제외된다. 자동 보관 실패 시에도 기록 자체는 유지된다.
+설정 해석/주기 상태는 `rr doctor`의 `auto prune` 라인에서 즉시 확인할 수 있다.
 
 ### 2-6) (선택) 오래된 로컬 히스토리 수동 정리
 먼저 영향 범위를 확인한다.
