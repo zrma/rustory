@@ -197,7 +197,10 @@ enum Command {
         #[arg(long)]
         tracker_token: Option<String>,
     },
-    Doctor {},
+    Doctor {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Import {
         #[arg(long, default_value = "zsh")]
         shell: String,
@@ -604,8 +607,8 @@ pub fn run() -> Result<()> {
                 &db_path,
             )?;
         }
-        Command::Doctor {} => {
-            run_doctor(&cfg, &db_path)?;
+        Command::Doctor { json } => {
+            run_doctor(&cfg, &db_path, json)?;
         }
         Command::Import {
             shell,
@@ -868,7 +871,7 @@ struct AutoPruneRuntimeSettings {
     last_trigger_unix: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct AsyncUploadDoctorReport {
     enabled: bool,
     interval_sec: u64,
@@ -878,7 +881,7 @@ struct AsyncUploadDoctorReport {
     next_due_in_sec: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct AutoPruneDoctorReport {
     enabled: bool,
     older_than_days: u64,
@@ -970,7 +973,282 @@ fn compute_next_due_in_sec(
     u64::try_from(remaining_i64).unwrap_or(0)
 }
 
-fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorReport {
+    config_path: String,
+    config_exists: bool,
+    db_path: String,
+    user_id: String,
+    device_id: String,
+    p2p_request_retry: DoctorP2pRequestRetryReport,
+    record_ignore_regex: DoctorRecordIgnoreRegexReport,
+    async_upload: DoctorAsyncUploadStatusReport,
+    auto_prune: DoctorAutoPruneStatusReport,
+    swarm_key: DoctorKeyStatusReport,
+    p2p_identity_key: DoctorKeyStatusReport,
+    relay_identity_key: DoctorKeyStatusReport,
+    relay_addr: DoctorRelayAddrReport,
+    trackers: Vec<SyncStatusTrackerReport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorP2pRequestRetryReport {
+    attempts: Option<usize>,
+    timeout_base_sec: Option<u64>,
+    timeout_cap_sec: Option<u64>,
+    backoff_base_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorRecordIgnoreRegexReport {
+    pattern: Option<String>,
+    valid: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorAsyncUploadStatusReport {
+    enabled: Option<bool>,
+    interval_sec: Option<u64>,
+    limit: Option<usize>,
+    marker_path: Option<String>,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorAutoPruneStatusReport {
+    enabled: Option<bool>,
+    older_than_days: Option<u64>,
+    interval_sec: Option<u64>,
+    keep_recent: Option<usize>,
+    marker_path: Option<String>,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorKeyStatusReport {
+    path: String,
+    exists: bool,
+    value: Option<String>,
+    mode: Option<u32>,
+    warning: Option<String>,
+    stat_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorRelayAddrReport {
+    value: Option<String>,
+    error: Option<String>,
+}
+
+fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<DoctorReport> {
+    use std::path::Path;
+
+    let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+    let cfg_exists = match std::fs::metadata(&cfg_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => false,
+    };
+
+    let db_path_expanded = if db_path == ":memory:" {
+        Path::new(":memory:").to_path_buf()
+    } else {
+        config::expand_home_path(db_path)?
+    };
+    let user_id = resolve_user_id(cfg);
+    let device_id = resolve_device_id(cfg);
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let p2p_request_retry = match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
+        Ok(policy) => DoctorP2pRequestRetryReport {
+            attempts: Some(policy.attempts),
+            timeout_base_sec: Some(policy.timeout_base.as_secs()),
+            timeout_cap_sec: Some(policy.timeout_cap.as_secs()),
+            backoff_base_ms: Some(
+                u64::try_from(policy.backoff_base.as_millis()).unwrap_or(u64::MAX),
+            ),
+            error: None,
+        },
+        Err(err) => DoctorP2pRequestRetryReport {
+            attempts: None,
+            timeout_base_sec: None,
+            timeout_cap_sec: None,
+            backoff_base_ms: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let record_ignore_regex = match resolve_record_ignore_regex(cfg) {
+        Some(pattern) => match regex::Regex::new(&pattern) {
+            Ok(_) => DoctorRecordIgnoreRegexReport {
+                pattern: Some(pattern),
+                valid: true,
+                error: None,
+            },
+            Err(err) => DoctorRecordIgnoreRegexReport {
+                pattern: Some(pattern),
+                valid: false,
+                error: Some(err.to_string()),
+            },
+        },
+        None => DoctorRecordIgnoreRegexReport {
+            pattern: None,
+            valid: true,
+            error: None,
+        },
+    };
+
+    let async_upload = match load_async_upload_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_async_upload_runtime(settings, now_unix);
+            DoctorAsyncUploadStatusReport {
+                enabled: Some(report.enabled),
+                interval_sec: Some(report.interval_sec),
+                limit: Some(report.limit),
+                marker_path: Some(report.marker_path.display().to_string()),
+                last_trigger_unix: report.last_trigger_unix,
+                next_due_in_sec: Some(report.next_due_in_sec),
+                error: None,
+            }
+        }
+        Err(err) => DoctorAsyncUploadStatusReport {
+            enabled: None,
+            interval_sec: None,
+            limit: None,
+            marker_path: None,
+            last_trigger_unix: None,
+            next_due_in_sec: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let auto_prune = match load_auto_prune_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_auto_prune_runtime(settings, now_unix);
+            DoctorAutoPruneStatusReport {
+                enabled: Some(report.enabled),
+                older_than_days: Some(report.older_than_days),
+                interval_sec: Some(report.interval_sec),
+                keep_recent: Some(report.keep_recent),
+                marker_path: Some(report.marker_path.display().to_string()),
+                last_trigger_unix: report.last_trigger_unix,
+                next_due_in_sec: Some(report.next_due_in_sec),
+                error: None,
+            }
+        }
+        Err(err) => DoctorAutoPruneStatusReport {
+            enabled: None,
+            older_than_days: None,
+            interval_sec: None,
+            keep_recent: None,
+            marker_path: None,
+            last_trigger_unix: None,
+            next_due_in_sec: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let swarm_key_path = resolve_swarm_key_path(None, cfg);
+    let swarm_value = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
+    let swarm_key = build_key_status_report(&swarm_key_path, swarm_value)?;
+
+    let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
+    let p2p_identity_value = config::load_identity_keypair(&p2p_identity_key_path)?
+        .map(|kp| kp.public().to_peer_id().to_string());
+    let p2p_identity_key = build_key_status_report(&p2p_identity_key_path, p2p_identity_value)?;
+
+    let relay_identity_key_path = resolve_relay_identity_key_path(None, cfg);
+    let relay_identity_value = config::load_identity_keypair(&relay_identity_key_path)?
+        .map(|kp| kp.public().to_peer_id().to_string());
+    let relay_identity_key =
+        build_key_status_report(&relay_identity_key_path, relay_identity_value)?;
+
+    let relay_addr = match resolve_relay_addr(None, cfg) {
+        Ok(Some(addr)) => DoctorRelayAddrReport {
+            value: Some(addr.to_string()),
+            error: None,
+        },
+        Ok(None) => DoctorRelayAddrReport {
+            value: None,
+            error: None,
+        },
+        Err(err) => DoctorRelayAddrReport {
+            value: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let trackers = resolve_trackers(Vec::new(), cfg)?;
+    let tracker_token = resolve_tracker_token(None, cfg)?;
+    let trackers = build_tracker_status_report(&trackers, tracker_token.as_deref());
+
+    Ok(DoctorReport {
+        config_path: cfg_path.display().to_string(),
+        config_exists: cfg_exists,
+        db_path: db_path_expanded.display().to_string(),
+        user_id,
+        device_id,
+        p2p_request_retry,
+        record_ignore_regex,
+        async_upload,
+        auto_prune,
+        swarm_key,
+        p2p_identity_key,
+        relay_identity_key,
+        relay_addr,
+        trackers,
+    })
+}
+
+fn build_key_status_report(path: &str, value: Option<String>) -> Result<DoctorKeyStatusReport> {
+    let expanded = config::expand_home_path(path)?;
+    let path_str = expanded.display().to_string();
+
+    let (exists, stat_error) = match std::fs::metadata(&expanded) {
+        Ok(_) => (true, None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(err) => (false, Some(err.to_string())),
+    };
+
+    let mode = if exists {
+        file_mode_777(&expanded)
+    } else {
+        None
+    };
+    let warning = mode.and_then(|resolved| {
+        if resolved != 0o600 {
+            Some(format!("mode={resolved:03o}, want 600"))
+        } else {
+            None
+        }
+    });
+
+    Ok(DoctorKeyStatusReport {
+        path: path_str,
+        exists,
+        value,
+        mode,
+        warning,
+        stat_error,
+    })
+}
+
+fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()> {
+    if json {
+        let report = build_doctor_report(cfg, db_path)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize doctor json")?
+        );
+        return Ok(());
+    }
+
     use std::path::Path;
 
     let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
@@ -1886,9 +2164,35 @@ mod tests {
     fn doctor_parses() {
         let app = App::parse_from(["rr", "doctor"]);
         match app.cmd {
-            Command::Doctor {} => {}
+            Command::Doctor { json } => {
+                assert!(!json);
+            }
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn doctor_parses_json_flag() {
+        let app = App::parse_from(["rr", "doctor", "--json"]);
+        match app.cmd {
+            Command::Doctor { json } => {
+                assert!(json);
+            }
+            _ => panic!("expected doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_report_builds_json_shape() {
+        let report = build_doctor_report(&config::FileConfig::default(), ":memory:").unwrap();
+        assert_eq!(report.db_path, ":memory:");
+        assert!(report.trackers.is_empty());
+        assert!(report.p2p_request_retry.error.is_none());
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"async_upload\""));
+        assert!(json.contains("\"auto_prune\""));
+        assert!(json.contains("\"relay_addr\""));
     }
 
     #[test]

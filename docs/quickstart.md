@@ -59,6 +59,7 @@ rr init \
   --tracker-token "secret"
 
 rr doctor
+rr doctor --json
 ```
 
 `rr init`는 기본적으로 다음을 준비한다.
