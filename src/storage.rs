@@ -436,9 +436,25 @@ WHERE ingest_seq > ?
         dry_run: bool,
     ) -> Result<PruneStats> {
         let keep_floor_seq = self.prune_keep_floor_seq(keep_recent)?;
+        let pushed_floor_seq = self.prune_pushed_floor_seq()?;
 
-        let matched: i64 = if let Some(floor_seq) = keep_floor_seq {
-            self.conn
+        let matched: i64 = match (keep_floor_seq, pushed_floor_seq) {
+            (Some(keep_floor_seq), Some(pushed_floor_seq)) => self
+                .conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entries
+WHERE ts < ?
+  AND ingest_seq < ?
+  AND ingest_seq <= ?
+"#,
+                    params![cutoff_unix, keep_floor_seq, pushed_floor_seq],
+                    |row| row.get(0),
+                )
+                .context("count prune candidates with keep_recent and push floor")?,
+            (Some(keep_floor_seq), None) => self
+                .conn
                 .query_row(
                     r#"
 SELECT COUNT(*)
@@ -446,12 +462,25 @@ FROM entries
 WHERE ts < ?
   AND ingest_seq < ?
 "#,
-                    params![cutoff_unix, floor_seq],
+                    params![cutoff_unix, keep_floor_seq],
                     |row| row.get(0),
                 )
-                .context("count prune candidates with keep_recent")?
-        } else {
-            self.conn
+                .context("count prune candidates with keep_recent")?,
+            (None, Some(pushed_floor_seq)) => self
+                .conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entries
+WHERE ts < ?
+  AND ingest_seq <= ?
+"#,
+                    params![cutoff_unix, pushed_floor_seq],
+                    |row| row.get(0),
+                )
+                .context("count prune candidates with push floor")?,
+            (None, None) => self
+                .conn
                 .query_row(
                     r#"
 SELECT COUNT(*)
@@ -461,7 +490,7 @@ WHERE ts < ?
                     params![cutoff_unix],
                     |row| row.get(0),
                 )
-                .context("count prune candidates")?
+                .context("count prune candidates")?,
         };
 
         if dry_run || matched <= 0 {
@@ -471,19 +500,44 @@ WHERE ts < ?
             });
         }
 
-        let deleted = if let Some(floor_seq) = keep_floor_seq {
-            self.conn
+        // push cursor가 남아 있는 peer가 있으면, 가장 느린 peer가 아직 못 받은 ingest_seq는 지우지 않는다.
+        let deleted = match (keep_floor_seq, pushed_floor_seq) {
+            (Some(keep_floor_seq), Some(pushed_floor_seq)) => self
+                .conn
+                .execute(
+                    r#"
+DELETE FROM entries
+WHERE ts < ?
+  AND ingest_seq < ?
+  AND ingest_seq <= ?
+"#,
+                    params![cutoff_unix, keep_floor_seq, pushed_floor_seq],
+                )
+                .context("delete pruned entries with keep_recent and push floor")?,
+            (Some(keep_floor_seq), None) => self
+                .conn
                 .execute(
                     r#"
 DELETE FROM entries
 WHERE ts < ?
   AND ingest_seq < ?
 "#,
-                    params![cutoff_unix, floor_seq],
+                    params![cutoff_unix, keep_floor_seq],
                 )
-                .context("delete pruned entries with keep_recent")?
-        } else {
-            self.conn
+                .context("delete pruned entries with keep_recent")?,
+            (None, Some(pushed_floor_seq)) => self
+                .conn
+                .execute(
+                    r#"
+DELETE FROM entries
+WHERE ts < ?
+  AND ingest_seq <= ?
+"#,
+                    params![cutoff_unix, pushed_floor_seq],
+                )
+                .context("delete pruned entries with push floor")?,
+            (None, None) => self
+                .conn
                 .execute(
                     r#"
 DELETE FROM entries
@@ -491,7 +545,7 @@ WHERE ts < ?
 "#,
                     params![cutoff_unix],
                 )
-                .context("delete pruned entries")?
+                .context("delete pruned entries")?,
         };
 
         Ok(PruneStats {
@@ -520,6 +574,16 @@ FROM (
                 |row| row.get::<_, Option<i64>>(0),
             )
             .context("resolve prune keep_recent floor seq")
+    }
+
+    fn prune_pushed_floor_seq(&self) -> Result<Option<i64>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(last_pushed_seq) FROM peer_push_state",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .context("resolve prune pushed floor seq")
     }
 
     pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
@@ -559,7 +623,7 @@ ON CONFLICT(peer_id) DO UPDATE SET
             r#"
 SELECT peer_id, addrs_json, user_id, device_id, last_seen
 FROM peer_book
-WHERE (user_id = ?1 OR user_id IS NULL)
+WHERE user_id = ?1
   AND last_seen >= ?2
 ORDER BY last_seen DESC, peer_id ASC
 LIMIT ?3
@@ -1076,6 +1140,37 @@ mod tests {
     }
 
     #[test]
+    fn prune_entries_older_than_keeps_entries_needed_by_slowest_push_peer() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let e1 = entry("id-1", 10, "echo 1");
+        let e2 = entry("id-2", 20, "echo 2");
+        let e3 = entry("id-3", 30, "echo 3");
+        store.insert_entries(&[e1, e2, e3]).unwrap();
+
+        store.set_last_pushed_seq("peer-fast", 3).unwrap();
+        store.set_last_pushed_seq("peer-slow", 1).unwrap();
+
+        let stats = store.prune_entries_older_than(100, 0, false).unwrap();
+        assert_eq!(
+            stats,
+            PruneStats {
+                matched: 1,
+                deleted: 1
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|e| e.entry_id == "id-2"));
+        assert!(remaining.iter().any(|e| e.entry_id == "id-3"));
+        assert_eq!(
+            store.count_pending_push_entries("peer-slow", None).unwrap(),
+            2
+        );
+    }
+
+    #[test]
     fn peer_book_upsert_and_list_filters_by_user_and_age() {
         let store = LocalStore::open(":memory:").unwrap();
 
@@ -1099,12 +1194,23 @@ mod tests {
             })
             .unwrap();
 
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-c".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/3/p2p/peer-c".to_string()],
+                user_id: None,
+                device_id: Some("d3".to_string()),
+                last_seen_unix: 300,
+            })
+            .unwrap();
+
         let got = store.list_peer_book(Some("u1"), 0, 10).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].peer_id, "peer-a");
 
         let got = store.list_peer_book(None, 150, 10).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].peer_id, "peer-b");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].peer_id, "peer-c");
+        assert_eq!(got[1].peer_id, "peer-b");
     }
 }

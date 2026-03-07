@@ -22,13 +22,13 @@ pub fn sync(
     }
 
     let store = LocalStore::open(db_path)?;
-    let mut any_ok = false;
+    let mut progress = sync::SyncRunProgress::new(push);
     let mut last_err: Option<anyhow::Error> = None;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
         match sync_pull_http_peer(&store, peer, 1000).with_context(|| format!("pull peer: {peer}"))
         {
-            Ok(_) => any_ok = true,
+            Ok(_) => progress.mark_pull_ok(),
             Err(err) => {
                 eprintln!("warn: http pull failed: {peer}: {err:#}");
                 last_err = Some(err);
@@ -36,14 +36,22 @@ pub fn sync(
         }
 
         if push {
+            let pending_push = match count_pending_http_push_entries(&store, peer, local_device_id)
+            {
+                Ok(count) => count,
+                Err(err) => {
+                    eprintln!("warn: http push preflight failed: {peer}: {err:#}");
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+            let push_needed = pending_push > 0;
+            progress.note_push_needed(push_needed);
+
             match sync_push_http_peer(&store, peer, 1000, local_device_id)
                 .with_context(|| format!("push peer: {peer}"))
             {
-                Ok(pushed) => {
-                    if pushed > 0 {
-                        any_ok = true;
-                    }
-                }
+                Ok(_) => progress.mark_push_ok(push_needed),
                 Err(err) => {
                     eprintln!("warn: http push failed: {peer}: {err:#}");
                     last_err = Some(err);
@@ -51,7 +59,7 @@ pub fn sync(
             }
         }
     }
-    if any_ok {
+    if progress.is_success() {
         Ok(())
     } else {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("http sync failed")))
@@ -112,6 +120,15 @@ fn sync_push_http_peer(
     sync::sync_push_to_peer(local, &peer_key, limit, local_device_id, |entries| {
         http_push_batch(&peer_key, entries)
     })
+}
+
+fn count_pending_http_push_entries(
+    local: &LocalStore,
+    peer_base_url: &str,
+    local_device_id: Option<&str>,
+) -> Result<usize> {
+    let peer_key = normalize_peer_base_url(peer_base_url)?;
+    local.count_pending_push_entries(&peer_key, local_device_id)
 }
 
 fn normalize_peer_base_url(value: &str) -> Result<String> {
@@ -445,5 +462,67 @@ mod tests {
         assert_eq!(parsed.ignored, 1);
 
         server.shutdown();
+    }
+
+    #[test]
+    fn http_sync_with_push_fails_when_pending_upload_cannot_be_sent() {
+        let dir = tempdir().unwrap();
+        let local_db = dir.path().join("local.db");
+        let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
+
+        let mut local_entry = entry("id-local", 1, "echo local");
+        local_entry.device_id = "dev-local".to_string();
+        local.insert_entries(&[local_entry]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let bind = format!("127.0.0.1:{}", addr.port());
+        let base_url = format!("http://{}", bind);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = shutdown.clone();
+
+        let join = thread::spawn(move || {
+            let server = tiny_http::Server::http(&bind).unwrap();
+            while !shutdown2.load(Ordering::SeqCst) {
+                match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => {
+                        let path = req.url().split('?').next().unwrap_or(req.url());
+                        let res = match (req.method().as_str(), path) {
+                            ("GET", "/api/v1/ping") => respond_text(200, "ok\n"),
+                            ("GET", "/api/v1/entries") => respond_json(
+                                200,
+                                &EntriesResponse {
+                                    entries: vec![],
+                                    next_cursor: None,
+                                },
+                            )
+                            .unwrap(),
+                            ("POST", "/api/v1/entries") => respond_text(500, "push failed\n"),
+                            _ => respond_text(404, "not found\n"),
+                        };
+                        let _ = req.respond(res);
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            let url = format!("{}/api/v1/ping", base_url);
+            if ureq::get(&url).call().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let peers = vec![base_url];
+        let err = sync(&peers, local_db.to_str().unwrap(), true, Some("dev-local")).unwrap_err();
+        assert!(format!("{err:#}").contains("push peer"));
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = join.join();
     }
 }
