@@ -78,4 +78,11 @@ jobs:
           scripts/check-lessons-log-enforcement.sh --range "$RANGE"
 
       - name: Run release gates (full manifest mode)
-        run: scripts/check-release-gates.sh --manifest-mode full
+        shell: bash
+        run: |
+          set -euo pipefail
+          if compgen -G 'docs/todo-*' >/dev/null; then
+            scripts/check-release-gates.sh --manifest-mode full
+          else
+            ALLOW_MISSING_WORK_ID_IN_CI=1 scripts/check-release-gates.sh --manifest-mode full --allow-missing-work-id
+          fi

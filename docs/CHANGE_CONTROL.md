@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-02-19
+- Last Verified: 2026-03-08
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
@@ -30,7 +30,7 @@
 - `--work-id` 미지정 + todo `1개`: 해당 work-id 자동 선택
 - `--work-id` 미지정 + todo `2개 이상`: 자동 단일 선택 없이 전체 readiness 점검
 - `--work-id` 명시: `docs/todo-<work-id>`를 직접 검증하며, 디렉터리가 없으면 현재 diff(또는 clean tree일 때 `HEAD^..HEAD`)의 단일 `docs/todo-*` 삭제 증거와 일치할 때만 마감 커밋으로 허용
-- `scripts/check-release-gates.sh`, `scripts/finalize-and-push.sh`: todo `0개`면 기본 실패(단일 `docs/todo-*` 삭제 마감 커밋은 자동 허용)
+- `scripts/check-release-gates.sh`, `scripts/finalize-and-push.sh`: todo `0개`면 기본 실패(단일 `docs/todo-*` 삭제 마감 커밋은 자동 허용). 단, GitHub Actions `Release Gates` workflow는 checkout 기준 todo가 `0개`일 때만 `ALLOW_MISSING_WORK_ID_IN_CI=1` + `--allow-missing-work-id`로 나머지 게이트를 계속 수행한다.
 - `scripts/check-push-gates.sh --mode strict`: todo `0개`면 todo readiness만 생략하고 나머지 push 게이트는 계속 수행
 - `scripts/check-push-gates.sh --mode quick`: `scripts/check-branch-hygiene.sh`만 빠르게 점검한다. strict 대체 경로가 아니며, 출고/공유 직전에는 strict 모드를 사용한다.
 - `--manifest-mode quick`(`check-release-gates`, `finalize-and-push`): 디버그 전용이며 `--allow-quick-manifest` + `DEBUG_GATES_OVERRIDE=1` + non-CI가 아니면 차단
@@ -44,7 +44,7 @@
 
 2. 출고 전 검증
 `scripts/check-release-gates.sh --manifest-mode full [--work-id <work-id>]`를 우선 실행한다.
-`--work-id`를 생략하면 `maintenance.todo_workspace_glob`(기본 `docs/todo-*`)을 자동 감지하며, `1개`면 해당 work-id를 자동 선택하고, `2개 이상`이면 전체 readiness를 자동 점검하며, `0개`면 기본 실패한다. 단, 현재 diff 또는 로컬 변경이 없을 때의 직전 커밋(`HEAD^..HEAD`)에 단일 `docs/todo-*` 삭제가 감지되면 마감 커밋으로 자동 허용한다. `--work-id`를 명시한 경우에도 해당 work-id가 삭제 증거(`현재 diff` 또는 로컬 변경이 없을 때의 `HEAD^..HEAD`)와 일치할 때만 마감 커밋으로 허용한다. (그 외 예외: `--allow-missing-work-id` + `DEBUG_GATES_OVERRIDE=1` + non-CI)
+`--work-id`를 생략하면 `maintenance.todo_workspace_glob`(기본 `docs/todo-*`)을 자동 감지하며, `1개`면 해당 work-id를 자동 선택하고, `2개 이상`이면 전체 readiness를 자동 점검하며, `0개`면 기본 실패한다. 단, 현재 diff 또는 로컬 변경이 없을 때의 직전 커밋(`HEAD^..HEAD`)에 단일 `docs/todo-*` 삭제가 감지되면 마감 커밋으로 자동 허용한다. `--work-id`를 명시한 경우에도 해당 work-id가 삭제 증거(`현재 diff` 또는 로컬 변경이 없을 때의 `HEAD^..HEAD`)와 일치할 때만 마감 커밋으로 허용한다. (그 외 예외: 로컬 `--allow-missing-work-id` + `DEBUG_GATES_OVERRIDE=1` + non-CI, 또는 GitHub Actions `Release Gates` workflow의 `ALLOW_MISSING_WORK_ID_IN_CI=1`)
 이 게이트는 아래 순서의 검증을 내부에서 실행한다.
 - `scripts/check-todo-readiness.sh docs/todo-<work-id>` (work-id가 있을 때, 자동 감지 규칙 포함)
 - `scripts/check-prod-preflight.sh` (submodule이 없으면 자동 skip)

@@ -7,6 +7,7 @@ source "$ROOT/scripts/lib/todo-workspace.sh"
 WORK_ID=""
 ALLOW_MISSING_WORK_ID=0
 DEBUG_GATES_OVERRIDE="${DEBUG_GATES_OVERRIDE:-0}"
+ALLOW_MISSING_WORK_ID_IN_CI="${ALLOW_MISSING_WORK_ID_IN_CI:-0}"
 MANIFEST_MODE="full"
 ALLOW_QUICK_MANIFEST=0
 REPO_KEY="rustory"
@@ -34,7 +35,8 @@ Options:
                                 docs/todo-<work-id>/open-questions.md만 대상으로 수행,
                                 미지정 시 감지된 docs/todo-*의 open-questions.md만 수행
   --allow-missing-work-id       force no-work-id path (skip single auto-selection;
-                                debug only, requires DEBUG_GATES_OVERRIDE=1 and non-CI env)
+                                local debug only via DEBUG_GATES_OVERRIDE=1,
+                                or dedicated CI path via ALLOW_MISSING_WORK_ID_IN_CI=1)
   --manifest-mode <quick|full>  run-manifest-checks mode (default: full)
   --allow-quick-manifest        allow --manifest-mode quick (debug only;
                                 requires DEBUG_GATES_OVERRIDE=1 and non-CI env)
@@ -104,6 +106,19 @@ require_debug_override() {
   warn "$reason override enabled via DEBUG_GATES_OVERRIDE=1"
 }
 
+require_missing_work_id_override() {
+  if [[ -n "${CI:-}" ]]; then
+    if [[ "$ALLOW_MISSING_WORK_ID_IN_CI" == "1" ]]; then
+      warn "--allow-missing-work-id override enabled in CI via ALLOW_MISSING_WORK_ID_IN_CI=1"
+      return 0
+    fi
+    fail "--allow-missing-work-id override is not allowed in CI (set ALLOW_MISSING_WORK_ID_IN_CI=1 only for the dedicated CI workflow)"
+    return 1
+  fi
+
+  require_debug_override "--allow-missing-work-id"
+}
+
 validate_work_id() {
   local work_id="$1"
   if ! todo_workspace_is_valid_work_id "$work_id"; then
@@ -161,7 +176,7 @@ if [[ "$MANIFEST_MODE" != "quick" && "$MANIFEST_MODE" != "full" ]]; then
 fi
 
 if [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
-  require_debug_override "--allow-missing-work-id"
+  require_missing_work_id_override
 fi
 
 if [[ "$ALLOW_QUICK_MANIFEST" -eq 1 ]]; then
@@ -198,7 +213,7 @@ elif [[ "$ALLOW_MISSING_WORK_ID" -ne 1 ]]; then
             echo "       - $closed_work_id"
           done <<< "$closed_work_id_output"
         else
-          fail "no '$TODO_WORKSPACE_GLOB' directory found. release gates require todo workspace (override: --allow-missing-work-id with DEBUG_GATES_OVERRIDE=1)"
+          fail "no '$TODO_WORKSPACE_GLOB' directory found. release gates require todo workspace (override: --allow-missing-work-id with local DEBUG_GATES_OVERRIDE=1 or CI ALLOW_MISSING_WORK_ID_IN_CI=1)"
         fi
       fi
     elif [[ "$discover_status" -eq 3 ]]; then

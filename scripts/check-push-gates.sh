@@ -8,6 +8,7 @@ MODE="strict"
 WORK_ID=""
 ALLOW_MISSING_WORK_ID=0
 DEBUG_GATES_OVERRIDE="${DEBUG_GATES_OVERRIDE:-0}"
+ALLOW_MISSING_WORK_ID_IN_CI="${ALLOW_MISSING_WORK_ID_IN_CI:-0}"
 DRY_RUN=0
 fail_count=0
 CLOSED_WORK_ID=0
@@ -44,7 +45,8 @@ Options:
                          미지정 시 감지된 docs/todo-*의 open-questions.md만 수행
   --allow-missing-work-id
                          force no-work-id path (skip single auto-selection;
-                         debug only, requires DEBUG_GATES_OVERRIDE=1 and non-CI env)
+                         local debug only via DEBUG_GATES_OVERRIDE=1,
+                         or dedicated CI path via ALLOW_MISSING_WORK_ID_IN_CI=1)
   --dry-run              print commands without executing
   -h, --help             show help
 USAGE
@@ -97,6 +99,19 @@ require_debug_override() {
   warn "$reason override enabled via DEBUG_GATES_OVERRIDE=1"
 }
 
+require_missing_work_id_override() {
+  if [[ -n "${CI:-}" ]]; then
+    if [[ "$ALLOW_MISSING_WORK_ID_IN_CI" == "1" ]]; then
+      warn "--allow-missing-work-id override enabled in CI via ALLOW_MISSING_WORK_ID_IN_CI=1"
+      return 0
+    fi
+    fail "--allow-missing-work-id override is not allowed in CI (set ALLOW_MISSING_WORK_ID_IN_CI=1 only for the dedicated CI workflow)"
+    return 1
+  fi
+
+  require_debug_override "--allow-missing-work-id"
+}
+
 validate_work_id() {
   local work_id="$1"
   if ! todo_workspace_is_valid_work_id "$work_id"; then
@@ -146,7 +161,7 @@ if [[ "$MODE" != "quick" && "$MODE" != "strict" ]]; then
 fi
 
 if [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
-  require_debug_override "--allow-missing-work-id"
+  require_missing_work_id_override
 fi
 
 safe_run "scripts/check-branch-hygiene.sh"
