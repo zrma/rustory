@@ -30,6 +30,7 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - 재시작 테스트(상태 파일/identity를 디스크에 쓰고 다시 로드)
 - smoke 시나리오 문서 + 실행 커맨드(사람이 그대로 따라하면 재현되는 수준)
   - 예: `scripts/smoke_p2p_local.sh` (tracker+relay+p2p-serve 2개+p2p-sync 스모크)
+  - 예: `scripts/acceptance_docker_macos_linux.sh` (macOS host + Linux container, relay fallback 확인)
 
 ### 버그/이슈를 발견하면: 재현 -> 테스트화 -> 수정
 1. 최소 재현 절차를 만든다(테스트 or 스모크 커맨드).

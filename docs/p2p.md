@@ -6,6 +6,10 @@
   - direct 연결을 우선 시도하고(direct-first),
   - 실패 시 relay로 fallback 한다.
 
+## 운영 가이드(PoC vs 안정화)
+- PoC 단계에서는 tracker/relay를 로컬/임시로 띄워도 된다. 내려가면 동기화가 지연될 뿐이고, 로컬 DB가 source of truth라 데이터 유실은 없다.
+- 안정화 이후에는 tracker/relay를 상시 실행하는 것을 권장한다(예: self-hosted k8s 1 replica). relay는 PeerId 고정을 위해 identity key(`~/.config/rustory/relay.key`)를 영속화(PV/Secret 마운트)하는 편이 안전하다.
+
 ## 프로토콜
 - pull protocol id:
   - `/rustory/sync-pull/1.0.1` (zstd 압축 JSON, 우선)
@@ -151,3 +155,10 @@ p2p_watch_start_jitter_sec = 10
 
 ## 트러블슈팅
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
+
+## Docker 기반 수용 테스트(macOS host + Linux container)
+루프백만으로는 NAT/프로세스 경계 이슈(특히 relay fallback)가 잘 안 잡힐 수 있어,
+Docker Desktop을 이용해 macOS host + Linux 컨테이너 조합으로 최소 수용 테스트를 제공한다.
+
+- 원커맨드: `bash scripts/acceptance_docker_macos_linux.sh`
+- 절차 문서: `docs/acceptance/docker-macos-linux.md`

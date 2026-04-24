@@ -1,0 +1,11 @@
+target
+.jj
+.git
+.DS_Store
+docs/todo-*
+**/*.db
+**/*.sqlite
+**/*.sqlite3
+**/*.key
+**/*.pem
+

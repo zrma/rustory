@@ -29,6 +29,13 @@ tracker + relay + 2 peer + sync(push 포함)까지 로컬에서 자동으로 띄
 
 ### 2-1) (항상 온라인일 필요는 없지만) tracker/relay 실행
 
+PoC 단계(권장):
+- tracker/relay는 로컬/임시로 띄워도 된다. 내려가면 동기화가 지연될 뿐이고, 로컬 DB가 source of truth라 데이터 유실은 없다.
+
+안정화 이후(권장):
+- self-hosted k8s 같은 환경에 tracker/relay를 상시(보통 1 replica)로 실행한다.
+- relay는 `relay_addr`에 peer id가 박히므로, PeerId가 바뀌지 않게 identity key(`~/.config/rustory/relay.key`)를 영속화(PV/Secret 마운트)하는 것을 권장한다.
+
 #### Relay 서버
 ```sh
 rr relay-serve --listen /ip4/0.0.0.0/tcp/4001

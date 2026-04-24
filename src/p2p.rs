@@ -272,6 +272,12 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
     loop {
         match swarm.select_next_some().await {
             SwarmEvent::NewListenAddr { address, .. } => {
+                // relay reservation 응답에는 "dial 가능한 relay 주소"가 최소 1개 필요하다.
+                // Swarm의 external address set이 비어 있으면 클라이언트가 reservation을 유효하게
+                // 처리하지 못해(relay spec상 최소 1개 필요) circuit이 항상 실패할 수 있다.
+                //
+                // PoC에서는 listen addr를 external addr로도 같이 등록해 단순하게 처리한다.
+                swarm.add_external_address(address.clone());
                 println!("relay listen: {}/p2p/{}", address, local_peer_id);
             }
             SwarmEvent::Behaviour(event) => match event {
@@ -949,7 +955,10 @@ impl P2pClient {
             return Ok(());
         }
 
+        // direct-first dial이 timeout/부분 실패하는 동안에도 relay dial을 시작할 수 있게,
+        // dial 조건에서 NotDialing을 제거한다.
         let opts = DialOpts::peer_id(self.peer_id)
+            .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
             .addresses(addrs.to_vec())
             .build();
         let connection_id = opts.connection_id();
