@@ -1,10 +1,12 @@
 mod cli;
+mod config;
 mod core;
 mod hook;
 mod p2p;
 mod search;
 mod storage;
 mod sync;
+mod tracker;
 mod transport;
 
 fn main() {
