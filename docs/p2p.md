@@ -62,6 +62,11 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
 이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
+pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 최대 3회 재시도한다(타임아웃/백오프는 attempt마다 지수 증가).
+재시도 정책은 환경에 맞게 튜닝할 수 있다(기본값: attempts=3, timeout base/cap=5s/30s, backoff base=200ms).
+- CLI: `--req-attempts`, `--req-timeout-base-sec`, `--req-timeout-cap-sec`, `--req-backoff-base-ms`
+- config.toml: `p2p_request_attempts`, `p2p_request_timeout_base_sec`, `p2p_request_timeout_cap_sec`, `p2p_request_backoff_base_ms`
+- env: `RUSTORY_P2P_REQUEST_ATTEMPTS`, `RUSTORY_P2P_REQUEST_TIMEOUT_BASE_SEC`, `RUSTORY_P2P_REQUEST_TIMEOUT_CAP_SEC`, `RUSTORY_P2P_REQUEST_BACKOFF_BASE_MS`
 
 주기적으로 동기화를 계속 돌리려면 `--watch --interval-sec 60` 옵션을 사용한다.
 여러 디바이스에서 같은 `--interval-sec`으로 동시에 데몬을 띄우면 요청이 몰릴 수 있으니,
@@ -70,6 +75,7 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 pull뿐 아니라 로컬 신규 엔트리를 peer로 업로드(push)하려면 `--push`를 켠다.
 이때 push는 **현재 디바이스의 엔트리만** 전송한다(`entry.device_id == local_device_id`).
 push 커서는 `peer_push_state.last_pushed_seq`(로컬 ingest_seq)로 저장해 재시작해도 이어서 진행한다.
+push 응답(ack)에는 (가능하면) `inserted`/`ignored` 카운트가 포함되어, 중복/삽입 여부를 관측할 수 있다.
 
 `rr p2p-serve`는 listen 주소뿐 아니라 libp2p가 발견한 **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)도 tracker에 같이 등록한다.
 따라서 같은 LAN/같은 네트워크 등에서 direct-first 성공 확률이 올라간다.

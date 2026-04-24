@@ -245,7 +245,7 @@ where
     Ok(pushed_total)
 }
 
-fn is_payload_too_large_error(err: &anyhow::Error) -> bool {
+pub(crate) fn is_payload_too_large_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         if let Some(e) = cause.downcast_ref::<ureq::Error>() {
             return matches!(e, ureq::Error::Status(413, _));

@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rustory.p2p-sync</string>
+
+  <!--
+    주의:
+    - `rr` 바이너리 경로는 환경에 맞게 수정해야 한다. (예: `which rr`)
+    - token 등 민감 값은 가능하면 config.toml 또는 별도 비밀 저장소를 사용하고,
+      파일 퍼미션(0600)을 확인한다.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/PATH/TO/rr</string>
+    <string>p2p-sync</string>
+    <string>--watch</string>
+    <string>--interval-sec</string>
+    <string>60</string>
+    <string>--start-jitter-sec</string>
+    <string>10</string>
+    <string>--push</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUSTORY_USER_ID</key>
+    <string>YOUR_USER</string>
+    <key>RUSTORY_DEVICE_ID</key>
+    <string>YOUR_DEVICE</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- 프로세스가 죽으면 자동 재시작 -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- 로그: 개인 환경에 맞게 경로를 조정 -->
+  <key>StandardOutPath</key>
+  <string>/tmp/rustory-p2p-sync.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/rustory-p2p-sync.err.log</string>
+</dict>
+</plist>
+

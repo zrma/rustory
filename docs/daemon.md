@@ -35,6 +35,12 @@ rr --db-path "$HOME/.rustory/history.db" p2p-sync \
 ### 1) plist 예시
 파일: `~/Library/LaunchAgents/com.rustory.p2p-sync.plist`
 
+레포에는 템플릿이 포함되어 있다:
+- `contrib/daemon/launchd/com.rustory.p2p-sync.plist`
+
+가장 빠른 방법은 위 템플릿을 복사해서 `ProgramArguments`의 `rr` 경로와
+`RUSTORY_USER_ID`/`RUSTORY_DEVICE_ID`를 환경에 맞게 수정하는 것이다.
+
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -98,6 +104,9 @@ tail -f /tmp/rustory-p2p-sync.err.log
 ### 1) unit 예시
 파일: `~/.config/systemd/user/rustory.service`
 
+레포에는 템플릿이 포함되어 있다:
+- `contrib/daemon/systemd/rustory.service`
+
 ```ini
 [Unit]
 Description=Rustory p2p-sync watch
@@ -124,3 +133,8 @@ journalctl --user -u rustory.service -f
 systemctl --user restart rustory.service
 systemctl --user stop rustory.service
 ```
+
+#### (옵션) 로그인 없이도 계속 돌리고 싶다면
+배포/운영 정책에 따라 다르지만, “사용자가 로그아웃해도 user service가 계속 실행”되길 원하면
+Linux에서 `loginctl enable-linger <user>`를 고려할 수 있다.
+환경/보안 정책에 맞게 선택한다.

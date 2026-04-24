@@ -30,6 +30,12 @@ const PULL_RESP_DECODED_MAX_BYTES: u64 = PULL_RESP_MAX_BYTES * DECODED_MAX_MULTI
 const PUSH_REQ_DECODED_MAX_BYTES: u64 = PUSH_REQ_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 const PUSH_RESP_DECODED_MAX_BYTES: u64 = PUSH_RESP_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 
+// request-response behaviour 내부 timeout은 request 상태 추적/정리를 위한 용도다.
+// pull/push는 attempt별 timeout을 별도로 구현하므로, 여기서 너무 작은 값을 두면
+// 사용자가 `--req-timeout-cap-sec` 등을 크게 잡았을 때 내부 Timeout이 먼저 터질 수 있다.
+// 따라서 "충분히 큰 값"으로 두고, 실제 attempt timeout은 클라이언트 로직에서 결정한다.
+const REQUEST_RESPONSE_INTERNAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+
 #[derive(Clone)]
 pub struct ServeConfig {
     pub identity: libp2p::identity::Keypair,
@@ -48,6 +54,26 @@ pub struct SyncConfig {
     pub tracker_token: Option<String>,
     pub user_id: Option<String>,
     pub device_id: Option<String>,
+    pub request_retry_policy: RequestRetryPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub struct RequestRetryPolicy {
+    pub attempts: usize,
+    pub timeout_base: Duration,
+    pub timeout_cap: Duration,
+    pub backoff_base: Duration,
+}
+
+impl Default for RequestRetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            timeout_base: Duration::from_secs(5),
+            timeout_cap: Duration::from_secs(30),
+            backoff_base: Duration::from_millis(200),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -76,6 +102,8 @@ struct EntriesPush {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PushAck {
     ok: bool,
+    inserted: Option<usize>,
+    ignored: Option<usize>,
 }
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -121,8 +149,8 @@ fn build_rustory_swarm_with_identity(
         ),
     ];
 
-    let rr_cfg =
-        libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
+    let rr_cfg = libp2p_request_response::Config::default()
+        .with_request_timeout(REQUEST_RESPONSE_INTERNAL_TIMEOUT);
     let rr_codec = crate::p2p_codec::JsonCodec::<SyncPull, SyncBatch>::new(
         PULL_REQ_MAX_BYTES,
         PULL_RESP_MAX_BYTES,
@@ -141,8 +169,8 @@ fn build_rustory_swarm_with_identity(
             ProtocolSupport::Full,
         ),
     ];
-    let push_cfg =
-        libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
+    let push_cfg = libp2p_request_response::Config::default()
+        .with_request_timeout(REQUEST_RESPONSE_INTERNAL_TIMEOUT);
     let push_codec = crate::p2p_codec::JsonCodec::<EntriesPush, PushAck>::new(
         PUSH_REQ_MAX_BYTES,
         PUSH_RESP_MAX_BYTES,
@@ -383,14 +411,23 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
                         libp2p_request_response::Event::Message { message, .. } => match message {
                             libp2p_request_response::Message::Request { request, channel, .. } => {
-                                let ok = store.insert_entries(&request.entries).is_ok();
-                                if !ok {
-                                    eprintln!("warn: p2p push insert failed");
-                                }
-                                let _ = swarm
-                                    .behaviour_mut()
-                                    .push
-                                    .send_response(channel, PushAck { ok });
+                                let resp = match store.insert_entries_with_stats(&request.entries) {
+                                    Ok(stats) => PushAck {
+                                        ok: true,
+                                        inserted: Some(stats.inserted),
+                                        ignored: Some(stats.ignored),
+                                    },
+                                    Err(err) => {
+                                        eprintln!("warn: p2p push insert failed: {err:#}");
+                                        PushAck {
+                                            ok: false,
+                                            inserted: None,
+                                            ignored: None,
+                                        }
+                                    }
+                                };
+
+                                let _ = swarm.behaviour_mut().push.send_response(channel, resp);
                             }
                             libp2p_request_response::Message::Response { .. } => {}
                         },
@@ -529,7 +566,13 @@ async fn sync_async(
     let mut any_ok = false;
     let mut last_err: Option<anyhow::Error> = None;
     for t in targets {
-        let mut client = match P2pClient::new(t.peer_id, t.direct_addrs, t.relay_addr, cfg.psk) {
+        let mut client = match P2pClient::new(
+            t.peer_id,
+            t.direct_addrs,
+            t.relay_addr,
+            cfg.psk,
+            cfg.request_retry_policy.clone(),
+        ) {
             Ok(v) => v,
             Err(err) => {
                 eprintln!("warn: p2p client init failed: {}: {err:#}", t.peer_key);
@@ -552,6 +595,8 @@ async fn sync_async(
         }
 
         if push {
+            client.reset_push_ack_stats();
+
             let push_res = crate::sync::sync_push_to_peer_async(
                 &store,
                 &t.peer_key,
@@ -567,8 +612,20 @@ async fn sync_async(
                     if pushed > 0 {
                         any_ok = true;
                     }
+                    if let Some((inserted, ignored)) = client.take_push_ack_stats() {
+                        eprintln!(
+                            "p2p push summary: {}: sent={pushed} inserted={inserted} ignored={ignored}",
+                            t.peer_key
+                        );
+                    }
                 }
                 Err(err) => {
+                    if let Some((inserted, ignored)) = client.take_push_ack_stats() {
+                        eprintln!(
+                            "warn: p2p push partial: {}: inserted={inserted} ignored={ignored}",
+                            t.peer_key
+                        );
+                    }
                     eprintln!("warn: p2p push failed: {}: {err:#}", t.peer_key);
                     last_err = Some(err);
                 }
@@ -775,6 +832,10 @@ struct P2pClient {
     peer_id: PeerId,
     direct_addrs: Vec<Multiaddr>,
     relay_addr: Option<Multiaddr>,
+    request_retry_policy: RequestRetryPolicy,
+    push_ack_stats_known: bool,
+    push_ack_inserted_total: usize,
+    push_ack_ignored_total: usize,
     swarm: Swarm<RustoryBehaviour>,
 }
 
@@ -784,6 +845,7 @@ impl P2pClient {
         direct_addrs: Vec<Multiaddr>,
         relay_addr: Option<Multiaddr>,
         psk: libp2p::pnet::PreSharedKey,
+        request_retry_policy: RequestRetryPolicy,
     ) -> Result<Self> {
         let mut swarm = build_rustory_swarm(psk)?;
         let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0"
@@ -795,8 +857,27 @@ impl P2pClient {
             peer_id,
             direct_addrs,
             relay_addr,
+            request_retry_policy,
+            push_ack_stats_known: false,
+            push_ack_inserted_total: 0,
+            push_ack_ignored_total: 0,
             swarm,
         })
+    }
+
+    fn reset_push_ack_stats(&mut self) {
+        self.push_ack_stats_known = false;
+        self.push_ack_inserted_total = 0;
+        self.push_ack_ignored_total = 0;
+    }
+
+    fn take_push_ack_stats(&mut self) -> Option<(usize, usize)> {
+        if !self.push_ack_stats_known {
+            return None;
+        }
+        let out = (self.push_ack_inserted_total, self.push_ack_ignored_total);
+        self.reset_push_ack_stats();
+        Some(out)
     }
 
     async fn ensure_connected(&mut self) -> Result<()> {
@@ -913,7 +994,45 @@ impl P2pClient {
         }
     }
 
-    async fn pull_batch(&mut self, cursor: i64, limit: usize) -> Result<PullBatch> {
+    async fn pull_batch_with_retries(&mut self, cursor: i64, limit: usize) -> Result<PullBatch> {
+        // mutable borrow(&mut self) 중에도 policy 값을 쓰기 위해 복사해 둔다.
+        let attempts = self.request_retry_policy.attempts;
+        let timeout_base = self.request_retry_policy.timeout_base;
+        let timeout_cap = self.request_retry_policy.timeout_cap;
+        let backoff_base = self.request_retry_policy.backoff_base;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..attempts {
+            let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
+
+            match self.pull_batch_once(cursor, limit, timeout).await {
+                Ok(v) => return Ok(v),
+                Err(err) => {
+                    if !is_retryable_p2p_request_error(&err) || attempt + 1 >= attempts {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+            }
+
+            // pending 상태를 정리하기 위해 best-effort disconnect를 시도한다.
+            let _ = self.swarm.disconnect_peer_id(self.peer_id);
+
+            let backoff = exp_duration(backoff_base, attempt as u32, None);
+            if backoff > Duration::from_millis(0) {
+                tokio::time::sleep(backoff).await;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p pull failed")))
+    }
+
+    async fn pull_batch_once(
+        &mut self,
+        cursor: i64,
+        limit: usize,
+        timeout: Duration,
+    ) -> Result<PullBatch> {
         self.ensure_connected().await?;
 
         let req = SyncPull { cursor, limit };
@@ -923,63 +1042,109 @@ impl P2pClient {
             .sync
             .send_request(&self.peer_id, req);
 
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+
         loop {
-            let event = self.swarm.select_next_some().await;
-            match event {
-                SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
-                    libp2p_request_response::Event::Message { message, .. } => match message {
-                        libp2p_request_response::Message::Response {
-                            request_id: got_id,
-                            response,
-                        } => {
-                            if got_id == request_id {
-                                return Ok(PullBatch {
-                                    entries: response.entries,
-                                    next_cursor: response.next_cursor,
-                                });
+            tokio::select! {
+                _ = &mut deadline => {
+                    anyhow::bail!("p2p request timeout after {timeout:?}");
+                }
+                event = self.swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
+                            libp2p_request_response::Event::Message { message, .. } => match message {
+                                libp2p_request_response::Message::Response {
+                                    request_id: got_id,
+                                    response,
+                                } => {
+                                    if got_id == request_id {
+                                        return Ok(PullBatch {
+                                            entries: response.entries,
+                                            next_cursor: response.next_cursor,
+                                        });
+                                    }
+                                }
+                                libp2p_request_response::Message::Request { .. } => {}
+                            },
+                            libp2p_request_response::Event::OutboundFailure {
+                                request_id: got_id,
+                                error,
+                                ..
+                            } => {
+                                if got_id == request_id {
+                                    return Err(anyhow::Error::new(error))
+                                        .context("p2p outbound request failed");
+                                }
                             }
-                        }
-                        libp2p_request_response::Message::Request { .. } => {}
-                    },
-                    libp2p_request_response::Event::OutboundFailure {
-                        request_id: got_id,
-                        error,
-                        ..
-                    } => {
-                        if got_id == request_id {
-                            return Err(anyhow::Error::new(error))
-                                .context("p2p outbound request failed");
-                        }
+                            libp2p_request_response::Event::InboundFailure { .. } => {}
+                            libp2p_request_response::Event::ResponseSent { .. } => {}
+                        },
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
+                            Ok(connection_id) => {
+                                eprintln!(
+                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                                    event.remote_peer_id
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    event.remote_peer_id
+                                );
+                            }
+                        },
+                        _ => {}
                     }
-                    libp2p_request_response::Event::InboundFailure { .. } => {}
-                    libp2p_request_response::Event::ResponseSent { .. } => {}
-                },
-                SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
-                    Ok(connection_id) => {
-                        eprintln!(
-                            "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                            event.remote_peer_id
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "dcutr: upgrade failed: peer={} error={err}",
-                            event.remote_peer_id
-                        );
-                    }
-                },
-                _ => {}
+                }
             }
         }
     }
 
-    async fn push_batch(&mut self, entries: Vec<crate::core::Entry>) -> Result<()> {
+    async fn push_batch_with_retries(&mut self, entries: Vec<crate::core::Entry>) -> Result<()> {
         if entries.is_empty() {
             return Ok(());
         }
 
+        // mutable borrow(&mut self) 중에도 policy 값을 쓰기 위해 복사해 둔다.
+        let attempts = self.request_retry_policy.attempts;
+        let timeout_base = self.request_retry_policy.timeout_base;
+        let timeout_cap = self.request_retry_policy.timeout_cap;
+        let backoff_base = self.request_retry_policy.backoff_base;
+
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..attempts {
+            let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
+
+            match self.push_batch_once(entries.clone(), timeout).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if !is_retryable_p2p_request_error(&err) || attempt + 1 >= attempts {
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+            }
+
+            let _ = self.swarm.disconnect_peer_id(self.peer_id);
+
+            let backoff = exp_duration(backoff_base, attempt as u32, None);
+            if backoff > Duration::from_millis(0) {
+                tokio::time::sleep(backoff).await;
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p push failed")))
+    }
+
+    async fn push_batch_once(
+        &mut self,
+        entries: Vec<crate::core::Entry>,
+        timeout: Duration,
+    ) -> Result<()> {
         self.ensure_connected().await?;
 
+        let entries_len = entries.len();
         let req = EntriesPush { entries };
         let request_id = self
             .swarm
@@ -987,52 +1152,78 @@ impl P2pClient {
             .push
             .send_request(&self.peer_id, req);
 
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+
         loop {
-            let event = self.swarm.select_next_some().await;
-            match event {
-                SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
-                    libp2p_request_response::Event::Message { message, .. } => match message {
-                        libp2p_request_response::Message::Response {
-                            request_id: got_id,
-                            response,
-                        } => {
-                            if got_id == request_id {
-                                if response.ok {
-                                    return Ok(());
+            tokio::select! {
+                _ = &mut deadline => {
+                    anyhow::bail!("p2p request timeout after {timeout:?}");
+                }
+                event = self.swarm.select_next_some() => {
+                    match event {
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
+                            libp2p_request_response::Event::Message { message, .. } => match message {
+                                libp2p_request_response::Message::Response {
+                                    request_id: got_id,
+                                    response,
+                                } => {
+                                    if got_id == request_id {
+                                        if response.ok {
+                                            if let (Some(inserted), Some(ignored)) =
+                                                (response.inserted, response.ignored)
+                                                && (ignored > 0 || inserted != entries_len)
+                                            {
+                                                self.push_ack_stats_known = true;
+                                                self.push_ack_inserted_total += inserted;
+                                                self.push_ack_ignored_total += ignored;
+                                                eprintln!(
+                                                    "p2p push ack: inserted={inserted} ignored={ignored}"
+                                                );
+                                            } else if let (Some(inserted), Some(ignored)) =
+                                                (response.inserted, response.ignored)
+                                            {
+                                                self.push_ack_stats_known = true;
+                                                self.push_ack_inserted_total += inserted;
+                                                self.push_ack_ignored_total += ignored;
+                                            }
+                                            return Ok(());
+                                        }
+                                        anyhow::bail!("p2p push rejected");
+                                    }
                                 }
-                                anyhow::bail!("p2p push rejected");
+                                libp2p_request_response::Message::Request { .. } => {}
+                            },
+                            libp2p_request_response::Event::OutboundFailure {
+                                request_id: got_id,
+                                error,
+                                ..
+                            } => {
+                                if got_id == request_id {
+                                    return Err(anyhow::Error::new(error))
+                                        .context("p2p outbound request failed");
+                                }
                             }
-                        }
-                        libp2p_request_response::Message::Request { .. } => {}
-                    },
-                    libp2p_request_response::Event::OutboundFailure {
-                        request_id: got_id,
-                        error,
-                        ..
-                    } => {
-                        if got_id == request_id {
-                            return Err(anyhow::Error::new(error))
-                                .context("p2p outbound request failed");
-                        }
+                            libp2p_request_response::Event::InboundFailure { .. } => {}
+                            libp2p_request_response::Event::ResponseSent { .. } => {}
+                        },
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
+                            Ok(connection_id) => {
+                                eprintln!(
+                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                                    event.remote_peer_id
+                                );
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    event.remote_peer_id
+                                );
+                            }
+                        },
+                        _ => {}
                     }
-                    libp2p_request_response::Event::InboundFailure { .. } => {}
-                    libp2p_request_response::Event::ResponseSent { .. } => {}
-                },
-                SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
-                    Ok(connection_id) => {
-                        eprintln!(
-                            "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                            event.remote_peer_id
-                        );
-                    }
-                    Err(err) => {
-                        eprintln!(
-                            "dcutr: upgrade failed: peer={} error={err}",
-                            event.remote_peer_id
-                        );
-                    }
-                },
-                _ => {}
+                }
             }
         }
     }
@@ -1044,7 +1235,7 @@ impl crate::sync::Puller for P2pClient {
         cursor: i64,
         limit: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PullBatch>> + 'a>> {
-        Box::pin(self.pull_batch(cursor, limit))
+        Box::pin(self.pull_batch_with_retries(cursor, limit))
     }
 }
 
@@ -1053,8 +1244,38 @@ impl crate::sync::Pusher for P2pClient {
         &'a mut self,
         entries: Vec<crate::core::Entry>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
-        Box::pin(self.push_batch(entries))
+        Box::pin(self.push_batch_with_retries(entries))
     }
+}
+
+fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
+    // payload-too-large는 상위 로직(배치 limit 축소)에 맡긴다.
+    if crate::sync::is_payload_too_large_error(err) {
+        return false;
+    }
+
+    // request-response 자체를 `tokio::select!`로 타임아웃 처리할 때는 anyhow string-only 에러가 된다.
+    // 이 경우도 일시 오류로 보고 retryable로 취급한다.
+    if err
+        .chain()
+        .any(|cause| cause.to_string().starts_with("p2p request timeout after"))
+    {
+        return true;
+    }
+
+    for cause in err.chain() {
+        if let Some(of) = cause.downcast_ref::<libp2p_request_response::OutboundFailure>() {
+            return match of {
+                libp2p_request_response::OutboundFailure::UnsupportedProtocols => false,
+                libp2p_request_response::OutboundFailure::DialFailure => true,
+                libp2p_request_response::OutboundFailure::Timeout => true,
+                libp2p_request_response::OutboundFailure::ConnectionClosed => true,
+                libp2p_request_response::OutboundFailure::Io(_) => true,
+            };
+        }
+    }
+
+    false
 }
 
 fn exp_duration(base: Duration, attempt: u32, cap: Option<Duration>) -> Duration {
@@ -1070,6 +1291,7 @@ fn exp_duration(base: Duration, attempt: u32, cap: Option<Duration>) -> Duration
 mod tests {
     use super::*;
     use crate::core::Entry;
+    use libp2p_request_response::OutboundFailure;
     use tempfile::tempdir;
     use time::OffsetDateTime;
 
@@ -1163,6 +1385,7 @@ mod tests {
             tracker_token: None,
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
+            request_retry_policy: RequestRetryPolicy::default(),
         };
 
         let got = discover_targets(&store, &cfg).unwrap();
@@ -1297,7 +1520,7 @@ mod tests {
                             && let libp2p_request_response::Message::Request { request, channel, .. } = message
                         {
                             remote.insert_entries(&request.entries).unwrap();
-                            let _ = server.behaviour_mut().push.send_response(channel, PushAck { ok: true });
+                            let _ = server.behaviour_mut().push.send_response(channel, PushAck { ok: true, inserted: None, ignored: None });
                         }
                     }
                     e = client.select_next_some() => {
@@ -1320,5 +1543,21 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].entry_id, entry.entry_id);
         assert_eq!(got[0].cmd, entry.cmd);
+    }
+
+    #[test]
+    fn is_retryable_p2p_request_error_marks_only_transient_failures_as_retryable() {
+        let err = anyhow::Error::new(OutboundFailure::UnsupportedProtocols);
+        assert!(!is_retryable_p2p_request_error(&err));
+
+        let ioe = std::io::Error::new(std::io::ErrorKind::InvalidInput, "request too large");
+        let err = anyhow::Error::new(OutboundFailure::Io(ioe));
+        assert!(!is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::Error::new(OutboundFailure::Timeout);
+        assert!(is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::anyhow!("p2p request timeout after 5s");
+        assert!(is_retryable_p2p_request_error(&err));
     }
 }
