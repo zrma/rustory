@@ -31,7 +31,7 @@ pub fn load_default() -> Result<FileConfig> {
 }
 
 pub fn load_from_path(path: &str) -> Result<FileConfig> {
-    let path = expand_home(path)?;
+    let path = expand_home_path(path)?;
     let content = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
@@ -50,7 +50,7 @@ pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedK
     use libp2p::pnet::PreSharedKey;
     use rand::RngCore;
 
-    let path = expand_home(path)?;
+    let path = expand_home_path(path)?;
     match std::fs::read_to_string(&path) {
         Ok(s) => {
             let key: PreSharedKey = s.parse().context("parse swarm key")?;
@@ -73,7 +73,7 @@ pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedK
 }
 
 pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity::Keypair> {
-    let path = expand_home(path)?;
+    let path = expand_home_path(path)?;
     match std::fs::read(&path) {
         Ok(bytes) => {
             if bytes.is_empty() {
@@ -98,7 +98,7 @@ pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity:
     }
 }
 
-fn expand_home(path: &str) -> Result<PathBuf> {
+pub fn expand_home_path(path: &str) -> Result<PathBuf> {
     if let Some(rest) = path.strip_prefix("~/") {
         let home = std::env::var_os("HOME").context("HOME env var not set")?;
         return Ok(Path::new(&home).join(rest));
