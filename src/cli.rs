@@ -5,6 +5,14 @@ use rand::Rng;
 use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
 use std::time::{Duration, Instant};
 
+const DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC: u64 = 15;
+const DEFAULT_ASYNC_UPLOAD_LIMIT: usize = 200;
+const DEFAULT_ASYNC_UPLOAD_MARKER_PATH: &str = "~/.config/rustory/async-upload.last";
+const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
+const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
+const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
+const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
+
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
 pub struct App {
@@ -125,6 +133,16 @@ enum Command {
     Search {
         #[arg(long)]
         limit: Option<usize>,
+    },
+    Prune {
+        #[arg(long)]
+        older_than_days: u64,
+
+        #[arg(long)]
+        keep_recent: Option<usize>,
+
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
     SyncStatus {
         #[arg(long)]
@@ -413,6 +431,16 @@ pub fn run() -> Result<()> {
             if print_id {
                 println!("{}", entry.entry_id);
             }
+
+            if let Err(err) = maybe_spawn_async_upload(&db_path) {
+                // 기록 성공을 우선하고, 비동기 업로드 트리거 실패는 경고로만 남긴다.
+                eprintln!("warn: async upload trigger failed: {err:#}");
+            }
+
+            if let Err(err) = maybe_run_auto_prune(&store) {
+                // 기록 성공을 우선하고, 자동 보관 실패는 경고로만 남긴다.
+                eprintln!("warn: auto prune failed: {err:#}");
+            }
         }
         Command::Search { limit } => {
             let limit = resolve_search_limit(limit, &cfg)?;
@@ -421,6 +449,29 @@ pub fn run() -> Result<()> {
             let entries = store.list_recent(limit)?;
             if let Some(cmd) = search::select_command(&entries)? {
                 println!("{cmd}");
+            }
+        }
+        Command::Prune {
+            older_than_days,
+            keep_recent,
+            dry_run,
+        } => {
+            let keep_recent = keep_recent.unwrap_or(0);
+            let store = storage::LocalStore::open(&db_path)?;
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
+            let stats = store.prune_entries_older_than(cutoff_unix, keep_recent, dry_run)?;
+
+            if dry_run {
+                println!(
+                    "prune dry-run: older_than_days={} keep_recent={} cutoff_unix={} matched={} deleted={}",
+                    older_than_days, keep_recent, cutoff_unix, stats.matched, stats.deleted
+                );
+            } else {
+                println!(
+                    "prune: older_than_days={} keep_recent={} cutoff_unix={} matched={} deleted={}",
+                    older_than_days, keep_recent, cutoff_unix, stats.matched, stats.deleted
+                );
             }
         }
         Command::SyncStatus {
@@ -1090,6 +1141,226 @@ fn env_nonempty(key: &str) -> Option<String> {
     normalize_opt_string(std::env::var(key).ok())
 }
 
+fn maybe_spawn_async_upload(db_path: &str) -> Result<()> {
+    if !resolve_async_upload_enabled()? {
+        return Ok(());
+    }
+
+    let min_interval_sec = resolve_async_upload_interval_sec()?;
+    let limit = resolve_async_upload_limit()?;
+    let marker_path = config::expand_home_path(&resolve_async_upload_marker_path())?;
+
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
+    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
+        return Ok(());
+    }
+    write_rate_limit_marker(&marker_path, now_unix)?;
+
+    let exe = std::env::current_exe().context("resolve current executable for async upload")?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--db-path")
+        .arg(db_path)
+        .arg("p2p-sync")
+        .arg("--push")
+        .arg("--limit")
+        .arg(limit.to_string())
+        .env("RUSTORY_ASYNC_UPLOAD", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd.spawn().context("spawn async upload p2p-sync")?;
+
+    Ok(())
+}
+
+fn maybe_run_auto_prune(store: &storage::LocalStore) -> Result<()> {
+    if !resolve_auto_prune_enabled()? {
+        return Ok(());
+    }
+
+    let older_than_days = resolve_auto_prune_days()?;
+    let keep_recent = resolve_auto_prune_keep_recent()?;
+    let min_interval_sec = resolve_auto_prune_interval_sec()?;
+    let marker_path = config::expand_home_path(&resolve_auto_prune_marker_path())?;
+
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
+    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
+        return Ok(());
+    }
+
+    let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
+    let stats = store.prune_entries_older_than(cutoff_unix, keep_recent, false)?;
+    write_rate_limit_marker(&marker_path, now_unix)?;
+
+    if stats.deleted > 0 {
+        eprintln!(
+            "info: auto prune deleted={} older_than_days={} keep_recent={} cutoff_unix={}",
+            stats.deleted, older_than_days, keep_recent, cutoff_unix
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_async_upload_enabled() -> Result<bool> {
+    let Some(raw) = env_nonempty("RUSTORY_ASYNC_UPLOAD") else {
+        return Ok(false);
+    };
+    parse_env_bool(&raw, "RUSTORY_ASYNC_UPLOAD")
+}
+
+fn resolve_async_upload_interval_sec() -> Result<u64> {
+    let Some(raw) = env_nonempty("RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC") else {
+        return Ok(DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC);
+    };
+
+    let parsed: u64 = raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC={:?}: {e}",
+            raw.trim()
+        )
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC must be >= 1");
+    }
+
+    Ok(parsed)
+}
+
+fn resolve_async_upload_limit() -> Result<usize> {
+    let Some(raw) = env_nonempty("RUSTORY_ASYNC_UPLOAD_LIMIT") else {
+        return Ok(DEFAULT_ASYNC_UPLOAD_LIMIT);
+    };
+
+    let parsed: usize = raw
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid RUSTORY_ASYNC_UPLOAD_LIMIT={:?}: {e}", raw.trim()))?;
+    if parsed == 0 {
+        anyhow::bail!("RUSTORY_ASYNC_UPLOAD_LIMIT must be >= 1");
+    }
+
+    Ok(parsed)
+}
+
+fn resolve_async_upload_marker_path() -> String {
+    env_nonempty("RUSTORY_ASYNC_UPLOAD_MARKER_PATH")
+        .unwrap_or_else(|| DEFAULT_ASYNC_UPLOAD_MARKER_PATH.to_string())
+}
+
+fn resolve_auto_prune_enabled() -> Result<bool> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE") else {
+        return Ok(false);
+    };
+    parse_env_bool(&raw, "RUSTORY_AUTO_PRUNE")
+}
+
+fn resolve_auto_prune_days() -> Result<u64> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_DAYS") else {
+        return Ok(DEFAULT_AUTO_PRUNE_DAYS);
+    };
+
+    let parsed: u64 = raw
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid RUSTORY_AUTO_PRUNE_DAYS={:?}: {e}", raw.trim()))?;
+    if parsed == 0 {
+        anyhow::bail!("RUSTORY_AUTO_PRUNE_DAYS must be >= 1");
+    }
+
+    Ok(parsed)
+}
+
+fn resolve_auto_prune_interval_sec() -> Result<u64> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_INTERVAL_SEC") else {
+        return Ok(DEFAULT_AUTO_PRUNE_INTERVAL_SEC);
+    };
+
+    let parsed: u64 = raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid RUSTORY_AUTO_PRUNE_INTERVAL_SEC={:?}: {e}",
+            raw.trim()
+        )
+    })?;
+    if parsed == 0 {
+        anyhow::bail!("RUSTORY_AUTO_PRUNE_INTERVAL_SEC must be >= 1");
+    }
+
+    Ok(parsed)
+}
+
+fn resolve_auto_prune_keep_recent() -> Result<usize> {
+    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_KEEP_RECENT") else {
+        return Ok(DEFAULT_AUTO_PRUNE_KEEP_RECENT);
+    };
+
+    raw.parse().map_err(|e| {
+        anyhow::anyhow!(
+            "invalid RUSTORY_AUTO_PRUNE_KEEP_RECENT={:?}: {e}",
+            raw.trim()
+        )
+    })
+}
+
+fn resolve_auto_prune_marker_path() -> String {
+    env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH")
+        .unwrap_or_else(|| DEFAULT_AUTO_PRUNE_MARKER_PATH.to_string())
+}
+
+fn parse_env_bool(value: &str, label: &str) -> Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => {
+            anyhow::bail!("invalid {label}={value:?}; expected one of 1/0/true/false/yes/no/on/off")
+        }
+    }
+}
+
+fn read_rate_limit_marker(path: &std::path::Path) -> Result<Option<i64>> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read rate limit marker: {}", path.display()));
+        }
+    };
+
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let parsed = trimmed
+        .parse::<i64>()
+        .map_err(|e| anyhow::anyhow!("invalid rate limit marker {}: {e}", path.display()))?;
+    Ok(Some(parsed))
+}
+
+fn write_rate_limit_marker(path: &std::path::Path, now_unix: i64) -> Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create rate limit marker dir: {}", parent.display()))?;
+    }
+    std::fs::write(path, format!("{now_unix}\n"))
+        .with_context(|| format!("write rate limit marker: {}", path.display()))?;
+    Ok(())
+}
+
+fn should_trigger_interval(
+    now_unix: i64,
+    last_trigger_unix: Option<i64>,
+    min_interval_sec: u64,
+) -> bool {
+    let min_interval_sec = i64::try_from(min_interval_sec).unwrap_or(i64::MAX);
+    let Some(last) = last_trigger_unix else {
+        return true;
+    };
+    now_unix.saturating_sub(last) >= min_interval_sec
+}
+
 fn resolve_search_limit(cli: Option<usize>, cfg: &config::FileConfig) -> Result<usize> {
     if let Some(v) = cli {
         return Ok(v);
@@ -1107,6 +1378,21 @@ fn resolve_search_limit(cli: Option<usize>, cfg: &config::FileConfig) -> Result<
     }
 
     Ok(100000)
+}
+
+fn compute_prune_cutoff_unix(now_unix: i64, older_than_days: u64) -> Result<i64> {
+    if older_than_days == 0 {
+        anyhow::bail!("--older-than-days must be >= 1");
+    }
+
+    let retention_sec = i64::try_from(older_than_days)
+        .context("older-than-days is too large")?
+        .checked_mul(86_400)
+        .context("older-than-days is too large")?;
+
+    now_unix
+        .checked_sub(retention_sec)
+        .context("failed to compute prune cutoff")
 }
 
 fn resolve_p2p_watch_start_jitter_sec(cli: Option<u64>, cfg: &config::FileConfig) -> Result<u64> {
@@ -1496,6 +1782,31 @@ mod tests {
     }
 
     #[test]
+    fn prune_parses_flags() {
+        let app = App::parse_from([
+            "rr",
+            "prune",
+            "--older-than-days",
+            "30",
+            "--keep-recent",
+            "200",
+            "--dry-run",
+        ]);
+        match app.cmd {
+            Command::Prune {
+                older_than_days,
+                keep_recent,
+                dry_run,
+            } => {
+                assert_eq!(older_than_days, 30);
+                assert_eq!(keep_recent, Some(200));
+                assert!(dry_run);
+            }
+            _ => panic!("expected prune"),
+        }
+    }
+
+    #[test]
     fn sync_status_report_includes_pending_push_and_filter() {
         use time::OffsetDateTime;
 
@@ -1581,6 +1892,50 @@ mod tests {
         assert_eq!(compute_last_seen_age_sec(100, Some(100)), Some(0));
         assert_eq!(compute_last_seen_age_sec(100, Some(110)), Some(0));
         assert_eq!(compute_last_seen_age_sec(100, None), None);
+    }
+
+    #[test]
+    fn compute_prune_cutoff_unix_validates_and_calculates() {
+        assert_eq!(compute_prune_cutoff_unix(900_000, 2).unwrap(), 727_200);
+        assert!(compute_prune_cutoff_unix(900_000, 0).is_err());
+        assert!(compute_prune_cutoff_unix(900_000, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn parse_env_bool_accepts_common_values() {
+        assert!(parse_env_bool("1", "X").unwrap());
+        assert!(parse_env_bool("true", "X").unwrap());
+        assert!(parse_env_bool("yes", "X").unwrap());
+        assert!(parse_env_bool("on", "X").unwrap());
+        assert!(!parse_env_bool("0", "X").unwrap());
+        assert!(!parse_env_bool("false", "X").unwrap());
+        assert!(!parse_env_bool("no", "X").unwrap());
+        assert!(!parse_env_bool("off", "X").unwrap());
+    }
+
+    #[test]
+    fn parse_env_bool_rejects_invalid_values() {
+        assert!(parse_env_bool("maybe", "X").is_err());
+        assert!(parse_env_bool("", "X").is_err());
+    }
+
+    #[test]
+    fn should_trigger_interval_respects_interval() {
+        assert!(should_trigger_interval(100, None, 15));
+        assert!(should_trigger_interval(100, Some(80), 15));
+        assert!(!should_trigger_interval(100, Some(90), 15));
+        assert!(!should_trigger_interval(100, Some(110), 15));
+    }
+
+    #[test]
+    fn rate_limit_marker_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("async-upload.last");
+
+        assert_eq!(read_rate_limit_marker(&marker).unwrap(), None);
+
+        write_rate_limit_marker(&marker, 1234).unwrap();
+        assert_eq!(read_rate_limit_marker(&marker).unwrap(), Some(1234));
     }
 
     #[test]

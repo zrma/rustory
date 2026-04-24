@@ -105,6 +105,38 @@ export RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|be
 
 이 옵션은 hook이 호출하는 `rr record`에도 적용된다. 상세는 `docs/hook.md` 참고.
 
+### 2-5-1) (선택) 기록 직후 비동기 업로드 트리거
+hook 기반 기록 직후 업로드를 자동으로 트리거하려면:
+```sh
+export RUSTORY_ASYNC_UPLOAD=1
+export RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC=15
+export RUSTORY_ASYNC_UPLOAD_LIMIT=200
+```
+
+업로드 실패 시에도 로컬 기록은 유지되며, 다음 트리거에서 `pending_push` 큐가 다시 전송된다.
+
+### 2-5-2) (선택) 기록 시 자동 보관(prune) 스케줄링
+오래된 로컬 엔트리를 주기적으로 자동 정리하려면:
+```sh
+export RUSTORY_AUTO_PRUNE=1
+export RUSTORY_AUTO_PRUNE_DAYS=180
+export RUSTORY_AUTO_PRUNE_INTERVAL_SEC=86400
+export RUSTORY_AUTO_PRUNE_KEEP_RECENT=5000
+```
+
+`rr record` 성공 후 주기 제한에 맞춰 자동 prune이 실행되며, `RUSTORY_AUTO_PRUNE_KEEP_RECENT`를 지정하면 최신 N개는 삭제 대상에서 제외된다. 자동 보관 실패 시에도 기록 자체는 유지된다.
+
+### 2-6) (선택) 오래된 로컬 히스토리 수동 정리
+먼저 영향 범위를 확인한다.
+```sh
+rr prune --older-than-days 180 --keep-recent 5000 --dry-run
+```
+
+결과가 의도와 같으면 실제 삭제를 수행한다.
+```sh
+rr prune --older-than-days 180 --keep-recent 5000
+```
+
 ## 다음 문서
 - P2P 상세/트러블슈팅: `docs/p2p.md`
 - 데몬/스케줄러: `docs/daemon.md`
