@@ -230,7 +230,7 @@ ON CONFLICT(peer_id) DO UPDATE SET
             r#"
 SELECT peer_id, addrs_json, user_id, device_id, last_seen
 FROM peer_book
-WHERE user_id = ?1
+WHERE (user_id = ?1 OR user_id IS NULL)
   AND last_seen >= ?2
 ORDER BY last_seen DESC, peer_id ASC
 LIMIT ?3

@@ -52,6 +52,13 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
 이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
 
+## Hole Punching(DCUtR)
+- relay 경유로 연결이 수립되면(libp2p `/p2p-circuit`), **가능하면 direct 연결로 업그레이드**(hole punching)한다.
+- 업그레이드 성공/실패는 로그로 확인할 수 있다.
+  - 성공 예: `dcutr: upgraded to direct: peer=<peer_id> connection_id=<...>`
+  - 실패 예: `dcutr: upgrade failed: peer=<peer_id> error=<...>`
+- 업그레이드가 실패해도 에러로 종료하지 않고, 기존처럼 relay 연결로 동기화를 계속한다.
+
 ### 단계 1: 수동 multiaddr (legacy)
 #### Peer A (서버 역할)
 ```sh
