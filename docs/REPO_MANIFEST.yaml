@@ -1,0 +1,77 @@
+schema_version: 1
+entrypoint: docs/HANDOFF.md
+operating_model: docs/OPERATING_MODEL.md
+change_control: docs/CHANGE_CONTROL.md
+improvement_loop: docs/IMPROVEMENT_LOOP.md
+escalation_policy: docs/ESCALATION_POLICY.md
+lessons_log: docs/LESSONS_LOG.md
+
+repositories:
+  - key: rustory
+    repo: local/rustory
+    default_ref: main
+    entrypoints:
+      - README.md
+      - AGENTS.md
+      - docs/HANDOFF.md
+      - docs/README.md
+      - docs/EXECUTION_LOOP.md
+      - docs/CHANGE_CONTROL.md
+      - docs/REPO_MANIFEST.yaml
+      - docs/OPERATING_MODEL.md
+      - docs/README_OPERATING_POLICY.md
+      - docs/SKILL_OPERATING_GUIDE.md
+      - docs/IMPROVEMENT_LOOP.md
+      - docs/ESCALATION_POLICY.md
+      - docs/LESSONS_LOG.md
+      - docs/LESSONS_ARCHIVE.md
+      - docs/quickstart.md
+      - docs/p2p.md
+      - docs/daemon.md
+      - docs/hook.md
+      - docs/dev-playbook.md
+      - docs/mvp.md
+    checks:
+      - scripts/check-todo-readiness.sh docs/todo-<work-id>
+      - scripts/check-open-questions-schema.sh --require-closed
+      - scripts/check-todo-closure.sh
+      - scripts/check-script-smoke.sh --work-id <work-id>
+      - scripts/check-jj-root-git-commit.sh
+      - scripts/check-branch-hygiene.sh
+      - scripts/check-jj-conflicts.sh
+      - scripts/check-doc-last-verified.sh
+      - scripts/check-doc-links.sh
+      - scripts/check-doc-index.sh
+      - scripts/check-readme-policy.sh
+      - scripts/check-manifest-entrypoints.sh
+      - scripts/check-submodules.sh --strict
+      - scripts/check-lessons-log-enforcement.sh --worktree
+      - cargo fmt --all --check
+      - cargo test --workspace
+      - cargo clippy --workspace --all-targets -- -D warnings
+      - scripts/smoke_p2p_local.sh
+      - ci:.github/workflows/ci.yml
+      - ci:.github/workflows/docs-integrity.yml
+      - ci:.github/workflows/release-gates.yml
+
+maintenance:
+  work_start_runner: scripts/start-work.sh
+  manifest_check_runner: scripts/run-manifest-checks.sh
+  release_gate_runner: scripts/check-release-gates.sh
+  push_gate_runner: scripts/check-push-gates.sh
+  submodule_health_script: scripts/check-submodules.sh
+  todo_workspace_glob: docs/todo-*
+  improvement_log: docs/LESSONS_LOG.md
+  notes:
+    - "top-level `entrypoint`는 무컨텍스트 시작 시 단일 네비게이션 시작점이고, `repositories[*].entrypoints`는 탐색/검증용 진입 문서 맵이다."
+    - "todo workspace 탐색 규칙은 `maintenance.todo_workspace_glob` 단일 기준을 사용한다. (`scripts/check-release-gates.sh`, `scripts/check-push-gates.sh`, `scripts/finalize-and-push.sh`, `scripts/start-work.sh` 등)"
+    - "비긴급 구현 시작은 `scripts/start-work.sh --work-id <work-id>`를 우선 사용해 todo 초기화 + readiness/open-questions/manifest quick 게이트를 단일 명령으로 실행한다."
+    - "구현 턴 종료는 `scripts/finalize-and-push.sh --message \"<type>: <summary>\" [--work-id <work-id>]` 기본 경로를 우선 사용해 게이트/커밋/푸시/SHA 검증을 원샷으로 닫는다."
+    - "`scripts/check-push-gates.sh`는 `--work-id` 미지정 시 docs/todo-*를 자동 감지하며, 1개는 자동 선택, 2개 이상은 전체 readiness + open-questions 닫힘 상태를 점검하고, 0개는 todo readiness/open-questions 점검을 생략한다."
+    - "`scripts/check-release-gates.sh`, `scripts/finalize-and-push.sh`의 `--work-id` 자동 감지/마감 커밋 예외 상세는 `docs/CHANGE_CONTROL.md` 단일 기준을 따른다."
+    - "`scripts/run-manifest-checks.sh --mode full`은 `<work-id>` placeholder 체크를 해석할 수 없으면 실패한다. (quick 모드만 경고 후 skip)"
+    - "출고/공유 직전에는 `scripts/check-branch-hygiene.sh`로 임시 브랜치(`rewrite/*`, `backup/*`)와 unbookmarked non-empty `jj head` 잔존 여부를 확인한다."
+    - "`.gitmodules`가 없는 저장소에서는 submodule 계열 게이트가 자동 skip 처리된다."
+    - "1인 개발 모드에서는 로컬 반복 개발 중 strict 게이트를 강제하지 않고, 배포/공유 직전에 strict 체크를 수행한다."
+    - "누락/실패/재작업이 발생하면 `docs/IMPROVEMENT_LOOP.md`를 따라 `docs/LESSONS_LOG.md`를 갱신한다."
+    - "고위험 변경 또는 판단 모호 케이스는 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 에스컬레이션한다."

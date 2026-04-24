@@ -1,0 +1,73 @@
+name: Docs Integrity
+
+on:
+  pull_request:
+    paths:
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/check-doc-links.sh"
+      - "scripts/check-doc-last-verified.sh"
+      - "scripts/check-todo-readiness.sh"
+      - "scripts/check-open-questions-schema.sh"
+      - "scripts/check-jj-conflicts.sh"
+      - "scripts/check-todo-closure.sh"
+      - "scripts/check-script-smoke.sh"
+      - "scripts/run-manifest-checks.sh"
+      - "scripts/check-release-gates.sh"
+      - "scripts/check-push-gates.sh"
+      - ".github/workflows/docs-integrity.yml"
+      - ".github/workflows/release-gates.yml"
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "AGENTS.md"
+      - "docs/**"
+      - "scripts/check-doc-links.sh"
+      - "scripts/check-doc-last-verified.sh"
+      - "scripts/check-todo-readiness.sh"
+      - "scripts/check-open-questions-schema.sh"
+      - "scripts/check-jj-conflicts.sh"
+      - "scripts/check-todo-closure.sh"
+      - "scripts/check-script-smoke.sh"
+      - "scripts/run-manifest-checks.sh"
+      - "scripts/check-release-gates.sh"
+      - "scripts/check-push-gates.sh"
+      - ".github/workflows/docs-integrity.yml"
+      - ".github/workflows/release-gates.yml"
+
+jobs:
+  docs-integrity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate markdown links
+        run: scripts/check-doc-links.sh
+
+      - name: Validate Last Verified freshness
+        run: scripts/check-doc-last-verified.sh
+
+      - name: Validate todo readiness
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t todo_dirs < <(find docs -maxdepth 1 -mindepth 1 -type d -name 'todo-*' | sort)
+          if (( ${#todo_dirs[@]} == 0 )); then
+            echo "No todo directories found. Skip readiness check."
+            exit 0
+          fi
+          for todo_dir in "${todo_dirs[@]}"; do
+            scripts/check-todo-readiness.sh "$todo_dir"
+          done
+
+      - name: Validate open-questions closed state
+        run: scripts/check-open-questions-schema.sh --require-closed
+
+      - name: Validate todo closure hygiene
+        run: scripts/check-todo-closure.sh
+
+      - name: Run script smoke checks
+        run: scripts/check-script-smoke.sh
