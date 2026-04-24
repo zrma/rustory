@@ -8,9 +8,17 @@ pub fn serve(bind: &str, db_path: &str) -> Result<()> {
     serve_http(bind, store)
 }
 
-pub fn sync(peers: &[String], db_path: &str) -> Result<()> {
+pub fn sync(
+    peers: &[String],
+    db_path: &str,
+    push: bool,
+    local_device_id: Option<&str>,
+) -> Result<()> {
     if peers.is_empty() {
         anyhow::bail!("no peers provided");
+    }
+    if push && local_device_id.is_none() {
+        anyhow::bail!("local_device_id required for push");
     }
 
     let store = LocalStore::open(db_path)?;
@@ -18,12 +26,28 @@ pub fn sync(peers: &[String], db_path: &str) -> Result<()> {
     let mut last_err: Option<anyhow::Error> = None;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
-        match sync_pull_http_peer(&store, peer, 1000).with_context(|| format!("sync peer: {peer}"))
+        match sync_pull_http_peer(&store, peer, 1000).with_context(|| format!("pull peer: {peer}"))
         {
             Ok(_) => any_ok = true,
             Err(err) => {
-                eprintln!("warn: http sync failed: {peer}: {err:#}");
+                eprintln!("warn: http pull failed: {peer}: {err:#}");
                 last_err = Some(err);
+            }
+        }
+
+        if push {
+            match sync_push_http_peer(&store, peer, 1000, local_device_id)
+                .with_context(|| format!("push peer: {peer}"))
+            {
+                Ok(pushed) => {
+                    if pushed > 0 {
+                        any_ok = true;
+                    }
+                }
+                Err(err) => {
+                    eprintln!("warn: http push failed: {peer}: {err:#}");
+                    last_err = Some(err);
+                }
             }
         }
     }
@@ -66,6 +90,17 @@ fn sync_pull_http_peer(local: &LocalStore, peer_base_url: &str, limit: usize) ->
     })
 }
 
+fn sync_push_http_peer(
+    local: &LocalStore,
+    peer_base_url: &str,
+    limit: usize,
+    local_device_id: Option<&str>,
+) -> Result<usize> {
+    sync::sync_push_to_peer(local, peer_base_url, limit, local_device_id, |entries| {
+        http_push_batch(peer_base_url, entries)
+    })
+}
+
 fn http_pull_batch(
     peer_base_url: &str,
     cursor: i64,
@@ -95,6 +130,24 @@ fn http_pull_batch(
         entries: parsed.entries,
         next_cursor: parsed.next_cursor,
     })
+}
+
+fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>) -> Result<()> {
+    let url = format!("{}/api/v1/entries", peer_base_url.trim_end_matches('/'));
+
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(30))
+        .build();
+
+    let body = serde_json::to_vec(&entries).context("serialize entries json")?;
+    let resp = agent
+        .post(&url)
+        .set("Content-Type", "application/json")
+        .send_bytes(&body)
+        .with_context(|| format!("POST {url}"))?;
+    let _ = resp.into_string().context("read response body")?;
+    Ok(())
 }
 
 fn route_http_request(
@@ -272,9 +325,11 @@ mod tests {
         let local_db = dir.path().join("local.db");
 
         let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
-        remote
-            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
-            .unwrap();
+        let mut r1 = entry("id-1", 1, "echo 1");
+        r1.device_id = "dev-remote".to_string();
+        let mut r2 = entry("id-2", 2, "echo 2");
+        r2.device_id = "dev-remote".to_string();
+        remote.insert_entries(&[r1, r2]).unwrap();
 
         let server = start_test_server(remote_db.to_str().unwrap().to_string());
 
@@ -284,6 +339,17 @@ mod tests {
         assert_eq!(pulled, 2);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
         assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 2);
+
+        let mut local_entry = entry("id-3", 3, "echo 3");
+        local_entry.device_id = "dev-local".to_string();
+        local.insert_entries(&[local_entry]).unwrap();
+
+        let pushed = sync_push_http_peer(&local, &server.base_url, 100, Some("dev-local")).unwrap();
+        assert_eq!(pushed, 1);
+
+        let got = remote.list_recent(10).unwrap();
+        assert_eq!(got.len(), 3);
+        assert!(got.iter().any(|e| e.entry_id == "id-3"));
 
         server.shutdown();
     }

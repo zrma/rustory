@@ -163,6 +163,60 @@ LIMIT ?
         })
     }
 
+    pub fn pull_since_cursor_for_device(
+        &self,
+        cursor: i64,
+        limit: usize,
+        device_id: &str,
+    ) -> Result<PullBatch> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT
+  ingest_seq,
+  entry_id,
+  device_id,
+  user_id,
+  ts,
+  cmd,
+  cwd,
+  exit_code,
+  duration_ms,
+  shell,
+  hostname,
+  version
+FROM entries
+WHERE ingest_seq > ?
+  AND device_id = ?
+ORDER BY ingest_seq ASC
+LIMIT ?
+"#,
+            )
+            .context("prepare pull_since_cursor_for_device")?;
+
+        let rows = stmt
+            .query_map(params![cursor, device_id, limit as i64], |row| {
+                let ingest_seq: i64 = row.get(0)?;
+                let entry = row_to_entry_with_offset(row, 1)?;
+                Ok((ingest_seq, entry))
+            })
+            .context("query pull_since_cursor_for_device")?;
+
+        let mut entries = Vec::new();
+        let mut last_cursor: Option<i64> = None;
+        for item in rows {
+            let (ingest_seq, entry) = item?;
+            last_cursor = Some(ingest_seq);
+            entries.push(entry);
+        }
+
+        Ok(PullBatch {
+            entries,
+            next_cursor: last_cursor,
+        })
+    }
+
     pub fn get_last_cursor(&self, peer_id: &str) -> Result<i64> {
         Ok(self.get_last_cursor_opt(peer_id)?.unwrap_or(0))
     }
@@ -190,6 +244,36 @@ ON CONFLICT(peer_id) DO UPDATE SET last_cursor = excluded.last_cursor
                 params![peer_id, cursor],
             )
             .context("upsert peer_state")?;
+        Ok(())
+    }
+
+    pub fn get_last_pushed_seq(&self, peer_id: &str) -> Result<i64> {
+        Ok(self.get_last_pushed_seq_opt(peer_id)?.unwrap_or(0))
+    }
+
+    pub fn get_last_pushed_seq_opt(&self, peer_id: &str) -> Result<Option<i64>> {
+        match self.conn.query_row(
+            "SELECT last_pushed_seq FROM peer_push_state WHERE peer_id = ?",
+            params![peer_id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err).context("query peer_push_state"),
+        }
+    }
+
+    pub fn set_last_pushed_seq(&self, peer_id: &str, seq: i64) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO peer_push_state(peer_id, last_pushed_seq)
+VALUES (?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET last_pushed_seq = excluded.last_pushed_seq
+"#,
+                params![peer_id, seq],
+            )
+            .context("upsert peer_push_state")?;
         Ok(())
     }
 
@@ -340,6 +424,11 @@ CREATE TABLE IF NOT EXISTS peer_state (
   last_cursor INTEGER NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS peer_push_state (
+  peer_id TEXT PRIMARY KEY,
+  last_pushed_seq INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS peer_book (
   peer_id TEXT PRIMARY KEY,
   addrs_json TEXT NOT NULL,
@@ -425,6 +514,8 @@ mod tests {
 
         assert!(names.iter().any(|n| n == "entries"));
         assert!(names.iter().any(|n| n == "peer_state"));
+        assert!(names.iter().any(|n| n == "peer_push_state"));
+        assert!(names.iter().any(|n| n == "peer_book"));
     }
 
     #[test]
@@ -458,6 +549,38 @@ mod tests {
     }
 
     #[test]
+    fn pull_by_cursor_can_filter_by_device_id() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo 1");
+        e1.device_id = "dev-local".to_string();
+
+        let mut e2 = entry("id-2", 2, "echo 2");
+        e2.device_id = "dev-remote".to_string();
+
+        let mut e3 = entry("id-3", 3, "echo 3");
+        e3.device_id = "dev-local".to_string();
+
+        store
+            .insert_entries(&[e1.clone(), e2.clone(), e3.clone()])
+            .unwrap();
+
+        let b1 = store
+            .pull_since_cursor_for_device(0, 10, "dev-local")
+            .unwrap();
+        assert_eq!(b1.entries.len(), 2);
+        assert_eq!(b1.entries[0].entry_id, "id-1");
+        assert_eq!(b1.entries[1].entry_id, "id-3");
+        assert_eq!(b1.next_cursor, Some(3));
+
+        let b2 = store
+            .pull_since_cursor_for_device(b1.next_cursor.unwrap(), 10, "dev-local")
+            .unwrap();
+        assert!(b2.entries.is_empty());
+        assert_eq!(b2.next_cursor, None);
+    }
+
+    #[test]
     fn list_recent_orders_by_ts_desc() {
         let store = LocalStore::open(":memory:").unwrap();
 
@@ -478,6 +601,15 @@ mod tests {
         assert_eq!(store.get_last_cursor("peer-a").unwrap(), 0);
         store.set_last_cursor("peer-a", 42).unwrap();
         assert_eq!(store.get_last_cursor("peer-a").unwrap(), 42);
+    }
+
+    #[test]
+    fn peer_push_state_roundtrip() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 0);
+        store.set_last_pushed_seq("peer-a", 7).unwrap();
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 7);
     }
 
     #[test]

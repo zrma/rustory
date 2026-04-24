@@ -52,6 +52,13 @@ pub trait Puller {
     ) -> Pin<Box<dyn Future<Output = Result<PullBatch>> + 'a>>;
 }
 
+pub trait Pusher {
+    fn push<'a>(
+        &'a mut self,
+        entries: Vec<crate::core::Entry>,
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
+}
+
 pub async fn sync_pull_from_peer_async<P>(
     local: &LocalStore,
     peer_id: &str,
@@ -88,6 +95,98 @@ where
     }
 
     Ok(pulled_total)
+}
+
+/// local에서 peer로 push 기반으로 cursor를 따라잡는다.
+///
+/// - cursor는 local의 `peer_push_state.last_pushed_seq(peer_id)`를 사용한다.
+/// - push 대상은 "로컬 ingest_seq" 기준으로 배치 전송한다.
+pub fn sync_push_to_peer<F>(
+    local: &LocalStore,
+    peer_id: &str,
+    limit: usize,
+    source_device_id: Option<&str>,
+    mut push: F,
+) -> Result<usize>
+where
+    F: FnMut(Vec<crate::core::Entry>) -> Result<()>,
+{
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    let mut cursor = local.get_last_pushed_seq(peer_id)?;
+    let mut pushed_total = 0usize;
+
+    loop {
+        let batch = match source_device_id {
+            Some(device_id) => local.pull_since_cursor_for_device(cursor, limit, device_id)?,
+            None => local.pull_since_cursor(cursor, limit)?,
+        };
+        if batch.entries.is_empty() {
+            break;
+        }
+
+        let entries = batch.entries;
+        let entries_len = entries.len();
+        push(entries)?;
+        pushed_total += entries_len;
+
+        let Some(next_cursor) = batch.next_cursor else {
+            anyhow::bail!("invalid local push batch: entries is non-empty but next_cursor is None");
+        };
+        if next_cursor <= cursor {
+            anyhow::bail!("invalid local push batch: next_cursor did not advance");
+        }
+        cursor = next_cursor;
+        local.set_last_pushed_seq(peer_id, cursor)?;
+    }
+
+    Ok(pushed_total)
+}
+
+pub async fn sync_push_to_peer_async<P>(
+    local: &LocalStore,
+    peer_id: &str,
+    limit: usize,
+    source_device_id: Option<&str>,
+    pusher: &mut P,
+) -> Result<usize>
+where
+    P: Pusher,
+{
+    if limit == 0 {
+        return Ok(0);
+    }
+
+    let mut cursor = local.get_last_pushed_seq(peer_id)?;
+    let mut pushed_total = 0usize;
+
+    loop {
+        let batch = match source_device_id {
+            Some(device_id) => local.pull_since_cursor_for_device(cursor, limit, device_id)?,
+            None => local.pull_since_cursor(cursor, limit)?,
+        };
+        if batch.entries.is_empty() {
+            break;
+        }
+
+        let entries = batch.entries;
+        let entries_len = entries.len();
+        pusher.push(entries).await?;
+        pushed_total += entries_len;
+
+        let Some(next_cursor) = batch.next_cursor else {
+            anyhow::bail!("invalid local push batch: entries is non-empty but next_cursor is None");
+        };
+        if next_cursor <= cursor {
+            anyhow::bail!("invalid local push batch: next_cursor did not advance");
+        }
+        cursor = next_cursor;
+        local.set_last_pushed_seq(peer_id, cursor)?;
+    }
+
+    Ok(pushed_total)
 }
 
 #[cfg(test)]
@@ -213,5 +312,76 @@ mod tests {
             .unwrap();
         assert_eq!(b, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_is_idempotent_when_run_multiple_times() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        local
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+
+        let a = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries| {
+            remote.insert_entries(&entries)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(a, 2);
+        assert_eq!(remote.list_recent(10).unwrap().len(), 2);
+
+        let b = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries| {
+            remote.insert_entries(&entries)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(b, 0);
+        assert_eq!(remote.list_recent(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn push_does_not_advance_cursor_when_push_fails() {
+        let local = LocalStore::open(":memory:").unwrap();
+
+        local
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+
+        let err = sync_push_to_peer(&local, "peer-1", 100, Some("dev1"), |_entries| {
+            anyhow::bail!("network error");
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("network error"));
+        assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn push_filters_by_device_id_and_avoids_gossip() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo local 1");
+        e1.device_id = "dev-local".to_string();
+        let mut e2 = entry("id-2", 2, "echo remote 2");
+        e2.device_id = "dev-remote".to_string();
+        let mut e3 = entry("id-3", 3, "echo local 3");
+        e3.device_id = "dev-local".to_string();
+
+        local.insert_entries(&[e1, e2, e3]).unwrap();
+
+        let pushed = sync_push_to_peer(&local, "peer-1", 100, Some("dev-local"), |entries| {
+            remote.insert_entries(&entries)?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(pushed, 2);
+        assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 3);
+
+        let got = remote.list_recent(10).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.iter().any(|e| e.entry_id == "id-1"));
+        assert!(got.iter().any(|e| e.entry_id == "id-3"));
+        assert!(!got.iter().any(|e| e.entry_id == "id-2"));
     }
 }
