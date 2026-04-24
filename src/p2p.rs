@@ -659,9 +659,10 @@ impl P2pClient {
         psk: libp2p::pnet::PreSharedKey,
     ) -> Result<Self> {
         let mut swarm = build_rustory_swarm(psk)?;
-        swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-            .context("listen_on ephemeral")?;
+        let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0"
+            .parse()
+            .context("parse ephemeral listen multiaddr")?;
+        swarm.listen_on(listen).context("listen_on ephemeral")?;
 
         Ok(Self {
             peer_id,

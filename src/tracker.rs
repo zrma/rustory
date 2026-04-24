@@ -81,7 +81,9 @@ fn route_http_request(
     token: Option<&str>,
     req: &mut tiny_http::Request,
 ) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
-    if token.is_some() && !is_authorized(req, token.unwrap()) {
+    if let Some(token) = token
+        && !is_authorized(req, token)
+    {
         return Ok(respond_text(401, "unauthorized\n"));
     }
 
