@@ -9,6 +9,43 @@ pub struct PullStats {
     pub ignored: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SyncRunProgress {
+    pull_ok: bool,
+    push_requested: bool,
+    push_needed: bool,
+    push_ok: bool,
+}
+
+impl SyncRunProgress {
+    pub(crate) fn new(push_requested: bool) -> Self {
+        Self {
+            pull_ok: false,
+            push_requested,
+            push_needed: false,
+            push_ok: false,
+        }
+    }
+
+    pub(crate) fn mark_pull_ok(&mut self) {
+        self.pull_ok = true;
+    }
+
+    pub(crate) fn note_push_needed(&mut self, needed: bool) {
+        self.push_needed |= needed;
+    }
+
+    pub(crate) fn mark_push_ok(&mut self, needed: bool) {
+        if needed {
+            self.push_ok = true;
+        }
+    }
+
+    pub(crate) fn is_success(self) -> bool {
+        self.pull_ok && (!self.push_requested || !self.push_needed || self.push_ok)
+    }
+}
+
 /// peer로부터 pull 기반으로 cursor를 따라잡는다.
 ///
 /// - cursor는 local의 `peer_state.last_cursor(peer_id)`를 사용한다.
@@ -333,6 +370,35 @@ mod tests {
             "request too large: 100 > 10 bytes",
         );
         anyhow::Error::new(OutboundFailure::Io(ioe))
+    }
+
+    #[test]
+    fn sync_run_progress_requires_pull_success() {
+        let mut progress = SyncRunProgress::new(true);
+        progress.note_push_needed(true);
+        progress.mark_push_ok(true);
+
+        assert!(!progress.is_success());
+    }
+
+    #[test]
+    fn sync_run_progress_allows_push_when_no_pending_work() {
+        let mut progress = SyncRunProgress::new(true);
+        progress.mark_pull_ok();
+        progress.note_push_needed(false);
+
+        assert!(progress.is_success());
+    }
+
+    #[test]
+    fn sync_run_progress_requires_push_success_when_pending_work_exists() {
+        let mut progress = SyncRunProgress::new(true);
+        progress.mark_pull_ok();
+        progress.note_push_needed(true);
+        assert!(!progress.is_success());
+
+        progress.mark_push_ok(true);
+        assert!(progress.is_success());
     }
 
     #[test]

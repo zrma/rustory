@@ -569,7 +569,7 @@ async fn sync_async(
         None
     };
 
-    let mut any_ok = false;
+    let mut progress = crate::sync::SyncRunProgress::new(push);
     let mut last_err: Option<anyhow::Error> = None;
     for t in targets {
         let mut client = match P2pClient::new(
@@ -594,7 +594,7 @@ async fn sync_async(
 
         match pull_res {
             Ok(stats) => {
-                any_ok = true;
+                progress.mark_pull_ok();
                 if stats.received > 0 || stats.inserted > 0 {
                     eprintln!(
                         "p2p pull summary: {}: received={} inserted={} ignored={}",
@@ -609,6 +609,17 @@ async fn sync_async(
         }
 
         if push {
+            let pending_push = match store.count_pending_push_entries(&t.peer_key, push_device_id) {
+                Ok(count) => count,
+                Err(err) => {
+                    eprintln!("warn: p2p push preflight failed: {}: {err:#}", t.peer_key);
+                    last_err = Some(err);
+                    continue;
+                }
+            };
+            let push_needed = pending_push > 0;
+            progress.note_push_needed(push_needed);
+
             client.reset_push_ack_stats();
 
             let push_res = crate::sync::sync_push_to_peer_async(
@@ -623,9 +634,7 @@ async fn sync_async(
 
             match push_res {
                 Ok(pushed) => {
-                    if pushed > 0 {
-                        any_ok = true;
-                    }
+                    progress.mark_push_ok(push_needed);
                     if let Some((inserted, ignored)) = client.take_push_ack_stats() {
                         eprintln!(
                             "p2p push summary: {}: sent={pushed} inserted={inserted} ignored={ignored}",
@@ -647,7 +656,7 @@ async fn sync_async(
         }
     }
 
-    if any_ok {
+    if progress.is_success() {
         Ok(())
     } else {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p sync failed")))
@@ -674,6 +683,12 @@ fn build_manual_targets(
             && let Some(old_cursor) = store.get_last_cursor_opt(&peer_key_old)?
         {
             store.set_last_cursor(&peer_key, old_cursor)?;
+        }
+
+        if store.get_last_pushed_seq_opt(&peer_key)?.is_none()
+            && let Some(old_seq) = store.get_last_pushed_seq_opt(&peer_key_old)?
+        {
+            store.set_last_pushed_seq(&peer_key, old_seq)?;
         }
 
         // 수동 입력도 peerbook 캐시에 기록해 tracker 다운 시 fallback 후보로 활용한다.
@@ -782,7 +797,13 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
             continue;
         }
 
-        let peer_id: PeerId = peer_id_str.parse().context("parse peer_id")?;
+        let peer_id: PeerId = match peer_id_str.parse() {
+            Ok(peer_id) => peer_id,
+            Err(err) => {
+                eprintln!("warn: skip peer with invalid peer_id: {peer_id_str}: {err}");
+                continue;
+            }
+        };
         let direct_addrs = direct_candidate_addrs_from_tracker(&peer.addrs);
         out.push(SyncTarget {
             peer_id,
@@ -790,6 +811,10 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
             direct_addrs,
             relay_addr: Some(relay_addr.clone()),
         });
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("no valid peers found after discovery");
     }
 
     Ok(out)
@@ -1412,6 +1437,63 @@ mod tests {
             got[0].direct_addrs,
             vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn build_manual_targets_migrates_legacy_pull_and_push_cursor_keys() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer_id = PeerId::random();
+        let peer_addr = format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}");
+        let peer_key = peer_id.to_string();
+
+        store.set_last_cursor(&peer_addr, 11).unwrap();
+        store.set_last_pushed_seq(&peer_addr, 7).unwrap();
+
+        let targets = build_manual_targets(&store, &[peer_addr], None).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].peer_key, peer_key);
+        assert_eq!(store.get_last_cursor(&targets[0].peer_key).unwrap(), 11);
+        assert_eq!(store.get_last_pushed_seq(&targets[0].peer_key).unwrap(), 7);
+    }
+
+    #[test]
+    fn discover_targets_skips_invalid_cached_peer_ids() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let valid_peer_id = PeerId::random().to_string();
+        for (peer_id, user_id) in [
+            ("not-a-peer-id".to_string(), "u1".to_string()),
+            (valid_peer_id.clone(), "u1".to_string()),
+        ] {
+            store
+                .upsert_peer_book(&PeerBookPeer {
+                    peer_id: peer_id.clone(),
+                    addrs: vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+                    user_id: Some(user_id),
+                    device_id: Some("dev-remote".to_string()),
+                    last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                })
+                .unwrap();
+        }
+
+        let relay_id = PeerId::random();
+        let cfg = SyncConfig {
+            psk: libp2p::pnet::PreSharedKey::new([0; 32]),
+            relay_addr: Some(
+                format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
+                    .parse()
+                    .unwrap(),
+            ),
+            trackers: vec!["http://127.0.0.1:1".to_string()],
+            tracker_token: None,
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            request_retry_policy: RequestRetryPolicy::default(),
+        };
+
+        let got = discover_targets(&store, &cfg).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peer_key, valid_peer_id);
     }
 
     #[tokio::test(flavor = "current_thread")]

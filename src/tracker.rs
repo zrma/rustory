@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;
@@ -110,17 +111,21 @@ fn route_http_request(
 
             let reg: RegisterRequest =
                 serde_json::from_slice(&buf).context("parse register request json")?;
-            let peer_id = reg.peer_id.trim().to_string();
+            let peer_id = reg.peer_id.trim();
             if peer_id.is_empty() {
                 return Ok(respond_text(400, "peer_id required\n"));
             }
+            let peer_id: PeerId = match peer_id.parse() {
+                Ok(peer_id) => peer_id,
+                Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
+            };
 
             let now = OffsetDateTime::now_utc();
             {
                 let mut locked = state.lock().unwrap();
                 prune_expired(&mut locked, now, ttl_sec);
                 locked.peers.insert(
-                    peer_id,
+                    peer_id.to_string(),
                     PeerRecord {
                         addrs: reg
                             .addrs
@@ -389,8 +394,9 @@ mod tests {
         let client = TrackerClient::new(server.base_url.clone(), None);
 
         let user_id = "u 1/2";
+        let peer_id = PeerId::random().to_string();
         let req = RegisterRequest {
-            peer_id: "peer-a".to_string(),
+            peer_id: peer_id.clone(),
             addrs: vec!["/ip4/127.0.0.1/tcp/1234".to_string()],
             meta: Some(PeerMeta {
                 user_id: Some(user_id.to_string()),
@@ -404,7 +410,7 @@ mod tests {
 
         let list = client.list(Some(user_id)).unwrap();
         assert_eq!(list.peers.len(), 1);
-        assert_eq!(list.peers[0].peer_id, "peer-a");
+        assert_eq!(list.peers[0].peer_id, peer_id);
 
         server.shutdown();
     }
@@ -415,7 +421,7 @@ mod tests {
         let client = TrackerClient::new(server.base_url.clone(), None);
 
         let req = RegisterRequest {
-            peer_id: "peer-a".to_string(),
+            peer_id: PeerId::random().to_string(),
             addrs: vec![],
             meta: None,
         };
@@ -433,12 +439,30 @@ mod tests {
         let client = TrackerClient::new(server.base_url.clone(), Some("secret".to_string()));
 
         let req = RegisterRequest {
-            peer_id: "peer-a".to_string(),
+            peer_id: PeerId::random().to_string(),
             addrs: vec![],
             meta: None,
         };
         let resp = client.register(&req).unwrap();
         assert!(resp.ok);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn tracker_rejects_invalid_peer_id() {
+        let server = start_test_server(60, None);
+        let client = TrackerClient::new(server.base_url.clone(), None);
+
+        let req = RegisterRequest {
+            peer_id: "not-a-peer-id".to_string(),
+            addrs: vec![],
+            meta: None,
+        };
+
+        let err = client.register(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("status code 400"));
 
         server.shutdown();
     }
