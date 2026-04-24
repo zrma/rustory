@@ -33,6 +33,7 @@
 - 테스트: `cargo test`
 - 로컬 실행: `cargo run --bin rr -- --help`
 - 로컬 P2P 스모크: `scripts/smoke_p2p_local.sh`
+- 백그라운드 실행(launchd/systemd): `docs/daemon.md`
 
 ## 사용(로컬 PoC)
 ### zsh

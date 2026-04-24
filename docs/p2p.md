@@ -15,6 +15,7 @@
 - response: `PushAck { ok }`
 - 직렬화: JSON(serde_json)
 - 전송: libp2p tcp + Noise + Yamux (+ pnet/relay)
+- 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB. 초과 시 `message/request too large` 에러가 날 수 있으며, 이 경우 sync는 `limit`을 자동으로 줄여 재시도한다(단, 단일 엔트리가 너무 큰 경우는 실패할 수 있으니 필요하면 `--limit`을 조정한다).
 
 ## 사용 예시
 ### 단계 2: tracker/relay + PSK(pnet) 기반
@@ -125,3 +126,4 @@ tracker_token = "secret"
 - tracker가 일시적으로 다운되거나 결과가 비어 있으면, 최근에 본 peer 캐시를 기반으로 동기화를 시도한다.
   - 기본 보존 기간: `7d`
   - `user_id`가 설정된 경우 같은 user의 peer만 사용한다.
+- tracker 조회/등록은 일시적인 네트워크 오류(transport error) 및 5xx/429/408에 대해 최대 3회 재시도한다(connect/read timeout은 attempt마다 지수 증가).

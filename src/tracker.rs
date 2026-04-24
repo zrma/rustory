@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 use time::OffsetDateTime;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,9 +99,14 @@ fn route_http_request(
         ("GET", "/api/v1/ping") => Ok(respond_text(200, "ok\n")),
         ("POST", "/api/v1/peers/register") => {
             let mut buf = Vec::new();
+            let max = max_request_body_bytes();
             req.as_reader()
+                .take((max as u64).saturating_add(1))
                 .read_to_end(&mut buf)
                 .context("read request body")?;
+            if buf.len() > max {
+                return Ok(respond_text(413, "payload too large\n"));
+            }
 
             let reg: RegisterRequest =
                 serde_json::from_slice(&buf).context("parse register request json")?;
@@ -166,6 +171,16 @@ fn route_http_request(
         }
         _ => Ok(respond_text(404, "not found\n")),
     }
+}
+
+#[cfg(test)]
+fn max_request_body_bytes() -> usize {
+    8 * 1024
+}
+
+#[cfg(not(test))]
+fn max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn prune_expired(state: &mut TrackerState, now: OffsetDateTime, ttl_sec: u64) {
@@ -239,17 +254,18 @@ impl TrackerClient {
         let url = format!("{}/api/v1/peers/register", self.base_url);
         let body = serde_json::to_vec(req).context("serialize register request")?;
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(10))
-            .build();
-
-        let mut r = agent.post(&url).set("Content-Type", "application/json");
-        if let Some(token) = &self.token {
-            r = r.set("Authorization", &format!("Bearer {}", token.trim()));
-        }
-
-        let resp = r.send_bytes(&body).with_context(|| format!("POST {url}"))?;
+        let token = self.token.clone();
+        let resp = crate::http_retry::request_with_retry(
+            crate::http_retry::RetryPolicy::tracker(),
+            |agent| {
+                let mut r = agent.post(&url).set("Content-Type", "application/json");
+                if let Some(token) = &token {
+                    r = r.set("Authorization", &format!("Bearer {}", token.trim()));
+                }
+                r.send_bytes(&body)
+            },
+        )
+        .with_context(|| format!("POST {url}"))?;
         let text = resp.into_string().context("read response body")?;
         serde_json::from_str(&text).context("parse register response json")
     }
@@ -261,17 +277,18 @@ impl TrackerClient {
             url = format!("{url}?user_id={encoded}");
         }
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(5))
-            .timeout_read(Duration::from_secs(10))
-            .build();
-
-        let mut r = agent.get(&url);
-        if let Some(token) = &self.token {
-            r = r.set("Authorization", &format!("Bearer {}", token.trim()));
-        }
-
-        let resp = r.call().with_context(|| format!("GET {url}"))?;
+        let token = self.token.clone();
+        let resp = crate::http_retry::request_with_retry(
+            crate::http_retry::RetryPolicy::tracker(),
+            |agent| {
+                let mut r = agent.get(&url);
+                if let Some(token) = &token {
+                    r = r.set("Authorization", &format!("Bearer {}", token.trim()));
+                }
+                r.call()
+            },
+        )
+        .with_context(|| format!("GET {url}"))?;
         let text = resp.into_string().context("read response body")?;
         serde_json::from_str(&text).context("parse list response json")
     }
@@ -302,8 +319,9 @@ fn respond_json<T: Serialize>(
 mod tests {
     use super::*;
     use std::net::TcpListener;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::thread;
+    use std::time::Duration;
 
     struct TestServer {
         base_url: String,
@@ -423,5 +441,66 @@ mod tests {
         assert!(resp.ok);
 
         server.shutdown();
+    }
+
+    #[test]
+    fn tracker_client_retries_on_5xx() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let bind = format!("127.0.0.1:{}", addr.port());
+        let base_url = format!("http://{}", bind);
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = shutdown.clone();
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let list_calls2 = list_calls.clone();
+
+        let join = thread::spawn(move || {
+            let server = tiny_http::Server::http(&bind).unwrap();
+            while !shutdown2.load(Ordering::SeqCst) {
+                match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => {
+                        let path = req.url().split('?').next().unwrap_or(req.url());
+                        let res = match (req.method().as_str(), path) {
+                            ("GET", "/api/v1/ping") => respond_text(200, "ok\n"),
+                            ("GET", "/api/v1/peers") => {
+                                let n = list_calls2.fetch_add(1, Ordering::SeqCst);
+                                if n < 2 {
+                                    respond_text(500, "temporary error\n")
+                                } else {
+                                    respond_json(200, &ListResponse { peers: vec![] })
+                                        .unwrap_or_else(|e| {
+                                            respond_text(500, &format!("error: {e:#}\n"))
+                                        })
+                                }
+                            }
+                            _ => respond_text(404, "not found\n"),
+                        };
+                        let _ = req.respond(res);
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 서버가 뜰 때까지 짧게 대기(ping).
+        for _ in 0..50 {
+            let url = format!("{}/api/v1/ping", base_url);
+            if ureq::get(&url).call().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        let client = TrackerClient::new(base_url.clone(), None);
+        let list = client.list(None).unwrap();
+        assert!(list.peers.is_empty());
+        assert!(list_calls.load(Ordering::SeqCst) >= 3);
+
+        shutdown.store(true, Ordering::SeqCst);
+        let _ = join.join();
     }
 }

@@ -1,7 +1,7 @@
 use crate::{core::Entry, storage::LocalStore, sync};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
+use std::io::Read;
 
 pub fn serve(bind: &str, db_path: &str) -> Result<()> {
     let store = LocalStore::open(db_path)?;
@@ -85,8 +85,9 @@ fn serve_http(bind: &str, store: LocalStore) -> Result<()> {
 }
 
 fn sync_pull_http_peer(local: &LocalStore, peer_base_url: &str, limit: usize) -> Result<usize> {
-    sync::sync_pull_from_peer(local, peer_base_url, limit, |cursor, limit| {
-        http_pull_batch(peer_base_url, cursor, limit)
+    let peer_key = normalize_peer_base_url(peer_base_url)?;
+    sync::sync_pull_from_peer(local, &peer_key, limit, |cursor, limit| {
+        http_pull_batch(&peer_key, cursor, limit)
     })
 }
 
@@ -96,9 +97,18 @@ fn sync_push_http_peer(
     limit: usize,
     local_device_id: Option<&str>,
 ) -> Result<usize> {
-    sync::sync_push_to_peer(local, peer_base_url, limit, local_device_id, |entries| {
-        http_push_batch(peer_base_url, entries)
+    let peer_key = normalize_peer_base_url(peer_base_url)?;
+    sync::sync_push_to_peer(local, &peer_key, limit, local_device_id, |entries| {
+        http_push_batch(&peer_key, entries)
     })
+}
+
+fn normalize_peer_base_url(value: &str) -> Result<String> {
+    let v = value.trim().trim_end_matches('/');
+    if v.is_empty() {
+        anyhow::bail!("peer url is empty");
+    }
+    Ok(v.to_string())
 }
 
 fn http_pull_batch(
@@ -113,15 +123,11 @@ fn http_pull_batch(
         limit
     );
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
-    let resp = agent
-        .get(&url)
-        .call()
-        .with_context(|| format!("GET {url}"))?;
+    let resp = crate::http_retry::request_with_retry(
+        crate::http_retry::RetryPolicy::transport(),
+        |agent| agent.get(&url).call(),
+    )
+    .with_context(|| format!("GET {url}"))?;
     let body = resp.into_string().context("read response body")?;
     let parsed: EntriesResponse =
         serde_json::from_str(&body).context("parse entries response json")?;
@@ -135,17 +141,17 @@ fn http_pull_batch(
 fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>) -> Result<()> {
     let url = format!("{}/api/v1/entries", peer_base_url.trim_end_matches('/'));
 
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(5))
-        .timeout_read(Duration::from_secs(30))
-        .build();
-
     let body = serde_json::to_vec(&entries).context("serialize entries json")?;
-    let resp = agent
-        .post(&url)
-        .set("Content-Type", "application/json")
-        .send_bytes(&body)
-        .with_context(|| format!("POST {url}"))?;
+    let resp = crate::http_retry::request_with_retry(
+        crate::http_retry::RetryPolicy::transport(),
+        |agent| {
+            agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .send_bytes(&body)
+        },
+    )
+    .with_context(|| format!("POST {url}"))?;
     let _ = resp.into_string().context("read response body")?;
     Ok(())
 }
@@ -177,9 +183,14 @@ fn route_http_request(
         }
         ("POST", "/api/v1/entries") => {
             let mut buf = Vec::new();
+            let max = max_request_body_bytes();
             req.as_reader()
+                .take((max as u64).saturating_add(1))
                 .read_to_end(&mut buf)
                 .context("read request body")?;
+            if buf.len() > max {
+                return Ok(respond_text(413, "payload too large\n"));
+            }
 
             let req_body: EntriesRequest =
                 serde_json::from_slice(&buf).context("parse entries request json")?;
@@ -193,6 +204,16 @@ fn route_http_request(
         }
         _ => Ok(respond_text(404, "not found\n")),
     }
+}
+
+#[cfg(test)]
+fn max_request_body_bytes() -> usize {
+    8 * 1024
+}
+
+#[cfg(not(test))]
+fn max_request_body_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, usize)> {
@@ -350,6 +371,31 @@ mod tests {
         let got = remote.list_recent(10).unwrap();
         assert_eq!(got.len(), 3);
         assert!(got.iter().any(|e| e.entry_id == "id-3"));
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_sync_normalizes_peer_url_key() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let local_db = dir.path().join("local.db");
+
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+        let mut r1 = entry("id-1", 1, "echo 1");
+        r1.device_id = "dev-remote".to_string();
+        remote.insert_entries(&[r1]).unwrap();
+
+        let server = start_test_server(remote_db.to_str().unwrap().to_string());
+
+        let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
+        let peer_with_slash = format!("{}/", server.base_url);
+        let pulled = sync_pull_http_peer(&local, &peer_with_slash, 100).unwrap();
+        assert_eq!(pulled, 1);
+
+        // cursor는 normalize된 key(끝의 / 제거)로 저장된다.
+        assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 1);
+        assert_eq!(local.get_last_cursor(&peer_with_slash).unwrap(), 0);
 
         server.shutdown();
     }
