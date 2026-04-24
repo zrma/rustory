@@ -35,6 +35,17 @@
 - 로컬 P2P 스모크: `scripts/smoke_p2p_local.sh`
 - 백그라운드 실행(launchd/systemd): `docs/daemon.md`
 
+## 신규 디바이스 온보딩(권장)
+```sh
+rr init --user-id "<user>" --device-id "<device>"
+rr doctor
+```
+
+- `rr init`는 `~/.config/rustory/config.toml` 템플릿과 key 파일들을 준비하고(fingerprint/PeerId 출력), 다음 단계를 안내한다.
+- **중요:** `swarm.key`는 같은 swarm(같은 사용자/클러스터) 내의 디바이스들이 **동일한 파일을 공유**해야 한다.
+  - 신규 디바이스를 기존 swarm에 붙이는 경우, 기존 디바이스의 `~/.config/rustory/swarm.key`를 복사한다.
+  - `identity.key`는 디바이스별로 고유해야 한다(공유하지 않음).
+
 ## 사용(로컬 PoC)
 ### zsh
 ```sh

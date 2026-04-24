@@ -74,6 +74,23 @@ pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedK
     }
 }
 
+pub fn load_swarm_key(path: &str) -> Result<Option<libp2p::pnet::PreSharedKey>> {
+    use libp2p::pnet::PreSharedKey;
+
+    let path = expand_home_path(path)?;
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            if s.trim().is_empty() {
+                anyhow::bail!("swarm key file is empty: {}", path.display());
+            }
+            let key: PreSharedKey = s.parse().context("parse swarm key")?;
+            Ok(Some(key))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("read swarm key: {}", path.display())),
+    }
+}
+
 pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity::Keypair> {
     let path = expand_home_path(path)?;
     match std::fs::read(&path) {
@@ -96,6 +113,23 @@ pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity:
             restrict_permissions(&path)?;
             Ok(keypair)
         }
+        Err(err) => Err(err).with_context(|| format!("read identity keypair: {}", path.display())),
+    }
+}
+
+pub fn load_identity_keypair(path: &str) -> Result<Option<libp2p::identity::Keypair>> {
+    let path = expand_home_path(path)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                anyhow::bail!("identity keypair file is empty: {}", path.display());
+            }
+
+            let keypair = libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
+                .context("parse identity keypair")?;
+            Ok(Some(keypair))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(err) => Err(err).with_context(|| format!("read identity keypair: {}", path.display())),
     }
 }
