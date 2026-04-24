@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-02-19
+- Last Verified: 2026-04-24
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
