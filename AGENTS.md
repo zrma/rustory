@@ -34,6 +34,12 @@
   - 예: `perf: p2p batch size tuning`
 - 커밋(=change) 메시지는 `jj describe -m "<message>"`로 작성/수정한다.
 
+## Security: secrets/PII
+- 커밋 메시지/코드/문서에 시크릿(토큰/키/패스워드/쿠키)과 개인정보(이메일/전화번호 등)를 넣지 않는다.
+- 로컬 사전 점검(권장): `scripts/secret_scan.sh`
+- CI는 PR/push에서 TruffleHog로 secret scan을 수행한다(실제 유출 감지 시 실패).
+- 만약 유출이 의심되면 “이미 노출된 것으로 간주”하고 즉시 revoke/rotate 후, 필요하면 히스토리 정리까지 진행한다.
+
 ## Execution: 기본 진행 루프(검토 -> 다음 진도)
 - 사용자가 `진행해줘`, `추천대로 진행`, `순서대로 진행`, `검토 후 진행` 류의 요청을 하면, 아래 루프를 **묻지 않고** 반복한다.
   1) (필요 시) `docs/todo-*`에 `spec.md`/`open-questions.md` 작성/갱신
@@ -41,6 +47,7 @@
   3) TDD로 구현 + 최소 1개 수용 테스트(재시작/스모크/e2e) 추가 또는 갱신
   4) 구현 후 자체 검토: 스펙 부합, 버그/논리 오류, 보안 문제, 리팩터링 포인트 점검
   5) 검증: `cargo fmt`, `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings`
+     - 보안(권장): `scripts/secret_scan.sh`
   6) (해당 시) 스모크: `scripts/smoke_p2p_local.sh`
   7) `jj describe -m`로 메시지 작성 후 `main` 이동 + `jj git push`
   8) 다음 추천 작업으로 자동 진도(결정이 필요한 경우에만 질문)
