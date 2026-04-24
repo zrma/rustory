@@ -3,15 +3,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
-const DEFAULT_DB_PATH: &str = "~/.rustory/history.db";
-
-pub fn serve(bind: &str) -> Result<()> {
-    let store = LocalStore::open(DEFAULT_DB_PATH)?;
+pub fn serve(bind: &str, db_path: &str) -> Result<()> {
+    let store = LocalStore::open(db_path)?;
     serve_http(bind, store)
 }
 
-pub fn sync(peers: &[String]) -> Result<()> {
-    let store = LocalStore::open(DEFAULT_DB_PATH)?;
+pub fn sync(peers: &[String], db_path: &str) -> Result<()> {
+    let store = LocalStore::open(db_path)?;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
         let _pulled = sync_pull_http_peer(&store, peer, 1000)
