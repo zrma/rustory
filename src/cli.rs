@@ -28,6 +28,9 @@ enum Command {
         listen: String,
 
         #[arg(long)]
+        identity_key: Option<String>,
+
+        #[arg(long)]
         swarm_key: Option<String>,
 
         #[arg(long)]
@@ -109,6 +112,9 @@ enum Command {
         listen: String,
 
         #[arg(long)]
+        identity_key: Option<String>,
+
+        #[arg(long)]
         swarm_key: Option<String>,
     },
 }
@@ -131,12 +137,14 @@ pub fn run() -> Result<()> {
         }
         Command::P2pServe {
             listen,
+            identity_key,
             swarm_key,
             relay,
             trackers,
             tracker_token,
         } => {
             let psk = resolve_swarm_psk(swarm_key, &cfg)?;
+            let identity = resolve_p2p_identity(identity_key, &cfg)?;
             let relay_addr = resolve_relay_addr(relay, &cfg)?;
             let trackers = resolve_trackers(trackers, &cfg)?;
             let tracker_token = resolve_tracker_token(tracker_token, &cfg)?;
@@ -146,6 +154,7 @@ pub fn run() -> Result<()> {
                 &listen,
                 &db_path,
                 p2p::ServeConfig {
+                    identity,
                     psk,
                     relay_addr,
                     trackers,
@@ -263,9 +272,14 @@ pub fn run() -> Result<()> {
         } => {
             tracker::serve(&bind, ttl_sec, token)?;
         }
-        Command::RelayServe { listen, swarm_key } => {
+        Command::RelayServe {
+            listen,
+            identity_key,
+            swarm_key,
+        } => {
             let psk = resolve_swarm_psk(swarm_key, &cfg)?;
-            p2p::relay_serve(&listen, p2p::RelayServeConfig { psk })?;
+            let identity = resolve_relay_identity(identity_key, &cfg)?;
+            p2p::relay_serve(&listen, p2p::RelayServeConfig { identity, psk })?;
         }
     }
 
@@ -329,6 +343,28 @@ fn resolve_swarm_psk(
         .or_else(|| normalize_opt_string(cfg.swarm_key_path.clone()))
         .unwrap_or_else(|| config::DEFAULT_SWARM_KEY_PATH.to_string());
     config::load_or_generate_swarm_key(&path)
+}
+
+fn resolve_p2p_identity(
+    cli_path: Option<String>,
+    cfg: &config::FileConfig,
+) -> Result<libp2p::identity::Keypair> {
+    let path = normalize_opt_string(cli_path)
+        .or_else(|| env_nonempty("RUSTORY_P2P_IDENTITY_KEY_PATH"))
+        .or_else(|| normalize_opt_string(cfg.p2p_identity_key_path.clone()))
+        .unwrap_or_else(|| config::DEFAULT_P2P_IDENTITY_KEY_PATH.to_string());
+    config::load_or_generate_identity_keypair(&path)
+}
+
+fn resolve_relay_identity(
+    cli_path: Option<String>,
+    cfg: &config::FileConfig,
+) -> Result<libp2p::identity::Keypair> {
+    let path = normalize_opt_string(cli_path)
+        .or_else(|| env_nonempty("RUSTORY_RELAY_IDENTITY_KEY_PATH"))
+        .or_else(|| normalize_opt_string(cfg.relay_identity_key_path.clone()))
+        .unwrap_or_else(|| config::DEFAULT_RELAY_IDENTITY_KEY_PATH.to_string());
+    config::load_or_generate_identity_keypair(&path)
 }
 
 fn resolve_relay_addr(

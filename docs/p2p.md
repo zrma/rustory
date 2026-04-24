@@ -52,6 +52,9 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
 이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
 
+`rr p2p-serve`는 listen 주소뿐 아니라 libp2p가 발견한 **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)도 tracker에 같이 등록한다.
+따라서 같은 LAN/같은 네트워크 등에서 direct-first 성공 확률이 올라간다.
+
 ## Hole Punching(DCUtR)
 - relay 경유로 연결이 수립되면(libp2p `/p2p-circuit`), **가능하면 direct 연결로 업그레이드**(hole punching)한다.
 - 업그레이드 성공/실패는 로그로 확인할 수 있다.
@@ -79,6 +82,14 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 - 서로 다른 머신에서 통신하려면 **같은 키 파일을 공유**해야 한다.
 - 오버라이드는 `--swarm-key <path>` 또는 `RUSTORY_SWARM_KEY_PATH`로 한다.
 
+## Identity Keypair(PeerId)
+- `rr p2p-serve`는 libp2p identity keypair를 디스크에 영속화하여 **재시작해도 PeerId가 유지**되게 한다.
+  - 기본 경로: `~/.config/rustory/identity.key`
+  - 오버라이드: `--identity-key <path>`, `RUSTORY_P2P_IDENTITY_KEY_PATH`, `config.toml`의 `p2p_identity_key_path`
+- `rr relay-serve`도 relay 전용 identity keypair를 별도로 영속화한다.
+  - 기본 경로: `~/.config/rustory/relay.key`
+  - 오버라이드: `--identity-key <path>`, `RUSTORY_RELAY_IDENTITY_KEY_PATH`, `config.toml`의 `relay_identity_key_path`
+
 ## 커서 저장
 - 동기화 커서는 `peer_state.last_cursor`에 저장한다.
 - key(`peer_state.peer_id`)는 **상대 피어의 `PeerId` 문자열**을 사용한다.
@@ -94,6 +105,8 @@ device_id = "macbook"
 trackers = ["http://127.0.0.1:8850"]
 relay_addr = "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>"
 swarm_key_path = "~/.config/rustory/swarm.key"
+p2p_identity_key_path = "~/.config/rustory/identity.key"
+relay_identity_key_path = "~/.config/rustory/relay.key"
 tracker_token = "secret"
 ```
 

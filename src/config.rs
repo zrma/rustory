@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_PATH: &str = "~/.config/rustory/config.toml";
 pub const DEFAULT_SWARM_KEY_PATH: &str = "~/.config/rustory/swarm.key";
+pub const DEFAULT_P2P_IDENTITY_KEY_PATH: &str = "~/.config/rustory/identity.key";
+pub const DEFAULT_RELAY_IDENTITY_KEY_PATH: &str = "~/.config/rustory/relay.key";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -17,6 +19,9 @@ pub struct FileConfig {
 
     pub relay_addr: Option<String>,
     pub swarm_key_path: Option<String>,
+
+    pub p2p_identity_key_path: Option<String>,
+    pub relay_identity_key_path: Option<String>,
 
     pub search_limit_default: Option<usize>,
 }
@@ -64,6 +69,32 @@ pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedK
             Ok(key)
         }
         Err(err) => Err(err).with_context(|| format!("read swarm key: {}", path.display())),
+    }
+}
+
+pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity::Keypair> {
+    let path = expand_home(path)?;
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            if bytes.is_empty() {
+                anyhow::bail!("identity keypair file is empty: {}", path.display());
+            }
+
+            libp2p::identity::Keypair::from_protobuf_encoding(&bytes)
+                .context("parse identity keypair")
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            ensure_parent_dir(&path)?;
+            let keypair = libp2p::identity::Keypair::generate_ed25519();
+            let bytes = keypair
+                .to_protobuf_encoding()
+                .context("encode identity keypair")?;
+            std::fs::write(&path, bytes)
+                .with_context(|| format!("write identity keypair: {}", path.display()))?;
+            restrict_permissions(&path)?;
+            Ok(keypair)
+        }
+        Err(err) => Err(err).with_context(|| format!("read identity keypair: {}", path.display())),
     }
 }
 
@@ -139,5 +170,16 @@ trackers = ["http://127.0.0.1:8850"]
         let k1 = load_or_generate_swarm_key(path.to_str().unwrap()).unwrap();
         let k2 = load_or_generate_swarm_key(path.to_str().unwrap()).unwrap();
         assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn load_or_generate_identity_keypair_creates_and_is_stable() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("identity.key");
+
+        let k1 = load_or_generate_identity_keypair(path.to_str().unwrap()).unwrap();
+        let k2 = load_or_generate_identity_keypair(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(k1.public().to_peer_id(), k2.public().to_peer_id());
     }
 }
