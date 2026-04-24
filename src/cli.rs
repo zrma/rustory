@@ -197,7 +197,10 @@ enum Command {
         #[arg(long)]
         tracker_token: Option<String>,
     },
-    Doctor {},
+    Doctor {
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
     Import {
         #[arg(long, default_value = "zsh")]
         shell: String,
@@ -604,8 +607,8 @@ pub fn run() -> Result<()> {
                 &db_path,
             )?;
         }
-        Command::Doctor {} => {
-            run_doctor(&cfg, &db_path)?;
+        Command::Doctor { json } => {
+            run_doctor(&cfg, &db_path, json)?;
         }
         Command::Import {
             shell,
@@ -849,7 +852,434 @@ fn restrict_permissions_0600(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AsyncUploadRuntimeSettings {
+    enabled: bool,
+    interval_sec: u64,
+    limit: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AutoPruneRuntimeSettings {
+    enabled: bool,
+    older_than_days: u64,
+    interval_sec: u64,
+    keep_recent: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct AsyncUploadDoctorReport {
+    enabled: bool,
+    interval_sec: u64,
+    limit: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct AutoPruneDoctorReport {
+    enabled: bool,
+    older_than_days: u64,
+    interval_sec: u64,
+    keep_recent: usize,
+    marker_path: std::path::PathBuf,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: u64,
+}
+
+fn load_async_upload_runtime_settings() -> Result<AsyncUploadRuntimeSettings> {
+    let marker_path_raw = resolve_async_upload_marker_path();
+    let marker_path = config::expand_home_path(&marker_path_raw)
+        .with_context(|| format!("expand async upload marker path: {marker_path_raw}"))?;
+
+    Ok(AsyncUploadRuntimeSettings {
+        enabled: resolve_async_upload_enabled()?,
+        interval_sec: resolve_async_upload_interval_sec()?,
+        limit: resolve_async_upload_limit()?,
+        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
+        marker_path,
+    })
+}
+
+fn summarize_async_upload_runtime(
+    settings: AsyncUploadRuntimeSettings,
+    now_unix: i64,
+) -> AsyncUploadDoctorReport {
+    AsyncUploadDoctorReport {
+        enabled: settings.enabled,
+        interval_sec: settings.interval_sec,
+        limit: settings.limit,
+        marker_path: settings.marker_path,
+        last_trigger_unix: settings.last_trigger_unix,
+        next_due_in_sec: compute_next_due_in_sec(
+            now_unix,
+            settings.last_trigger_unix,
+            settings.interval_sec,
+        ),
+    }
+}
+
+fn load_auto_prune_runtime_settings() -> Result<AutoPruneRuntimeSettings> {
+    let marker_path_raw = resolve_auto_prune_marker_path();
+    let marker_path = config::expand_home_path(&marker_path_raw)
+        .with_context(|| format!("expand auto prune marker path: {marker_path_raw}"))?;
+
+    Ok(AutoPruneRuntimeSettings {
+        enabled: resolve_auto_prune_enabled()?,
+        older_than_days: resolve_auto_prune_days()?,
+        interval_sec: resolve_auto_prune_interval_sec()?,
+        keep_recent: resolve_auto_prune_keep_recent()?,
+        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
+        marker_path,
+    })
+}
+
+fn summarize_auto_prune_runtime(
+    settings: AutoPruneRuntimeSettings,
+    now_unix: i64,
+) -> AutoPruneDoctorReport {
+    AutoPruneDoctorReport {
+        enabled: settings.enabled,
+        older_than_days: settings.older_than_days,
+        interval_sec: settings.interval_sec,
+        keep_recent: settings.keep_recent,
+        marker_path: settings.marker_path,
+        last_trigger_unix: settings.last_trigger_unix,
+        next_due_in_sec: compute_next_due_in_sec(
+            now_unix,
+            settings.last_trigger_unix,
+            settings.interval_sec,
+        ),
+    }
+}
+
+fn compute_next_due_in_sec(
+    now_unix: i64,
+    last_trigger_unix: Option<i64>,
+    interval_sec: u64,
+) -> u64 {
+    let Some(last) = last_trigger_unix else {
+        return 0;
+    };
+
+    let interval_i64 = i64::try_from(interval_sec).unwrap_or(i64::MAX);
+    let elapsed_i64 = now_unix.saturating_sub(last).max(0);
+    let remaining_i64 = interval_i64.saturating_sub(elapsed_i64).max(0);
+    u64::try_from(remaining_i64).unwrap_or(0)
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorReport {
+    config_path: String,
+    config_exists: bool,
+    db_path: String,
+    user_id: String,
+    device_id: String,
+    p2p_request_retry: DoctorP2pRequestRetryReport,
+    record_ignore_regex: DoctorRecordIgnoreRegexReport,
+    async_upload: DoctorAsyncUploadStatusReport,
+    auto_prune: DoctorAutoPruneStatusReport,
+    swarm_key: DoctorKeyStatusReport,
+    p2p_identity_key: DoctorKeyStatusReport,
+    relay_identity_key: DoctorKeyStatusReport,
+    relay_addr: DoctorRelayAddrReport,
+    trackers: Vec<SyncStatusTrackerReport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorP2pRequestRetryReport {
+    attempts: Option<usize>,
+    timeout_base_sec: Option<u64>,
+    timeout_cap_sec: Option<u64>,
+    backoff_base_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorRecordIgnoreRegexReport {
+    pattern: Option<String>,
+    valid: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorAsyncUploadStatusReport {
+    enabled: Option<bool>,
+    interval_sec: Option<u64>,
+    limit: Option<usize>,
+    marker_path: Option<String>,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorAutoPruneStatusReport {
+    enabled: Option<bool>,
+    older_than_days: Option<u64>,
+    interval_sec: Option<u64>,
+    keep_recent: Option<usize>,
+    marker_path: Option<String>,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorKeyStatusReport {
+    path: String,
+    exists: bool,
+    value: Option<String>,
+    load_error: Option<String>,
+    mode: Option<u32>,
+    warning: Option<String>,
+    stat_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorRelayAddrReport {
+    value: Option<String>,
+    error: Option<String>,
+}
+
+fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<DoctorReport> {
+    use std::path::Path;
+
+    let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+    let cfg_exists = match std::fs::metadata(&cfg_path) {
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => false,
+    };
+
+    let db_path_expanded = if db_path == ":memory:" {
+        Path::new(":memory:").to_path_buf()
+    } else {
+        config::expand_home_path(db_path)?
+    };
+    let user_id = resolve_user_id(cfg);
+    let device_id = resolve_device_id(cfg);
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+
+    let p2p_request_retry = match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
+        Ok(policy) => DoctorP2pRequestRetryReport {
+            attempts: Some(policy.attempts),
+            timeout_base_sec: Some(policy.timeout_base.as_secs()),
+            timeout_cap_sec: Some(policy.timeout_cap.as_secs()),
+            backoff_base_ms: Some(
+                u64::try_from(policy.backoff_base.as_millis()).unwrap_or(u64::MAX),
+            ),
+            error: None,
+        },
+        Err(err) => DoctorP2pRequestRetryReport {
+            attempts: None,
+            timeout_base_sec: None,
+            timeout_cap_sec: None,
+            backoff_base_ms: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let record_ignore_regex = match resolve_record_ignore_regex(cfg) {
+        Some(pattern) => match regex::Regex::new(&pattern) {
+            Ok(_) => DoctorRecordIgnoreRegexReport {
+                pattern: Some(pattern),
+                valid: true,
+                error: None,
+            },
+            Err(err) => DoctorRecordIgnoreRegexReport {
+                pattern: Some(pattern),
+                valid: false,
+                error: Some(err.to_string()),
+            },
+        },
+        None => DoctorRecordIgnoreRegexReport {
+            pattern: None,
+            valid: true,
+            error: None,
+        },
+    };
+
+    let async_upload = match load_async_upload_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_async_upload_runtime(settings, now_unix);
+            DoctorAsyncUploadStatusReport {
+                enabled: Some(report.enabled),
+                interval_sec: Some(report.interval_sec),
+                limit: Some(report.limit),
+                marker_path: Some(report.marker_path.display().to_string()),
+                last_trigger_unix: report.last_trigger_unix,
+                next_due_in_sec: Some(report.next_due_in_sec),
+                error: None,
+            }
+        }
+        Err(err) => DoctorAsyncUploadStatusReport {
+            enabled: None,
+            interval_sec: None,
+            limit: None,
+            marker_path: None,
+            last_trigger_unix: None,
+            next_due_in_sec: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let auto_prune = match load_auto_prune_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_auto_prune_runtime(settings, now_unix);
+            DoctorAutoPruneStatusReport {
+                enabled: Some(report.enabled),
+                older_than_days: Some(report.older_than_days),
+                interval_sec: Some(report.interval_sec),
+                keep_recent: Some(report.keep_recent),
+                marker_path: Some(report.marker_path.display().to_string()),
+                last_trigger_unix: report.last_trigger_unix,
+                next_due_in_sec: Some(report.next_due_in_sec),
+                error: None,
+            }
+        }
+        Err(err) => DoctorAutoPruneStatusReport {
+            enabled: None,
+            older_than_days: None,
+            interval_sec: None,
+            keep_recent: None,
+            marker_path: None,
+            last_trigger_unix: None,
+            next_due_in_sec: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let swarm_key_path = resolve_swarm_key_path(None, cfg);
+    let (swarm_value, swarm_load_error) = match config::load_swarm_key(&swarm_key_path) {
+        Ok(value) => (
+            value.map(|key| key.fingerprint().to_string()),
+            None::<String>,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    let swarm_key = build_key_status_report(&swarm_key_path, swarm_value, swarm_load_error)?;
+
+    let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
+    let (p2p_identity_value, p2p_identity_load_error) =
+        match config::load_identity_keypair(&p2p_identity_key_path) {
+            Ok(value) => (
+                value.map(|key| key.public().to_peer_id().to_string()),
+                None::<String>,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
+    let p2p_identity_key = build_key_status_report(
+        &p2p_identity_key_path,
+        p2p_identity_value,
+        p2p_identity_load_error,
+    )?;
+
+    let relay_identity_key_path = resolve_relay_identity_key_path(None, cfg);
+    let (relay_identity_value, relay_identity_load_error) =
+        match config::load_identity_keypair(&relay_identity_key_path) {
+            Ok(value) => (
+                value.map(|key| key.public().to_peer_id().to_string()),
+                None::<String>,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
+    let relay_identity_key = build_key_status_report(
+        &relay_identity_key_path,
+        relay_identity_value,
+        relay_identity_load_error,
+    )?;
+
+    let relay_addr = match resolve_relay_addr(None, cfg) {
+        Ok(Some(addr)) => DoctorRelayAddrReport {
+            value: Some(addr.to_string()),
+            error: None,
+        },
+        Ok(None) => DoctorRelayAddrReport {
+            value: None,
+            error: None,
+        },
+        Err(err) => DoctorRelayAddrReport {
+            value: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
+    let trackers = resolve_trackers(Vec::new(), cfg)?;
+    let tracker_token = resolve_tracker_token(None, cfg)?;
+    let trackers = build_tracker_status_report(&trackers, tracker_token.as_deref());
+
+    Ok(DoctorReport {
+        config_path: cfg_path.display().to_string(),
+        config_exists: cfg_exists,
+        db_path: db_path_expanded.display().to_string(),
+        user_id,
+        device_id,
+        p2p_request_retry,
+        record_ignore_regex,
+        async_upload,
+        auto_prune,
+        swarm_key,
+        p2p_identity_key,
+        relay_identity_key,
+        relay_addr,
+        trackers,
+    })
+}
+
+fn build_key_status_report(
+    path: &str,
+    value: Option<String>,
+    load_error: Option<String>,
+) -> Result<DoctorKeyStatusReport> {
+    let expanded = config::expand_home_path(path)?;
+    let path_str = expanded.display().to_string();
+
+    let (exists, stat_error) = match std::fs::metadata(&expanded) {
+        Ok(_) => (true, None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (false, None),
+        Err(err) => (false, Some(err.to_string())),
+    };
+
+    let mode = if exists {
+        file_mode_777(&expanded)
+    } else {
+        None
+    };
+    let warning = mode.and_then(|resolved| {
+        if resolved != 0o600 {
+            Some(format!("mode={resolved:03o}, want 600"))
+        } else {
+            None
+        }
+    });
+
+    Ok(DoctorKeyStatusReport {
+        path: path_str,
+        exists,
+        value,
+        load_error,
+        mode,
+        warning,
+        stat_error,
+    })
+}
+
+fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()> {
+    if json {
+        let report = build_doctor_report(cfg, db_path)?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize doctor json")?
+        );
+        return Ok(());
+    }
+
     use std::path::Path;
 
     let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
@@ -899,27 +1329,92 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
         },
         None => println!("record ignore regex: (none)"),
     }
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    match load_async_upload_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_async_upload_runtime(settings, now_unix);
+            let last_trigger = report
+                .last_trigger_unix
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "async upload: enabled={} interval_sec={} limit={} marker_path={} last_trigger_unix={} next_due_in_sec={}",
+                report.enabled,
+                report.interval_sec,
+                report.limit,
+                report.marker_path.display(),
+                last_trigger,
+                report.next_due_in_sec,
+            );
+        }
+        Err(err) => println!("async upload: invalid: {err:#}"),
+    }
+    match load_auto_prune_runtime_settings() {
+        Ok(settings) => {
+            let report = summarize_auto_prune_runtime(settings, now_unix);
+            let last_trigger = report
+                .last_trigger_unix
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "auto prune: enabled={} older_than_days={} interval_sec={} keep_recent={} marker_path={} last_trigger_unix={} next_due_in_sec={}",
+                report.enabled,
+                report.older_than_days,
+                report.interval_sec,
+                report.keep_recent,
+                report.marker_path.display(),
+                last_trigger,
+                report.next_due_in_sec,
+            );
+        }
+        Err(err) => println!("auto prune: invalid: {err:#}"),
+    }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
-    let swarm_fp = config::load_swarm_key(&swarm_key_path)?.map(|k| k.fingerprint().to_string());
-    print_key_status("swarm key", &swarm_key_path, swarm_fp.as_deref())?;
+    let (swarm_fp, swarm_load_error) = match config::load_swarm_key(&swarm_key_path) {
+        Ok(value) => (
+            value.map(|key| key.fingerprint().to_string()),
+            None::<String>,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
+    print_key_status(
+        "swarm key",
+        &swarm_key_path,
+        swarm_fp.as_deref(),
+        swarm_load_error.as_deref(),
+    )?;
 
     let p2p_identity_key_path = resolve_p2p_identity_key_path(None, cfg);
-    let p2p_peer_id = config::load_identity_keypair(&p2p_identity_key_path)?
-        .map(|kp| kp.public().to_peer_id().to_string());
+    let (p2p_peer_id, p2p_load_error) = match config::load_identity_keypair(&p2p_identity_key_path)
+    {
+        Ok(value) => (
+            value.map(|key| key.public().to_peer_id().to_string()),
+            None::<String>,
+        ),
+        Err(err) => (None, Some(format!("{err:#}"))),
+    };
     print_key_status(
         "p2p identity key",
         &p2p_identity_key_path,
         p2p_peer_id.as_deref(),
+        p2p_load_error.as_deref(),
     )?;
 
     let relay_identity_key_path = resolve_relay_identity_key_path(None, cfg);
-    let relay_peer_id = config::load_identity_keypair(&relay_identity_key_path)?
-        .map(|kp| kp.public().to_peer_id().to_string());
+    let (relay_peer_id, relay_load_error) =
+        match config::load_identity_keypair(&relay_identity_key_path) {
+            Ok(value) => (
+                value.map(|key| key.public().to_peer_id().to_string()),
+                None::<String>,
+            ),
+            Err(err) => (None, Some(format!("{err:#}"))),
+        };
     print_key_status(
         "relay identity key",
         &relay_identity_key_path,
         relay_peer_id.as_deref(),
+        relay_load_error.as_deref(),
     )?;
 
     match resolve_relay_addr(None, cfg) {
@@ -947,7 +1442,12 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn print_key_status(label: &str, path: &str, extra: Option<&str>) -> Result<()> {
+fn print_key_status(
+    label: &str,
+    path: &str,
+    value: Option<&str>,
+    load_error: Option<&str>,
+) -> Result<()> {
     let expanded = config::expand_home_path(path)?;
     let exists = match std::fs::metadata(&expanded) {
         Ok(_) => true,
@@ -963,18 +1463,29 @@ fn print_key_status(label: &str, path: &str, extra: Option<&str>) -> Result<()> 
         return Ok(());
     }
 
-    let mut suffix = String::new();
-    if let Some(extra) = extra {
-        suffix.push_str(&format!(" {extra}"));
+    let mut details = Vec::new();
+    if let Some(value) = value {
+        details.push(value.to_string());
+    }
+    if let Some(load_error) = load_error {
+        details.push(format!("invalid: {load_error}"));
     }
 
     if let Some(mode) = file_mode_777(&expanded)
         && mode != 0o600
     {
-        suffix.push_str(&format!(" (warn: mode={mode:03o}, want 600)"));
+        details.push(format!("warn: mode={mode:03o}, want 600"));
     }
 
-    println!("{label}: {} (exists){suffix}", expanded.display());
+    if details.is_empty() {
+        println!("{label}: {} (exists)", expanded.display());
+    } else {
+        println!(
+            "{label}: {} (exists) {}",
+            expanded.display(),
+            details.join(" | ")
+        );
+    }
     Ok(())
 }
 
@@ -1725,9 +2236,74 @@ mod tests {
     fn doctor_parses() {
         let app = App::parse_from(["rr", "doctor"]);
         match app.cmd {
-            Command::Doctor {} => {}
+            Command::Doctor { json } => {
+                assert!(!json);
+            }
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn doctor_parses_json_flag() {
+        let app = App::parse_from(["rr", "doctor", "--json"]);
+        match app.cmd {
+            Command::Doctor { json } => {
+                assert!(json);
+            }
+            _ => panic!("expected doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_report_builds_json_shape() {
+        let report = build_doctor_report(&config::FileConfig::default(), ":memory:").unwrap();
+        assert_eq!(report.db_path, ":memory:");
+        assert!(report.trackers.is_empty());
+        assert!(report.p2p_request_retry.error.is_none());
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"async_upload\""));
+        assert!(json.contains("\"auto_prune\""));
+        assert!(json.contains("\"relay_addr\""));
+    }
+
+    #[test]
+    fn doctor_report_keeps_running_when_swarm_key_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_swarm_key = dir.path().join("swarm-invalid.key");
+        std::fs::write(&invalid_swarm_key, "invalid-swarm-key").unwrap();
+
+        let cfg = config::FileConfig {
+            swarm_key_path: Some(invalid_swarm_key.display().to_string()),
+            ..Default::default()
+        };
+
+        let report = build_doctor_report(&cfg, ":memory:").unwrap();
+        assert!(report.swarm_key.exists);
+        assert!(report.swarm_key.value.is_none());
+        assert!(report.swarm_key.load_error.is_some());
+        assert!(
+            report
+                .swarm_key
+                .load_error
+                .as_deref()
+                .unwrap()
+                .contains("parse swarm key")
+        );
+    }
+
+    #[test]
+    fn doctor_text_output_keeps_running_when_swarm_key_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let invalid_swarm_key = dir.path().join("swarm-invalid.key");
+        std::fs::write(&invalid_swarm_key, "invalid-swarm-key").unwrap();
+
+        let cfg = config::FileConfig {
+            swarm_key_path: Some(invalid_swarm_key.display().to_string()),
+            ..Default::default()
+        };
+
+        assert!(run_doctor(&cfg, ":memory:", false).is_ok());
     }
 
     #[test]
@@ -1925,6 +2501,56 @@ mod tests {
         assert!(should_trigger_interval(100, Some(80), 15));
         assert!(!should_trigger_interval(100, Some(90), 15));
         assert!(!should_trigger_interval(100, Some(110), 15));
+    }
+
+    #[test]
+    fn compute_next_due_in_sec_handles_missing_and_elapsed_markers() {
+        assert_eq!(compute_next_due_in_sec(100, None, 15), 0);
+        assert_eq!(compute_next_due_in_sec(100, Some(80), 15), 0);
+        assert_eq!(compute_next_due_in_sec(100, Some(90), 15), 5);
+        assert_eq!(compute_next_due_in_sec(100, Some(110), 15), 15);
+    }
+
+    #[test]
+    fn summarize_async_upload_runtime_reports_marker_and_next_due() {
+        let report = summarize_async_upload_runtime(
+            AsyncUploadRuntimeSettings {
+                enabled: true,
+                interval_sec: 15,
+                limit: 200,
+                marker_path: std::path::PathBuf::from("/tmp/async-upload.last"),
+                last_trigger_unix: Some(95),
+            },
+            100,
+        );
+
+        assert!(report.enabled);
+        assert_eq!(report.interval_sec, 15);
+        assert_eq!(report.limit, 200);
+        assert_eq!(report.last_trigger_unix, Some(95));
+        assert_eq!(report.next_due_in_sec, 10);
+    }
+
+    #[test]
+    fn summarize_auto_prune_runtime_reports_marker_and_next_due() {
+        let report = summarize_auto_prune_runtime(
+            AutoPruneRuntimeSettings {
+                enabled: true,
+                older_than_days: 180,
+                interval_sec: 86_400,
+                keep_recent: 5000,
+                marker_path: std::path::PathBuf::from("/tmp/auto-prune.last"),
+                last_trigger_unix: Some(1_000_000),
+            },
+            1_000_300,
+        );
+
+        assert!(report.enabled);
+        assert_eq!(report.older_than_days, 180);
+        assert_eq!(report.interval_sec, 86_400);
+        assert_eq!(report.keep_recent, 5000);
+        assert_eq!(report.last_trigger_unix, Some(1_000_000));
+        assert_eq!(report.next_due_in_sec, 86_100);
     }
 
     #[test]
