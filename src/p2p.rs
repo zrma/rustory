@@ -11,8 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use time::OffsetDateTime;
 
-const SYNC_PULL_PROTOCOL: &str = "/rustory/sync-pull/1.0.0";
-const ENTRIES_PUSH_PROTOCOL: &str = "/rustory/entries-push/1.0.0";
+const SYNC_PULL_PROTOCOL_PLAIN: &str = "/rustory/sync-pull/1.0.0";
+const SYNC_PULL_PROTOCOL_ZSTD: &str = "/rustory/sync-pull/1.0.1";
+const ENTRIES_PUSH_PROTOCOL_PLAIN: &str = "/rustory/entries-push/1.0.0";
+const ENTRIES_PUSH_PROTOCOL_ZSTD: &str = "/rustory/entries-push/1.0.1";
 
 // request-response는 stream EOF까지 읽기 때문에, 크기 상한을 너무 작게 잡으면 “잘린 JSON 파싱 실패”로 보이기 쉽다.
 // PoC/MVP 범위에서는 "상한을 넉넉히" + "명확한 too-large 에러"를 우선한다.
@@ -20,6 +22,13 @@ const PULL_REQ_MAX_BYTES: u64 = 64 * 1024;
 const PULL_RESP_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const PUSH_REQ_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PUSH_RESP_MAX_BYTES: u64 = 64 * 1024;
+
+// zstd 프로토콜에서는 "wire 상한"과 별개로 decode(압축 해제 후 JSON bytes) 상한을 둔다.
+const DECODED_MAX_MULTIPLIER: u64 = 4;
+const PULL_REQ_DECODED_MAX_BYTES: u64 = PULL_REQ_MAX_BYTES * DECODED_MAX_MULTIPLIER;
+const PULL_RESP_DECODED_MAX_BYTES: u64 = PULL_RESP_MAX_BYTES * DECODED_MAX_MULTIPLIER;
+const PUSH_REQ_DECODED_MAX_BYTES: u64 = PUSH_REQ_MAX_BYTES * DECODED_MAX_MULTIPLIER;
+const PUSH_RESP_DECODED_MAX_BYTES: u64 = PUSH_RESP_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 
 #[derive(Clone)]
 pub struct ServeConfig {
@@ -100,29 +109,45 @@ fn build_rustory_swarm_with_identity(
     let local_public_key = identity.public();
     let local_peer_id = local_public_key.to_peer_id();
 
-    let protocols = [(
-        StreamProtocol::new(SYNC_PULL_PROTOCOL),
-        ProtocolSupport::Full,
-    )];
+    // 양쪽이 지원하면 zstd(1.0.1)를 우선 선택한다. 구버전은 plain(1.0.0)으로 폴백.
+    let protocols = [
+        (
+            StreamProtocol::new(SYNC_PULL_PROTOCOL_ZSTD),
+            ProtocolSupport::Full,
+        ),
+        (
+            StreamProtocol::new(SYNC_PULL_PROTOCOL_PLAIN),
+            ProtocolSupport::Full,
+        ),
+    ];
 
     let rr_cfg =
         libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
     let rr_codec = crate::p2p_codec::JsonCodec::<SyncPull, SyncBatch>::new(
         PULL_REQ_MAX_BYTES,
         PULL_RESP_MAX_BYTES,
-    );
+    )
+    .with_decoded_maximum(PULL_REQ_DECODED_MAX_BYTES, PULL_RESP_DECODED_MAX_BYTES);
     let rr = libp2p_request_response::Behaviour::with_codec(rr_codec, protocols, rr_cfg);
 
-    let push_protocols = [(
-        StreamProtocol::new(ENTRIES_PUSH_PROTOCOL),
-        ProtocolSupport::Full,
-    )];
+    // 양쪽이 지원하면 zstd(1.0.1)를 우선 선택한다. 구버전은 plain(1.0.0)으로 폴백.
+    let push_protocols = [
+        (
+            StreamProtocol::new(ENTRIES_PUSH_PROTOCOL_ZSTD),
+            ProtocolSupport::Full,
+        ),
+        (
+            StreamProtocol::new(ENTRIES_PUSH_PROTOCOL_PLAIN),
+            ProtocolSupport::Full,
+        ),
+    ];
     let push_cfg =
         libp2p_request_response::Config::default().with_request_timeout(Duration::from_secs(30));
     let push_codec = crate::p2p_codec::JsonCodec::<EntriesPush, PushAck>::new(
         PUSH_REQ_MAX_BYTES,
         PUSH_RESP_MAX_BYTES,
-    );
+    )
+    .with_decoded_maximum(PUSH_REQ_DECODED_MAX_BYTES, PUSH_RESP_DECODED_MAX_BYTES);
     let push_rr =
         libp2p_request_response::Behaviour::with_codec(push_codec, push_protocols, push_cfg);
 

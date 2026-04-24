@@ -25,3 +25,11 @@
 - 스펙에는 기능뿐 아니라 "운영 성질"(재시작 지속성, 오프라인/부분 장애, 인코딩, 관측성)을 반드시 명시한다.
 - unit 테스트만으로 부족한 경우, 최소 1개의 수용 테스트(재시작/스모크/e2e)를 추가한다.
 - 반복 개발 교훈/체크리스트는 `docs/dev-playbook.md`를 따른다.
+
+## VCS: 커밋 메시지 컨벤션
+- 형식: `<type>: <summary>`
+- scope 괄호는 사용하지 않는다. 예: `feat(sync): ...` 형태 금지
+- 범위/모듈을 드러내고 싶으면 summary에 포함한다.
+  - 예: `feat: sync push cursor persistence`
+  - 예: `perf: p2p batch size tuning`
+- 커밋(=change) 메시지는 `jj describe -m "<message>"`로 작성/수정한다.
