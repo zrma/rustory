@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use rand::Rng;
 
 use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
@@ -125,6 +125,16 @@ enum Command {
     Search {
         #[arg(long)]
         limit: Option<usize>,
+    },
+    SyncStatus {
+        #[arg(long)]
+        peer: Option<String>,
+
+        #[arg(long, default_value_t = false)]
+        json: bool,
+
+        #[arg(long = "with-tracker", default_value_t = false)]
+        with_tracker: bool,
     },
     Hook {
         #[arg(long, default_value = "zsh")]
@@ -411,6 +421,94 @@ pub fn run() -> Result<()> {
             let entries = store.list_recent(limit)?;
             if let Some(cmd) = search::select_command(&entries)? {
                 println!("{cmd}");
+            }
+        }
+        Command::SyncStatus {
+            peer,
+            json,
+            with_tracker,
+        } => {
+            let peer = normalize_opt_string(peer);
+            let store = storage::LocalStore::open(&db_path)?;
+            let local_device_id = resolve_device_id(&cfg);
+            let tracker_status = if with_tracker {
+                let trackers = resolve_trackers(Vec::new(), &cfg)?;
+                let tracker_token = resolve_tracker_token(None, &cfg)?;
+                Some(build_tracker_status_report(
+                    &trackers,
+                    tracker_token.as_deref(),
+                ))
+            } else {
+                None
+            };
+            let report = build_sync_status_report(
+                &store,
+                &local_device_id,
+                peer.as_deref(),
+                tracker_status,
+            )?;
+
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).context("serialize sync-status json")?
+                );
+                return Ok(());
+            }
+
+            println!("local ingest head: {}", report.local_head);
+            println!("local device id: {}", report.local_device_id);
+
+            if report.peers.is_empty() {
+                if let Some(peer_id) = peer.as_deref() {
+                    println!("peer sync state: no state for peer '{peer_id}'");
+                } else {
+                    println!("peer sync state: (empty)");
+                }
+            } else {
+                for status in report.peers {
+                    let last_seen = status
+                        .last_seen_unix
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let last_seen_age = status
+                        .last_seen_age_sec
+                        .map(|age| age.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={} last_seen_age_sec={}",
+                        status.peer_id,
+                        status.pull_cursor,
+                        status.push_cursor,
+                        status.pending_push,
+                        last_seen,
+                        last_seen_age
+                    );
+                }
+            }
+
+            if let Some(trackers) = report.tracker_status {
+                if trackers.is_empty() {
+                    println!("tracker status: (none)");
+                } else {
+                    for tracker in trackers {
+                        let latency = tracker
+                            .latency_ms
+                            .map(|ms| ms.to_string())
+                            .unwrap_or_else(|| "-".to_string());
+                        if let Some(error) = tracker.error {
+                            println!(
+                                "tracker={} reachable={} latency_ms={} error={error}",
+                                tracker.base_url, tracker.reachable, latency
+                            );
+                        } else {
+                            println!(
+                                "tracker={} reachable={} latency_ms={}",
+                                tracker.base_url, tracker.reachable, latency
+                            );
+                        }
+                    }
+                }
             }
         }
         Command::Hook { shell } => {
@@ -790,7 +888,7 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
     for base_url in trackers {
         let ping = tracker_ping(&base_url, token.as_deref());
         match ping {
-            Ok(()) => println!("- {base_url} (ping: ok)"),
+            Ok(latency_ms) => println!("- {base_url} (ping: ok, latency_ms={latency_ms})"),
             Err(err) => println!("- {base_url} (ping: fail: {err})"),
         }
     }
@@ -843,7 +941,7 @@ fn file_mode_777(path: &std::path::Path) -> Option<u32> {
     }
 }
 
-fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<(), String> {
+fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<u64, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(1))
         .timeout_read(Duration::from_secs(1))
@@ -856,16 +954,111 @@ fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<(), 
         req = req.set("Authorization", &format!("Bearer {}", token.trim()));
     }
 
+    let started = Instant::now();
     match req.call() {
         Ok(resp) => {
             if resp.status() == 200 {
-                Ok(())
+                let elapsed_ms = started.elapsed().as_millis();
+                let latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
+                Ok(latency_ms)
             } else {
                 Err(format!("status {}", resp.status()))
             }
         }
         Err(err) => Err(err.to_string()),
     }
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct SyncStatusPeerReport {
+    peer_id: String,
+    pull_cursor: i64,
+    push_cursor: i64,
+    pending_push: usize,
+    last_seen_unix: Option<i64>,
+    last_seen_age_sec: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct SyncStatusTrackerReport {
+    base_url: String,
+    reachable: bool,
+    latency_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct SyncStatusReport {
+    local_head: i64,
+    local_device_id: String,
+    peers: Vec<SyncStatusPeerReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracker_status: Option<Vec<SyncStatusTrackerReport>>,
+}
+
+fn compute_last_seen_age_sec(now_unix: i64, last_seen_unix: Option<i64>) -> Option<i64> {
+    last_seen_unix.map(|ts| now_unix.saturating_sub(ts).max(0))
+}
+
+fn build_sync_status_report(
+    store: &storage::LocalStore,
+    local_device_id: &str,
+    peer_filter: Option<&str>,
+    tracker_status: Option<Vec<SyncStatusTrackerReport>>,
+) -> Result<SyncStatusReport> {
+    let local_head = store.latest_ingest_seq()?;
+    let peer_last_seen = store.list_peer_book_last_seen_map()?;
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut statuses = store.list_peer_sync_status()?;
+    if let Some(peer_id) = peer_filter {
+        statuses.retain(|status| status.peer_id == peer_id);
+    }
+
+    let mut peers = Vec::with_capacity(statuses.len());
+    for status in statuses {
+        let peer_id = status.peer_id;
+        let pending_push = store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
+        let last_seen_unix = peer_last_seen.get(&peer_id).copied();
+        let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
+        peers.push(SyncStatusPeerReport {
+            peer_id,
+            pull_cursor: status.last_cursor,
+            push_cursor: status.last_pushed_seq,
+            pending_push,
+            last_seen_unix,
+            last_seen_age_sec,
+        });
+    }
+
+    Ok(SyncStatusReport {
+        local_head,
+        local_device_id: local_device_id.to_string(),
+        peers,
+        tracker_status,
+    })
+}
+
+fn build_tracker_status_report(
+    trackers: &[String],
+    tracker_token: Option<&str>,
+) -> Vec<SyncStatusTrackerReport> {
+    trackers
+        .iter()
+        .map(|base_url| match tracker_ping(base_url, tracker_token) {
+            Ok(latency_ms) => SyncStatusTrackerReport {
+                base_url: base_url.clone(),
+                reachable: true,
+                latency_ms: Some(latency_ms),
+                error: None,
+            },
+            Err(err) => SyncStatusTrackerReport {
+                base_url: base_url.clone(),
+                reachable: false,
+                latency_ms: None,
+                error: Some(err),
+            },
+        })
+        .collect()
 }
 
 fn default_cwd() -> String {
@@ -1249,6 +1442,183 @@ mod tests {
             Command::Doctor {} => {}
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn sync_status_parses_peer_filter() {
+        let app = App::parse_from(["rr", "sync-status", "--peer", "peer-a"]);
+        match app.cmd {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+            } => {
+                assert_eq!(peer.as_deref(), Some("peer-a"));
+                assert!(!json);
+                assert!(!with_tracker);
+            }
+            _ => panic!("expected sync-status"),
+        }
+    }
+
+    #[test]
+    fn sync_status_parses_json_flag() {
+        let app = App::parse_from(["rr", "sync-status", "--json"]);
+        match app.cmd {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+            } => {
+                assert!(peer.is_none());
+                assert!(json);
+                assert!(!with_tracker);
+            }
+            _ => panic!("expected sync-status"),
+        }
+    }
+
+    #[test]
+    fn sync_status_parses_with_tracker_flag() {
+        let app = App::parse_from(["rr", "sync-status", "--with-tracker"]);
+        match app.cmd {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+            } => {
+                assert!(peer.is_none());
+                assert!(!json);
+                assert!(with_tracker);
+            }
+            _ => panic!("expected sync-status"),
+        }
+    }
+
+    #[test]
+    fn sync_status_report_includes_pending_push_and_filter() {
+        use time::OffsetDateTime;
+
+        fn entry(entry_id: &str, ts: i64, device_id: &str) -> crate::core::Entry {
+            crate::core::Entry {
+                entry_id: entry_id.to_string(),
+                device_id: device_id.to_string(),
+                user_id: "user1".to_string(),
+                ts: OffsetDateTime::from_unix_timestamp(ts).unwrap(),
+                cmd: "echo test".to_string(),
+                cwd: "/tmp".to_string(),
+                exit_code: 0,
+                duration_ms: 10,
+                shell: "zsh".to_string(),
+                hostname: "host".to_string(),
+                version: "0.1.0".to_string(),
+            }
+        }
+
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store
+            .insert_entries(&[
+                entry("id-1", 1, "dev-local"),
+                entry("id-2", 2, "dev-remote"),
+                entry("id-3", 3, "dev-local"),
+            ])
+            .unwrap();
+        store.set_last_cursor("peer-a", 2).unwrap();
+        store.set_last_pushed_seq("peer-a", 1).unwrap();
+        store.set_last_cursor("peer-b", 3).unwrap();
+        store.set_last_pushed_seq("peer-b", 3).unwrap();
+        store
+            .upsert_peer_book(&storage::PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some("dev-remote".to_string()),
+                last_seen_unix: 99,
+            })
+            .unwrap();
+
+        let report = build_sync_status_report(&store, "dev-local", None, None).unwrap();
+        assert_eq!(report.local_head, 3);
+        assert_eq!(report.local_device_id, "dev-local");
+        assert_eq!(report.peers.len(), 2);
+        assert!(report.tracker_status.is_none());
+
+        let peer_a = report
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer-a")
+            .unwrap();
+        assert_eq!(peer_a.pull_cursor, 2);
+        assert_eq!(peer_a.push_cursor, 1);
+        assert_eq!(peer_a.pending_push, 1);
+        assert_eq!(peer_a.last_seen_unix, Some(99));
+        assert!(peer_a.last_seen_age_sec.is_some());
+
+        let peer_b = report
+            .peers
+            .iter()
+            .find(|peer| peer.peer_id == "peer-b")
+            .unwrap();
+        assert_eq!(peer_b.pending_push, 0);
+        assert_eq!(peer_b.last_seen_unix, None);
+        assert_eq!(peer_b.last_seen_age_sec, None);
+
+        let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a"), None).unwrap();
+        assert_eq!(filtered.peers.len(), 1);
+        assert_eq!(filtered.peers[0].peer_id, "peer-a");
+
+        let json = serde_json::to_string(&filtered).unwrap();
+        assert!(json.contains("\"local_head\""));
+        assert!(json.contains("\"local_device_id\""));
+        assert!(json.contains("\"pending_push\""));
+        assert!(json.contains("\"last_seen_unix\""));
+        assert!(json.contains("\"last_seen_age_sec\""));
+    }
+
+    #[test]
+    fn compute_last_seen_age_sec_handles_past_and_future() {
+        assert_eq!(compute_last_seen_age_sec(100, Some(90)), Some(10));
+        assert_eq!(compute_last_seen_age_sec(100, Some(100)), Some(0));
+        assert_eq!(compute_last_seen_age_sec(100, Some(110)), Some(0));
+        assert_eq!(compute_last_seen_age_sec(100, None), None);
+    }
+
+    #[test]
+    fn tracker_status_report_marks_unreachable_on_ping_error() {
+        let reports = build_tracker_status_report(&["http://127.0.0.1:0".to_string()], None);
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].reachable);
+        assert!(reports[0].latency_ms.is_none());
+        assert!(reports[0].error.is_some());
+    }
+
+    #[test]
+    fn tracker_status_report_includes_latency_on_success() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let server = tiny_http::Server::http(addr).unwrap();
+        let handle = std::thread::spawn(move || {
+            let req = server.recv().unwrap();
+            let path = req.url().split('?').next().unwrap_or(req.url());
+            let status = if path == "/api/v1/ping" { 200 } else { 404 };
+            let response = tiny_http::Response::empty(tiny_http::StatusCode(status));
+            req.respond(response).unwrap();
+        });
+
+        let reports = build_tracker_status_report(&[format!("http://{addr}")], None);
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].reachable);
+        assert!(reports[0].latency_ms.is_some());
+        assert!(reports[0].error.is_none());
+        assert!(
+            serde_json::to_string(&reports[0])
+                .unwrap()
+                .contains("\"latency_ms\"")
+        );
+
+        handle.join().unwrap();
     }
 
     #[test]
