@@ -7,6 +7,11 @@
 bash scripts/acceptance_docker_macos_linux.sh
 ```
 
+전체 로컬 검증 흐름에서 이 시나리오까지 같이 돌리려면:
+```sh
+scripts/check.sh --acceptance
+```
+
 성공하면 다음을 확인할 수 있다.
 - macOS 측 출력에 `p2p pull summary: ... inserted=...`가 표시된다.
 - macOS에서 기록한 엔트리가(`acceptance-from-mac`) linux peer DB로 push되어 들어간다.

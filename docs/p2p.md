@@ -177,5 +177,7 @@ p2p_watch_start_jitter_sec = 10
 루프백만으로는 NAT/프로세스 경계 이슈(특히 relay fallback)가 잘 안 잡힐 수 있어,
 Docker Desktop을 이용해 macOS host + Linux 컨테이너 조합으로 최소 수용 테스트를 제공한다.
 
+- 반복 검증 경로: `scripts/check.sh --acceptance`
+- smoke는 생략하고 Docker acceptance만 더 보고 싶으면: `scripts/check.sh --fast --acceptance`
 - 원커맨드: `bash scripts/acceptance_docker_macos_linux.sh`
 - 절차 문서: `docs/acceptance/docker-macos-linux.md`

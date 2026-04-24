@@ -6,6 +6,7 @@
 
 - 빠른 시작: `docs/quickstart.md`
 - 로컬 검증(권장): `scripts/check.sh`
+- Docker relay fallback 수용 테스트 포함: `scripts/check.sh --acceptance`
 - 빠른 검증(smoke 생략): `scripts/check.sh --fast`
 
 ## Agent Navigation
@@ -33,4 +34,5 @@
 - 테스트: `cargo test --workspace`
 - 린트/포맷: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
 - 로컬 P2P 스모크: `scripts/smoke_p2p_local.sh`
+- Docker relay fallback 수용 테스트: `scripts/check.sh --acceptance` 또는 `bash scripts/acceptance_docker_macos_linux.sh`
 - 보안 점검(권장): `scripts/secret_scan.sh`

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-Usage: scripts/check.sh [--fast|--no-smoke] [--secret-scan]
+Usage: scripts/check.sh [--fast|--no-smoke] [--acceptance] [--secret-scan]
 
 Runs the same Rust checks as CI:
   - cargo fmt --all --check
@@ -11,13 +11,18 @@ Runs the same Rust checks as CI:
   - cargo clippy --workspace --all-targets -- -D warnings
   - scripts/smoke_p2p_local.sh
 
+Optional heavy check:
+  - scripts/acceptance_docker_macos_linux.sh
+
 Options:
   --fast, --no-smoke  Skip the smoke test.
+  --acceptance        Run the Docker relay fallback acceptance after the base checks.
   --secret-scan       Run TruffleHog scan (Docker): scripts/secret_scan.sh
 EOF
 }
 
 smoke=1
+acceptance=0
 secret_scan=0
 
 while [[ $# -gt 0 ]]; do
@@ -28,6 +33,9 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--fast | --no-smoke)
 		smoke=0
+		;;
+	--acceptance)
+		acceptance=1
 		;;
 	--secret-scan)
 		secret_scan=1
@@ -54,4 +62,8 @@ fi
 
 if [[ "$smoke" -eq 1 ]]; then
 	bash scripts/smoke_p2p_local.sh
+fi
+
+if [[ "$acceptance" -eq 1 ]]; then
+	bash scripts/acceptance_docker_macos_linux.sh
 fi
