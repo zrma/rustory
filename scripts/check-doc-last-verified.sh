@@ -82,13 +82,13 @@ TARGET_FILES=(
 import re
 import subprocess
 import sys
-from datetime import date
+from datetime import datetime, timezone
 from pathlib import Path
 
 root = Path(sys.argv[1])
 max_age_days = int(sys.argv[2])
 files = sys.argv[3:]
-today = date.today()
+today = datetime.now(timezone.utc).date()
 failed = False
 
 def git_stdout(repo_root: Path, args):
@@ -103,11 +103,11 @@ def git_stdout(repo_root: Path, args):
     return result.stdout.strip()
 
 def git_last_change_date(repo_root: Path, rel_path: str):
-    raw = git_stdout(repo_root, ["log", "-1", "--format=%cs", "--", rel_path])
+    raw = git_stdout(repo_root, ["log", "-1", "--format=%cI", "--", rel_path])
     if not raw:
         return None
     try:
-        return date.fromisoformat(raw)
+        return datetime.fromisoformat(raw).astimezone(timezone.utc).date()
     except ValueError:
         return None
 
@@ -130,7 +130,7 @@ for rel in files:
         continue
 
     raw = match.group(1)
-    verified_date = date.fromisoformat(raw)
+    verified_date = datetime.fromisoformat(raw).date()
     if verified_date > today:
         print(
             f"[FAIL] Last Verified is in the future: {rel} "
