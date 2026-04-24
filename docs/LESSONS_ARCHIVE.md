@@ -16,3 +16,4 @@
 - 2026-02-20: `todo-doctor-runtime-status-report`
 - 2026-02-20: `todo-doctor-json-output`
 - 2026-02-20: `todo-doctor-key-error-resilience`
+- 2026-02-20: `todo-docs-integrity-fetch-depth-fix`

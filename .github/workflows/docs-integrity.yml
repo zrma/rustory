@@ -43,6 +43,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # check-doc-last-verified.sh는 파일별 git history를 참조하므로 shallow clone을 피한다.
+          fetch-depth: 0
 
       - name: Validate markdown links
         run: scripts/check-doc-links.sh
