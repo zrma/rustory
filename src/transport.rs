@@ -91,7 +91,11 @@ fn serve_http(bind: &str, store: LocalStore) -> Result<()> {
     Ok(())
 }
 
-fn sync_pull_http_peer(local: &LocalStore, peer_base_url: &str, limit: usize) -> Result<usize> {
+fn sync_pull_http_peer(
+    local: &LocalStore,
+    peer_base_url: &str,
+    limit: usize,
+) -> Result<sync::PullStats> {
     let peer_key = normalize_peer_base_url(peer_base_url)?;
     sync::sync_pull_from_peer(local, &peer_key, limit, |cursor, limit| {
         http_pull_batch(&peer_key, cursor, limit)
@@ -370,7 +374,9 @@ mod tests {
         let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
         let pulled = sync_pull_http_peer(&local, &server.base_url, 1).unwrap();
 
-        assert_eq!(pulled, 2);
+        assert_eq!(pulled.received, 2);
+        assert_eq!(pulled.inserted, 2);
+        assert_eq!(pulled.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
         assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 2);
 
@@ -404,7 +410,9 @@ mod tests {
         let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
         let peer_with_slash = format!("{}/", server.base_url);
         let pulled = sync_pull_http_peer(&local, &peer_with_slash, 100).unwrap();
-        assert_eq!(pulled, 1);
+        assert_eq!(pulled.received, 1);
+        assert_eq!(pulled.inserted, 1);
+        assert_eq!(pulled.ignored, 0);
 
         // cursor는 normalize된 key(끝의 / 제거)로 저장된다.
         assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 1);

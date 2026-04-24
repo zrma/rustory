@@ -30,6 +30,8 @@ pub struct FileConfig {
     pub p2p_request_backoff_base_ms: Option<u64>,
 
     pub search_limit_default: Option<usize>,
+
+    pub record_ignore_regex: Option<String>,
 }
 
 pub fn load_default() -> Result<FileConfig> {
@@ -198,6 +200,7 @@ p2p_request_attempts = 4
 p2p_request_timeout_base_sec = 6
 p2p_request_timeout_cap_sec = 40
 p2p_request_backoff_base_ms = 250
+record_ignore_regex = "(?i)token|password"
 "#,
         )
         .unwrap();
@@ -210,6 +213,10 @@ p2p_request_backoff_base_ms = 250
         assert_eq!(cfg.p2p_request_timeout_base_sec, Some(6));
         assert_eq!(cfg.p2p_request_timeout_cap_sec, Some(40));
         assert_eq!(cfg.p2p_request_backoff_base_ms, Some(250));
+        assert_eq!(
+            cfg.record_ignore_regex.as_deref(),
+            Some("(?i)token|password")
+        );
     }
 
     #[test]

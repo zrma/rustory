@@ -1,6 +1,7 @@
 mod cli;
 mod config;
 mod core;
+mod history_import;
 mod hook;
 mod http_retry;
 mod p2p;

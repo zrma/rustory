@@ -587,7 +587,15 @@ async fn sync_async(
                 .with_context(|| format!("p2p pull peer: {}", t.peer_key));
 
         match pull_res {
-            Ok(_) => any_ok = true,
+            Ok(stats) => {
+                any_ok = true;
+                if stats.received > 0 || stats.inserted > 0 {
+                    eprintln!(
+                        "p2p pull summary: {}: received={} inserted={} ignored={}",
+                        t.peer_key, stats.received, stats.inserted, stats.ignored
+                    );
+                }
+            }
             Err(err) => {
                 eprintln!("warn: p2p pull failed: {}: {err:#}", t.peer_key);
                 last_err = Some(err);

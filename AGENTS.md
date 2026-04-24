@@ -33,3 +33,15 @@
   - 예: `feat: sync push cursor persistence`
   - 예: `perf: p2p batch size tuning`
 - 커밋(=change) 메시지는 `jj describe -m "<message>"`로 작성/수정한다.
+
+## Execution: 기본 진행 루프(검토 -> 다음 진도)
+- 사용자가 `진행해줘`, `추천대로 진행`, `순서대로 진행`, `검토 후 진행` 류의 요청을 하면, 아래 루프를 **묻지 않고** 반복한다.
+  1) (필요 시) `docs/todo-*`에 `spec.md`/`open-questions.md` 작성/갱신
+  2) `open-questions.md`가 비었는지 확인 후 구현 시작
+  3) TDD로 구현 + 최소 1개 수용 테스트(재시작/스모크/e2e) 추가 또는 갱신
+  4) 구현 후 자체 검토: 스펙 부합, 버그/논리 오류, 보안 문제, 리팩터링 포인트 점검
+  5) 검증: `cargo fmt`, `cargo test`, `cargo clippy --workspace --all-targets -- -D warnings`
+  6) (해당 시) 스모크: `scripts/smoke_p2p_local.sh`
+  7) `jj describe -m`로 메시지 작성 후 `main` 이동 + `jj git push`
+  8) 다음 추천 작업으로 자동 진도(결정이 필요한 경우에만 질문)
+- 사용자가 `잠깐`, `여기서 멈춰` 같은 중단 의사를 표현하면 즉시 멈추고 다음 행동을 확인한다.

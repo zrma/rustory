@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rand::Rng;
 
-use crate::{config, hook, p2p, search, storage, tracker, transport};
+use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -170,6 +170,25 @@ enum Command {
         tracker_token: Option<String>,
     },
     Doctor {},
+    Import {
+        #[arg(long, default_value = "zsh")]
+        shell: String,
+
+        #[arg(long)]
+        path: Option<String>,
+
+        #[arg(long)]
+        limit: Option<usize>,
+
+        #[arg(long)]
+        user_id: Option<String>,
+
+        #[arg(long)]
+        device_id: Option<String>,
+
+        #[arg(long)]
+        hostname: Option<String>,
+    },
 }
 
 pub fn run() -> Result<()> {
@@ -331,6 +350,19 @@ pub fn run() -> Result<()> {
             if is_self_rr_command(cmd) {
                 return Ok(());
             }
+            if let Some(pattern) = resolve_record_ignore_regex(&cfg) {
+                match should_ignore_record_command(cmd, &pattern) {
+                    Ok(true) => return Ok(()),
+                    Ok(false) => {}
+                    Err(err) => {
+                        // 훅은 stderr를 버릴 수 있으므로, 실패 시에도 안전하게(= 기록 스킵) 동작한다.
+                        eprintln!(
+                            "warn: invalid record ignore regex: {err} (skipping record for safety)"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
 
             let store = storage::LocalStore::open(&db_path)?;
             let cwd = normalize_opt_string(cwd).unwrap_or_else(default_cwd);
@@ -425,6 +457,72 @@ pub fn run() -> Result<()> {
         }
         Command::Doctor {} => {
             run_doctor(&cfg, &db_path)?;
+        }
+        Command::Import {
+            shell,
+            path,
+            limit,
+            user_id,
+            device_id,
+            hostname,
+        } => {
+            let shell = history_import::HistoryShell::parse(shell.as_str())?;
+            let path = normalize_opt_string(path)
+                .unwrap_or_else(|| shell.default_history_path().to_string());
+            let path = config::expand_home_path(&path)?;
+
+            let hostname = normalize_opt_string(hostname)
+                .or_else(|| env_nonempty("HOSTNAME"))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let user_id = normalize_opt_string(user_id)
+                .or_else(|| env_nonempty("RUSTORY_USER_ID"))
+                .or_else(|| normalize_opt_string(cfg.user_id.clone()))
+                .or_else(|| env_nonempty("USER"))
+                .unwrap_or_else(|| "unknown".to_string());
+
+            let device_id = normalize_opt_string(device_id)
+                .or_else(|| env_nonempty("RUSTORY_DEVICE_ID"))
+                .or_else(|| normalize_opt_string(cfg.device_id.clone()))
+                .unwrap_or_else(|| hostname.clone());
+
+            let ignore_re = match resolve_record_ignore_regex(&cfg) {
+                Some(pattern) => match regex::Regex::new(&pattern) {
+                    Ok(re) => Some(re),
+                    Err(err) => {
+                        eprintln!(
+                            "warn: invalid record ignore regex: {err} (skipping import for safety)"
+                        );
+                        return Ok(());
+                    }
+                },
+                None => None,
+            };
+
+            let content = history_import::read_history_file(&path)?;
+            let store = storage::LocalStore::open(&db_path)?;
+            let stats = history_import::import_into_store(
+                &store,
+                history_import::ImportRequest {
+                    shell,
+                    content: &content,
+                    limit,
+                    user_id: &user_id,
+                    device_id: &device_id,
+                    hostname: &hostname,
+                    ignore_regex: ignore_re.as_ref(),
+                },
+            )?;
+
+            println!(
+                "import: path={} shell={} received={} inserted={} ignored={} skipped={}",
+                path.display(),
+                shell.as_str(),
+                stats.received,
+                stats.inserted,
+                stats.ignored,
+                stats.skipped
+            );
         }
     }
 
@@ -585,6 +683,7 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push_str("# p2p_request_timeout_cap_sec = 30 # optional\n");
     out.push_str("# p2p_request_backoff_base_ms = 200 # optional\n");
     out.push_str("# search_limit_default = 100000 # optional\n");
+    out.push_str("# record_ignore_regex = \"(?i)(password|token|secret)\" # optional\n");
 
     Ok(out)
 }
@@ -641,6 +740,15 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str) -> Result<()> {
             );
         }
         Err(err) => println!("p2p request retry: invalid: {err:#}"),
+    }
+    match resolve_record_ignore_regex(cfg) {
+        Some(pattern) => match regex::Regex::new(&pattern) {
+            Ok(_) => println!("record ignore regex: {pattern}"),
+            Err(err) => {
+                println!("record ignore regex: invalid: {err} (skipping record for safety)")
+            }
+        },
+        None => println!("record ignore regex: (none)"),
     }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
@@ -1018,6 +1126,19 @@ fn resolve_device_id(cfg: &config::FileConfig) -> String {
         })
 }
 
+fn resolve_record_ignore_regex(cfg: &config::FileConfig) -> Option<String> {
+    env_nonempty("RUSTORY_RECORD_IGNORE_REGEX")
+        .or_else(|| normalize_opt_string(cfg.record_ignore_regex.clone()))
+}
+
+fn should_ignore_record_command(
+    cmd: &str,
+    pattern: &str,
+) -> std::result::Result<bool, regex::Error> {
+    let re = regex::Regex::new(pattern)?;
+    Ok(re.is_match(cmd))
+}
+
 fn is_self_rr_command(cmd: &str) -> bool {
     let Some(first) = cmd.split_whitespace().next() else {
         return false;
@@ -1192,5 +1313,34 @@ mod tests {
         assert!(text.contains("swarm_key_path"));
         assert!(text.contains("p2p_identity_key_path"));
         assert!(text.contains("p2p_request_attempts"));
+        assert!(text.contains("record_ignore_regex"));
+    }
+
+    #[test]
+    fn record_ignore_regex_matches_command() {
+        assert!(should_ignore_record_command("echo token=abc", "(?i)token").unwrap());
+        assert!(!should_ignore_record_command("echo hello", "(?i)token").unwrap());
+    }
+
+    #[test]
+    fn record_ignore_regex_invalid_pattern_is_error() {
+        assert!(should_ignore_record_command("echo hello", "(").is_err());
+    }
+
+    #[test]
+    fn import_parses_flags() {
+        let app = App::parse_from([
+            "rr", "import", "--shell", "bash", "--path", "/tmp/x", "--limit", "10",
+        ]);
+        match app.cmd {
+            Command::Import {
+                shell, path, limit, ..
+            } => {
+                assert_eq!(shell, "bash");
+                assert_eq!(path.as_deref(), Some("/tmp/x"));
+                assert_eq!(limit, Some(10));
+            }
+            _ => panic!("expected import"),
+        }
     }
 }
