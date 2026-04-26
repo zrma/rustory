@@ -50,11 +50,13 @@ parse_opt_value() {
 add_bookmark() {
   local bookmark="$1"
   local existing=""
-  for existing in "${UNIQUE_BOOKMARKS[@]}"; do
-    if [[ "$existing" == "$bookmark" ]]; then
-      return 0
-    fi
-  done
+  if (( ${#UNIQUE_BOOKMARKS[@]} > 0 )); then
+    for existing in "${UNIQUE_BOOKMARKS[@]}"; do
+      if [[ "$existing" == "$bookmark" ]]; then
+        return 0
+      fi
+    done
+  fi
   UNIQUE_BOOKMARKS+=("$bookmark")
 }
 
@@ -124,13 +126,17 @@ if (( CHECK_AT == 1 )); then
   check_rev_conflicts '@' "working-copy(@)"
 fi
 
-for bookmark in "${BOOKMARKS[@]}"; do
-  add_bookmark "$bookmark"
-done
+if (( ${#BOOKMARKS[@]} > 0 )); then
+  for bookmark in "${BOOKMARKS[@]}"; do
+    add_bookmark "$bookmark"
+  done
+fi
 
-for bookmark in "${UNIQUE_BOOKMARKS[@]}"; do
-  check_rev_conflicts "$bookmark" "bookmark '$bookmark'"
-done
+if (( ${#UNIQUE_BOOKMARKS[@]} > 0 )); then
+  for bookmark in "${UNIQUE_BOOKMARKS[@]}"; do
+    check_rev_conflicts "$bookmark" "bookmark '$bookmark'"
+  done
+fi
 
 if (( fail_count > 0 )); then
   echo "[FAIL] jj conflict check failed with $fail_count issue(s)" >&2

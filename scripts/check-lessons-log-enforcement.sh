@@ -87,21 +87,20 @@ resolve_diff_output_from_range() {
 }
 
 collect_worktree_files() {
-  local -a unstaged_files=()
-  local -a staged_files=()
-  declare -A seen_files=()
+  {
+    git diff --name-only 2>/dev/null || true
+    git diff --cached --name-only 2>/dev/null || true
+  } | awk 'NF && !seen[$0]++ { print }'
+}
 
-  mapfile -t unstaged_files < <(git diff --name-only 2>/dev/null || true)
-  mapfile -t staged_files < <(git diff --cached --name-only 2>/dev/null || true)
-
-  for file in "${unstaged_files[@]}" "${staged_files[@]}"; do
+append_changed_files() {
+  local input="$1"
+  local file=""
+  CHANGED_FILES=()
+  while IFS= read -r file; do
     [[ -z "$file" ]] && continue
-    seen_files["$file"]=1
-  done
-
-  for file in "${!seen_files[@]}"; do
-    echo "$file"
-  done
+    CHANGED_FILES+=("$file")
+  done <<< "$input"
 }
 
 if [[ -n "$RANGE" && "$WORKTREE_MODE" -eq 1 ]]; then
@@ -114,14 +113,11 @@ if [[ -n "$RANGE" ]]; then
     echo "[FAIL] invalid --range for lessons-log enforcement: $RANGE" >&2
     exit 1
   fi
-  mapfile -t CHANGED_FILES <<<"$diff_output"
-  if (( ${#CHANGED_FILES[@]} == 1 )) && [[ -z "${CHANGED_FILES[0]}" ]]; then
-    CHANGED_FILES=()
-  fi
+  append_changed_files "$diff_output"
 elif [[ "$WORKTREE_MODE" -eq 1 ]]; then
-  mapfile -t CHANGED_FILES < <(collect_worktree_files)
+  append_changed_files "$(collect_worktree_files)"
 else
-  mapfile -t CHANGED_FILES < <(git diff --cached --name-only)
+  append_changed_files "$(git diff --cached --name-only)"
 fi
 
 if (( ${#CHANGED_FILES[@]} == 0 )); then

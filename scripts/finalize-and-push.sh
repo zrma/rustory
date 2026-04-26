@@ -325,7 +325,11 @@ if (( DRY_RUN == 0 )); then
   remote_sha_before="$(resolve_remote_head_sha "$REMOTE" "$BOOKMARK" 1 || true)"
 fi
 
-run_argv "${push_gate_env[@]}" scripts/jj-git-push-safe.sh "${push_args[@]}"
+if (( ${#push_args[@]} > 0 )); then
+  run_argv "${push_gate_env[@]}" scripts/jj-git-push-safe.sh "${push_args[@]}"
+else
+  run_argv "${push_gate_env[@]}" scripts/jj-git-push-safe.sh
+fi
 ok "push completed"
 
 local_sha=""

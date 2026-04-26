@@ -111,7 +111,10 @@ todo_workspace_discover_work_id() {
   local todo_dir=""
   local resolved_work_id=""
 
-  readarray -t todo_dirs < <(todo_workspace_find_dirs "$root")
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
+    todo_dirs+=("$todo_dir")
+  done < <(todo_workspace_find_dirs "$root")
 
   if (( ${#todo_dirs[@]} == 1 )); then
     if ! resolved_work_id="$(todo_workspace_extract_work_id "${todo_dirs[0]}")"; then
@@ -183,7 +186,10 @@ todo_workspace_discover_closed_work_id() {
   local closed_work_ids=()
   local closed_work_id=""
 
-  readarray -t closed_work_ids < <(todo_workspace_collect_deleted_work_ids "$root" "$include_head_range")
+  while IFS= read -r closed_work_id; do
+    [[ -z "$closed_work_id" ]] && continue
+    closed_work_ids+=("$closed_work_id")
+  done < <(todo_workspace_collect_deleted_work_ids "$root" "$include_head_range")
 
   if (( ${#closed_work_ids[@]} == 1 )); then
     printf '%s\n' "${closed_work_ids[0]}"

@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 fail_count=0
-submodule_paths=()
+SUBMODULE_PATHS=""
 
 resolve_python_cmd() {
   local candidate
@@ -78,55 +78,45 @@ resolve_target() {
 submodule_for_path() {
   local path="$1"
   local submodule_path
-  for submodule_path in "${submodule_paths[@]}"; do
+  while IFS= read -r submodule_path; do
+    [[ -z "$submodule_path" ]] && continue
     if [[ "$path" == "$submodule_path" || "$path" == "$submodule_path/"* ]]; then
       printf '%s\n' "$submodule_path"
       return 0
     fi
-  done
+  done <<< "$SUBMODULE_PATHS"
   return 1
 }
 
 collect_markdown_files() {
   local rel_file
-  declare -A seen=()
-  local -a files=()
 
   if git -C "$ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-    while IFS= read -r rel_file; do
-      [[ -z "$rel_file" ]] && continue
-      if [[ -z "${seen[$rel_file]+x}" ]]; then
-        seen["$rel_file"]=1
-        files+=("$rel_file")
-      fi
-    done < <(git -C "$ROOT" ls-files -- '*.md')
-  else
-    local file
+    git -C "$ROOT" ls-files -- '*.md' | sort -u
+    return
+  fi
+
+  local file
+  {
     for file in README.md AGENTS.md; do
       if [[ -f "$ROOT/$file" ]]; then
-        seen["$file"]=1
-        files+=("$file")
+        printf '%s\n' "$file"
       fi
     done
     if [[ -d "$ROOT/docs" ]]; then
       while IFS= read -r -d '' file; do
         rel_file="${file#$ROOT/}"
-        if [[ -z "${seen[$rel_file]+x}" ]]; then
-          seen["$rel_file"]=1
-          files+=("$rel_file")
-        fi
+        printf '%s\n' "$rel_file"
       done < <(find "$ROOT/docs" -type f -name '*.md' -print0)
     fi
-  fi
-
-  printf '%s\n' "${files[@]}" | sort -u
+  } | sort -u
 }
 
 if [[ -f "$ROOT/.gitmodules" ]]; then
-  readarray -t submodule_paths < <(
+  SUBMODULE_PATHS="$(
     git -C "$ROOT" config -f .gitmodules --get-regexp '^submodule\..*\.path$' \
-      | awk '{print $2}'
-  )
+      | awk '{print $2}' || true
+  )"
 fi
 
 extract_links() {
@@ -181,13 +171,18 @@ if ! PYTHON_BIN="$(resolve_python_cmd)"; then
   exit 1
 fi
 
-readarray -t markdown_files < <(collect_markdown_files)
+found_markdown=0
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
+  found_markdown=1
+done < <(collect_markdown_files)
 
-if [[ "${#markdown_files[@]}" -eq 0 ]]; then
+if (( found_markdown == 0 )); then
   fail "no markdown files found for validation"
 fi
 
-for file in "${markdown_files[@]}"; do
+while IFS= read -r file; do
+  [[ -z "$file" ]] && continue
   abs_file="$ROOT/$file"
   if [[ ! -f "$abs_file" ]]; then
     warn "skip missing file in current checkout: $file"
@@ -216,7 +211,7 @@ for file in "${markdown_files[@]}"; do
 
     fail "$file -> $raw_link (resolved: ${resolved_path#$ROOT/})"
   done < <(extract_links "$abs_file")
-done
+done < <(collect_markdown_files)
 
 if (( fail_count > 0 )); then
   fail "markdown link check failed with $fail_count issue(s)"

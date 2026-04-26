@@ -183,7 +183,10 @@ PY
 
 CHECKS=()
 if [[ -n "$CHECKS_RAW" ]]; then
-  readarray -t CHECKS <<<"$CHECKS_RAW"
+  while IFS= read -r raw_check; do
+    [[ -z "$raw_check" ]] && continue
+    CHECKS+=("$raw_check")
+  done <<<"$CHECKS_RAW"
 fi
 
 if [[ "${#CHECKS[@]}" -eq 0 ]]; then

@@ -278,7 +278,11 @@ if [[ -n "$WORK_ID" ]]; then
     fail "$todo_rel missing while todo readiness is required"
   fi
 else
-  readarray -t TODO_DIRS < <(todo_workspace_find_dirs "$ROOT")
+  TODO_DIRS=()
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
+    TODO_DIRS+=("$todo_dir")
+  done < <(todo_workspace_find_dirs "$ROOT")
   if [[ "${#TODO_DIRS[@]}" -eq 0 ]]; then
     if [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
       warn "no todo directory found. skip todo readiness due --allow-missing-work-id override"
@@ -302,7 +306,11 @@ if [[ -n "$WORK_ID" && -d "$todo_abs" ]]; then
 elif [[ -n "$WORK_ID" && "$CLOSED_WORK_ID" -eq 1 ]]; then
   warn "skip scoped open-questions check for closed work-id: $WORK_ID (workspace deleted in current diff)"
 else
-  readarray -t TODO_DIRS_FOR_OPEN_Q < <(todo_workspace_find_dirs "$ROOT")
+  TODO_DIRS_FOR_OPEN_Q=()
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
+    TODO_DIRS_FOR_OPEN_Q+=("$todo_dir")
+  done < <(todo_workspace_find_dirs "$ROOT")
   if [[ "${#TODO_DIRS_FOR_OPEN_Q[@]}" -eq 0 ]]; then
     warn "no todo directory found. skip open-questions checks."
   else

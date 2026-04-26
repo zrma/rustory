@@ -7,7 +7,7 @@ source "$ROOT/scripts/lib/todo-workspace.sh"
 DOCS_DIR="$ROOT/docs"
 INDEX_FILE="$DOCS_DIR/README.md"
 fail_count=0
-declare -a TODO_WORKSPACE_DIRS=()
+TODO_WORKSPACE_DIRS=""
 
 usage() {
   cat <<'USAGE'
@@ -61,12 +61,13 @@ is_todo_workspace_doc() {
   local rel_path="$1"
   local todo_dir=""
   local todo_rel=""
-  for todo_dir in "${TODO_WORKSPACE_DIRS[@]}"; do
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
     todo_rel="${todo_dir#$ROOT/}"
     if [[ "$rel_path" == "$todo_rel/"* ]]; then
       return 0
     fi
-  done
+  done <<< "$TODO_WORKSPACE_DIRS"
   return 1
 }
 
@@ -93,11 +94,10 @@ if ! todo_workspace_load_config "$ROOT"; then
   exit 1
 fi
 
-readarray -t TODO_WORKSPACE_DIRS < <(todo_workspace_find_dirs "$ROOT")
+TODO_WORKSPACE_DIRS="$(todo_workspace_find_dirs "$ROOT" || true)"
 
-readarray -t top_docs < <(find "$DOCS_DIR" -maxdepth 1 -type f -name '*.md' | sort)
-
-for doc_file in "${top_docs[@]}"; do
+while IFS= read -r doc_file; do
+  [[ -z "$doc_file" ]] && continue
   doc_name="$(basename "$doc_file")"
   if [[ "$doc_name" == "README.md" ]]; then
     continue
@@ -109,11 +109,10 @@ for doc_file in "${top_docs[@]}"; do
   fi
 
   fail "missing docs/README.md entry for docs/$doc_name"
-done
+done < <(find "$DOCS_DIR" -maxdepth 1 -type f -name '*.md' | sort)
 
-readarray -t nested_docs < <(find "$DOCS_DIR" -mindepth 2 -type f -name '*.md' | sort)
-
-for doc_file in "${nested_docs[@]}"; do
+while IFS= read -r doc_file; do
+  [[ -z "$doc_file" ]] && continue
   rel_path="${doc_file#$ROOT/}"
   if is_todo_workspace_doc "$rel_path"; then
     continue
@@ -146,7 +145,7 @@ for doc_file in "${nested_docs[@]}"; do
   fi
 
   fail "missing directory index: $doc_dir_rel/README.md (required for nested doc $rel_path)"
-done
+done < <(find "$DOCS_DIR" -mindepth 2 -type f -name '*.md' | sort)
 
 if (( fail_count > 0 )); then
   echo "[FAIL] doc index check failed with $fail_count issue(s)" >&2

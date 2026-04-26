@@ -45,11 +45,13 @@ add_target_bookmark() {
     exit 1
   fi
 
-  for existing in "${TARGET_BOOKMARKS[@]}"; do
-    if [[ "$existing" == "$candidate" ]]; then
-      return 0
-    fi
-  done
+  if (( ${#TARGET_BOOKMARKS[@]} > 0 )); then
+    for existing in "${TARGET_BOOKMARKS[@]}"; do
+      if [[ "$existing" == "$candidate" ]]; then
+        return 0
+      fi
+    done
+  fi
 
   TARGET_BOOKMARKS+=("$candidate")
 }

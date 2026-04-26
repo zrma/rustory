@@ -308,12 +308,18 @@ fi
 
 TARGET_DIR="${1:-}"
 if [[ -z "$TARGET_DIR" ]]; then
-  mapfile -t TODO_DIRS < <(todo_workspace_find_dirs "$ROOT")
+  TODO_DIRS=()
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
+    TODO_DIRS+=("$todo_dir")
+  done < <(todo_workspace_find_dirs "$ROOT")
   if (( ${#TODO_DIRS[@]} == 0 )); then
     fail "no todo directory found (expected '$TODO_WORKSPACE_GLOB')"
   elif (( ${#TODO_DIRS[@]} > 1 )); then
     echo "[FAIL] multiple todo directories found. specify one explicitly:" >&2
-    printf '  - %s\n' "${TODO_DIRS[@]#$ROOT/}" >&2
+    for todo_dir in "${TODO_DIRS[@]}"; do
+      printf '  - %s\n' "${todo_dir#$ROOT/}" >&2
+    done
     exit 1
   fi
   TARGET_DIR="${TODO_DIRS[0]#$ROOT/}"

@@ -77,7 +77,10 @@ check_deleted_todo_lessons_refs() {
   local token
   local -a deleted_work_ids=()
 
-  readarray -t deleted_work_ids < <(collect_deleted_todo_work_ids)
+  while IFS= read -r work_id; do
+    [[ -z "$work_id" ]] && continue
+    deleted_work_ids+=("$work_id")
+  done < <(collect_deleted_todo_work_ids)
   if (( ${#deleted_work_ids[@]} == 0 )); then
     return 0
   fi
@@ -234,8 +237,17 @@ collect_external_refs() {
   )
 }
 
-readarray -t TODO_DIRS < <(todo_workspace_find_dirs "$ROOT")
-readarray -t ARCHIVE_DIRS < <(find "$ROOT/docs" -maxdepth 1 -mindepth 1 -type d -name 'archive-*' | sort)
+TODO_DIRS=()
+while IFS= read -r todo_dir; do
+  [[ -z "$todo_dir" ]] && continue
+  TODO_DIRS+=("$todo_dir")
+done < <(todo_workspace_find_dirs "$ROOT")
+
+ARCHIVE_DIRS=()
+while IFS= read -r archive_dir; do
+  [[ -z "$archive_dir" ]] && continue
+  ARCHIVE_DIRS+=("$archive_dir")
+done < <(find "$ROOT/docs" -maxdepth 1 -mindepth 1 -type d -name 'archive-*' | sort)
 
 if [[ "${#ARCHIVE_DIRS[@]}" -gt 0 ]]; then
   for archive_dir in "${ARCHIVE_DIRS[@]}"; do
@@ -295,7 +307,11 @@ for todo_abs in "${TODO_DIRS[@]}"; do
   fi
 
   if [[ "$state" == "done" && "$closed_open_q" -eq 1 ]]; then
-    readarray -t refs < <(collect_external_refs "$todo_rel")
+    refs=()
+    while IFS= read -r ref; do
+      [[ -z "$ref" ]] && continue
+      refs+=("$ref")
+    done < <(collect_external_refs "$todo_rel")
     if [[ "${#refs[@]}" -gt 0 ]]; then
       fail "$todo_rel: 완료된 todo를 참조하는 외부 경로가 남아 있음 (정리 후 삭제 필요)"
       for ref in "${refs[@]}"; do

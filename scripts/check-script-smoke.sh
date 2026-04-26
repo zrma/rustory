@@ -49,7 +49,12 @@ parse_opt_value() {
 }
 
 discover_single_work_id() {
-  readarray -t TODO_DIRS < <(todo_workspace_find_dirs "$ROOT")
+  TODO_DIRS=()
+  local todo_dir=""
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
+    TODO_DIRS+=("$todo_dir")
+  done < <(todo_workspace_find_dirs "$ROOT")
 
   if (( ${#TODO_DIRS[@]} == 1 )); then
     local resolved_work_id=""
