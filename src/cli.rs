@@ -229,7 +229,7 @@ pub fn run() -> Result<()> {
     let mut config_load_error = None;
     let cfg = match config::load_default() {
         Ok(cfg) => cfg,
-        Err(err) if matches!(&app.cmd, Command::Doctor { .. }) => {
+        Err(err) if can_continue_after_config_load_error(&app.cmd) => {
             config_load_error = Some(format!("{err:#}"));
             config::FileConfig::default()
         }
@@ -604,6 +604,9 @@ pub fn run() -> Result<()> {
             relay,
             tracker_token,
         } => {
+            if let Some(err) = config_load_error.as_deref() {
+                eprintln!("warn: ignoring invalid config because --force was set: {err}");
+            }
             run_init(
                 InitArgs {
                     force,
@@ -689,6 +692,13 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn can_continue_after_config_load_error(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Doctor { .. } | Command::Init { force: true, .. }
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -2493,6 +2503,24 @@ mod tests {
             }
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn config_load_error_policy_keeps_doctor_running() {
+        let app = App::parse_from(["rr", "doctor"]);
+
+        assert!(can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn config_load_error_policy_allows_only_force_init() {
+        let force_app = App::parse_from(["rr", "init", "--force"]);
+        let non_force_app = App::parse_from(["rr", "init"]);
+        let search_app = App::parse_from(["rr", "search"]);
+
+        assert!(can_continue_after_config_load_error(&force_app.cmd));
+        assert!(!can_continue_after_config_load_error(&non_force_app.cmd));
+        assert!(!can_continue_after_config_load_error(&search_app.cmd));
     }
 
     #[test]
