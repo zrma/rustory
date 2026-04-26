@@ -64,6 +64,7 @@ rr doctor --json
 ```
 
 `rr doctor`의 `db status:` 라인에서 로컬 DB 파일 존재 여부, 저장된 entry 수, peer book/sync peer 수를 확인할 수 있다. `entries=0`이면 ctrl+r 검색 후보가 아직 없는 상태다.
+`hook:` 라인에서는 현재 셸에서 hook 설치 마커가 보이는지(`installed`), `RUSTORY_HOOK_DISABLE`로 비활성화됐는지(`disabled`), ctrl+r 검색 limit 값이 유효한지(`search_limit`)를 확인한다.
 
 `rr init`는 기본적으로 다음을 준비한다.
 - `~/.config/rustory/config.toml` (설정 템플릿)

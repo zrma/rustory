@@ -2,6 +2,7 @@
 
 ## 설치(현재 세션)
 ctrl+r 검색은 외부 실행 파일 `fzf`를 사용한다. 설치/PATH 상태는 `rr doctor`의 `fzf:` 라인에서 확인한다.
+현재 셸에 hook이 적용됐는지는 `rr doctor`의 `hook:` 라인에서 `installed=true`로 확인한다.
 
 ### zsh
 ```sh
@@ -15,6 +16,7 @@ source <(rr hook --shell bash)
 
 ## 환경 변수
 - `RUSTORY_HOOK_DISABLE=1`: hook 동작 비활성화(기록/검색 모두)
+- `RUSTORY_HOOK_INSTALLED=1`: `rr hook`이 현재 셸에 export하는 설치 마커다. 직접 설정할 필요는 없고, `rr doctor`가 hook 적용 여부를 판단할 때 사용한다.
 - `RUSTORY_DB_PATH=/path/to/db.sqlite`: 기본 DB 경로 오버라이드(`rr --db-path ...` 대신 사용 가능)
 - `RUSTORY_SEARCH_LIMIT=100000`: ctrl+r 검색 시 `rr search --limit` 기본값 오버라이드
 - `RUSTORY_RECORD_IGNORE_REGEX="<regex>"`: 정규식에 매칭되는 커맨드는 기록하지 않는다.

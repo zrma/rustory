@@ -12,6 +12,7 @@ const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
 const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
 const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
 const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
+const DEFAULT_HOOK_SEARCH_LIMIT: usize = 100_000;
 const FZF_PURPOSE: &str = "ctrl+r search";
 
 #[derive(Parser)]
@@ -983,6 +984,7 @@ struct DoctorReport {
     user_id: String,
     device_id: String,
     fzf: DoctorToolStatusReport,
+    hook: DoctorHookStatusReport,
     p2p_request_retry: DoctorP2pRequestRetryReport,
     record_ignore_regex: DoctorRecordIgnoreRegexReport,
     async_upload: DoctorAsyncUploadStatusReport,
@@ -1020,6 +1022,16 @@ struct DoctorToolStatusReport {
     available: bool,
     path: Option<String>,
     warning: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorHookStatusReport {
+    shell: Option<String>,
+    installed: bool,
+    disabled: bool,
+    search_limit: Option<usize>,
+    warnings: Vec<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -1081,6 +1093,7 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
     let fzf = build_tool_status_report("fzf", FZF_PURPOSE);
+    let hook = build_hook_status_report();
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
 
     let p2p_request_retry = match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
@@ -1239,6 +1252,7 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
         user_id,
         device_id,
         fzf,
+        hook,
         p2p_request_retry,
         record_ignore_regex,
         async_upload,
@@ -1335,6 +1349,7 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
     print_tool_status(&build_tool_status_report("fzf", FZF_PURPOSE));
+    print_hook_status(&build_hook_status_report());
     match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
         Ok(request_retry_policy) => {
             println!(
@@ -1539,6 +1554,89 @@ fn print_tool_status(report: &DoctorToolStatusReport) {
     } else {
         println!("{}: missing", report.command);
     }
+}
+
+fn build_hook_status_report() -> DoctorHookStatusReport {
+    build_hook_status_report_from_env(
+        default_shell(),
+        env_nonempty("RUSTORY_HOOK_INSTALLED"),
+        env_nonempty("RUSTORY_HOOK_DISABLE"),
+        env_nonempty("RUSTORY_SEARCH_LIMIT"),
+    )
+}
+
+fn build_hook_status_report_from_env(
+    shell: Option<String>,
+    installed_marker: Option<String>,
+    disable_marker: Option<String>,
+    search_limit_raw: Option<String>,
+) -> DoctorHookStatusReport {
+    let installed = installed_marker.is_some();
+    let disabled = disable_marker.is_some();
+    let search_limit_raw =
+        search_limit_raw.unwrap_or_else(|| DEFAULT_HOOK_SEARCH_LIMIT.to_string());
+    let (search_limit, error) = match search_limit_raw.parse::<usize>() {
+        Ok(value) => (Some(value), None),
+        Err(err) => (
+            None,
+            Some(format!(
+                "invalid RUSTORY_SEARCH_LIMIT={:?}: {err}",
+                search_limit_raw.trim()
+            )),
+        ),
+    };
+
+    let mut warnings = Vec::new();
+    if !installed {
+        let shell_hint = match shell.as_deref() {
+            Some("bash" | "zsh") => shell.as_deref().unwrap(),
+            _ => "zsh",
+        };
+        warnings.push(format!(
+            "hook marker missing; run source <(rr hook --shell {shell_hint})"
+        ));
+    }
+    if disabled {
+        warnings.push("RUSTORY_HOOK_DISABLE is set; record/search hook is disabled".to_string());
+    }
+    match shell.as_deref() {
+        Some("bash" | "zsh") => {}
+        Some(other) => warnings.push(format!("unsupported shell for rr hook: {other}")),
+        None => warnings.push("SHELL is not set; choose bash or zsh for rr hook".to_string()),
+    }
+
+    DoctorHookStatusReport {
+        shell,
+        installed,
+        disabled,
+        search_limit,
+        warnings,
+        error,
+    }
+}
+
+fn print_hook_status(report: &DoctorHookStatusReport) {
+    let shell = report.shell.as_deref().unwrap_or("-");
+    let search_limit = report
+        .search_limit
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+
+    let mut parts = vec![
+        format!("installed={}", report.installed),
+        format!("disabled={}", report.disabled),
+        format!("shell={shell}"),
+        format!("search_limit={search_limit}"),
+    ];
+
+    if let Some(error) = report.error.as_deref() {
+        parts.push(format!("error={error}"));
+    }
+    if !report.warnings.is_empty() {
+        parts.push(format!("warnings={}", report.warnings.join("; ")));
+    }
+
+    println!("hook: {}", parts.join(" "));
 }
 
 fn print_db_status(report: &DoctorDbStatusReport) {
@@ -2386,6 +2484,7 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"db\""));
         assert!(json.contains("\"fzf\""));
+        assert!(json.contains("\"hook\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
         assert!(json.contains("\"relay_addr\""));
@@ -2463,6 +2562,57 @@ mod tests {
         assert!(report.available);
         assert_eq!(report.path.as_deref(), Some(fzf.to_str().unwrap()));
         assert!(report.warning.is_none());
+    }
+
+    #[test]
+    fn hook_status_reports_missing_marker_with_default_limit() {
+        let report = build_hook_status_report_from_env(Some("zsh".to_string()), None, None, None);
+
+        assert!(!report.installed);
+        assert!(!report.disabled);
+        assert_eq!(report.shell.as_deref(), Some("zsh"));
+        assert_eq!(report.search_limit, Some(DEFAULT_HOOK_SEARCH_LIMIT));
+        assert!(report.error.is_none());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("hook marker missing"))
+        );
+    }
+
+    #[test]
+    fn hook_status_reports_disable_and_invalid_limit() {
+        let report = build_hook_status_report_from_env(
+            Some("fish".to_string()),
+            Some("1".to_string()),
+            Some("1".to_string()),
+            Some("many".to_string()),
+        );
+
+        assert!(report.installed);
+        assert!(report.disabled);
+        assert_eq!(report.shell.as_deref(), Some("fish"));
+        assert!(report.search_limit.is_none());
+        assert!(
+            report
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("invalid RUSTORY_SEARCH_LIMIT")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("RUSTORY_HOOK_DISABLE"))
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("unsupported shell"))
+        );
     }
 
     #[test]

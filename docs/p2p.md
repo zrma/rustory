@@ -155,6 +155,7 @@ p2p_watch_start_jitter_sec = 10
 
 ## 트러블슈팅
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
+  - `hook` 라인은 현재 셸에서 hook 설치 마커가 보이는지, `RUSTORY_HOOK_DISABLE`로 비활성화됐는지, ctrl+r 검색 limit 값이 유효한지 확인한다.
   - `async upload`/`auto prune`가 활성화된 환경이면 각 기능의 `enabled`, `interval`, `limit/retention`, `marker_path`, `last_trigger_unix`, `next_due_in_sec`도 함께 출력해 실행 타이밍을 점검할 수 있다.
   - 관련 env 값이 잘못됐으면 해당 섹션을 `invalid: ...`로 표시한다.
   - key 파일이 손상/파싱 실패 상태여도 doctor 전체는 종료하지 않고, key 라인에 `invalid: ...`를 표시해 원인을 확인할 수 있다.

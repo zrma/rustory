@@ -28,9 +28,11 @@ fn render_bash_hook() -> String {
 # 설치(예): source <(rr hook --shell bash)
 
 if [[ -n "${__RUSTORY_HOOK_INSTALLED:-}" ]]; then
+  export RUSTORY_HOOK_INSTALLED=1
   return 0
 fi
 __RUSTORY_HOOK_INSTALLED=1
+export RUSTORY_HOOK_INSTALLED=1
 
 __rustory_last_histnum=""
 __rustory_last_start_histnum=""
@@ -134,9 +136,11 @@ fn render_zsh_hook() -> String {
 # 설치(예): source <(rr hook --shell zsh)
 
 if [[ -n "${__RUSTORY_HOOK_INSTALLED:-}" ]]; then
+  export RUSTORY_HOOK_INSTALLED=1
   return 0
 fi
 typeset -g __RUSTORY_HOOK_INSTALLED=1
+export RUSTORY_HOOK_INSTALLED=1
 
 autoload -Uz add-zsh-hook
 
@@ -213,6 +217,7 @@ mod tests {
     fn bash_hook_contains_disable_and_ctrl_r_and_rr_filter() {
         let got = render_hook(Shell::Bash);
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
+        assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
         assert!(got.contains("trap '__rustory_preexec' DEBUG"));
@@ -227,6 +232,7 @@ mod tests {
     fn zsh_hook_contains_disable_and_ctrl_r_and_rr_filter() {
         let got = render_hook(Shell::Zsh);
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
+        assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("bindkey '^R'"));
 
