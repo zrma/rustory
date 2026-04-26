@@ -226,7 +226,15 @@ enum Command {
 
 pub fn run() -> Result<()> {
     let app = App::parse();
-    let cfg = config::load_default()?;
+    let mut config_load_error = None;
+    let cfg = match config::load_default() {
+        Ok(cfg) => cfg,
+        Err(err) if matches!(&app.cmd, Command::Doctor { .. }) => {
+            config_load_error = Some(format!("{err:#}"));
+            config::FileConfig::default()
+        }
+        Err(err) => return Err(err),
+    };
 
     let db_path = normalize_opt_string(app.db_path)
         .or_else(|| env_nonempty("RUSTORY_DB_PATH"))
@@ -610,7 +618,7 @@ pub fn run() -> Result<()> {
             )?;
         }
         Command::Doctor { json } => {
-            run_doctor(&cfg, &db_path, json)?;
+            run_doctor(&cfg, &db_path, json, config_load_error.as_deref())?;
         }
         Command::Import {
             shell,
@@ -979,6 +987,7 @@ fn compute_next_due_in_sec(
 struct DoctorReport {
     config_path: String,
     config_exists: bool,
+    config_error: Option<String>,
     db_path: String,
     db: DoctorDbStatusReport,
     user_id: String,
@@ -1081,7 +1090,11 @@ struct DoctorRelayAddrReport {
     error: Option<String>,
 }
 
-fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<DoctorReport> {
+fn build_doctor_report(
+    cfg: &config::FileConfig,
+    db_path: &str,
+    config_error: Option<&str>,
+) -> Result<DoctorReport> {
     let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
     let cfg_exists = match std::fs::metadata(&cfg_path) {
         Ok(_) => true,
@@ -1247,6 +1260,7 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
     Ok(DoctorReport {
         config_path: cfg_path.display().to_string(),
         config_exists: cfg_exists,
+        config_error: config_error.map(|err| err.to_string()),
         db_path: db.path.clone(),
         db,
         user_id,
@@ -1316,9 +1330,14 @@ fn build_key_status_report(
     })
 }
 
-fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()> {
+fn run_doctor(
+    cfg: &config::FileConfig,
+    db_path: &str,
+    json: bool,
+    config_error: Option<&str>,
+) -> Result<()> {
     if json {
-        let report = build_doctor_report(cfg, db_path)?;
+        let report = build_doctor_report(cfg, db_path, config_error)?;
         println!(
             "{}",
             serde_json::to_string_pretty(&report).context("serialize doctor json")?
@@ -1344,6 +1363,11 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
     let db = build_db_status_report(db_path)?;
 
     println!("config path: {} (exists: {cfg_exists})", cfg_path.display());
+    match config_error {
+        Some(err) => println!("config status: invalid: {err}"),
+        None if cfg_exists => println!("config status: ok"),
+        None => println!("config status: missing (using defaults/env)"),
+    }
     println!("db path: {}", db.path);
     print_db_status(&db);
     println!("user_id: {user_id}");
@@ -2473,9 +2497,10 @@ mod tests {
 
     #[test]
     fn doctor_report_builds_json_shape() {
-        let report = build_doctor_report(&config::FileConfig::default(), ":memory:").unwrap();
+        let report = build_doctor_report(&config::FileConfig::default(), ":memory:", None).unwrap();
         assert_eq!(report.db_path, ":memory:");
         assert_eq!(report.db.path, ":memory:");
+        assert!(report.config_error.is_none());
         assert!(!report.db.exists);
         assert_eq!(report.fzf.command, "fzf");
         assert!(report.trackers.is_empty());
@@ -2483,11 +2508,31 @@ mod tests {
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"db\""));
+        assert!(json.contains("\"config_error\""));
         assert!(json.contains("\"fzf\""));
         assert!(json.contains("\"hook\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
         assert!(json.contains("\"relay_addr\""));
+    }
+
+    #[test]
+    fn doctor_report_records_config_error() {
+        let report = build_doctor_report(
+            &config::FileConfig::default(),
+            ":memory:",
+            Some("parse config toml: invalid TOML"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.config_error.as_deref(),
+            Some("parse config toml: invalid TOML")
+        );
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"config_error\""));
+        assert!(json.contains("parse config toml"));
     }
 
     #[test]
@@ -2522,8 +2567,12 @@ mod tests {
         store.set_last_cursor("peer-a", 1).unwrap();
         drop(store);
 
-        let report =
-            build_doctor_report(&config::FileConfig::default(), db_path.to_str().unwrap()).unwrap();
+        let report = build_doctor_report(
+            &config::FileConfig::default(),
+            db_path.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
         assert!(report.db.exists);
         assert_eq!(report.db.entry_count, Some(1));
         assert_eq!(report.db.latest_ingest_seq, Some(1));
@@ -2626,7 +2675,7 @@ mod tests {
             ..Default::default()
         };
 
-        let report = build_doctor_report(&cfg, ":memory:").unwrap();
+        let report = build_doctor_report(&cfg, ":memory:", None).unwrap();
         assert!(report.swarm_key.exists);
         assert!(report.swarm_key.value.is_none());
         assert!(report.swarm_key.load_error.is_some());
@@ -2651,7 +2700,20 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(run_doctor(&cfg, ":memory:", false).is_ok());
+        assert!(run_doctor(&cfg, ":memory:", false, None).is_ok());
+    }
+
+    #[test]
+    fn doctor_text_output_keeps_running_when_config_is_invalid() {
+        assert!(
+            run_doctor(
+                &config::FileConfig::default(),
+                ":memory:",
+                false,
+                Some("parse config toml: invalid TOML")
+            )
+            .is_ok()
+        );
     }
 
     #[test]

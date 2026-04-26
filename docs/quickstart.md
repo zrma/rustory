@@ -63,6 +63,8 @@ rr doctor
 rr doctor --json
 ```
 
+`config status: invalid: ...`가 표시되면 `~/.config/rustory/config.toml`을 먼저 고친다. `rr doctor`는 설정 파일이 잘못된 상태에서도 계속 실행되어 어떤 파일과 에러를 봐야 하는지 보여준다.
+
 `rr doctor`의 `db status:` 라인에서 로컬 DB 파일 존재 여부, 저장된 entry 수, peer book/sync peer 수를 확인할 수 있다. `entries=0`이면 ctrl+r 검색 후보가 아직 없는 상태다.
 `hook:` 라인에서는 현재 셸에서 hook 설치 마커가 보이는지(`installed`), `RUSTORY_HOOK_DISABLE`로 비활성화됐는지(`disabled`), ctrl+r 검색 limit 값이 유효한지(`search_limit`)를 확인한다.
 
