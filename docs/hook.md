@@ -1,6 +1,8 @@
 # Shell Hook (bash/zsh)
 
 ## 설치(현재 세션)
+ctrl+r 검색은 외부 실행 파일 `fzf`를 사용한다. 설치/PATH 상태는 `rr doctor`의 `fzf:` 라인에서 확인한다.
+
 ### zsh
 ```sh
 source <(rr hook --shell zsh)

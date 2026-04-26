@@ -12,6 +12,7 @@ const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
 const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
 const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
 const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
+const FZF_PURPOSE: &str = "ctrl+r search";
 
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
@@ -980,6 +981,7 @@ struct DoctorReport {
     db_path: String,
     user_id: String,
     device_id: String,
+    fzf: DoctorToolStatusReport,
     p2p_request_retry: DoctorP2pRequestRetryReport,
     record_ignore_regex: DoctorRecordIgnoreRegexReport,
     async_upload: DoctorAsyncUploadStatusReport,
@@ -998,6 +1000,14 @@ struct DoctorP2pRequestRetryReport {
     timeout_cap_sec: Option<u64>,
     backoff_base_ms: Option<u64>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorToolStatusReport {
+    command: String,
+    available: bool,
+    path: Option<String>,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -1064,6 +1074,7 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
     };
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
+    let fzf = build_tool_status_report("fzf", FZF_PURPOSE);
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
 
     let p2p_request_retry = match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
@@ -1220,6 +1231,7 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
         db_path: db_path_expanded.display().to_string(),
         user_id,
         device_id,
+        fzf,
         p2p_request_retry,
         record_ignore_regex,
         async_upload,
@@ -1308,6 +1320,7 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
     println!("db path: {}", db_path_expanded.display());
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
+    print_tool_status(&build_tool_status_report("fzf", FZF_PURPOSE));
     match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
         Ok(request_retry_policy) => {
             println!(
@@ -1440,6 +1453,78 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
     }
 
     Ok(())
+}
+
+fn build_tool_status_report(command: &str, purpose: &str) -> DoctorToolStatusReport {
+    let path_env = std::env::var_os("PATH");
+    build_tool_status_report_with_path(command, purpose, path_env.as_deref())
+}
+
+fn build_tool_status_report_with_path(
+    command: &str,
+    purpose: &str,
+    path_env: Option<&std::ffi::OsStr>,
+) -> DoctorToolStatusReport {
+    let path = find_executable_on_path(command, path_env);
+    match path {
+        Some(path) => DoctorToolStatusReport {
+            command: command.to_string(),
+            available: true,
+            path: Some(path.display().to_string()),
+            warning: None,
+        },
+        None => DoctorToolStatusReport {
+            command: command.to_string(),
+            available: false,
+            path: None,
+            warning: Some(format!("missing from PATH; {purpose} requires {command}")),
+        },
+    }
+}
+
+fn find_executable_on_path(
+    command: &str,
+    path_env: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    let paths = path_env?;
+    for dir in std::env::split_paths(paths) {
+        let candidate = dir.join(command);
+        if is_executable_file(&candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(md) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !md.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        md.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+fn print_tool_status(report: &DoctorToolStatusReport) {
+    if report.available {
+        let path = report.path.as_deref().unwrap_or("available");
+        println!("{}: {path}", report.command);
+    } else if let Some(warning) = report.warning.as_deref() {
+        println!("{}: missing ({warning})", report.command);
+    } else {
+        println!("{}: missing", report.command);
+    }
 }
 
 fn print_key_status(
@@ -2258,13 +2343,47 @@ mod tests {
     fn doctor_report_builds_json_shape() {
         let report = build_doctor_report(&config::FileConfig::default(), ":memory:").unwrap();
         assert_eq!(report.db_path, ":memory:");
+        assert_eq!(report.fzf.command, "fzf");
         assert!(report.trackers.is_empty());
         assert!(report.p2p_request_retry.error.is_none());
 
         let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"fzf\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
         assert!(json.contains("\"relay_addr\""));
+    }
+
+    #[test]
+    fn fzf_status_reports_missing_when_path_is_empty() {
+        let report =
+            build_tool_status_report_with_path("fzf", FZF_PURPOSE, Some(std::ffi::OsStr::new("")));
+
+        assert_eq!(report.command, "fzf");
+        assert!(!report.available);
+        assert!(report.path.is_none());
+        assert!(report.warning.unwrap().contains("ctrl+r search"));
+    }
+
+    #[test]
+    fn fzf_status_finds_executable_on_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let fzf = dir.path().join("fzf");
+        std::fs::write(&fzf, "#!/bin/sh\nexit 0\n").unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fzf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let report =
+            build_tool_status_report_with_path("fzf", FZF_PURPOSE, Some(dir.path().as_os_str()));
+
+        assert_eq!(report.command, "fzf");
+        assert!(report.available);
+        assert_eq!(report.path.as_deref(), Some(fzf.to_str().unwrap()));
+        assert!(report.warning.is_none());
     }
 
     #[test]

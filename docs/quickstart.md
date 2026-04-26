@@ -4,6 +4,7 @@
 
 ## 0) 준비
 - Rust 툴체인: `rust-toolchain.toml` 기준(`1.89.0`)
+- ctrl+r 검색 UX를 쓰려면 `fzf`가 `PATH`에 있어야 한다. `rr doctor`에서 `fzf:` 라인을 확인한다.
 
 ### 빌드(로컬)
 ```sh
