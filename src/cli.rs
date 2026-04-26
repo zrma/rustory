@@ -532,12 +532,12 @@ pub fn run() -> Result<()> {
                 println!("{}", entry.entry_id);
             }
 
-            if let Err(err) = maybe_spawn_async_upload(&db_path) {
+            if let Err(err) = maybe_spawn_async_upload(&db_path, &cfg) {
                 // 기록 성공을 우선하고, 비동기 업로드 트리거 실패는 경고로만 남긴다.
                 eprintln!("warn: async upload trigger failed: {err:#}");
             }
 
-            if let Err(err) = maybe_run_auto_prune(&store) {
+            if let Err(err) = maybe_run_auto_prune(&store, &cfg) {
                 // 기록 성공을 우선하고, 자동 보관 실패는 경고로만 남긴다.
                 eprintln!("warn: auto prune failed: {err:#}");
             }
@@ -943,6 +943,17 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push_str("# p2p_request_backoff_base_ms = 200 # optional\n");
     out.push_str("# search_limit_default = 100000 # optional\n");
     out.push_str("# record_ignore_regex = \"(?i)(password|token|secret)\" # optional\n");
+    out.push_str("# async_upload = false # optional; env RUSTORY_ASYNC_UPLOAD overrides\n");
+    out.push_str("# async_upload_interval_sec = 15 # optional\n");
+    out.push_str("# async_upload_limit = 200 # optional\n");
+    out.push_str(
+        "# async_upload_marker_path = \"~/.config/rustory/async-upload.last\" # optional\n",
+    );
+    out.push_str("# auto_prune = false # optional; env RUSTORY_AUTO_PRUNE overrides\n");
+    out.push_str("# auto_prune_days = 180 # optional\n");
+    out.push_str("# auto_prune_interval_sec = 86400 # optional\n");
+    out.push_str("# auto_prune_keep_recent = 0 # optional\n");
+    out.push_str("# auto_prune_marker_path = \"~/.config/rustory/auto-prune.last\" # optional\n");
 
     Ok(out)
 }
@@ -999,15 +1010,17 @@ struct AutoPruneDoctorReport {
     next_due_in_sec: u64,
 }
 
-fn load_async_upload_runtime_settings() -> Result<AsyncUploadRuntimeSettings> {
-    let marker_path_raw = resolve_async_upload_marker_path();
+fn load_async_upload_runtime_settings(
+    cfg: &config::FileConfig,
+) -> Result<AsyncUploadRuntimeSettings> {
+    let marker_path_raw = resolve_async_upload_marker_path(cfg);
     let marker_path = config::expand_home_path(&marker_path_raw)
         .with_context(|| format!("expand async upload marker path: {marker_path_raw}"))?;
 
     Ok(AsyncUploadRuntimeSettings {
-        enabled: resolve_async_upload_enabled()?,
-        interval_sec: resolve_async_upload_interval_sec()?,
-        limit: resolve_async_upload_limit()?,
+        enabled: resolve_async_upload_enabled(cfg)?,
+        interval_sec: resolve_async_upload_interval_sec(cfg)?,
+        limit: resolve_async_upload_limit(cfg)?,
         last_trigger_unix: read_rate_limit_marker(&marker_path)?,
         marker_path,
     })
@@ -1031,16 +1044,16 @@ fn summarize_async_upload_runtime(
     }
 }
 
-fn load_auto_prune_runtime_settings() -> Result<AutoPruneRuntimeSettings> {
-    let marker_path_raw = resolve_auto_prune_marker_path();
+fn load_auto_prune_runtime_settings(cfg: &config::FileConfig) -> Result<AutoPruneRuntimeSettings> {
+    let marker_path_raw = resolve_auto_prune_marker_path(cfg);
     let marker_path = config::expand_home_path(&marker_path_raw)
         .with_context(|| format!("expand auto prune marker path: {marker_path_raw}"))?;
 
     Ok(AutoPruneRuntimeSettings {
-        enabled: resolve_auto_prune_enabled()?,
-        older_than_days: resolve_auto_prune_days()?,
-        interval_sec: resolve_auto_prune_interval_sec()?,
-        keep_recent: resolve_auto_prune_keep_recent()?,
+        enabled: resolve_auto_prune_enabled(cfg)?,
+        older_than_days: resolve_auto_prune_days(cfg)?,
+        interval_sec: resolve_auto_prune_interval_sec(cfg)?,
+        keep_recent: resolve_auto_prune_keep_recent(cfg)?,
         last_trigger_unix: read_rate_limit_marker(&marker_path)?,
         marker_path,
     })
@@ -1245,7 +1258,7 @@ fn build_doctor_report(
         },
     };
 
-    let async_upload = match load_async_upload_runtime_settings() {
+    let async_upload = match load_async_upload_runtime_settings(cfg) {
         Ok(settings) => {
             let report = summarize_async_upload_runtime(settings, now_unix);
             DoctorAsyncUploadStatusReport {
@@ -1269,7 +1282,7 @@ fn build_doctor_report(
         },
     };
 
-    let auto_prune = match load_auto_prune_runtime_settings() {
+    let auto_prune = match load_auto_prune_runtime_settings(cfg) {
         Ok(settings) => {
             let report = summarize_auto_prune_runtime(settings, now_unix);
             DoctorAutoPruneStatusReport {
@@ -1493,7 +1506,7 @@ fn run_doctor(
         None => println!("record ignore regex: (none)"),
     }
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-    match load_async_upload_runtime_settings() {
+    match load_async_upload_runtime_settings(cfg) {
         Ok(settings) => {
             let report = summarize_async_upload_runtime(settings, now_unix);
             let last_trigger = report
@@ -1512,7 +1525,7 @@ fn run_doctor(
         }
         Err(err) => println!("async upload: invalid: {err:#}"),
     }
-    match load_auto_prune_runtime_settings() {
+    match load_auto_prune_runtime_settings(cfg) {
         Ok(settings) => {
             let report = summarize_auto_prune_runtime(settings, now_unix);
             let last_trigger = report
@@ -1990,14 +2003,14 @@ fn env_nonempty(key: &str) -> Option<String> {
     normalize_opt_string(std::env::var(key).ok())
 }
 
-fn maybe_spawn_async_upload(db_path: &str) -> Result<()> {
-    if !resolve_async_upload_enabled()? {
+fn maybe_spawn_async_upload(db_path: &str, cfg: &config::FileConfig) -> Result<()> {
+    if !resolve_async_upload_enabled(cfg)? {
         return Ok(());
     }
 
-    let min_interval_sec = resolve_async_upload_interval_sec()?;
-    let limit = resolve_async_upload_limit()?;
-    let marker_path = config::expand_home_path(&resolve_async_upload_marker_path())?;
+    let min_interval_sec = resolve_async_upload_interval_sec(cfg)?;
+    let limit = resolve_async_upload_limit(cfg)?;
+    let marker_path = config::expand_home_path(&resolve_async_upload_marker_path(cfg))?;
 
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
     let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
@@ -2023,15 +2036,15 @@ fn maybe_spawn_async_upload(db_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn maybe_run_auto_prune(store: &storage::LocalStore) -> Result<()> {
-    if !resolve_auto_prune_enabled()? {
+fn maybe_run_auto_prune(store: &storage::LocalStore, cfg: &config::FileConfig) -> Result<()> {
+    if !resolve_auto_prune_enabled(cfg)? {
         return Ok(());
     }
 
-    let older_than_days = resolve_auto_prune_days()?;
-    let keep_recent = resolve_auto_prune_keep_recent()?;
-    let min_interval_sec = resolve_auto_prune_interval_sec()?;
-    let marker_path = config::expand_home_path(&resolve_auto_prune_marker_path())?;
+    let older_than_days = resolve_auto_prune_days(cfg)?;
+    let keep_recent = resolve_auto_prune_keep_recent(cfg)?;
+    let min_interval_sec = resolve_auto_prune_interval_sec(cfg)?;
+    let marker_path = config::expand_home_path(&resolve_auto_prune_marker_path(cfg))?;
 
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
     let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
@@ -2053,107 +2066,165 @@ fn maybe_run_auto_prune(store: &storage::LocalStore) -> Result<()> {
     Ok(())
 }
 
-fn resolve_async_upload_enabled() -> Result<bool> {
-    let Some(raw) = env_nonempty("RUSTORY_ASYNC_UPLOAD") else {
-        return Ok(false);
-    };
-    parse_env_bool(&raw, "RUSTORY_ASYNC_UPLOAD")
+fn resolve_async_upload_enabled(cfg: &config::FileConfig) -> Result<bool> {
+    resolve_bool_setting(
+        "RUSTORY_ASYNC_UPLOAD",
+        env_nonempty("RUSTORY_ASYNC_UPLOAD"),
+        cfg.async_upload,
+        false,
+    )
 }
 
-fn resolve_async_upload_interval_sec() -> Result<u64> {
-    let Some(raw) = env_nonempty("RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC") else {
-        return Ok(DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC);
-    };
+fn resolve_async_upload_interval_sec(cfg: &config::FileConfig) -> Result<u64> {
+    resolve_u64_setting(
+        "RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC",
+        "async_upload_interval_sec",
+        env_nonempty("RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC"),
+        cfg.async_upload_interval_sec,
+        DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC,
+        1,
+    )
+}
 
-    let parsed: u64 = raw.parse().map_err(|e| {
-        anyhow::anyhow!(
-            "invalid RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC={:?}: {e}",
-            raw.trim()
-        )
-    })?;
-    if parsed == 0 {
-        anyhow::bail!("RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC must be >= 1");
+fn resolve_async_upload_limit(cfg: &config::FileConfig) -> Result<usize> {
+    resolve_usize_setting(
+        "RUSTORY_ASYNC_UPLOAD_LIMIT",
+        "async_upload_limit",
+        env_nonempty("RUSTORY_ASYNC_UPLOAD_LIMIT"),
+        cfg.async_upload_limit,
+        DEFAULT_ASYNC_UPLOAD_LIMIT,
+        1,
+    )
+}
+
+fn resolve_async_upload_marker_path(cfg: &config::FileConfig) -> String {
+    resolve_string_setting(
+        env_nonempty("RUSTORY_ASYNC_UPLOAD_MARKER_PATH"),
+        cfg.async_upload_marker_path.clone(),
+        DEFAULT_ASYNC_UPLOAD_MARKER_PATH,
+    )
+}
+
+fn resolve_auto_prune_enabled(cfg: &config::FileConfig) -> Result<bool> {
+    resolve_bool_setting(
+        "RUSTORY_AUTO_PRUNE",
+        env_nonempty("RUSTORY_AUTO_PRUNE"),
+        cfg.auto_prune,
+        false,
+    )
+}
+
+fn resolve_auto_prune_days(cfg: &config::FileConfig) -> Result<u64> {
+    resolve_u64_setting(
+        "RUSTORY_AUTO_PRUNE_DAYS",
+        "auto_prune_days",
+        env_nonempty("RUSTORY_AUTO_PRUNE_DAYS"),
+        cfg.auto_prune_days,
+        DEFAULT_AUTO_PRUNE_DAYS,
+        1,
+    )
+}
+
+fn resolve_auto_prune_interval_sec(cfg: &config::FileConfig) -> Result<u64> {
+    resolve_u64_setting(
+        "RUSTORY_AUTO_PRUNE_INTERVAL_SEC",
+        "auto_prune_interval_sec",
+        env_nonempty("RUSTORY_AUTO_PRUNE_INTERVAL_SEC"),
+        cfg.auto_prune_interval_sec,
+        DEFAULT_AUTO_PRUNE_INTERVAL_SEC,
+        1,
+    )
+}
+
+fn resolve_auto_prune_keep_recent(cfg: &config::FileConfig) -> Result<usize> {
+    resolve_usize_setting(
+        "RUSTORY_AUTO_PRUNE_KEEP_RECENT",
+        "auto_prune_keep_recent",
+        env_nonempty("RUSTORY_AUTO_PRUNE_KEEP_RECENT"),
+        cfg.auto_prune_keep_recent,
+        DEFAULT_AUTO_PRUNE_KEEP_RECENT,
+        0,
+    )
+}
+
+fn resolve_auto_prune_marker_path(cfg: &config::FileConfig) -> String {
+    resolve_string_setting(
+        env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH"),
+        cfg.auto_prune_marker_path.clone(),
+        DEFAULT_AUTO_PRUNE_MARKER_PATH,
+    )
+}
+
+fn resolve_bool_setting(
+    env_key: &str,
+    env_value: Option<String>,
+    cfg_value: Option<bool>,
+    default: bool,
+) -> Result<bool> {
+    match env_value {
+        Some(raw) => parse_env_bool(&raw, env_key),
+        None => Ok(cfg_value.unwrap_or(default)),
+    }
+}
+
+fn resolve_u64_setting(
+    env_key: &str,
+    cfg_key: &str,
+    env_value: Option<String>,
+    cfg_value: Option<u64>,
+    default: u64,
+    min: u64,
+) -> Result<u64> {
+    if let Some(raw) = env_value {
+        let parsed: u64 = raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid {env_key}={:?}: {e}", raw.trim()))?;
+        if parsed < min {
+            anyhow::bail!("{env_key} must be >= {min}");
+        }
+        return Ok(parsed);
     }
 
-    Ok(parsed)
+    let value = cfg_value.unwrap_or(default);
+    if value < min {
+        anyhow::bail!("{cfg_key} must be >= {min}");
+    }
+    Ok(value)
 }
 
-fn resolve_async_upload_limit() -> Result<usize> {
-    let Some(raw) = env_nonempty("RUSTORY_ASYNC_UPLOAD_LIMIT") else {
-        return Ok(DEFAULT_ASYNC_UPLOAD_LIMIT);
-    };
-
-    let parsed: usize = raw
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid RUSTORY_ASYNC_UPLOAD_LIMIT={:?}: {e}", raw.trim()))?;
-    if parsed == 0 {
-        anyhow::bail!("RUSTORY_ASYNC_UPLOAD_LIMIT must be >= 1");
+fn resolve_usize_setting(
+    env_key: &str,
+    cfg_key: &str,
+    env_value: Option<String>,
+    cfg_value: Option<usize>,
+    default: usize,
+    min: usize,
+) -> Result<usize> {
+    if let Some(raw) = env_value {
+        let parsed: usize = raw
+            .parse()
+            .map_err(|e| anyhow::anyhow!("invalid {env_key}={:?}: {e}", raw.trim()))?;
+        if parsed < min {
+            anyhow::bail!("{env_key} must be >= {min}");
+        }
+        return Ok(parsed);
     }
 
-    Ok(parsed)
-}
-
-fn resolve_async_upload_marker_path() -> String {
-    env_nonempty("RUSTORY_ASYNC_UPLOAD_MARKER_PATH")
-        .unwrap_or_else(|| DEFAULT_ASYNC_UPLOAD_MARKER_PATH.to_string())
-}
-
-fn resolve_auto_prune_enabled() -> Result<bool> {
-    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE") else {
-        return Ok(false);
-    };
-    parse_env_bool(&raw, "RUSTORY_AUTO_PRUNE")
-}
-
-fn resolve_auto_prune_days() -> Result<u64> {
-    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_DAYS") else {
-        return Ok(DEFAULT_AUTO_PRUNE_DAYS);
-    };
-
-    let parsed: u64 = raw
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid RUSTORY_AUTO_PRUNE_DAYS={:?}: {e}", raw.trim()))?;
-    if parsed == 0 {
-        anyhow::bail!("RUSTORY_AUTO_PRUNE_DAYS must be >= 1");
+    let value = cfg_value.unwrap_or(default);
+    if value < min {
+        anyhow::bail!("{cfg_key} must be >= {min}");
     }
-
-    Ok(parsed)
+    Ok(value)
 }
 
-fn resolve_auto_prune_interval_sec() -> Result<u64> {
-    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_INTERVAL_SEC") else {
-        return Ok(DEFAULT_AUTO_PRUNE_INTERVAL_SEC);
-    };
-
-    let parsed: u64 = raw.parse().map_err(|e| {
-        anyhow::anyhow!(
-            "invalid RUSTORY_AUTO_PRUNE_INTERVAL_SEC={:?}: {e}",
-            raw.trim()
-        )
-    })?;
-    if parsed == 0 {
-        anyhow::bail!("RUSTORY_AUTO_PRUNE_INTERVAL_SEC must be >= 1");
-    }
-
-    Ok(parsed)
-}
-
-fn resolve_auto_prune_keep_recent() -> Result<usize> {
-    let Some(raw) = env_nonempty("RUSTORY_AUTO_PRUNE_KEEP_RECENT") else {
-        return Ok(DEFAULT_AUTO_PRUNE_KEEP_RECENT);
-    };
-
-    raw.parse().map_err(|e| {
-        anyhow::anyhow!(
-            "invalid RUSTORY_AUTO_PRUNE_KEEP_RECENT={:?}: {e}",
-            raw.trim()
-        )
-    })
-}
-
-fn resolve_auto_prune_marker_path() -> String {
-    env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH")
-        .unwrap_or_else(|| DEFAULT_AUTO_PRUNE_MARKER_PATH.to_string())
+fn resolve_string_setting(
+    env_value: Option<String>,
+    cfg_value: Option<String>,
+    default: &str,
+) -> String {
+    env_value
+        .or_else(|| normalize_opt_string(cfg_value))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn parse_env_bool(value: &str, label: &str) -> Result<bool> {
@@ -3099,6 +3170,106 @@ mod tests {
     }
 
     #[test]
+    fn runtime_settings_use_config_fallback_when_env_is_absent() {
+        assert!(resolve_bool_setting("RUSTORY_ASYNC_UPLOAD", None, Some(true), false).unwrap());
+        assert_eq!(
+            resolve_u64_setting(
+                "RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC",
+                "async_upload_interval_sec",
+                None,
+                Some(30),
+                DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC,
+                1,
+            )
+            .unwrap(),
+            30
+        );
+        assert_eq!(
+            resolve_usize_setting(
+                "RUSTORY_ASYNC_UPLOAD_LIMIT",
+                "async_upload_limit",
+                None,
+                Some(500),
+                DEFAULT_ASYNC_UPLOAD_LIMIT,
+                1,
+            )
+            .unwrap(),
+            500
+        );
+        assert_eq!(
+            resolve_string_setting(
+                None,
+                Some("~/custom-runtime.last".to_string()),
+                DEFAULT_ASYNC_UPLOAD_MARKER_PATH,
+            ),
+            "~/custom-runtime.last"
+        );
+    }
+
+    #[test]
+    fn runtime_settings_env_override_config_values() {
+        assert!(
+            !resolve_bool_setting(
+                "RUSTORY_ASYNC_UPLOAD",
+                Some("0".to_string()),
+                Some(true),
+                false,
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            resolve_u64_setting(
+                "RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC",
+                "async_upload_interval_sec",
+                Some("7".to_string()),
+                Some(30),
+                DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC,
+                1,
+            )
+            .unwrap(),
+            7
+        );
+        assert_eq!(
+            resolve_string_setting(
+                Some("~/env-runtime.last".to_string()),
+                Some("~/config-runtime.last".to_string()),
+                DEFAULT_ASYNC_UPLOAD_MARKER_PATH,
+            ),
+            "~/env-runtime.last"
+        );
+    }
+
+    #[test]
+    fn runtime_settings_reject_zero_config_values() {
+        assert!(
+            resolve_u64_setting(
+                "RUSTORY_AUTO_PRUNE_DAYS",
+                "auto_prune_days",
+                None,
+                Some(0),
+                DEFAULT_AUTO_PRUNE_DAYS,
+                1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("auto_prune_days must be >= 1")
+        );
+        assert!(
+            resolve_usize_setting(
+                "RUSTORY_ASYNC_UPLOAD_LIMIT",
+                "async_upload_limit",
+                None,
+                Some(0),
+                DEFAULT_ASYNC_UPLOAD_LIMIT,
+                1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("async_upload_limit must be >= 1")
+        );
+    }
+
+    #[test]
     fn should_trigger_interval_respects_interval() {
         assert!(should_trigger_interval(100, None, 15));
         assert!(should_trigger_interval(100, Some(80), 15));
@@ -3268,6 +3439,8 @@ mod tests {
         assert!(text.contains("p2p_identity_key_path"));
         assert!(text.contains("p2p_request_attempts"));
         assert!(text.contains("record_ignore_regex"));
+        assert!(text.contains("async_upload"));
+        assert!(text.contains("auto_prune"));
     }
 
     #[test]

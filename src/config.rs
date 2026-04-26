@@ -32,6 +32,17 @@ pub struct FileConfig {
     pub search_limit_default: Option<usize>,
 
     pub record_ignore_regex: Option<String>,
+
+    pub async_upload: Option<bool>,
+    pub async_upload_interval_sec: Option<u64>,
+    pub async_upload_limit: Option<usize>,
+    pub async_upload_marker_path: Option<String>,
+
+    pub auto_prune: Option<bool>,
+    pub auto_prune_days: Option<u64>,
+    pub auto_prune_interval_sec: Option<u64>,
+    pub auto_prune_keep_recent: Option<usize>,
+    pub auto_prune_marker_path: Option<String>,
 }
 
 pub fn load_default() -> Result<FileConfig> {
@@ -201,6 +212,15 @@ p2p_request_timeout_base_sec = 6
 p2p_request_timeout_cap_sec = 40
 p2p_request_backoff_base_ms = 250
 record_ignore_regex = "(?i)token|password"
+async_upload = true
+async_upload_interval_sec = 30
+async_upload_limit = 500
+async_upload_marker_path = "~/.config/rustory/async-upload.custom.last"
+auto_prune = true
+auto_prune_days = 90
+auto_prune_interval_sec = 3600
+auto_prune_keep_recent = 1000
+auto_prune_marker_path = "~/.config/rustory/auto-prune.custom.last"
 "#,
         )
         .unwrap();
@@ -216,6 +236,21 @@ record_ignore_regex = "(?i)token|password"
         assert_eq!(
             cfg.record_ignore_regex.as_deref(),
             Some("(?i)token|password")
+        );
+        assert_eq!(cfg.async_upload, Some(true));
+        assert_eq!(cfg.async_upload_interval_sec, Some(30));
+        assert_eq!(cfg.async_upload_limit, Some(500));
+        assert_eq!(
+            cfg.async_upload_marker_path.as_deref(),
+            Some("~/.config/rustory/async-upload.custom.last")
+        );
+        assert_eq!(cfg.auto_prune, Some(true));
+        assert_eq!(cfg.auto_prune_days, Some(90));
+        assert_eq!(cfg.auto_prune_interval_sec, Some(3600));
+        assert_eq!(cfg.auto_prune_keep_recent, Some(1000));
+        assert_eq!(
+            cfg.auto_prune_marker_path.as_deref(),
+            Some("~/.config/rustory/auto-prune.custom.last")
         );
     }
 

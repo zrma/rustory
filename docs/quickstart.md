@@ -120,6 +120,14 @@ export RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC=15
 export RUSTORY_ASYNC_UPLOAD_LIMIT=200
 ```
 
+지속 설정으로 남기려면 `~/.config/rustory/config.toml`에 다음 값을 둘 수 있다. 같은 이름의 `RUSTORY_*` 환경 변수가 있으면 환경 변수가 우선한다.
+
+```toml
+async_upload = true
+async_upload_interval_sec = 15
+async_upload_limit = 200
+```
+
 업로드 실패 시에도 로컬 기록은 유지되며, 다음 트리거에서 `pending_push` 큐가 다시 전송된다.
 설정 해석/주기 상태는 `rr doctor`의 `async upload` 라인에서 즉시 확인할 수 있다.
 
@@ -130,6 +138,15 @@ export RUSTORY_AUTO_PRUNE=1
 export RUSTORY_AUTO_PRUNE_DAYS=180
 export RUSTORY_AUTO_PRUNE_INTERVAL_SEC=86400
 export RUSTORY_AUTO_PRUNE_KEEP_RECENT=5000
+```
+
+지속 설정으로 남기려면 `~/.config/rustory/config.toml`에 다음 값을 둘 수 있다. 같은 이름의 `RUSTORY_*` 환경 변수가 있으면 환경 변수가 우선한다.
+
+```toml
+auto_prune = true
+auto_prune_days = 180
+auto_prune_interval_sec = 86400
+auto_prune_keep_recent = 5000
 ```
 
 `rr record` 성공 후 주기 제한에 맞춰 자동 prune이 실행되며, `RUSTORY_AUTO_PRUNE_KEEP_RECENT`를 지정하면 최신 N개는 삭제 대상에서 제외된다. 자동 보관 실패 시에도 기록 자체는 유지된다.
