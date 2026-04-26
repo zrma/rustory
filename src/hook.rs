@@ -117,9 +117,9 @@ esac
 
 __rustory_ctrl_r() {
   [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
-  local limit="${RUSTORY_SEARCH_LIMIT:-100000}"
   local selected
-  selected="$(rr search --limit "$limit")" || return 0
+  # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
+  selected="$(rr search)" || return 0
   [[ -z "$selected" ]] && return 0
 
   READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}$selected${READLINE_LINE:$READLINE_POINT}"
@@ -194,9 +194,9 @@ add-zsh-hook precmd __rustory_precmd
 
 __rustory_widget_ctrl_r() {
   [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
-  local limit="${RUSTORY_SEARCH_LIMIT:-100000}"
   local selected
-  selected="$(rr search --limit "$limit")" || return 0
+  # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
+  selected="$(rr search)" || return 0
   if [[ -n "$selected" ]]; then
     LBUFFER+="$selected"
   fi
@@ -219,6 +219,8 @@ mod tests {
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
         assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
+        assert!(got.contains("selected=\"$(rr search)\""));
+        assert!(!got.contains("rr search --limit"));
         assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
         assert!(got.contains("trap '__rustory_preexec' DEBUG"));
         assert!(got.contains("--duration-ms"));
@@ -234,6 +236,8 @@ mod tests {
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
         assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
+        assert!(got.contains("selected=\"$(rr search)\""));
+        assert!(!got.contains("rr search --limit"));
         assert!(got.contains("bindkey '^R'"));
 
         // ensure we skip both `rr` and `rr ...`

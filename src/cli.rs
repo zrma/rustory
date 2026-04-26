@@ -1216,7 +1216,7 @@ fn build_doctor_report(
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
     let fzf = build_tool_status_report("fzf", FZF_PURPOSE);
-    let hook = build_hook_status_report();
+    let hook = build_hook_status_report(cfg);
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
 
     let p2p_request_retry = match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
@@ -1483,7 +1483,7 @@ fn run_doctor(
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
     print_tool_status(&build_tool_status_report("fzf", FZF_PURPOSE));
-    print_hook_status(&build_hook_status_report());
+    print_hook_status(&build_hook_status_report(cfg));
     match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
         Ok(request_retry_policy) => {
             println!(
@@ -1690,12 +1690,13 @@ fn print_tool_status(report: &DoctorToolStatusReport) {
     }
 }
 
-fn build_hook_status_report() -> DoctorHookStatusReport {
+fn build_hook_status_report(cfg: &config::FileConfig) -> DoctorHookStatusReport {
     build_hook_status_report_from_env(
         default_shell(),
         env_nonempty("RUSTORY_HOOK_INSTALLED"),
         env_nonempty("RUSTORY_HOOK_DISABLE"),
         env_nonempty("RUSTORY_SEARCH_LIMIT"),
+        cfg.search_limit_default,
     )
 }
 
@@ -1704,21 +1705,15 @@ fn build_hook_status_report_from_env(
     installed_marker: Option<String>,
     disable_marker: Option<String>,
     search_limit_raw: Option<String>,
+    config_search_limit: Option<usize>,
 ) -> DoctorHookStatusReport {
     let installed = installed_marker.is_some();
     let disabled = disable_marker.is_some();
-    let search_limit_raw =
-        search_limit_raw.unwrap_or_else(|| DEFAULT_HOOK_SEARCH_LIMIT.to_string());
-    let (search_limit, error) = match search_limit_raw.parse::<usize>() {
-        Ok(value) => (Some(value), None),
-        Err(err) => (
-            None,
-            Some(format!(
-                "invalid RUSTORY_SEARCH_LIMIT={:?}: {err}",
-                search_limit_raw.trim()
-            )),
-        ),
-    };
+    let (search_limit, error) =
+        match resolve_search_limit_from_values(None, search_limit_raw, config_search_limit) {
+            Ok(value) => (Some(value), None),
+            Err(err) => (None, Some(err.to_string())),
+        };
 
     let mut warnings = Vec::new();
     if !installed {
@@ -2282,22 +2277,34 @@ fn should_trigger_interval(
 }
 
 fn resolve_search_limit(cli: Option<usize>, cfg: &config::FileConfig) -> Result<usize> {
+    resolve_search_limit_from_values(
+        cli,
+        env_nonempty("RUSTORY_SEARCH_LIMIT"),
+        cfg.search_limit_default,
+    )
+}
+
+fn resolve_search_limit_from_values(
+    cli: Option<usize>,
+    env_value: Option<String>,
+    config_value: Option<usize>,
+) -> Result<usize> {
     if let Some(v) = cli {
         return Ok(v);
     }
 
-    if let Some(v) = env_nonempty("RUSTORY_SEARCH_LIMIT") {
+    if let Some(v) = env_value {
         let parsed: usize = v
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid RUSTORY_SEARCH_LIMIT={:?}: {e}", v.trim()))?;
         return Ok(parsed);
     }
 
-    if let Some(v) = cfg.search_limit_default {
+    if let Some(v) = config_value {
         return Ok(v);
     }
 
-    Ok(100000)
+    Ok(DEFAULT_HOOK_SEARCH_LIMIT)
 }
 
 fn compute_prune_cutoff_unix(now_unix: i64, older_than_days: u64) -> Result<i64> {
@@ -2879,7 +2886,8 @@ mod tests {
 
     #[test]
     fn hook_status_reports_missing_marker_with_default_limit() {
-        let report = build_hook_status_report_from_env(Some("zsh".to_string()), None, None, None);
+        let report =
+            build_hook_status_report_from_env(Some("zsh".to_string()), None, None, None, None);
 
         assert!(!report.installed);
         assert!(!report.disabled);
@@ -2901,6 +2909,7 @@ mod tests {
             Some("1".to_string()),
             Some("1".to_string()),
             Some("many".to_string()),
+            Some(42),
         );
 
         assert!(report.installed);
@@ -2926,6 +2935,36 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("unsupported shell"))
         );
+    }
+
+    #[test]
+    fn hook_status_uses_config_search_limit_when_env_is_absent() {
+        let report = build_hook_status_report_from_env(
+            Some("zsh".to_string()),
+            Some("1".to_string()),
+            None,
+            None,
+            Some(42),
+        );
+
+        assert!(report.installed);
+        assert_eq!(report.search_limit, Some(42));
+        assert!(report.error.is_none());
+    }
+
+    #[test]
+    fn hook_status_env_search_limit_overrides_config() {
+        let report = build_hook_status_report_from_env(
+            Some("zsh".to_string()),
+            Some("1".to_string()),
+            None,
+            Some("7".to_string()),
+            Some(42),
+        );
+
+        assert!(report.installed);
+        assert_eq!(report.search_limit, Some(7));
+        assert!(report.error.is_none());
     }
 
     #[test]
@@ -3236,6 +3275,40 @@ mod tests {
                 DEFAULT_ASYNC_UPLOAD_MARKER_PATH,
             ),
             "~/env-runtime.last"
+        );
+    }
+
+    #[test]
+    fn search_limit_uses_config_default_when_env_is_absent() {
+        assert_eq!(
+            resolve_search_limit_from_values(None, None, Some(42)).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn search_limit_env_overrides_config_default() {
+        assert_eq!(
+            resolve_search_limit_from_values(None, Some("7".to_string()), Some(42)).unwrap(),
+            7
+        );
+    }
+
+    #[test]
+    fn search_limit_cli_overrides_env_and_config() {
+        assert_eq!(
+            resolve_search_limit_from_values(Some(3), Some("7".to_string()), Some(42)).unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn search_limit_rejects_invalid_env_value() {
+        assert!(
+            resolve_search_limit_from_values(None, Some("many".to_string()), Some(42))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid RUSTORY_SEARCH_LIMIT")
         );
     }
 
