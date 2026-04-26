@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-04-24
+- Last Verified: 2026-04-26
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
@@ -19,6 +19,8 @@
 - 작업 네비게이션은 `docs/HANDOFF.md -> docs/EXECUTION_LOOP.md -> docs/todo-*/spec.md`를 기본 경로로 사용한다.
 - 결정 사항은 `spec.md`에 유지하고, 미결 항목은 `open-questions.md`에만 유지한다.
 - 동일 규칙/절차를 여러 문서에 중복 작성하지 않는다.
+- LLM 에이전트는 세부 지시를 기다리지 않고 저장소 문서/스크립트가 정한 경로로 목표 달성까지 진행한다.
+- 사람 호출은 명시적 에스컬레이션 조건 또는 담당 개발자의 판단이 필요한 경우로 제한한다.
 
 ## 문서 역할 분리 (AI-first)
 
@@ -44,6 +46,7 @@
 5. 동일 게이트 실패가 2회 반복되면 임의 재시도를 중단하고 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 보고한다.
 6. `DEBUG_GATES_OVERRIDE` 계열 우회는 사람 승인 없이 사용하지 않는다.
 7. `scripts/check-doc-last-verified.sh` 실패 시 관련 문서 `Last Verified`를 갱신하고 재검증 전까지 출고/푸시를 진행하지 않는다.
+8. 위 조건에 걸리지 않는 구현/검증/문서화/커밋/푸시는 같은 턴에서 자율적으로 닫는다.
 
 ## 전역 스킬 운영 원칙
 

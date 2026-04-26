@@ -13,6 +13,12 @@
 - 질문 카드/닫힘 상태는 `scripts/check-open-questions-schema.sh --require-closed`를 기준으로 관리한다.
 - 누락/실패/재작업 대응은 `docs/IMPROVEMENT_LOOP.md`를 단일 기준으로 따른다.
 
+## Workflow: Autonomous execution
+
+- 에이전트는 사용자에게 세부 지시를 요구하지 않고, 저장소 문서/스크립트 기준으로 목표 달성까지 자율적으로 진행한다.
+- 사용자 호출은 `docs/ESCALATION_POLICY.md`의 즉시 에스컬레이션 조건 또는 명시적 사용자 판단이 필요한 경우로 제한한다.
+- 그 외 진행 상황은 간단히 공유하되, 구현/검증/문서화/커밋/푸시를 같은 턴에서 닫는 것을 기본값으로 둔다.
+
 ## Workflow: Execution loop
 
 - 표준 사이클은 `구현 + 테스트 -> 검수 + 보완 -> 커밋 정리 + 푸시` 순서로 진행한다.
