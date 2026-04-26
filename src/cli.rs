@@ -979,6 +979,7 @@ struct DoctorReport {
     config_path: String,
     config_exists: bool,
     db_path: String,
+    db: DoctorDbStatusReport,
     user_id: String,
     device_id: String,
     fzf: DoctorToolStatusReport,
@@ -991,6 +992,17 @@ struct DoctorReport {
     relay_identity_key: DoctorKeyStatusReport,
     relay_addr: DoctorRelayAddrReport,
     trackers: Vec<SyncStatusTrackerReport>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorDbStatusReport {
+    path: String,
+    exists: bool,
+    entry_count: Option<usize>,
+    latest_ingest_seq: Option<i64>,
+    peer_book_count: Option<usize>,
+    sync_peer_count: Option<usize>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -1058,8 +1070,6 @@ struct DoctorRelayAddrReport {
 }
 
 fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<DoctorReport> {
-    use std::path::Path;
-
     let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
     let cfg_exists = match std::fs::metadata(&cfg_path) {
         Ok(_) => true,
@@ -1067,11 +1077,7 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
         Err(_) => false,
     };
 
-    let db_path_expanded = if db_path == ":memory:" {
-        Path::new(":memory:").to_path_buf()
-    } else {
-        config::expand_home_path(db_path)?
-    };
+    let db = build_db_status_report(db_path)?;
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
     let fzf = build_tool_status_report("fzf", FZF_PURPOSE);
@@ -1228,7 +1234,8 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
     Ok(DoctorReport {
         config_path: cfg_path.display().to_string(),
         config_exists: cfg_exists,
-        db_path: db_path_expanded.display().to_string(),
+        db_path: db.path.clone(),
+        db,
         user_id,
         device_id,
         fzf,
@@ -1241,6 +1248,19 @@ fn build_doctor_report(cfg: &config::FileConfig, db_path: &str) -> Result<Doctor
         relay_identity_key,
         relay_addr,
         trackers,
+    })
+}
+
+fn build_db_status_report(db_path: &str) -> Result<DoctorDbStatusReport> {
+    let inspection = storage::inspect_existing_store(db_path)?;
+    Ok(DoctorDbStatusReport {
+        path: inspection.path.display().to_string(),
+        exists: inspection.exists,
+        entry_count: inspection.entry_count,
+        latest_ingest_seq: inspection.latest_ingest_seq,
+        peer_book_count: inspection.peer_book_count,
+        sync_peer_count: inspection.sync_peer_count,
+        error: inspection.error,
     })
 }
 
@@ -1292,8 +1312,6 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
         return Ok(());
     }
 
-    use std::path::Path;
-
     let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
     let cfg_exists = match std::fs::metadata(&cfg_path) {
         Ok(_) => true,
@@ -1307,17 +1325,13 @@ fn run_doctor(cfg: &config::FileConfig, db_path: &str, json: bool) -> Result<()>
         }
     };
 
-    let db_path_expanded = if db_path == ":memory:" {
-        Path::new(":memory:").to_path_buf()
-    } else {
-        config::expand_home_path(db_path)?
-    };
-
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
+    let db = build_db_status_report(db_path)?;
 
     println!("config path: {} (exists: {cfg_exists})", cfg_path.display());
-    println!("db path: {}", db_path_expanded.display());
+    println!("db path: {}", db.path);
+    print_db_status(&db);
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
     print_tool_status(&build_tool_status_report("fzf", FZF_PURPOSE));
@@ -1525,6 +1539,26 @@ fn print_tool_status(report: &DoctorToolStatusReport) {
     } else {
         println!("{}: missing", report.command);
     }
+}
+
+fn print_db_status(report: &DoctorDbStatusReport) {
+    if let Some(error) = report.error.as_deref() {
+        println!("db status: error: {error}");
+        return;
+    }
+
+    if !report.exists {
+        println!("db status: missing");
+        return;
+    }
+
+    println!(
+        "db status: exists entries={} latest_ingest_seq={} peer_book_peers={} sync_peers={}",
+        report.entry_count.unwrap_or(0),
+        report.latest_ingest_seq.unwrap_or(0),
+        report.peer_book_count.unwrap_or(0),
+        report.sync_peer_count.unwrap_or(0),
+    );
 }
 
 fn print_key_status(
@@ -2343,15 +2377,60 @@ mod tests {
     fn doctor_report_builds_json_shape() {
         let report = build_doctor_report(&config::FileConfig::default(), ":memory:").unwrap();
         assert_eq!(report.db_path, ":memory:");
+        assert_eq!(report.db.path, ":memory:");
+        assert!(!report.db.exists);
         assert_eq!(report.fzf.command, "fzf");
         assert!(report.trackers.is_empty());
         assert!(report.p2p_request_retry.error.is_none());
 
         let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"db\""));
         assert!(json.contains("\"fzf\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
         assert!(json.contains("\"relay_addr\""));
+    }
+
+    #[test]
+    fn doctor_report_includes_existing_db_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let store = storage::LocalStore::open(db_path.to_str().unwrap()).unwrap();
+        store
+            .insert_entries(&[crate::core::Entry {
+                entry_id: "id-1".to_string(),
+                device_id: "dev1".to_string(),
+                user_id: "user1".to_string(),
+                ts: time::OffsetDateTime::from_unix_timestamp(1).unwrap(),
+                cmd: "echo test".to_string(),
+                cwd: "/tmp".to_string(),
+                exit_code: 0,
+                duration_ms: 10,
+                shell: "zsh".to_string(),
+                hostname: "host".to_string(),
+                version: "0.1.0".to_string(),
+            }])
+            .unwrap();
+        store
+            .upsert_peer_book(&storage::PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some("dev2".to_string()),
+                last_seen_unix: 99,
+            })
+            .unwrap();
+        store.set_last_cursor("peer-a", 1).unwrap();
+        drop(store);
+
+        let report =
+            build_doctor_report(&config::FileConfig::default(), db_path.to_str().unwrap()).unwrap();
+        assert!(report.db.exists);
+        assert_eq!(report.db.entry_count, Some(1));
+        assert_eq!(report.db.latest_ingest_seq, Some(1));
+        assert_eq!(report.db.peer_book_count, Some(1));
+        assert_eq!(report.db.sync_peer_count, Some(1));
+        assert!(report.db.error.is_none());
     }
 
     #[test]

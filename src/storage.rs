@@ -1,6 +1,6 @@
 use crate::core::Entry;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OpenFlags, params};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,6 +27,17 @@ pub struct PruneStats {
 
 pub struct LocalStore {
     conn: Connection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoreInspection {
+    pub path: PathBuf,
+    pub exists: bool,
+    pub entry_count: Option<usize>,
+    pub latest_ingest_seq: Option<i64>,
+    pub peer_book_count: Option<usize>,
+    pub sync_peer_count: Option<usize>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -661,6 +672,134 @@ LIMIT ?2
     }
 }
 
+pub fn inspect_existing_store(path: &str) -> Result<StoreInspection> {
+    let path = expand_home(path)?;
+
+    if path == Path::new(":memory:") {
+        return Ok(StoreInspection {
+            path,
+            exists: false,
+            entry_count: None,
+            latest_ingest_seq: None,
+            peer_book_count: None,
+            sync_peer_count: None,
+            error: None,
+        });
+    }
+
+    let exists = match std::fs::metadata(&path) {
+        Ok(md) => {
+            if !md.is_file() {
+                return Ok(StoreInspection {
+                    path,
+                    exists: true,
+                    entry_count: None,
+                    latest_ingest_seq: None,
+                    peer_book_count: None,
+                    sync_peer_count: None,
+                    error: Some("path exists but is not a regular file".to_string()),
+                });
+            }
+            true
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
+        Err(err) => {
+            return Ok(StoreInspection {
+                path,
+                exists: false,
+                entry_count: None,
+                latest_ingest_seq: None,
+                peer_book_count: None,
+                sync_peer_count: None,
+                error: Some(format!("stat db path: {err}")),
+            });
+        }
+    };
+
+    if !exists {
+        return Ok(StoreInspection {
+            path,
+            exists,
+            entry_count: None,
+            latest_ingest_seq: None,
+            peer_book_count: None,
+            sync_peer_count: None,
+            error: None,
+        });
+    }
+
+    match inspect_existing_store_file(&path) {
+        Ok((entry_count, latest_ingest_seq, peer_book_count, sync_peer_count)) => {
+            Ok(StoreInspection {
+                path,
+                exists,
+                entry_count: Some(entry_count),
+                latest_ingest_seq: Some(latest_ingest_seq),
+                peer_book_count: Some(peer_book_count),
+                sync_peer_count: Some(sync_peer_count),
+                error: None,
+            })
+        }
+        Err(err) => Ok(StoreInspection {
+            path,
+            exists,
+            entry_count: None,
+            latest_ingest_seq: None,
+            peer_book_count: None,
+            sync_peer_count: None,
+            error: Some(format!("{err:#}")),
+        }),
+    }
+}
+
+fn inspect_existing_store_file(path: &Path) -> Result<(usize, i64, usize, usize)> {
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open sqlite db read-only: {}", path.display()))?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("set sqlite busy_timeout")?;
+
+    let entry_count = query_count(&conn, "SELECT COUNT(*) FROM entries", "entry count")?;
+    let latest_ingest_seq = conn
+        .query_row(
+            "SELECT COALESCE(MAX(ingest_seq), 0) FROM entries",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .context("query latest ingest_seq")?;
+    let peer_book_count = query_count(&conn, "SELECT COUNT(*) FROM peer_book", "peer book count")?;
+    let sync_peer_count = query_count(
+        &conn,
+        r#"
+SELECT COUNT(*)
+FROM (
+  SELECT peer_id FROM peer_state
+  UNION
+  SELECT peer_id FROM peer_push_state
+  UNION
+  SELECT peer_id FROM peer_book
+) peers
+"#,
+        "sync peer count",
+    )?;
+
+    Ok((
+        entry_count,
+        latest_ingest_seq,
+        peer_book_count,
+        sync_peer_count,
+    ))
+}
+
+fn query_count(conn: &Connection, sql: &str, label: &str) -> Result<usize> {
+    let count = conn
+        .query_row(sql, [], |row| row.get::<_, i64>(0))
+        .with_context(|| format!("query {label}"))?;
+    Ok(count.max(0) as usize)
+}
+
 fn row_to_peer_book_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerBookPeer> {
     let peer_id: String = row.get(0)?;
     let addrs_json: String = row.get(1)?;
@@ -825,6 +964,49 @@ mod tests {
         assert!(names.iter().any(|n| n == "peer_state"));
         assert!(names.iter().any(|n| n == "peer_push_state"));
         assert!(names.iter().any(|n| n == "peer_book"));
+    }
+
+    #[test]
+    fn inspect_existing_store_reports_missing_without_creating() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.db");
+
+        let inspection = inspect_existing_store(db_path.to_str().unwrap()).unwrap();
+
+        assert!(!inspection.exists);
+        assert_eq!(inspection.entry_count, None);
+        assert!(inspection.error.is_none());
+        assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn inspect_existing_store_reports_counts_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let store = LocalStore::open(db_path.to_str().unwrap()).unwrap();
+        store
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+        store.set_last_cursor("peer-a", 2).unwrap();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some("dev2".to_string()),
+                last_seen_unix: 99,
+            })
+            .unwrap();
+        drop(store);
+
+        let inspection = inspect_existing_store(db_path.to_str().unwrap()).unwrap();
+
+        assert!(inspection.exists);
+        assert_eq!(inspection.entry_count, Some(2));
+        assert_eq!(inspection.latest_ingest_seq, Some(2));
+        assert_eq!(inspection.peer_book_count, Some(1));
+        assert_eq!(inspection.sync_peer_count, Some(1));
+        assert!(inspection.error.is_none());
     }
 
     #[test]

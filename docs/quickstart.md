@@ -63,6 +63,8 @@ rr doctor
 rr doctor --json
 ```
 
+`rr doctor`의 `db status:` 라인에서 로컬 DB 파일 존재 여부, 저장된 entry 수, peer book/sync peer 수를 확인할 수 있다. `entries=0`이면 ctrl+r 검색 후보가 아직 없는 상태다.
+
 `rr init`는 기본적으로 다음을 준비한다.
 - `~/.config/rustory/config.toml` (설정 템플릿)
 - `~/.config/rustory/swarm.key` (PSK, 같은 swarm 내 디바이스는 동일 파일 공유)
