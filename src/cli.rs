@@ -33,212 +33,280 @@ pub struct App {
 enum Command {
     #[command(about = "Serve the debug HTTP sync API")]
     Serve {
-        #[arg(long, default_value = "0.0.0.0:8844")]
+        #[arg(
+            long,
+            default_value = "0.0.0.0:8844",
+            help = "TCP bind address for the debug HTTP server"
+        )]
         bind: String,
     },
     #[command(about = "Sync with HTTP peers")]
     Sync {
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated HTTP peer base URLs to sync with"
+        )]
         peers: Vec<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Push local entries to peers after pulling")]
         push: bool,
     },
     #[command(about = "Serve this device as a P2P peer")]
     P2pServe {
-        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
+        #[arg(
+            long,
+            default_value = "/ip4/0.0.0.0/tcp/0",
+            help = "libp2p multiaddr to listen on"
+        )]
         listen: String,
 
-        #[arg(long)]
+        #[arg(long, help = "Path to this device's persistent P2P identity key")]
         identity_key: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Relay multiaddr used for relay fallback")]
         relay: Option<String>,
 
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated tracker base URLs for peer discovery"
+        )]
         trackers: Vec<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Bearer token sent to tracker endpoints")]
         tracker_token: Option<String>,
     },
     #[command(about = "Sync with P2P peers, trackers, or cached peers")]
     P2pSync {
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated peer multiaddrs to dial directly"
+        )]
         peers: Vec<String>,
 
-        #[arg(long, default_value_t = 1000)]
+        #[arg(
+            long,
+            default_value_t = 1000,
+            help = "Maximum entries per pull or push batch"
+        )]
         limit: usize,
 
-        #[arg(long)]
+        #[arg(long, help = "Push local entries after pulling from peers")]
         push: bool,
 
-        #[arg(long)]
+        #[arg(long, help = "Run sync repeatedly until interrupted")]
         watch: bool,
 
-        #[arg(long, default_value_t = 60)]
+        #[arg(
+            long,
+            default_value_t = 60,
+            help = "Seconds between watch-mode sync attempts"
+        )]
         interval_sec: u64,
 
-        #[arg(long)]
+        #[arg(long, help = "Random initial delay upper bound for watch mode")]
         start_jitter_sec: Option<u64>,
 
-        #[arg(long)]
+        #[arg(long, help = "Request retry attempts per peer operation")]
         req_attempts: Option<u64>,
 
-        #[arg(long)]
+        #[arg(long, help = "Initial request timeout in seconds before backoff")]
         req_timeout_base_sec: Option<u64>,
 
-        #[arg(long)]
+        #[arg(long, help = "Maximum request timeout in seconds after backoff")]
         req_timeout_cap_sec: Option<u64>,
 
-        #[arg(long)]
+        #[arg(long, help = "Base retry backoff in milliseconds")]
         req_backoff_base_ms: Option<u64>,
 
-        #[arg(long)]
+        #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Relay multiaddr used for tracker-discovered peers")]
         relay: Option<String>,
 
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated tracker base URLs for peer discovery"
+        )]
         trackers: Vec<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Bearer token sent to tracker endpoints")]
         tracker_token: Option<String>,
     },
     #[command(about = "Create or inspect the shared P2P swarm key")]
     SwarmKey {
-        #[arg(long)]
+        #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
     },
     #[command(about = "Record one shell command into the local history store")]
     Record {
-        #[arg(long)]
+        #[arg(long, help = "Shell command line to record")]
         cmd: String,
 
-        #[arg(long)]
+        #[arg(long, help = "Working directory where the command ran")]
         cwd: Option<String>,
 
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, help = "Command exit status")]
         exit_code: i32,
 
-        #[arg(long, default_value_t = 0)]
+        #[arg(long, default_value_t = 0, help = "Command runtime in milliseconds")]
         duration_ms: i64,
 
-        #[arg(long)]
+        #[arg(long, help = "Shell name that produced the command")]
         shell: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Hostname where the command ran")]
         hostname: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Logical Rustory user id for this entry")]
         user_id: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Device id for this entry")]
         device_id: Option<String>,
 
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print the inserted entry id")]
         print_id: bool,
     },
     #[command(about = "Search local history with fzf")]
     Search {
-        #[arg(long)]
+        #[arg(long, help = "Maximum recent entries to offer to fzf")]
         limit: Option<usize>,
     },
     #[command(about = "Delete old local history entries")]
     Prune {
-        #[arg(long)]
+        #[arg(long, help = "Delete entries older than this many days")]
         older_than_days: u64,
 
-        #[arg(long)]
+        #[arg(long, help = "Always keep at least this many recent entries")]
         keep_recent: Option<usize>,
 
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Report matching rows without deleting"
+        )]
         dry_run: bool,
     },
     #[command(about = "Show local pull and push cursor status")]
     SyncStatus {
-        #[arg(long)]
+        #[arg(long, help = "Show status for one peer id only")]
         peer: Option<String>,
 
-        #[arg(long, default_value_t = false)]
+        #[arg(long, default_value_t = false, help = "Print status as pretty JSON")]
         json: bool,
 
-        #[arg(long = "with-tracker", default_value_t = false)]
+        #[arg(
+            long = "with-tracker",
+            default_value_t = false,
+            help = "Ping configured trackers and include reachability"
+        )]
         with_tracker: bool,
     },
     #[command(about = "Print a bash or zsh shell hook")]
     Hook {
-        #[arg(long, default_value = "zsh")]
+        #[arg(
+            long,
+            default_value = "zsh",
+            help = "Shell hook to render: bash or zsh"
+        )]
         shell: String,
     },
     #[command(about = "Run the lightweight P2P peer tracker")]
     TrackerServe {
-        #[arg(long, default_value = "0.0.0.0:8850")]
+        #[arg(
+            long,
+            default_value = "0.0.0.0:8850",
+            help = "TCP bind address for the tracker HTTP server"
+        )]
         bind: String,
 
-        #[arg(long, default_value_t = 60)]
+        #[arg(
+            long,
+            default_value_t = 60,
+            help = "Seconds before registered peers expire"
+        )]
         ttl_sec: u64,
 
-        #[arg(long)]
+        #[arg(long, help = "Bearer token required by tracker clients")]
         token: Option<String>,
     },
     #[command(about = "Run the P2P relay service")]
     RelayServe {
-        #[arg(long, default_value = "/ip4/0.0.0.0/tcp/4001")]
+        #[arg(
+            long,
+            default_value = "/ip4/0.0.0.0/tcp/4001",
+            help = "libp2p multiaddr to listen on"
+        )]
         listen: String,
 
-        #[arg(long)]
+        #[arg(long, help = "Path to the relay's persistent identity key")]
         identity_key: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
     },
     #[command(about = "Write config and create local P2P key files")]
     Init {
-        #[arg(long)]
+        #[arg(long, help = "Overwrite an existing config.toml")]
         force: bool,
 
-        #[arg(long)]
+        #[arg(long, help = "Logical Rustory user id to write into config")]
         user_id: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Device id to write into config")]
         device_id: Option<String>,
 
-        #[arg(long, value_delimiter = ',')]
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated tracker base URLs to write into config"
+        )]
         trackers: Vec<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Relay multiaddr to write into config")]
         relay: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Tracker bearer token to write into config")]
         tracker_token: Option<String>,
     },
     #[command(about = "Diagnose local config, tools, keys, and connectivity")]
     Doctor {
-        #[arg(long, default_value_t = false)]
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Print diagnostics as pretty JSON"
+        )]
         json: bool,
     },
     #[command(about = "Import existing shell history into the local store")]
     Import {
-        #[arg(long, default_value = "zsh")]
+        #[arg(
+            long,
+            default_value = "zsh",
+            help = "History format to import: bash or zsh"
+        )]
         shell: String,
 
-        #[arg(long)]
+        #[arg(long, help = "History file path; defaults to the selected shell")]
         path: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Maximum newest parsed history entries to import")]
         limit: Option<usize>,
 
-        #[arg(long)]
+        #[arg(long, help = "Logical Rustory user id for imported entries")]
         user_id: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Device id for imported entries")]
         device_id: Option<String>,
 
-        #[arg(long)]
+        #[arg(long, help = "Hostname for imported entries")]
         hostname: Option<String>,
     },
 }
@@ -2433,7 +2501,59 @@ mod tests {
         let help = init.render_help().to_string();
 
         assert!(help.contains("Write config and create local P2P key files"));
-        assert!(help.contains("--force"));
+        assert!(help.contains("Overwrite an existing config.toml"));
+        assert!(help.contains("Comma-separated tracker base URLs to write into config"));
+    }
+
+    #[test]
+    fn cli_help_describes_all_visible_options() {
+        use clap::CommandFactory;
+
+        let cmd = App::command();
+        assert_args_have_help(&cmd);
+    }
+
+    fn assert_args_have_help(cmd: &clap::Command) {
+        for arg in cmd.get_arguments() {
+            assert!(
+                arg.get_help().is_some() || arg.get_long_help().is_some(),
+                "{} option '{}' has no help text",
+                cmd.get_name(),
+                arg.get_id()
+            );
+        }
+
+        for subcommand in cmd.get_subcommands() {
+            assert_args_have_help(subcommand);
+        }
+    }
+
+    #[test]
+    fn flag_help_describes_onboarding_options() {
+        use clap::CommandFactory;
+
+        let mut cmd = App::command();
+
+        let doctor = cmd
+            .find_subcommand_mut("doctor")
+            .expect("doctor subcommand");
+        let doctor_help = doctor.render_help().to_string();
+        assert!(doctor_help.contains("Print diagnostics as pretty JSON"));
+
+        let p2p_sync = cmd
+            .find_subcommand_mut("p2p-sync")
+            .expect("p2p-sync subcommand");
+        let p2p_sync_help = p2p_sync.render_help().to_string();
+        assert!(p2p_sync_help.contains("Comma-separated peer multiaddrs to dial directly"));
+        assert!(p2p_sync_help.contains("Run sync repeatedly until interrupted"));
+        assert!(p2p_sync_help.contains("Relay multiaddr used for tracker-discovered peers"));
+
+        let record = cmd
+            .find_subcommand_mut("record")
+            .expect("record subcommand");
+        let record_help = record.render_help().to_string();
+        assert!(record_help.contains("Shell command line to record"));
+        assert!(record_help.contains("Print the inserted entry id"));
     }
 
     #[test]
