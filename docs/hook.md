@@ -18,6 +18,9 @@ source <(rr hook --shell bash)
 hook runtime 설정은 `~/.config/rustory/config.toml`에도 둘 수 있다. 같은 설정이 환경 변수와 config에 모두 있으면 환경 변수가 우선한다.
 
 - `RUSTORY_HOOK_DISABLE=1`: hook 동작 비활성화(기록/검색 모두)
+  - `1/true/yes/on`은 비활성화로 해석한다.
+  - unset 또는 `0/false/no/off`는 비활성화하지 않는다.
+  - 알 수 없는 값은 안전을 위해 비활성화로 취급하며, `rr doctor`의 `hook:` 라인에 경고가 표시된다.
 - `RUSTORY_HOOK_INSTALLED=1`: `rr hook`이 현재 셸에 export하는 설치 마커다. 직접 설정할 필요는 없고, `rr doctor`가 hook 적용 여부를 판단할 때 사용한다.
 - `RUSTORY_DB_PATH=/path/to/db.sqlite`: 기본 DB 경로 오버라이드(`rr --db-path ...` 대신 사용 가능)
 - `RUSTORY_SEARCH_LIMIT=100000`: ctrl+r 검색 limit을 오버라이드한다.

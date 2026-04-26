@@ -1708,7 +1708,7 @@ fn build_hook_status_report_from_env(
     config_search_limit: Option<usize>,
 ) -> DoctorHookStatusReport {
     let installed = installed_marker.is_some();
-    let disabled = disable_marker.is_some();
+    let (disabled, disable_warning) = resolve_hook_disabled_from_env(disable_marker);
     let (search_limit, error) =
         match resolve_search_limit_from_values(None, search_limit_raw, config_search_limit) {
             Ok(value) => (Some(value), None),
@@ -1728,6 +1728,9 @@ fn build_hook_status_report_from_env(
     if disabled {
         warnings.push("RUSTORY_HOOK_DISABLE is set; record/search hook is disabled".to_string());
     }
+    if let Some(warning) = disable_warning {
+        warnings.push(warning);
+    }
     match shell.as_deref() {
         Some("bash" | "zsh") => {}
         Some(other) => warnings.push(format!("unsupported shell for rr hook: {other}")),
@@ -1741,6 +1744,19 @@ fn build_hook_status_report_from_env(
         search_limit,
         warnings,
         error,
+    }
+}
+
+fn resolve_hook_disabled_from_env(disable_marker: Option<String>) -> (bool, Option<String>) {
+    match disable_marker {
+        Some(raw) => match parse_env_bool(&raw, "RUSTORY_HOOK_DISABLE") {
+            Ok(value) => (value, None),
+            Err(err) => (
+                true,
+                Some(format!("{err}; disabling record/search hook for safety")),
+            ),
+        },
+        None => (false, None),
     }
 }
 
@@ -2934,6 +2950,51 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|warning| warning.contains("unsupported shell"))
+        );
+    }
+
+    #[test]
+    fn hook_status_accepts_disable_false_values() {
+        for value in ["0", "false", "no", "off"] {
+            let report = build_hook_status_report_from_env(
+                Some("zsh".to_string()),
+                Some("1".to_string()),
+                Some(value.to_string()),
+                None,
+                Some(42),
+            );
+
+            assert!(report.installed);
+            assert!(!report.disabled, "value={value}");
+            assert_eq!(report.search_limit, Some(42));
+            assert!(report.error.is_none());
+            assert!(
+                !report
+                    .warnings
+                    .iter()
+                    .any(|warning| warning.contains("RUSTORY_HOOK_DISABLE is set")),
+                "value={value}"
+            );
+        }
+    }
+
+    #[test]
+    fn hook_status_disables_on_invalid_disable_value_for_safety() {
+        let report = build_hook_status_report_from_env(
+            Some("zsh".to_string()),
+            Some("1".to_string()),
+            Some("maybe".to_string()),
+            None,
+            Some(42),
+        );
+
+        assert!(report.disabled);
+        assert!(report.error.is_none());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("invalid RUSTORY_HOOK_DISABLE"))
         );
     }
 

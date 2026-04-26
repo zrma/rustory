@@ -40,8 +40,15 @@ __rustory_last_start_us=""
 __rustory_last_start_sec=""
 __rustory_in_hook=""
 
+__rustory_hook_disabled() {
+  case "${RUSTORY_HOOK_DISABLE:-}" in
+    ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 __rustory_preexec() {
-  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  __rustory_hook_disabled && return 0
   [[ -n "$__rustory_in_hook" ]] && return 0
 
   local histnum="${HISTCMD:-}"
@@ -65,7 +72,7 @@ trap '__rustory_preexec' DEBUG
 
 __rustory_precmd() {
   local exit_code=$?
-  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  __rustory_hook_disabled && return 0
   __rustory_in_hook=1
 
   local line
@@ -116,7 +123,7 @@ case ";$PROMPT_COMMAND;" in
 esac
 
 __rustory_ctrl_r() {
-  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  __rustory_hook_disabled && return 0
   local selected
   # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
   selected="$(rr search)" || return 0
@@ -147,6 +154,13 @@ autoload -Uz add-zsh-hook
 typeset -g __rustory_last_cmd=""
 typeset -g __rustory_last_start_us=""
 
+__rustory_hook_disabled() {
+  case "${RUSTORY_HOOK_DISABLE:-}" in
+    ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 __rustory_preexec() {
   __rustory_last_cmd="$1"
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
@@ -158,7 +172,7 @@ __rustory_preexec() {
 
 __rustory_precmd() {
   local exit_code=$?
-  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  __rustory_hook_disabled && return 0
 
   local cmd="$__rustory_last_cmd"
   cmd="${cmd#"${cmd%%[![:space:]]*}"}"
@@ -193,7 +207,7 @@ add-zsh-hook preexec __rustory_preexec
 add-zsh-hook precmd __rustory_precmd
 
 __rustory_widget_ctrl_r() {
-  [[ -n "${RUSTORY_HOOK_DISABLE:-}" ]] && return 0
+  __rustory_hook_disabled && return 0
   local selected
   # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
   selected="$(rr search)" || return 0
@@ -217,6 +231,8 @@ mod tests {
     fn bash_hook_contains_disable_and_ctrl_r_and_rr_filter() {
         let got = render_hook(Shell::Bash);
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
+        assert!(got.contains("__rustory_hook_disabled()"));
+        assert!(got.contains("0|false|False|FALSE|no|No|NO|off|Off|OFF"));
         assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
@@ -234,6 +250,8 @@ mod tests {
     fn zsh_hook_contains_disable_and_ctrl_r_and_rr_filter() {
         let got = render_hook(Shell::Zsh);
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
+        assert!(got.contains("__rustory_hook_disabled()"));
+        assert!(got.contains("0|false|False|FALSE|no|No|NO|off|Off|OFF"));
         assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
