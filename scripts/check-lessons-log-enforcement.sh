@@ -137,6 +137,7 @@ if (( contains_lessons_log == 0 )); then
 fi
 
 has_enforcement_change=0
+has_todo_closure_change=0
 for file in "${CHANGED_FILES[@]}"; do
   case "$file" in
     scripts/*|lefthook.yml|AGENTS.md|docs/EXECUTION_LOOP.md|docs/CHANGE_CONTROL.md|docs/IMPROVEMENT_LOOP.md|docs/OPERATING_MODEL.md|modules/*/AGENTS.md)
@@ -146,7 +147,16 @@ for file in "${CHANGED_FILES[@]}"; do
   esac
 done
 
-if (( has_enforcement_change == 1 )); then
+for file in "${CHANGED_FILES[@]}"; do
+  case "$file" in
+    docs/todo-*)
+      has_todo_closure_change=1
+      break
+      ;;
+  esac
+done
+
+if (( has_enforcement_change == 1 || has_todo_closure_change == 1 )); then
   echo "[ OK ] lessons-log enforcement coupling passed"
   exit 0
 fi
@@ -156,7 +166,7 @@ cat >&2 <<'EOF'
        (자동화/강제가 없는 교훈 기록은 금지)
        - 허용 예시: scripts/*, lefthook.yml, AGENTS.md,
                    docs/{EXECUTION_LOOP.md,CHANGE_CONTROL.md,IMPROVEMENT_LOOP.md,OPERATING_MODEL.md},
-                   modules/*/AGENTS.md
+                   modules/*/AGENTS.md, docs/todo-* 삭제 마감 증거
 EOF
 echo "       changed files:" >&2
 for file in "${CHANGED_FILES[@]}"; do
