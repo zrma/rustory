@@ -18,7 +18,11 @@ const FZF_PURPOSE: &str = "ctrl+r search";
 #[derive(Parser)]
 #[command(name = "rr", version, about = "Rustory CLI")]
 pub struct App {
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Path to the local SQLite history database"
+    )]
     db_path: Option<String>,
 
     #[command(subcommand)]
@@ -27,10 +31,12 @@ pub struct App {
 
 #[derive(Subcommand)]
 enum Command {
+    #[command(about = "Serve the debug HTTP sync API")]
     Serve {
         #[arg(long, default_value = "0.0.0.0:8844")]
         bind: String,
     },
+    #[command(about = "Sync with HTTP peers")]
     Sync {
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
@@ -38,6 +44,7 @@ enum Command {
         #[arg(long)]
         push: bool,
     },
+    #[command(about = "Serve this device as a P2P peer")]
     P2pServe {
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/0")]
         listen: String,
@@ -57,6 +64,7 @@ enum Command {
         #[arg(long)]
         tracker_token: Option<String>,
     },
+    #[command(about = "Sync with P2P peers, trackers, or cached peers")]
     P2pSync {
         #[arg(long, value_delimiter = ',')]
         peers: Vec<String>,
@@ -100,10 +108,12 @@ enum Command {
         #[arg(long)]
         tracker_token: Option<String>,
     },
+    #[command(about = "Create or inspect the shared P2P swarm key")]
     SwarmKey {
         #[arg(long)]
         swarm_key: Option<String>,
     },
+    #[command(about = "Record one shell command into the local history store")]
     Record {
         #[arg(long)]
         cmd: String,
@@ -132,10 +142,12 @@ enum Command {
         #[arg(long, default_value_t = false)]
         print_id: bool,
     },
+    #[command(about = "Search local history with fzf")]
     Search {
         #[arg(long)]
         limit: Option<usize>,
     },
+    #[command(about = "Delete old local history entries")]
     Prune {
         #[arg(long)]
         older_than_days: u64,
@@ -146,6 +158,7 @@ enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    #[command(about = "Show local pull and push cursor status")]
     SyncStatus {
         #[arg(long)]
         peer: Option<String>,
@@ -156,10 +169,12 @@ enum Command {
         #[arg(long = "with-tracker", default_value_t = false)]
         with_tracker: bool,
     },
+    #[command(about = "Print a bash or zsh shell hook")]
     Hook {
         #[arg(long, default_value = "zsh")]
         shell: String,
     },
+    #[command(about = "Run the lightweight P2P peer tracker")]
     TrackerServe {
         #[arg(long, default_value = "0.0.0.0:8850")]
         bind: String,
@@ -170,6 +185,7 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    #[command(about = "Run the P2P relay service")]
     RelayServe {
         #[arg(long, default_value = "/ip4/0.0.0.0/tcp/4001")]
         listen: String,
@@ -180,6 +196,7 @@ enum Command {
         #[arg(long)]
         swarm_key: Option<String>,
     },
+    #[command(about = "Write config and create local P2P key files")]
     Init {
         #[arg(long)]
         force: bool,
@@ -199,10 +216,12 @@ enum Command {
         #[arg(long)]
         tracker_token: Option<String>,
     },
+    #[command(about = "Diagnose local config, tools, keys, and connectivity")]
     Doctor {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    #[command(about = "Import existing shell history into the local store")]
     Import {
         #[arg(long, default_value = "zsh")]
         shell: String,
@@ -2390,6 +2409,32 @@ fn is_self_rr_command(cmd: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_help_describes_key_commands() {
+        use clap::CommandFactory;
+
+        let mut cmd = App::command();
+        let help = cmd.render_help().to_string();
+
+        assert!(help.contains("Write config and create local P2P key files"));
+        assert!(help.contains("Diagnose local config, tools, keys, and connectivity"));
+        assert!(help.contains("Sync with P2P peers, trackers, or cached peers"));
+        assert!(help.contains("Print a bash or zsh shell hook"));
+        assert!(help.contains("Path to the local SQLite history database"));
+    }
+
+    #[test]
+    fn init_help_describes_init_purpose() {
+        use clap::CommandFactory;
+
+        let mut cmd = App::command();
+        let init = cmd.find_subcommand_mut("init").expect("init subcommand");
+        let help = init.render_help().to_string();
+
+        assert!(help.contains("Write config and create local P2P key files"));
+        assert!(help.contains("--force"));
+    }
 
     #[test]
     fn is_self_rr_command_detects_rr_invocation() {
