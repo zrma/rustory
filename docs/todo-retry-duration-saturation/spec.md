@@ -17,13 +17,14 @@
 
 | ID | 상태 | Owner | Verify command | 작업 항목 |
 | --- | --- | --- | --- | --- |
-| C1 | todo | codex | `cargo test http_retry` | `exp_duration` overflow/cap 경계 테스트를 추가하고 실패를 확인한다. |
-| C2 | todo | codex | `cargo test http_retry` | `exp_duration`이 overflow 시 cap 또는 `Duration::MAX`로 포화되도록 수정한다. |
-| C3 | todo | codex | `scripts/run-manifest-checks.sh --mode quick --work-id retry-duration-saturation` | todo readiness/manifest quick 게이트와 체크포인트를 갱신한다. |
+| C1 | done | codex | `cargo test http_retry` | `exp_duration` overflow/cap 경계 테스트를 추가하고 실패를 확인한다. |
+| C2 | done | codex | `cargo test http_retry` | `exp_duration`이 overflow 시 cap 또는 `Duration::MAX`로 포화되도록 수정한다. |
+| C3 | done | codex | `scripts/run-manifest-checks.sh --mode quick --work-id retry-duration-saturation` | todo readiness/manifest quick 게이트와 체크포인트를 갱신한다. |
+| C4 | todo | codex | `scripts/check-todo-closure.sh` | 마감 커밋에서 작업 디렉터리를 삭제하고 교훈 로그에 식별자를 남긴다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: 계획 스냅샷 작성, open questions 닫힘 상태 확인.
-- 미완료: C1, C2, C3.
-- 다음 액션: `src/http_retry.rs` 테스트를 먼저 추가한 뒤 계산 로직을 수정한다.
-- 검증 증거: `scripts/start-work.sh --work-id retry-duration-saturation`.
+- 완료: C1, C2, C3.
+- 미완료: C4.
+- 다음 액션: 구현 커밋을 출고한 뒤 마감 커밋에서 작업 디렉터리를 삭제하고 교훈 로그에 식별자를 남긴다.
+- 검증 증거: `cargo test http_retry` 최초 실행은 overflow 테스트 2개 실패를 확인했고, 수정 후 `cargo test http_retry`, `cargo fmt --all --check`, `scripts/run-manifest-checks.sh --mode quick --work-id retry-duration-saturation` 통과.
