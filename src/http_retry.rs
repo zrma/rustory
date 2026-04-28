@@ -38,7 +38,7 @@ impl RetryPolicy {
 
 pub fn request_with_retry<T, F>(policy: RetryPolicy, mut f: F) -> Result<T>
 where
-    F: FnMut(&ureq::Agent) -> std::result::Result<T, ureq::Error>,
+    F: FnMut(&ureq::Agent) -> std::result::Result<T, Box<ureq::Error>>,
 {
     let attempts = policy.attempts.max(1);
     let mut last_err: Option<anyhow::Error> = None;

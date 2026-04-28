@@ -153,7 +153,7 @@ fn http_pull_batch(
 
     let resp = crate::http_retry::request_with_retry(
         crate::http_retry::RetryPolicy::transport(),
-        |agent| agent.get(&url).call(),
+        |agent| agent.get(&url).call().map_err(Box::new),
     )
     .with_context(|| format!("GET {url}"))?;
     let body = resp.into_string().context("read response body")?;
@@ -177,6 +177,7 @@ fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>) -> Result<()> {
                 .post(&url)
                 .set("Content-Type", "application/json")
                 .send_bytes(&body)
+                .map_err(Box::new)
         },
     )
     .with_context(|| format!("POST {url}"))?;

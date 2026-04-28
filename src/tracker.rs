@@ -267,7 +267,7 @@ impl TrackerClient {
                 if let Some(token) = &token {
                     r = r.set("Authorization", &format!("Bearer {}", token.trim()));
                 }
-                r.send_bytes(&body)
+                r.send_bytes(&body).map_err(Box::new)
             },
         )
         .with_context(|| format!("POST {url}"))?;
@@ -290,7 +290,7 @@ impl TrackerClient {
                 if let Some(token) = &token {
                     r = r.set("Authorization", &format!("Bearer {}", token.trim()));
                 }
-                r.call()
+                r.call().map_err(Box::new)
             },
         )
         .with_context(|| format!("GET {url}"))?;
