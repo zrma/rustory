@@ -19,6 +19,13 @@
 - 사용자 호출은 `docs/ESCALATION_POLICY.md`의 즉시 에스컬레이션 조건 또는 명시적 사용자 판단이 필요한 경우로 제한한다.
 - 그 외 진행 상황은 간단히 공유하되, 구현/검증/문서화/커밋/푸시를 같은 턴에서 닫는 것을 기본값으로 둔다.
 
+## Workflow: OpenAI GPT-5.5
+
+- OpenAI 모델/API/프롬프트/에이전트 기준을 갱신할 때는 `openai-docs` 스킬과 공식 OpenAI developer docs를 먼저 확인한다.
+- 최신 OpenAI 기준을 요구받으면 `gpt-5.5`를 baseline으로 보되, 활성 model string과 직접 연결된 prompt/harness 문구만 좁게 갱신한다.
+- GPT-5.5용 지침은 outcome-first로 작성한다. 목표, 성공 기준, 허용되는 부작용, 검증 증거, 중단/에스컬레이션 조건, 출력 형태를 먼저 고정한다.
+- reasoning/verbosity/Responses API/tool wiring은 현재 저장소가 안전한 설정 지점을 노출할 때만 바꾼다. API surface나 tool handler 변경이 필요하면 blocker로 기록한다.
+
 ## Workflow: Execution loop
 
 - 표준 사이클은 `구현 + 테스트 -> 검수 + 보완 -> 커밋 정리 + 푸시` 순서로 진행한다.

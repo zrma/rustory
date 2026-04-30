@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-04-24
+- Last Verified: 2026-04-30
 
 이 문서는 전역 스킬과 레포 문서의 책임 경계를 분리해, 전역 오염 없이 재사용 가능한 스킬만 유지하기 위한 기준이다.
 
@@ -32,10 +32,13 @@
 2. 도메인 유지보수 계층: `rust-project-maintenance` (필요 시 `python/go/terraform-project-maintenance` 병행)
 - 언어/도메인별 검증 세트와 실패 보고 규약
 
-3. VCS 계층: `vcs-jj`
+3. OpenAI 문서 계층: `openai-docs`
+- OpenAI 모델/API/프롬프트/에이전트 기준과 GPT-5.5 migration guidance 확인
+
+4. VCS 계층: `vcs-jj`
 - `jj` 우선 버전관리 규칙
 
-4. 환경 계층(선택): `microk8s-cluster-ops`
+5. 환경 계층(선택): `microk8s-cluster-ops`
 - 특정 레포가 아닌 운영 환경(MicroK8s) 기준 런북
 
 ## 어댑터 패턴
@@ -80,4 +83,5 @@
 ## 참고
 
 - OpenAI Harness Engineering: <https://openai.com/index/harness-engineering/>
+- OpenAI GPT-5.5 guidance는 `openai-docs` 스킬과 공식 OpenAI developer docs를 우선한다.
 - Anthropic Skills Guide: <https://resources.anthropic.com/hubfs/The-Complete-Guide-to-Building-Skill-for-Claude.pdf?hsLang=en>

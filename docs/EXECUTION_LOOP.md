@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-04-24
+- Last Verified: 2026-04-30
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -25,6 +25,14 @@
 4. 상태 가시성
 - 진행 상태의 단일 기준은 `docs/todo-*/spec.md`의 `C1..Cn` 체크리스트와 `완료/미완료/다음 액션` 체크포인트다.
 - 핵심 명령/예외 규칙은 소유 문서 링크로만 참조하고 중복 본문을 만들지 않는다.
+
+## OpenAI GPT-5.5 적용 기준
+
+OpenAI 모델/API/프롬프트/에이전트 운영 기준을 다루는 작업은 `openai-docs` 스킬과 공식 OpenAI developer docs를 먼저 확인한다. 최신 OpenAI 기준을 요구받으면 `gpt-5.5`를 기준으로 삼되, 변경 범위는 활성 model string과 직접 연결된 prompt/harness 문구로 제한한다.
+
+GPT-5.5용 지침은 절차를 길게 늘리기보다 outcome-first로 작성한다. 목표, 성공 기준, 허용되는 부작용, 검증 증거, 중단/에스컬레이션 조건, 최종 출력 형태를 명확히 둔다. 기존 historical docs, examples, tests, eval baseline, provider 비교, fallback 경로는 명시 요청이 없으면 그대로 둔다.
+
+reasoning effort, verbosity, Responses API state, tool definitions, structured output contract는 현재 코드가 안전한 설정 지점을 제공할 때만 조정한다. SDK/API surface 변경, tool handler rewiring, schema 변경이 필요하면 이번 범위에 억지로 포함하지 말고 blocker 또는 별도 follow-up으로 기록한다.
 
 ## 표준 사이클
 

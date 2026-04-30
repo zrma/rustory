@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-04-26
+- Last Verified: 2026-04-30
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
@@ -46,7 +46,8 @@
 5. 동일 게이트 실패가 2회 반복되면 임의 재시도를 중단하고 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 보고한다.
 6. `DEBUG_GATES_OVERRIDE` 계열 우회는 사람 승인 없이 사용하지 않는다.
 7. `scripts/check-doc-last-verified.sh` 실패 시 관련 문서 `Last Verified`를 갱신하고 재검증 전까지 출고/푸시를 진행하지 않는다.
-8. 위 조건에 걸리지 않는 구현/검증/문서화/커밋/푸시는 같은 턴에서 자율적으로 닫는다.
+8. OpenAI 모델/API/프롬프트/에이전트 기준을 갱신할 때는 `openai-docs`와 공식 OpenAI developer docs를 먼저 확인하고, GPT-5.5 변경은 활성 통합 지점과 직접 연결된 prompt/harness 표면으로 좁힌다.
+9. 위 조건에 걸리지 않는 구현/검증/문서화/커밋/푸시는 같은 턴에서 자율적으로 닫는다.
 
 ## 전역 스킬 운영 원칙
 
