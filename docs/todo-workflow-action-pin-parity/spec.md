@@ -21,14 +21,14 @@
 
 | ID | 상태 | Owner | Verify command | 작업 항목 |
 | --- | --- | --- | --- | --- |
-| C1 | todo | codex | `git ls-remote https://github.com/actions/checkout.git refs/tags/v6.0.2` | `actions/checkout` v6.0.2의 pin SHA를 확인한다. |
-| C2 | todo | codex | `git ls-remote https://github.com/actions/setup-python.git refs/tags/v6.2.0` | `actions/setup-python` v6.2.0의 pin SHA를 확인한다. |
-| C3 | todo | codex | `rg -n "uses: actions/(checkout|setup-python)@" .github/workflows` | workflow의 action 참조를 검증한 SHA + version comment 형태로 정렬한다. |
+| C1 | done | codex | `git ls-remote https://github.com/actions/checkout.git refs/tags/v6.0.2` | `actions/checkout` v6.0.2의 pin SHA를 확인한다. |
+| C2 | done | codex | `git ls-remote https://github.com/actions/setup-python.git refs/tags/v6.2.0` | `actions/setup-python` v6.2.0의 pin SHA를 확인한다. |
+| C3 | done | codex | `rg -n "uses: actions/(checkout|setup-python)@" .github/workflows` | workflow의 action 참조를 검증한 SHA + version comment 형태로 정렬한다. |
 | C4 | todo | codex | `scripts/check-release-gates.sh --manifest-mode full --work-id workflow-action-pin-parity` | repo release gates를 통과시킨다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: `scripts/start-work.sh --work-id workflow-action-pin-parity`로 todo workspace를 생성하고 초기 readiness/open-questions/quick manifest 게이트를 통과했다.
-- 미완료: C1, C2, C3, C4.
-- 다음 액션: planning commit을 먼저 푸시한 뒤 workflow pinning을 구현한다.
-- 검증 증거: `scripts/start-work.sh --work-id workflow-action-pin-parity`, `git ls-remote https://github.com/actions/checkout.git refs/tags/v6.0.2`, `git ls-remote https://github.com/actions/setup-python.git refs/tags/v6.2.0`.
+- 완료: C1, C2, C3. `actions/checkout` v6.0.2는 `de0fac2e4500dabe0009e67214ff5f5447ce83dd`, `actions/setup-python` v6.2.0은 `a309ff8b426b58ec0e2a45f0f869d46889d02405`로 확인했고 workflow 참조를 SHA pin + version comment로 정렬했다.
+- 미완료: C4.
+- 다음 액션: 구현 commit finalize 경로에서 release gates를 다시 통과시키고, 별도 closure commit에서 lesson 기록과 todo 삭제를 진행한다.
+- 검증 증거: `git ls-remote https://github.com/actions/checkout.git refs/tags/v6.0.2`, `git ls-remote https://github.com/actions/setup-python.git refs/tags/v6.2.0`, `rg -n "uses: actions/(checkout|setup-python)@" .github/workflows`, `scripts/check-release-gates.sh --manifest-mode full --work-id workflow-action-pin-parity` 사전 실행 결과 중 Rust test 129개, clippy, `scripts/smoke_p2p_local.sh` 통과.
