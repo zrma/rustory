@@ -1,6 +1,6 @@
+use crate::libp2p::StreamProtocol;
 use async_trait::async_trait;
 use futures::prelude::*;
-use libp2p::StreamProtocol;
 use serde::{Serialize, de::DeserializeOwned};
 use std::{io, marker::PhantomData};
 

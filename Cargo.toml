@@ -14,9 +14,19 @@ async-trait = "0.1"
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 futures = "0.3"
-libp2p = { version = "0.56", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "request-response", "identify", "ping", "relay", "dcutr", "pnet"] }
+libp2p-core = "0.43"
+libp2p-dcutr = "0.14"
+libp2p-identify = "0.47"
+libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
 libp2p-mplex = "0.43"
+libp2p-noise = "0.46"
+libp2p-ping = "0.47"
+libp2p-pnet = "0.26"
+libp2p-relay = "0.21"
 libp2p-request-response = { version = "0.29", features = ["json"] }
+libp2p-swarm = { version = "0.47", features = ["macros", "tokio"] }
+libp2p-tcp = { version = "0.44", features = ["tokio"] }
+multiaddr = "0.18"
 rand = "0.8"
 regex = "1.12"
 rusqlite = { version = "0.39", features = ["bundled"] }

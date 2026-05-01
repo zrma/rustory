@@ -22,7 +22,7 @@
 - request: `EntriesPush { entries }`
 - response: `PushAck { ok }`
 - 직렬화: JSON(serde_json). `1.0.1` 프로토콜은 “JSON bytes를 zstd로 압축”해서 전송한다(양쪽이 지원하면 자동 선택).
-- 전송: libp2p tcp + Noise + Yamux (+ pnet/relay)
+- 전송: libp2p tcp + Noise + Mplex (+ pnet/relay)
 - 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB.
   - `1.0.1`은 zstd 압축을 적용한 “wire bytes” 기준으로 상한을 체크한다.
   - 압축 해제 후 JSON bytes는 별도 상한(현재 wire의 4배)을 두며, 초과 시 `too large` 에러가 날 수 있다.
@@ -37,6 +37,10 @@ rr relay-serve --listen /ip4/0.0.0.0/tcp/4001
 
 실행하면 다음 형태의 주소를 출력한다.
 - `relay listen: /ip4/<ip>/tcp/<port>/p2p/<relay_peer_id>`
+
+P2P relay 주소는 `/ip4/...` 또는 `/ip6/...` 형태로 넘긴다. DNS 이름을 써야 하는 환경에서는
+호스트명 해석을 먼저 수행한 뒤 IP 기반 multiaddr를 전달한다. tracker URL은 일반 URL이므로 DNS
+호스트명을 그대로 사용할 수 있다.
 
 #### 2) Tracker 서버
 ```sh

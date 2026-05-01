@@ -66,9 +66,12 @@ services:
           --hostname "linux" \
           --print-id >/dev/null
 
+        relay_ip="$(getent hosts relay | awk '{print $1; exit}')"
+        test -n "$relay_ip"
+
         rr --db-path /tmp/linux.db p2p-serve \
           --listen /ip4/0.0.0.0/tcp/0 \
           --swarm-key /data/swarm.key \
           --identity-key /data/linux.identity.key \
           --trackers http://tracker:8850 \
-          --relay "/dns4/relay/tcp/4001/p2p/${RELAY_PEER_ID:-}"
+          --relay "/ip4/${relay_ip}/tcp/4001/p2p/${RELAY_PEER_ID:-}"

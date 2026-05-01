@@ -1,5 +1,5 @@
+use crate::libp2p::PeerId;
 use anyhow::{Context, Result};
-use libp2p::PeerId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::Read;

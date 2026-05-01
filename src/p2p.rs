@@ -1,12 +1,13 @@
+use crate::libp2p;
+use crate::libp2p::core::transport::choice::OrTransport;
+use crate::libp2p::core::upgrade::Version;
+use crate::libp2p::swarm::{SwarmEvent, dial_opts::DialOpts};
+use crate::libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
 use crate::storage::{LocalStore, PeerBookPeer, PullBatch};
 use anyhow::{Context, Result};
 use futures::StreamExt;
-use libp2p::core::transport::choice::OrTransport;
-use libp2p::core::upgrade::Version;
-use libp2p::multiaddr::Protocol;
-use libp2p::swarm::{SwarmEvent, dial_opts::DialOpts};
-use libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
 use libp2p_request_response::ProtocolSupport;
+use multiaddr::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -106,8 +107,8 @@ struct PushAck {
     ignored: Option<usize>,
 }
 
-#[derive(libp2p::swarm::NetworkBehaviour)]
-#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+#[derive(libp2p_swarm::NetworkBehaviour)]
+#[behaviour(prelude = "libp2p_swarm::derive_prelude")]
 struct RustoryBehaviour {
     relay: libp2p::relay::client::Behaviour,
     identify: libp2p::identify::Behaviour,
@@ -117,8 +118,8 @@ struct RustoryBehaviour {
     push: libp2p_request_response::Behaviour<crate::p2p_codec::JsonCodec<EntriesPush, PushAck>>,
 }
 
-#[derive(libp2p::swarm::NetworkBehaviour)]
-#[behaviour(prelude = "libp2p::swarm::derive_prelude")]
+#[derive(libp2p_swarm::NetworkBehaviour)]
+#[behaviour(prelude = "libp2p_swarm::derive_prelude")]
 struct RelayServerBehaviour {
     relay: libp2p::relay::Behaviour,
     identify: libp2p::identify::Behaviour,
@@ -182,7 +183,6 @@ fn build_rustory_swarm_with_identity(
     let (relay_transport, relay_behaviour) = libp2p::relay::client::new(local_peer_id);
     let tcp_transport = libp2p::tcp::tokio::Transport::default();
     let transport = OrTransport::new(relay_transport, tcp_transport);
-    let transport = libp2p::dns::tokio::Transport::system(transport).context("dns transport")?;
 
     let pnet = libp2p::pnet::PnetConfig::new(psk);
     let transport = transport.and_then(move |socket, _| pnet.handshake(socket));
@@ -221,9 +221,7 @@ fn build_relay_swarm_with_identity(
     let local_public_key = identity.public();
     let local_peer_id = identity.public().to_peer_id();
 
-    let tcp_transport = libp2p::tcp::tokio::Transport::default();
-    let transport =
-        libp2p::dns::tokio::Transport::system(tcp_transport).context("dns transport")?;
+    let transport = libp2p::tcp::tokio::Transport::default();
 
     let pnet = libp2p::pnet::PnetConfig::new(psk);
     let transport = transport.and_then(move |socket, _| pnet.handshake(socket));
