@@ -14,7 +14,8 @@ async-trait = "0.1"
 clap = { version = "4.6", features = ["derive"] }
 ctrlc = "3.5"
 futures = "0.3"
-libp2p = { version = "0.56", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "yamux", "request-response", "identify", "ping", "relay", "dcutr", "pnet"] }
+libp2p = { version = "0.56", default-features = false, features = ["tokio", "macros", "tcp", "dns", "noise", "request-response", "identify", "ping", "relay", "dcutr", "pnet"] }
+libp2p-mplex = "0.43"
 libp2p-request-response = { version = "0.29", features = ["json"] }
 rand = "0.8"
 regex = "1.12"

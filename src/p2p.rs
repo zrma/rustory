@@ -191,7 +191,7 @@ fn build_rustory_swarm_with_identity(
     let transport = transport
         .upgrade(Version::V1)
         .authenticate(noise_cfg)
-        .multiplex(libp2p::yamux::Config::default())
+        .multiplex(libp2p_mplex::Config::default())
         .boxed();
 
     let identify_cfg = libp2p::identify::Config::new("rustory/0.1.0".to_string(), local_public_key)
@@ -232,7 +232,7 @@ fn build_relay_swarm_with_identity(
     let transport = transport
         .upgrade(Version::V1)
         .authenticate(noise_cfg)
-        .multiplex(libp2p::yamux::Config::default())
+        .multiplex(libp2p_mplex::Config::default())
         .boxed();
 
     let identify_cfg =
