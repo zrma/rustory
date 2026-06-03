@@ -36,10 +36,19 @@ enum Command {
     Serve {
         #[arg(
             long,
-            default_value = "0.0.0.0:8844",
+            default_value = "127.0.0.1:8844",
             help = "TCP bind address for the debug HTTP server"
         )]
         bind: String,
+
+        #[arg(long, help = "Bearer token required by HTTP sync clients")]
+        token: Option<String>,
+
+        #[arg(
+            long,
+            help = "Allow serving the HTTP sync API without a token on non-loopback bind addresses"
+        )]
+        allow_unauthenticated: bool,
     },
     #[command(about = "Sync with HTTP peers")]
     Sync {
@@ -52,6 +61,9 @@ enum Command {
 
         #[arg(long, help = "Push local entries to peers after pulling")]
         push: bool,
+
+        #[arg(long, help = "Bearer token sent to HTTP sync peers")]
+        token: Option<String>,
     },
     #[command(about = "Serve this device as a P2P peer")]
     P2pServe {
@@ -330,12 +342,25 @@ pub fn run() -> Result<()> {
         .unwrap_or_else(|| storage::DEFAULT_DB_PATH.to_string());
 
     match app.cmd {
-        Command::Serve { bind } => {
-            transport::serve(&bind, &db_path)?;
+        Command::Serve {
+            bind,
+            token,
+            allow_unauthenticated,
+        } => {
+            let token = resolve_http_sync_token(token);
+            validate_http_sync_serve_auth(&bind, token.as_deref(), allow_unauthenticated)?;
+            transport::serve(&bind, &db_path, transport::ServeConfig { token })?;
         }
-        Command::Sync { peers, push } => {
+        Command::Sync { peers, push, token } => {
             let device_id = resolve_device_id(&cfg);
-            transport::sync(&peers, &db_path, push, Some(&device_id))?;
+            let token = resolve_http_sync_token(token);
+            transport::sync(
+                &peers,
+                &db_path,
+                push,
+                Some(&device_id),
+                transport::SyncConfig { token },
+            )?;
         }
         Command::P2pServe {
             listen,
@@ -2552,6 +2577,32 @@ fn resolve_device_id(cfg: &config::FileConfig) -> String {
 fn resolve_record_ignore_regex(cfg: &config::FileConfig) -> Option<String> {
     env_nonempty("RUSTORY_RECORD_IGNORE_REGEX")
         .or_else(|| normalize_opt_string(cfg.record_ignore_regex.clone()))
+}
+
+fn resolve_http_sync_token(cli: Option<String>) -> Option<String> {
+    normalize_opt_string(cli).or_else(|| env_nonempty("RUSTORY_HTTP_SYNC_TOKEN"))
+}
+
+fn validate_http_sync_serve_auth(
+    bind: &str,
+    token: Option<&str>,
+    allow_unauthenticated: bool,
+) -> Result<()> {
+    if token.is_some() || allow_unauthenticated || is_loopback_bind(bind) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing to serve unauthenticated HTTP sync API on non-loopback bind address {bind}; pass --token or --allow-unauthenticated"
+    );
+}
+
+fn is_loopback_bind(bind: &str) -> bool {
+    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+        return addr.ip().is_loopback();
+    }
+
+    bind.starts_with("localhost:") || bind.starts_with("[::1]:")
 }
 
 fn should_ignore_record_command(

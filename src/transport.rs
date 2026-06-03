@@ -3,9 +3,17 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
-pub fn serve(bind: &str, db_path: &str) -> Result<()> {
+pub struct ServeConfig {
+    pub token: Option<String>,
+}
+
+pub struct SyncConfig {
+    pub token: Option<String>,
+}
+
+pub fn serve(bind: &str, db_path: &str, cfg: ServeConfig) -> Result<()> {
     let store = LocalStore::open(db_path)?;
-    serve_http(bind, store)
+    serve_http(bind, store, cfg)
 }
 
 pub fn sync(
@@ -13,6 +21,7 @@ pub fn sync(
     db_path: &str,
     push: bool,
     local_device_id: Option<&str>,
+    cfg: SyncConfig,
 ) -> Result<()> {
     if peers.is_empty() {
         anyhow::bail!("no peers provided");
@@ -26,7 +35,8 @@ pub fn sync(
     let mut last_err: Option<anyhow::Error> = None;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
-        match sync_pull_http_peer(&store, peer, 1000).with_context(|| format!("pull peer: {peer}"))
+        match sync_pull_http_peer(&store, peer, 1000, cfg.token.as_deref())
+            .with_context(|| format!("pull peer: {peer}"))
         {
             Ok(_) => progress.mark_pull_ok(),
             Err(err) => {
@@ -48,7 +58,7 @@ pub fn sync(
             let push_needed = pending_push > 0;
             progress.note_push_needed(push_needed);
 
-            match sync_push_http_peer(&store, peer, 1000, local_device_id)
+            match sync_push_http_peer(&store, peer, 1000, local_device_id, cfg.token.as_deref())
                 .with_context(|| format!("push peer: {peer}"))
             {
                 Ok(_) => progress.mark_push_ok(push_needed),
@@ -86,12 +96,13 @@ enum EntriesRequest {
     Object { entries: Vec<Entry> },
 }
 
-fn serve_http(bind: &str, store: LocalStore) -> Result<()> {
+fn serve_http(bind: &str, store: LocalStore, cfg: ServeConfig) -> Result<()> {
     let server =
         tiny_http::Server::http(bind).map_err(|e| anyhow::anyhow!("listen {bind}: {e}"))?;
+    let token = cfg.token;
 
     for mut req in server.incoming_requests() {
-        let res = route_http_request(&store, &mut req)
+        let res = route_http_request(&store, token.as_deref(), &mut req)
             .unwrap_or_else(|err| respond_text(500, &format!("error: {err:#}\n")));
         let _ = req.respond(res);
     }
@@ -103,10 +114,11 @@ fn sync_pull_http_peer(
     local: &LocalStore,
     peer_base_url: &str,
     limit: usize,
+    token: Option<&str>,
 ) -> Result<sync::PullStats> {
     let peer_key = normalize_peer_base_url(peer_base_url)?;
     sync::sync_pull_from_peer(local, &peer_key, limit, |cursor, limit| {
-        http_pull_batch(&peer_key, cursor, limit)
+        http_pull_batch(&peer_key, cursor, limit, token)
     })
 }
 
@@ -115,10 +127,11 @@ fn sync_push_http_peer(
     peer_base_url: &str,
     limit: usize,
     local_device_id: Option<&str>,
+    token: Option<&str>,
 ) -> Result<usize> {
     let peer_key = normalize_peer_base_url(peer_base_url)?;
     sync::sync_push_to_peer(local, &peer_key, limit, local_device_id, |entries| {
-        http_push_batch(&peer_key, entries)
+        http_push_batch(&peer_key, entries, token)
     })
 }
 
@@ -143,6 +156,7 @@ fn http_pull_batch(
     peer_base_url: &str,
     cursor: i64,
     limit: usize,
+    token: Option<&str>,
 ) -> Result<crate::storage::PullBatch> {
     let url = format!(
         "{}/api/v1/entries?cursor={}&limit={}",
@@ -153,7 +167,13 @@ fn http_pull_batch(
 
     let resp = crate::http_retry::request_with_retry(
         crate::http_retry::RetryPolicy::transport(),
-        |agent| agent.get(&url).call().map_err(Box::new),
+        |agent| {
+            let mut req = agent.get(&url);
+            if let Some(token) = token {
+                req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+            }
+            req.call().map_err(Box::new)
+        },
     )
     .with_context(|| format!("GET {url}"))?;
     let body = resp.into_string().context("read response body")?;
@@ -166,18 +186,18 @@ fn http_pull_batch(
     })
 }
 
-fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>) -> Result<()> {
+fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>, token: Option<&str>) -> Result<()> {
     let url = format!("{}/api/v1/entries", peer_base_url.trim_end_matches('/'));
 
     let body = serde_json::to_vec(&entries).context("serialize entries json")?;
     let resp = crate::http_retry::request_with_retry(
         crate::http_retry::RetryPolicy::transport(),
         |agent| {
-            agent
-                .post(&url)
-                .set("Content-Type", "application/json")
-                .send_bytes(&body)
-                .map_err(Box::new)
+            let mut req = agent.post(&url).set("Content-Type", "application/json");
+            if let Some(token) = token {
+                req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+            }
+            req.send_bytes(&body).map_err(Box::new)
         },
     )
     .with_context(|| format!("POST {url}"))?;
@@ -187,6 +207,7 @@ fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>) -> Result<()> {
 
 fn route_http_request(
     store: &LocalStore,
+    token: Option<&str>,
     req: &mut tiny_http::Request,
 ) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
     let url = req.url().to_string();
@@ -200,6 +221,9 @@ fn route_http_request(
     match (method, path) {
         ("GET", "/api/v1/ping") => Ok(respond_text(200, "ok\n")),
         ("GET", "/api/v1/entries") => {
+            if !is_authorized(req, token) {
+                return Ok(respond_text(401, "unauthorized\n"));
+            }
             let (cursor, limit) = parse_cursor_limit(query)?;
             let batch = store.pull_since_cursor(cursor, limit)?;
             respond_json(
@@ -211,6 +235,9 @@ fn route_http_request(
             )
         }
         ("POST", "/api/v1/entries") => {
+            if !is_authorized(req, token) {
+                return Ok(respond_text(401, "unauthorized\n"));
+            }
             let mut buf = Vec::new();
             let max = max_request_body_bytes();
             req.as_reader()
@@ -239,6 +266,31 @@ fn route_http_request(
         }
         _ => Ok(respond_text(404, "not found\n")),
     }
+}
+
+fn is_authorized(req: &tiny_http::Request, token: Option<&str>) -> bool {
+    let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
+        return true;
+    };
+
+    if let Some(value) = header_value(req, "Authorization")
+        && let Some(rest) = value.strip_prefix("Bearer ")
+    {
+        return rest.trim() == token;
+    }
+
+    if let Some(value) = header_value(req, "X-Rustory-Token") {
+        return value.trim() == token;
+    }
+
+    false
+}
+
+fn header_value(req: &tiny_http::Request, name: &'static str) -> Option<String> {
+    req.headers()
+        .iter()
+        .find(|h| h.field.equiv(name))
+        .map(|h| h.value.as_str().to_string())
 }
 
 #[cfg(test)]
@@ -317,6 +369,10 @@ mod tests {
     }
 
     fn start_test_server(db_path: String) -> TestServer {
+        start_test_server_with_token(db_path, None)
+    }
+
+    fn start_test_server_with_token(db_path: String, token: Option<String>) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -325,6 +381,7 @@ mod tests {
         let base_url = format!("http://{}", bind);
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown2 = shutdown.clone();
+        let token2 = token.clone();
 
         let join = thread::spawn(move || {
             let store = LocalStore::open(&db_path).unwrap();
@@ -332,7 +389,7 @@ mod tests {
             while !shutdown2.load(Ordering::SeqCst) {
                 match server.recv_timeout(Duration::from_millis(50)) {
                     Ok(Some(mut req)) => {
-                        let res = route_http_request(&store, &mut req)
+                        let res = route_http_request(&store, token2.as_deref(), &mut req)
                             .unwrap_or_else(|e| respond_text(500, &format!("error: {e:#}\n")));
                         let _ = req.respond(res);
                     }
@@ -390,7 +447,7 @@ mod tests {
         let server = start_test_server(remote_db.to_str().unwrap().to_string());
 
         let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
-        let pulled = sync_pull_http_peer(&local, &server.base_url, 1).unwrap();
+        let pulled = sync_pull_http_peer(&local, &server.base_url, 1, None).unwrap();
 
         assert_eq!(pulled.received, 2);
         assert_eq!(pulled.inserted, 2);
@@ -402,7 +459,8 @@ mod tests {
         local_entry.device_id = "dev-local".to_string();
         local.insert_entries(&[local_entry]).unwrap();
 
-        let pushed = sync_push_http_peer(&local, &server.base_url, 100, Some("dev-local")).unwrap();
+        let pushed =
+            sync_push_http_peer(&local, &server.base_url, 100, Some("dev-local"), None).unwrap();
         assert_eq!(pushed, 1);
 
         let got = remote.list_recent(10).unwrap();
@@ -427,7 +485,7 @@ mod tests {
 
         let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
         let peer_with_slash = format!("{}/", server.base_url);
-        let pulled = sync_pull_http_peer(&local, &peer_with_slash, 100).unwrap();
+        let pulled = sync_pull_http_peer(&local, &peer_with_slash, 100, None).unwrap();
         assert_eq!(pulled.received, 1);
         assert_eq!(pulled.inserted, 1);
         assert_eq!(pulled.ignored, 0);
@@ -435,6 +493,36 @@ mod tests {
         // cursor는 normalize된 key(끝의 / 제거)로 저장된다.
         assert_eq!(local.get_last_cursor(&server.base_url).unwrap(), 1);
         assert_eq!(local.get_last_cursor(&peer_with_slash).unwrap(), 0);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_entries_require_token_when_configured() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+        remote
+            .insert_entries(&[entry("id-1", 1, "echo 1")])
+            .unwrap();
+
+        let server = start_test_server_with_token(
+            remote_db.to_str().unwrap().to_string(),
+            Some("sync-secret".to_string()),
+        );
+
+        let url = format!("{}/api/v1/entries?cursor=0&limit=1", server.base_url);
+        let err = ureq::get(&url).call().unwrap_err();
+        let ureq::Error::Status(status, _) = err else {
+            panic!("expected status error");
+        };
+        assert_eq!(status, 401);
+
+        let resp = ureq::get(&url)
+            .set("Authorization", "Bearer sync-secret")
+            .call()
+            .unwrap();
+        assert_eq!(resp.status(), 200);
 
         server.shutdown();
     }
@@ -520,7 +608,14 @@ mod tests {
         }
 
         let peers = vec![base_url];
-        let err = sync(&peers, local_db.to_str().unwrap(), true, Some("dev-local")).unwrap_err();
+        let err = sync(
+            &peers,
+            local_db.to_str().unwrap(),
+            true,
+            Some("dev-local"),
+            SyncConfig { token: None },
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("push peer"));
 
         shutdown.store(true, Ordering::SeqCst);
