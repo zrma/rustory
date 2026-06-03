@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-04-24
+- Last Verified: 2026-06-03
 
 이 문서는 AI 에이전트 중심 개발 환경에서 `README.md`, `AGENTS.md`, `docs/*`의 역할 경계를 고정한다.
 

@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-04-30
+- Last Verified: 2026-06-03
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
