@@ -1,7 +1,7 @@
 use crate::libp2p;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use rand::Rng;
+use rand::RngExt;
 
 use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
 use std::time::{Duration, Instant};
@@ -457,7 +457,7 @@ pub fn run() -> Result<()> {
                 };
 
                 if start_jitter_sec > 0 {
-                    let delay = rand::thread_rng().gen_range(0..=start_jitter_sec);
+                    let delay = rand::rng().random_range(0..=start_jitter_sec);
                     if delay > 0 {
                         eprintln!("p2p-sync watch: start jitter={delay}s");
                         sleep_with_stop(Duration::from_secs(delay), stop.as_ref());

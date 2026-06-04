@@ -68,7 +68,7 @@ pub fn load_from_path(path: &str) -> Result<FileConfig> {
 
 pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedKey> {
     use libp2p::pnet::PreSharedKey;
-    use rand::RngCore;
+    use rand::TryRng;
 
     let path = expand_home_path(path)?;
     match std::fs::read_to_string(&path) {
@@ -80,7 +80,9 @@ pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedK
             ensure_parent_dir(&path)?;
 
             let mut raw = [0u8; 32];
-            rand::rngs::OsRng.fill_bytes(&mut raw);
+            rand::rngs::SysRng
+                .try_fill_bytes(&mut raw)
+                .context("generate swarm key")?;
             let key = PreSharedKey::new(raw);
 
             std::fs::write(&path, key.to_string())
