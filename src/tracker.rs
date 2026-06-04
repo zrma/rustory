@@ -282,15 +282,19 @@ impl TrackerClient {
         let resp = crate::http_retry::request_with_retry(
             crate::http_retry::RetryPolicy::tracker(),
             |agent| {
-                let mut r = agent.post(&url).set("Content-Type", "application/json");
+                let mut r = agent.post(&url).header("Content-Type", "application/json");
                 if let Some(token) = &token {
-                    r = r.set("Authorization", &format!("Bearer {}", token.trim()));
+                    r = r.header("Authorization", format!("Bearer {}", token.trim()));
                 }
-                r.send_bytes(&body).map_err(Box::new)
+                r.send(&body)
             },
         )
         .with_context(|| format!("POST {url}"))?;
-        let text = resp.into_string().context("read response body")?;
+        let mut resp = resp;
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .context("read response body")?;
         serde_json::from_str(&text).context("parse register response json")
     }
 
@@ -307,13 +311,17 @@ impl TrackerClient {
             |agent| {
                 let mut r = agent.get(&url);
                 if let Some(token) = &token {
-                    r = r.set("Authorization", &format!("Bearer {}", token.trim()));
+                    r = r.header("Authorization", format!("Bearer {}", token.trim()));
                 }
-                r.call().map_err(Box::new)
+                r.call()
             },
         )
         .with_context(|| format!("GET {url}"))?;
-        let text = resp.into_string().context("read response body")?;
+        let mut resp = resp;
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .context("read response body")?;
         serde_json::from_str(&text).context("parse list response json")
     }
 }
@@ -407,6 +415,18 @@ mod tests {
         }
     }
 
+    fn assert_ureq_status(err: &anyhow::Error, want: u16) {
+        let got = err.chain().find_map(|cause| {
+            cause
+                .downcast_ref::<ureq::Error>()
+                .and_then(|err| match err {
+                    ureq::Error::StatusCode(code) => Some(*code),
+                    _ => None,
+                })
+        });
+        assert_eq!(got, Some(want));
+    }
+
     #[test]
     fn tracker_register_and_list_end_to_end() {
         let server = start_test_server(60, None);
@@ -446,8 +466,7 @@ mod tests {
         };
 
         let err = client.register(&req).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("status code 401"));
+        assert_ureq_status(&err, 401);
 
         server.shutdown();
     }
@@ -484,13 +503,11 @@ mod tests {
         };
 
         let err = client.register(&req).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("status code 401"));
+        assert_ureq_status(&err, 401);
 
         let client = TrackerClient::new(server.base_url.clone(), Some("   ".to_string()));
         let err = client.register(&req).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("status code 401"));
+        assert_ureq_status(&err, 401);
 
         server.shutdown();
     }
@@ -507,8 +524,7 @@ mod tests {
         };
 
         let err = client.register(&req).unwrap_err();
-        let msg = format!("{err:#}");
-        assert!(msg.contains("status code 400"));
+        assert_ureq_status(&err, 400);
 
         server.shutdown();
     }

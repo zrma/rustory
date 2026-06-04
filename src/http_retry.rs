@@ -38,7 +38,7 @@ impl RetryPolicy {
 
 pub fn request_with_retry<T, F>(policy: RetryPolicy, mut f: F) -> Result<T>
 where
-    F: FnMut(&ureq::Agent) -> std::result::Result<T, Box<ureq::Error>>,
+    F: FnMut(&ureq::Agent) -> std::result::Result<T, ureq::Error>,
 {
     let attempts = policy.attempts.max(1);
     let mut last_err: Option<anyhow::Error> = None;
@@ -51,10 +51,12 @@ where
         );
         let read = exp_duration(policy.read_base, attempt as u32, Some(policy.read_cap));
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(connect)
-            .timeout_read(read)
-            .build();
+        let agent: ureq::Agent = ureq::Agent::config_builder()
+            .timeout_connect(Some(connect))
+            .timeout_recv_response(Some(read))
+            .timeout_recv_body(Some(read))
+            .build()
+            .into();
 
         match f(&agent) {
             Ok(v) => return Ok(v),
@@ -79,11 +81,15 @@ where
 
 fn is_retryable_error(err: &ureq::Error) -> bool {
     match err {
-        ureq::Error::Transport(_) => true,
-        ureq::Error::Status(code, _) => {
+        ureq::Error::StatusCode(code) => {
             let code = *code;
             code == 408 || code == 429 || (500..=599).contains(&code)
         }
+        ureq::Error::Timeout(_)
+        | ureq::Error::Io(_)
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectionFailed => true,
+        _ => false,
     }
 }
 

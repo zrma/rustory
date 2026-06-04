@@ -1892,22 +1892,25 @@ fn file_mode_777(path: &std::path::Path) -> Option<u32> {
 }
 
 fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<u64, String> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(1))
-        .timeout_read(Duration::from_secs(1))
-        .timeout_write(Duration::from_secs(1))
-        .build();
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_connect(Some(Duration::from_secs(1)))
+        .timeout_send_request(Some(Duration::from_secs(1)))
+        .timeout_send_body(Some(Duration::from_secs(1)))
+        .timeout_recv_response(Some(Duration::from_secs(1)))
+        .timeout_recv_body(Some(Duration::from_secs(1)))
+        .build()
+        .into();
 
     let url = format!("{}/api/v1/ping", base_url.trim_end_matches('/'));
     let mut req = agent.get(&url);
     if let Some(token) = token {
-        req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+        req = req.header("Authorization", format!("Bearer {}", token.trim()));
     }
 
     let started = Instant::now();
     match req.call() {
         Ok(resp) => {
-            if resp.status() == 200 {
+            if resp.status().as_u16() == 200 {
                 let elapsed_ms = started.elapsed().as_millis();
                 let latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
                 Ok(latency_ms)

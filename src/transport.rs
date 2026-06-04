@@ -185,13 +185,17 @@ fn http_pull_batch(
         |agent| {
             let mut req = agent.get(&url);
             if let Some(token) = token {
-                req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+                req = req.header("Authorization", format!("Bearer {}", token.trim()));
             }
-            req.call().map_err(Box::new)
+            req.call()
         },
     )
     .with_context(|| format!("GET {url}"))?;
-    let body = resp.into_string().context("read response body")?;
+    let mut resp = resp;
+    let body = resp
+        .body_mut()
+        .read_to_string()
+        .context("read response body")?;
     let parsed: EntriesResponse =
         serde_json::from_str(&body).context("parse entries response json")?;
 
@@ -208,15 +212,19 @@ fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>, token: Option<&str>
     let resp = crate::http_retry::request_with_retry(
         crate::http_retry::RetryPolicy::transport(),
         |agent| {
-            let mut req = agent.post(&url).set("Content-Type", "application/json");
+            let mut req = agent.post(&url).header("Content-Type", "application/json");
             if let Some(token) = token {
-                req = req.set("Authorization", &format!("Bearer {}", token.trim()));
+                req = req.header("Authorization", format!("Bearer {}", token.trim()));
             }
-            req.send_bytes(&body).map_err(Box::new)
+            req.send(&body)
         },
     )
     .with_context(|| format!("POST {url}"))?;
-    let _ = resp.into_string().context("read response body")?;
+    let mut resp = resp;
+    let _ = resp
+        .body_mut()
+        .read_to_string()
+        .context("read response body")?;
     Ok(())
 }
 
@@ -532,16 +540,16 @@ mod tests {
 
         let url = format!("{}/api/v1/entries?cursor=0&limit=1", server.base_url);
         let err = ureq::get(&url).call().unwrap_err();
-        let ureq::Error::Status(status, _) = err else {
+        let ureq::Error::StatusCode(status) = err else {
             panic!("expected status error");
         };
         assert_eq!(status, 401);
 
         let resp = ureq::get(&url)
-            .set("Authorization", "Bearer sync-secret")
+            .header("Authorization", "Bearer sync-secret")
             .call()
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.status().as_u16(), 200);
 
         server.shutdown();
     }
@@ -567,7 +575,7 @@ mod tests {
 
         let url = format!("{}/api/v1/entries?cursor=0&limit=1", server.base_url);
         let err = ureq::get(&url).call().unwrap_err();
-        let ureq::Error::Status(status, _) = err else {
+        let ureq::Error::StatusCode(status) = err else {
             panic!("expected status error");
         };
         assert_eq!(status, 401);
@@ -599,13 +607,13 @@ mod tests {
         let body = serde_json::to_vec(&[e1.clone(), e2.clone(), e1]).unwrap();
 
         let url = format!("{}/api/v1/entries", server.base_url);
-        let resp = ureq::post(&url)
-            .set("Content-Type", "application/json")
-            .send_bytes(&body)
+        let mut resp = ureq::post(&url)
+            .header("Content-Type", "application/json")
+            .send(&body)
             .unwrap();
-        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.status().as_u16(), 200);
 
-        let text = resp.into_string().unwrap();
+        let text = resp.body_mut().read_to_string().unwrap();
         let parsed: PushResponse = serde_json::from_str(&text).unwrap();
         assert!(parsed.ok);
         assert_eq!(parsed.inserted, 2);
