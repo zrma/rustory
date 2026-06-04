@@ -54,6 +54,7 @@ struct TrackerState {
 }
 
 pub fn serve(bind: &str, ttl_sec: u64, token: Option<String>) -> Result<()> {
+    let token = normalize_configured_token(token, "tracker token")?;
     let state = Arc::new(Mutex::new(TrackerState::default()));
     serve_http(bind, ttl_sec, token, state)
 }
@@ -216,7 +217,7 @@ fn query_get<'a>(query: &'a str, key: &str) -> Option<&'a str> {
 fn is_authorized(req: &tiny_http::Request, token: &str) -> bool {
     let token = token.trim();
     if token.is_empty() {
-        return true;
+        return false;
     }
 
     // 1) Authorization: Bearer <token>
@@ -234,6 +235,19 @@ fn is_authorized(req: &tiny_http::Request, token: &str) -> bool {
     false
 }
 
+fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Option<String>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("{label} must not be empty");
+    }
+
+    Ok(Some(token.to_string()))
+}
+
 fn header_value(req: &tiny_http::Request, name: &'static str) -> Option<String> {
     req.headers()
         .iter()
@@ -249,6 +263,11 @@ pub struct TrackerClient {
 
 impl TrackerClient {
     pub fn new(base_url: String, token: Option<String>) -> Self {
+        let token = token.and_then(|token| {
+            let token = token.trim();
+            (!token.is_empty()).then(|| token.to_string())
+        });
+
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
@@ -445,6 +464,33 @@ mod tests {
         };
         let resp = client.register(&req).unwrap();
         assert!(resp.ok);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn tracker_rejects_blank_configured_token() {
+        let err =
+            normalize_configured_token(Some(" \t ".to_string()), "tracker token").unwrap_err();
+        assert!(format!("{err:#}").contains("tracker token must not be empty"));
+
+        let server = start_test_server(60, Some("   ".to_string()));
+        let client = TrackerClient::new(server.base_url.clone(), None);
+
+        let req = RegisterRequest {
+            peer_id: PeerId::random().to_string(),
+            addrs: vec![],
+            meta: None,
+        };
+
+        let err = client.register(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("status code 401"));
+
+        let client = TrackerClient::new(server.base_url.clone(), Some("   ".to_string()));
+        let err = client.register(&req).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("status code 401"));
 
         server.shutdown();
     }

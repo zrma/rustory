@@ -12,8 +12,9 @@ pub struct SyncConfig {
 }
 
 pub fn serve(bind: &str, db_path: &str, cfg: ServeConfig) -> Result<()> {
+    let token = normalize_configured_token(cfg.token, "HTTP sync token")?;
     let store = LocalStore::open(db_path)?;
-    serve_http(bind, store, cfg)
+    serve_http(bind, store, ServeConfig { token })
 }
 
 pub fn sync(
@@ -30,12 +31,13 @@ pub fn sync(
         anyhow::bail!("local_device_id required for push");
     }
 
+    let token = normalize_configured_token(cfg.token, "HTTP sync token")?;
     let store = LocalStore::open(db_path)?;
     let mut progress = sync::SyncRunProgress::new(push);
     let mut last_err: Option<anyhow::Error> = None;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
-        match sync_pull_http_peer(&store, peer, 1000, cfg.token.as_deref())
+        match sync_pull_http_peer(&store, peer, 1000, token.as_deref())
             .with_context(|| format!("pull peer: {peer}"))
         {
             Ok(_) => progress.mark_pull_ok(),
@@ -58,7 +60,7 @@ pub fn sync(
             let push_needed = pending_push > 0;
             progress.note_push_needed(push_needed);
 
-            match sync_push_http_peer(&store, peer, 1000, local_device_id, cfg.token.as_deref())
+            match sync_push_http_peer(&store, peer, 1000, local_device_id, token.as_deref())
                 .with_context(|| format!("push peer: {peer}"))
             {
                 Ok(_) => progress.mark_push_ok(push_needed),
@@ -150,6 +152,19 @@ fn normalize_peer_base_url(value: &str) -> Result<String> {
         anyhow::bail!("peer url is empty");
     }
     Ok(v.to_string())
+}
+
+fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Option<String>> {
+    let Some(token) = token else {
+        return Ok(None);
+    };
+
+    let token = token.trim();
+    if token.is_empty() {
+        anyhow::bail!("{label} must not be empty");
+    }
+
+    Ok(Some(token.to_string()))
 }
 
 fn http_pull_batch(
@@ -269,9 +284,13 @@ fn route_http_request(
 }
 
 fn is_authorized(req: &tiny_http::Request, token: Option<&str>) -> bool {
-    let Some(token) = token.map(str::trim).filter(|token| !token.is_empty()) else {
+    let Some(token) = token else {
         return true;
     };
+    let token = token.trim();
+    if token.is_empty() {
+        return false;
+    }
 
     if let Some(value) = header_value(req, "Authorization")
         && let Some(rest) = value.strip_prefix("Bearer ")
@@ -523,6 +542,48 @@ mod tests {
             .call()
             .unwrap();
         assert_eq!(resp.status(), 200);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_sync_rejects_blank_configured_token() {
+        let err =
+            normalize_configured_token(Some(" \t ".to_string()), "HTTP sync token").unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP sync token must not be empty"));
+
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let local_db = dir.path().join("local.db");
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+        remote
+            .insert_entries(&[entry("id-1", 1, "echo 1")])
+            .unwrap();
+
+        let server = start_test_server_with_token(
+            remote_db.to_str().unwrap().to_string(),
+            Some("   ".into()),
+        );
+
+        let url = format!("{}/api/v1/entries?cursor=0&limit=1", server.base_url);
+        let err = ureq::get(&url).call().unwrap_err();
+        let ureq::Error::Status(status, _) = err else {
+            panic!("expected status error");
+        };
+        assert_eq!(status, 401);
+
+        let peers = vec![server.base_url.clone()];
+        let err = sync(
+            &peers,
+            local_db.to_str().unwrap(),
+            false,
+            None,
+            SyncConfig {
+                token: Some("   ".into()),
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("HTTP sync token must not be empty"));
 
         server.shutdown();
     }
