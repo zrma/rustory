@@ -3,6 +3,10 @@ set -euo pipefail
 
 ROOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
+# shellcheck source=scripts/lib/rust-toolchain.sh
+source "$ROOT_DIR/scripts/lib/rust-toolchain.sh"
+
+rustory_require_cargo
 
 pick_port() {
   python3 - <<'PY'

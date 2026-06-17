@@ -16,13 +16,14 @@
 
 | ID | 상태 | Owner | Verify command | 작업 항목 |
 | --- | --- | --- | --- | --- |
-| C1 | todo | codex | `env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" scripts/check.sh --fast` | `scripts/check.sh`가 `cargo`를 직접 전제하지 않고 rustup cargo fallback을 사용하게 한다. |
-| C2 | todo | codex | `env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" scripts/run-manifest-checks.sh --mode full --repo-key rustory --work-id toolchain-path-fallback` | manifest full mode의 `cargo fmt/test/clippy`도 동일한 fallback 환경에서 통과하게 한다. |
-| C3 | todo | codex | `scripts/run-manifest-checks.sh --mode quick --work-id toolchain-path-fallback` | todo/readiness/script smoke와 문서 게이트가 기존 정책과 호환되는지 확인한다. |
+| C1 | done | codex | `env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" scripts/check.sh --fast` | `scripts/check.sh`가 `cargo`를 직접 전제하지 않고 rustup cargo fallback을 사용하게 한다. |
+| C2 | done | codex | `env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" scripts/run-manifest-checks.sh --mode full --repo-key rustory --work-id toolchain-path-fallback` | manifest full mode의 `cargo fmt/test/clippy`도 동일한 fallback 환경에서 통과하게 한다. |
+| C3 | done | codex | `scripts/run-manifest-checks.sh --mode quick --work-id toolchain-path-fallback` | todo/readiness/script smoke와 문서 게이트가 기존 정책과 호환되는지 확인한다. |
+| C4 | todo | codex | `scripts/check-todo-closure.sh` | 구현 커밋 후 lessons 기록과 todo workspace 삭제로 마감한다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: 계획 workspace 생성 및 초기 readiness/quick manifest 게이트 통과.
-- 미완료: C1, C2, C3.
-- 다음 액션: repo scripts에 cargo PATH fallback을 추가하고 재현 환경에서 검증한다.
-- 검증 증거: `scripts/start-work.sh --work-id toolchain-path-fallback`; 실패 재현 `scripts/check.sh --fast` -> `scripts/check.sh: line 55: cargo: command not found`.
+- 완료: C1, C2, C3. 공용 `scripts/lib/rust-toolchain.sh`를 추가하고 `scripts/check.sh`, `scripts/run-manifest-checks.sh`, `scripts/smoke_p2p_local.sh`, `scripts/acceptance_docker_macos_linux.sh`에서 cargo fallback을 사용한다. `scripts/check-script-smoke.sh`는 lib와 주요 non-check scripts의 syntax smoke를 함께 확인한다.
+- 미완료: C4. lessons 기록과 todo workspace 삭제는 구현 커밋 이후 별도 마감 단위로 진행한다.
+- 다음 액션: 구현 단위를 커밋/푸시한 뒤 C4 todo closure를 진행한다.
+- 검증 증거: 실패 재현 `scripts/check.sh --fast` -> `scripts/check.sh: line 55: cargo: command not found`; 수정 후 `env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" scripts/check.sh --fast`; `env PATH="/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin" scripts/run-manifest-checks.sh --mode full --repo-key rustory --work-id toolchain-path-fallback`; `scripts/run-manifest-checks.sh --mode quick --work-id toolchain-path-fallback`.

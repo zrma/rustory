@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=scripts/lib/todo-workspace.sh
 source "$ROOT/scripts/lib/todo-workspace.sh"
+# shellcheck source=scripts/lib/rust-toolchain.sh
+source "$ROOT/scripts/lib/rust-toolchain.sh"
 MANIFEST="$ROOT/docs/REPO_MANIFEST.yaml"
 MODE="quick"
 WORK_ID=""
@@ -147,6 +149,8 @@ then
   echo "$PYTHON_BIN package 'yaml' is required to parse $MANIFEST" >&2
   exit 1
 fi
+
+rustory_ensure_cargo_on_path || true
 
 CHECKS_RAW="$(
   "$PYTHON_BIN" - "$MANIFEST" "$REPO_KEY" <<'PY'

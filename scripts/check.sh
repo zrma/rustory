@@ -51,6 +51,10 @@ done
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+# shellcheck source=scripts/lib/rust-toolchain.sh
+source "$ROOT/scripts/lib/rust-toolchain.sh"
+
+rustory_require_cargo
 
 cargo fmt --all --check
 cargo test --workspace

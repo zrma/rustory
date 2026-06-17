@@ -528,7 +528,12 @@ EOF
 while IFS= read -r script; do
   [[ -z "$script" ]] && continue
   run_cmd "bash -n $script"
-done < <(find "$ROOT/scripts" -maxdepth 1 -type f -name 'check-*.sh' | sort)
+done < <(
+  {
+    find "$ROOT/scripts" -maxdepth 1 -type f -name 'check-*.sh'
+    find "$ROOT/scripts/lib" -maxdepth 1 -type f -name '*.sh'
+  } | sort
+)
 
 push_strict_cmd="scripts/check-push-gates.sh --mode strict --dry-run --work-id $RESOLVED_WORK_ID"
 release_full_cmd="scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $RESOLVED_WORK_ID"
@@ -545,6 +550,9 @@ run_cmd "scripts/check-manifest-entrypoints.sh"
 run_cmd "bash -n scripts/finalize-and-push.sh"
 run_cmd "bash -n scripts/jj-git-push-safe.sh"
 run_cmd "bash -n scripts/start-work.sh"
+run_cmd "bash -n scripts/check.sh"
+run_cmd "bash -n scripts/smoke_p2p_local.sh"
+run_cmd "bash -n scripts/acceptance_docker_macos_linux.sh"
 run_cmd "scripts/check-push-gates.sh --mode quick --dry-run"
 run_cmd "$push_strict_cmd"
 run_debug_override_cmd "ALLOW_MISSING_WORK_ID_IN_CI=0 DEBUG_GATES_OVERRIDE=1 scripts/check-push-gates.sh --mode strict --allow-missing-work-id --dry-run"
