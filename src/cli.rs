@@ -303,11 +303,11 @@ enum Command {
         #[arg(
             long,
             default_value = "zsh",
-            help = "History format to import: bash or zsh"
+            help = "History source format to import: bash, zsh, or hishtory"
         )]
         shell: String,
 
-        #[arg(long, help = "History file path; defaults to the selected shell")]
+        #[arg(long, help = "History source path; defaults to the selected source")]
         path: Option<String>,
 
         #[arg(long, help = "Maximum newest parsed history entries to import")]
@@ -777,20 +777,34 @@ pub fn run() -> Result<()> {
                 None => None,
             };
 
-            let content = history_import::read_history_file(&path)?;
             let store = storage::LocalStore::open(&db_path)?;
-            let stats = history_import::import_into_store(
-                &store,
-                history_import::ImportRequest {
-                    shell,
-                    content: &content,
-                    limit,
-                    user_id: &user_id,
-                    device_id: &device_id,
-                    hostname: &hostname,
-                    ignore_regex: ignore_re.as_ref(),
-                },
-            )?;
+            let stats = if shell.is_hishtory() {
+                history_import::import_hishtory_sqlite_into_store(
+                    &store,
+                    history_import::HishtoryImportRequest {
+                        path: &path,
+                        limit,
+                        user_id: &user_id,
+                        device_id: &device_id,
+                        hostname: &hostname,
+                        ignore_regex: ignore_re.as_ref(),
+                    },
+                )?
+            } else {
+                let content = history_import::read_history_file(&path)?;
+                history_import::import_into_store(
+                    &store,
+                    history_import::ImportRequest {
+                        shell,
+                        content: &content,
+                        limit,
+                        user_id: &user_id,
+                        device_id: &device_id,
+                        hostname: &hostname,
+                        ignore_regex: ignore_re.as_ref(),
+                    },
+                )?
+            };
 
             println!(
                 "import: path={} shell={} received={} inserted={} ignored={} skipped={}",
@@ -3655,6 +3669,17 @@ mod tests {
                 assert_eq!(shell, "bash");
                 assert_eq!(path.as_deref(), Some("/tmp/x"));
                 assert_eq!(limit, Some(10));
+            }
+            _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn import_accepts_hishtory_source() {
+        let app = App::parse_from(["rr", "import", "--shell", "hishtory"]);
+        match app.cmd {
+            Command::Import { shell, .. } => {
+                assert_eq!(shell, "hishtory");
             }
             _ => panic!("expected import"),
         }

@@ -1,7 +1,9 @@
 use crate::{core, storage::LocalStore};
 use anyhow::{Context, Result};
+use rusqlite::{Connection, OpenFlags, params};
 use std::path::Path;
-use time::{Duration, OffsetDateTime};
+use std::time::Duration as StdDuration;
+use time::{Duration as TimeDuration, OffsetDateTime};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRecord {
@@ -15,6 +17,7 @@ pub struct HistoryRecord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryShell {
     Bash,
+    Hishtory,
     Zsh,
 }
 
@@ -22,14 +25,16 @@ impl HistoryShell {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "bash" => Ok(Self::Bash),
+            "hishtory" => Ok(Self::Hishtory),
             "zsh" => Ok(Self::Zsh),
-            _ => anyhow::bail!("unsupported shell: {value} (expected: bash|zsh)"),
+            _ => anyhow::bail!("unsupported shell: {value} (expected: bash|zsh|hishtory)"),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bash => "bash",
+            Self::Hishtory => "hishtory",
             Self::Zsh => "zsh",
         }
     }
@@ -37,8 +42,13 @@ impl HistoryShell {
     pub fn default_history_path(self) -> &'static str {
         match self {
             Self::Bash => "~/.bash_history",
+            Self::Hishtory => "~/.hishtory/.hishtory.db",
             Self::Zsh => "~/.zsh_history",
         }
+    }
+
+    pub fn is_hishtory(self) -> bool {
+        matches!(self, Self::Hishtory)
     }
 }
 
@@ -59,6 +69,7 @@ pub fn read_history_file(path: &Path) -> Result<String> {
 pub fn parse_history(shell: HistoryShell, content: &str) -> Vec<HistoryRecord> {
     match shell {
         HistoryShell::Bash => parse_bash_history(content),
+        HistoryShell::Hishtory => Vec::new(),
         HistoryShell::Zsh => parse_zsh_history(content),
     }
 }
@@ -144,12 +155,17 @@ fn filled_ts_unix(total: usize, index: usize, original: Option<i64>, now: Offset
         None => {
             // Preserve file order: oldest record gets the earliest synthetic timestamp.
             let delta = (total - 1).saturating_sub(index) as i64;
-            (now - Duration::seconds(delta)).unix_timestamp()
+            (now - TimeDuration::seconds(delta)).unix_timestamp()
         }
     }
 }
 
 pub fn import_into_store(store: &LocalStore, req: ImportRequest<'_>) -> Result<ImportStats> {
+    anyhow::ensure!(
+        !req.shell.is_hishtory(),
+        "hishtory imports require import_hishtory_sqlite_into_store"
+    );
+
     let mut records = parse_history(req.shell, req.content);
 
     // Keep only the last N commands, if requested.
@@ -234,6 +250,245 @@ pub fn import_into_store(store: &LocalStore, req: ImportRequest<'_>) -> Result<I
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct HishtoryImportRequest<'a> {
+    pub path: &'a Path,
+    pub limit: Option<usize>,
+    pub user_id: &'a str,
+    pub device_id: &'a str,
+    pub hostname: &'a str,
+    pub ignore_regex: Option<&'a regex::Regex>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HishtoryRecord {
+    source_rowid: u64,
+    source_entry_id: Option<String>,
+    ts_unix: i64,
+    duration_ms: i64,
+    cmd: String,
+    cwd: String,
+    exit_code: i32,
+    hostname: String,
+}
+
+pub fn import_hishtory_sqlite_into_store(
+    store: &LocalStore,
+    req: HishtoryImportRequest<'_>,
+) -> Result<ImportStats> {
+    let conn = Connection::open_with_flags(
+        req.path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("open hishtory sqlite read-only: {}", req.path.display()))?;
+    conn.busy_timeout(StdDuration::from_secs(5))
+        .context("set hishtory sqlite busy_timeout")?;
+
+    let records = read_hishtory_records(&conn, req.limit, req.hostname)?;
+    let mut stats = ImportStats::default();
+
+    const BATCH: usize = 2000;
+    let mut buf: Vec<core::Entry> = Vec::with_capacity(BATCH);
+
+    for r in records {
+        stats.received += 1;
+
+        let cmd = r.cmd.trim();
+        if should_skip_import_command(cmd, req.ignore_regex) {
+            stats.skipped += 1;
+            continue;
+        }
+
+        let ts = OffsetDateTime::from_unix_timestamp(r.ts_unix)
+            .map_err(|_| anyhow::anyhow!("invalid hishtory unix timestamp: {}", r.ts_unix))?;
+
+        let entry_id = hishtory_import_entry_id(
+            req.user_id,
+            req.device_id,
+            r.source_entry_id.as_deref(),
+            r.source_rowid,
+            r.ts_unix,
+            cmd,
+        );
+
+        buf.push(core::Entry::new_with_id(
+            entry_id,
+            core::EntryInput {
+                device_id: req.device_id.to_string(),
+                user_id: req.user_id.to_string(),
+                ts,
+                cmd: cmd.to_string(),
+                cwd: normalize_import_text(&r.cwd, "unknown"),
+                exit_code: r.exit_code,
+                duration_ms: r.duration_ms,
+                shell: HistoryShell::Hishtory.as_str().to_string(),
+                hostname: normalize_import_text(&r.hostname, req.hostname),
+            },
+        ));
+
+        if buf.len() >= BATCH {
+            let s = store.insert_entries_with_stats(&buf)?;
+            stats.inserted += s.inserted;
+            stats.ignored += s.ignored;
+            buf.clear();
+        }
+    }
+
+    if !buf.is_empty() {
+        let s = store.insert_entries_with_stats(&buf)?;
+        stats.inserted += s.inserted;
+        stats.ignored += s.ignored;
+    }
+
+    Ok(stats)
+}
+
+fn read_hishtory_records(
+    conn: &Connection,
+    limit: Option<usize>,
+    fallback_hostname: &str,
+) -> Result<Vec<HishtoryRecord>> {
+    let sql_all = r#"
+SELECT
+  rowid AS source_rowid,
+  NULLIF(TRIM(COALESCE(entry_id, '')), '') AS source_entry_id,
+  command,
+  COALESCE(NULLIF(current_working_directory, ''), 'unknown') AS cwd,
+  COALESCE(exit_code, 0) AS exit_code,
+  unixepoch(start_time) AS start_ts,
+  unixepoch(end_time) AS end_ts,
+  COALESCE(NULLIF(hostname, ''), ?1) AS hostname
+FROM history_entries
+WHERE command IS NOT NULL
+  AND TRIM(command) != ''
+  AND unixepoch(start_time) IS NOT NULL
+ORDER BY start_ts ASC, source_rowid ASC
+"#;
+
+    let sql_limited = r#"
+SELECT
+  source_rowid,
+  source_entry_id,
+  command,
+  cwd,
+  exit_code,
+  start_ts,
+  end_ts,
+  hostname
+FROM (
+  SELECT
+    rowid AS source_rowid,
+    NULLIF(TRIM(COALESCE(entry_id, '')), '') AS source_entry_id,
+    command,
+    COALESCE(NULLIF(current_working_directory, ''), 'unknown') AS cwd,
+    COALESCE(exit_code, 0) AS exit_code,
+    unixepoch(start_time) AS start_ts,
+    unixepoch(end_time) AS end_ts,
+    COALESCE(NULLIF(hostname, ''), ?1) AS hostname
+  FROM history_entries
+  WHERE command IS NOT NULL
+    AND TRIM(command) != ''
+    AND unixepoch(start_time) IS NOT NULL
+  ORDER BY start_ts DESC, source_rowid DESC
+  LIMIT ?2
+) selected
+ORDER BY start_ts ASC, source_rowid ASC
+"#;
+
+    let mut out = Vec::new();
+    if let Some(limit) = limit {
+        let mut stmt = conn
+            .prepare(sql_limited)
+            .context("prepare hishtory limited import query")?;
+        let rows = stmt
+            .query_map(
+                params![fallback_hostname, limit as i64],
+                row_to_hishtory_record,
+            )
+            .context("query hishtory limited records")?;
+        for row in rows {
+            out.push(row?);
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(sql_all)
+            .context("prepare hishtory import query")?;
+        let rows = stmt
+            .query_map(params![fallback_hostname], row_to_hishtory_record)
+            .context("query hishtory records")?;
+        for row in rows {
+            out.push(row?);
+        }
+    }
+
+    Ok(out)
+}
+
+fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryRecord> {
+    let source_rowid: i64 = row.get(0)?;
+    let source_rowid = u64::try_from(source_rowid).unwrap_or(0);
+    let start_ts: i64 = row.get(5)?;
+    let end_ts: Option<i64> = row.get(6)?;
+    let duration_ms = end_ts
+        .filter(|end| *end > start_ts)
+        .map(|end| end.saturating_sub(start_ts).saturating_mul(1000))
+        .unwrap_or(0);
+
+    Ok(HishtoryRecord {
+        source_rowid,
+        source_entry_id: row.get(1)?,
+        ts_unix: start_ts,
+        duration_ms,
+        cmd: row.get(2)?,
+        cwd: row.get(3)?,
+        exit_code: row.get(4)?,
+        hostname: row.get(7)?,
+    })
+}
+
+fn should_skip_import_command(cmd: &str, ignore_regex: Option<&regex::Regex>) -> bool {
+    if cmd.is_empty() {
+        return true;
+    }
+    if cmd.split_whitespace().next() == Some("rr") {
+        return true;
+    }
+    if let Some(re) = ignore_regex
+        && re.is_match(cmd)
+    {
+        return true;
+    }
+    false
+}
+
+fn normalize_import_text(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn hishtory_import_entry_id(
+    user_id: &str,
+    device_id: &str,
+    source_entry_id: Option<&str>,
+    source_rowid: u64,
+    ts_unix: i64,
+    cmd: &str,
+) -> core::EntryId {
+    let source_key = match source_entry_id.and_then(|id| {
+        let trimmed = id.trim();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }) {
+        Some(id) => format!("entry_id\0{id}"),
+        None => format!("fallback\0{device_id}\0{source_rowid}\0{ts_unix}\0{cmd}"),
+    };
+    let name = format!("rustory:hishtory-import\0{user_id}\0{source_key}");
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ImportRequest<'a> {
     pub shell: HistoryShell,
     pub content: &'a str,
@@ -248,6 +503,7 @@ pub struct ImportRequest<'a> {
 mod tests {
     use super::*;
     use crate::storage::LocalStore;
+    use rusqlite::params;
 
     #[test]
     fn parse_zsh_extended_history() {
@@ -398,5 +654,215 @@ mod tests {
         assert_eq!(s.skipped, 1);
         assert_eq!(s.inserted, 1);
         assert_eq!(store.list_recent(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_hishtory_sqlite_preserves_metadata_and_is_idempotent() {
+        let hishtory_db = synthetic_hishtory_db(&[
+            HishtoryFixtureRow {
+                entry_id: "hist-1",
+                hostname: "old-host",
+                command: "echo ok",
+                cwd: "/work",
+                exit_code: 7,
+                start_time: "2024-01-01 00:00:00+00:00",
+                end_time: "2024-01-01 00:00:02+00:00",
+            },
+            HishtoryFixtureRow {
+                entry_id: "hist-2",
+                hostname: "old-host",
+                command: "rr doctor",
+                cwd: "/work",
+                exit_code: 0,
+                start_time: "2024-01-01 00:00:03+00:00",
+                end_time: "2024-01-01 00:00:04+00:00",
+            },
+            HishtoryFixtureRow {
+                entry_id: "hist-3",
+                hostname: "old-host",
+                command: "echo token=abc",
+                cwd: "/work",
+                exit_code: 0,
+                start_time: "2024-01-01 00:00:05+00:00",
+                end_time: "2024-01-01 00:00:06+00:00",
+            },
+        ]);
+        let store = LocalStore::open(":memory:").unwrap();
+        let ignore_re = regex::Regex::new("token=").unwrap();
+
+        let s1 = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-a",
+                hostname: "fallback-host",
+                ignore_regex: Some(&ignore_re),
+            },
+        )
+        .unwrap();
+        assert_eq!(s1.received, 3);
+        assert_eq!(s1.inserted, 1);
+        assert_eq!(s1.ignored, 0);
+        assert_eq!(s1.skipped, 2);
+
+        let entries = store.list_recent(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].device_id, "rustory-device-a");
+        assert_eq!(entries[0].user_id, "u1");
+        assert_eq!(entries[0].shell, "hishtory");
+        assert_eq!(entries[0].hostname, "old-host");
+        assert_eq!(entries[0].cmd, "echo ok");
+        assert_eq!(entries[0].cwd, "/work");
+        assert_eq!(entries[0].exit_code, 7);
+        assert_eq!(entries[0].duration_ms, 2000);
+        assert_eq!(entries[0].ts.unix_timestamp(), 1704067200);
+
+        let s2 = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-b",
+                hostname: "fallback-host",
+                ignore_regex: Some(&ignore_re),
+            },
+        )
+        .unwrap();
+        assert_eq!(s2.received, 3);
+        assert_eq!(s2.inserted, 0);
+        assert_eq!(s2.ignored, 1);
+        assert_eq!(s2.skipped, 2);
+        assert_eq!(store.list_recent(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_hishtory_sqlite_limit_keeps_newest_rows() {
+        let hishtory_db = synthetic_hishtory_db(&[
+            HishtoryFixtureRow {
+                entry_id: "hist-1",
+                hostname: "host",
+                command: "echo one",
+                cwd: "/one",
+                exit_code: 0,
+                start_time: "2024-01-01 00:00:00+00:00",
+                end_time: "2024-01-01 00:00:01+00:00",
+            },
+            HishtoryFixtureRow {
+                entry_id: "hist-2",
+                hostname: "host",
+                command: "echo two",
+                cwd: "/two",
+                exit_code: 0,
+                start_time: "2024-01-01 00:00:02+00:00",
+                end_time: "2024-01-01 00:00:03+00:00",
+            },
+            HishtoryFixtureRow {
+                entry_id: "hist-3",
+                hostname: "host",
+                command: "echo three",
+                cwd: "/three",
+                exit_code: 0,
+                start_time: "2024-01-01 00:00:04+00:00",
+                end_time: "2024-01-01 00:00:05+00:00",
+            },
+        ]);
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let stats = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: Some(2),
+                user_id: "u1",
+                device_id: "d1",
+                hostname: "fallback-host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(stats.received, 2);
+        assert_eq!(stats.inserted, 2);
+
+        let commands: Vec<_> = store
+            .list_recent(10)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.cmd)
+            .collect();
+        assert_eq!(commands, vec!["echo three", "echo two"]);
+    }
+
+    #[derive(Clone, Copy)]
+    struct HishtoryFixtureRow<'a> {
+        entry_id: &'a str,
+        hostname: &'a str,
+        command: &'a str,
+        cwd: &'a str,
+        exit_code: i32,
+        start_time: &'a str,
+        end_time: &'a str,
+    }
+
+    fn synthetic_hishtory_db(rows: &[HishtoryFixtureRow<'_>]) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let conn = Connection::open(file.path()).unwrap();
+        conn.execute_batch(
+            r#"
+CREATE TABLE history_entries (
+  local_username text,
+  hostname text,
+  command text,
+  current_working_directory text,
+  home_directory text,
+  exit_code integer,
+  start_time datetime,
+  end_time datetime,
+  device_id text,
+  custom_columns blob,
+  entry_id text
+);
+"#,
+        )
+        .unwrap();
+
+        for row in rows {
+            conn.execute(
+                r#"
+INSERT INTO history_entries (
+  local_username,
+  hostname,
+  command,
+  current_working_directory,
+  home_directory,
+  exit_code,
+  start_time,
+  end_time,
+  device_id,
+  custom_columns,
+  entry_id
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"#,
+                params![
+                    "local-user",
+                    row.hostname,
+                    row.command,
+                    row.cwd,
+                    "/home/local-user",
+                    row.exit_code,
+                    row.start_time,
+                    row.end_time,
+                    "hishtory-device",
+                    Vec::<u8>::new(),
+                    row.entry_id,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        file
     }
 }

@@ -26,6 +26,7 @@ repositories:
       - docs/LESSONS_LOG.md
       - docs/LESSONS_ARCHIVE.md
       - docs/quickstart.md
+      - docs/hishtory-migration.md
       - docs/p2p.md
       - docs/daemon.md
       - docs/hook.md

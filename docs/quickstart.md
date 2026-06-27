@@ -82,6 +82,9 @@ rr import --shell zsh
 
 # bash
 rr import --shell bash
+
+# Hishtory local SQLite DB
+rr import --shell hishtory
 ```
 
 필요하면:
@@ -89,6 +92,7 @@ rr import --shell bash
 - 마지막 N개만: `rr import --shell zsh --limit 100000`
 
 import는 `RUSTORY_RECORD_IGNORE_REGEX` / `record_ignore_regex`를 존중한다.
+Hishtory에서 Rustory P2P 클러스터로 점진 이관하려면 `docs/hishtory-migration.md`를 먼저 확인한다.
 
 ### 2-3) 주기 동기화 실행(추천: 데몬/스케줄러)
 ```sh
