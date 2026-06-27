@@ -112,13 +112,16 @@ RELAY_ADDR="/ip4/127.0.0.1/tcp/${RELAY_PORT}/p2p/${RELAY_PEER_ID}"
 echo "relay addr (host): $RELAY_ADDR"
 
 echo "[5/8] start linux peer (docker)"
+RUSTORY_ACCEPTANCE_DIR="$ACC_DIR" \
+docker compose -f "$COMPOSE_FILE" -p "$PROJECT" build linux-peer >/dev/null
+
 RELAY_PEER_ID="$RELAY_PEER_ID" \
 RUSTORY_ACCEPTANCE_DIR="$ACC_DIR" \
 RUSTORY_ACCEPTANCE_TRACKER_PORT="$TRACKER_PORT" \
 RUSTORY_ACCEPTANCE_RELAY_PORT="$RELAY_PORT" \
 RUSTORY_ACCEPTANCE_USER_ID="$USER_ID" \
 RUSTORY_ACCEPTANCE_TRACKER_TOKEN="$TOKEN" \
-docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d linux-peer >/dev/null
+docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --no-deps linux-peer >/dev/null
 
 echo "[6/8] wait tracker has peers (linux peer registered)"
 ENC_USER_ID="$(python3 - <<'PY' "$USER_ID"

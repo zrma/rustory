@@ -324,6 +324,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
     if let Some(relay_addr) = relay_addr.clone() {
         let relay_listen = relay_addr.with(Protocol::P2pCircuit);
+        eprintln!("p2p relay listen requested: {relay_listen}");
         swarm.listen_on(relay_listen).context("listen_on relay")?;
     }
 
@@ -454,6 +455,53 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                 );
                             }
                         }
+                    }
+                    SwarmEvent::Behaviour(RustoryBehaviourEvent::Relay(event)) => match event {
+                        libp2p::relay::client::Event::ReservationReqAccepted {
+                            relay_peer_id,
+                            renewal,
+                            ..
+                        } => {
+                            eprintln!(
+                                "p2p relay reservation accepted: relay={relay_peer_id} renewal={renewal}"
+                            );
+                        }
+                        libp2p::relay::client::Event::OutboundCircuitEstablished {
+                            relay_peer_id,
+                            ..
+                        } => {
+                            eprintln!("p2p relay outbound circuit established: relay={relay_peer_id}");
+                        }
+                        libp2p::relay::client::Event::InboundCircuitEstablished {
+                            src_peer_id,
+                            ..
+                        } => {
+                            eprintln!("p2p relay inbound circuit established: src={src_peer_id}");
+                        }
+                    },
+                    SwarmEvent::Dialing { peer_id, connection_id } => {
+                        eprintln!("p2p dialing: peer={peer_id:?} connection_id={connection_id:?}");
+                    }
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        connection_id,
+                        endpoint,
+                        ..
+                    } => {
+                        eprintln!(
+                            "p2p connection established: peer={peer_id} connection_id={connection_id:?} endpoint={endpoint:?}"
+                        );
+                    }
+                    SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                        eprintln!("warn: p2p outgoing connection error: peer={peer_id:?} error={error}");
+                    }
+                    SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                        eprintln!(
+                            "warn: p2p listener closed: addresses={addresses:?} reason={reason:?}"
+                        );
+                    }
+                    SwarmEvent::ListenerError { error, .. } => {
+                        eprintln!("warn: p2p listener error: {error}");
                     }
                     _ => {}
                 }
@@ -1642,6 +1690,79 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].entry_id, entry.entry_id);
         assert_eq!(got[0].cmd, entry.cmd);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_reservation_reports_relays_listen_addr() {
+        let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
+
+        let mut relay =
+            build_relay_swarm_with_identity(libp2p::identity::Keypair::generate_ed25519(), psk)
+                .unwrap();
+        relay
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let relay_peer_id = *relay.local_peer_id();
+
+        let relay_addr = loop {
+            let event = relay.select_next_some().await;
+            if let SwarmEvent::NewListenAddr { address, .. } = event {
+                relay.add_external_address(address.clone());
+                break address;
+            }
+        };
+
+        let mut client = build_rustory_swarm(psk).unwrap();
+        let client_peer_id = *client.local_peer_id();
+        let client_addr = relay_addr
+            .with(Protocol::P2p(relay_peer_id))
+            .with(Protocol::P2pCircuit);
+        client.listen_on(client_addr.clone()).unwrap();
+
+        let expected_listen_addr = client_addr.with(Protocol::P2p(client_peer_id));
+        let mut reservation_accepted = false;
+        let mut listen_addr_reported = false;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !reservation_accepted || !listen_addr_reported {
+                tokio::select! {
+                    event = relay.select_next_some() => {
+                        match event {
+                            SwarmEvent::NewListenAddr { address, .. } => {
+                                relay.add_external_address(address);
+                            }
+                            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(
+                                libp2p::relay::Event::ReservationReqAccepted { .. },
+                            )) => {}
+                            _ => {}
+                        }
+                    }
+                    event = client.select_next_some() => {
+                        match event {
+                            SwarmEvent::Behaviour(RustoryBehaviourEvent::Relay(
+                                libp2p::relay::client::Event::ReservationReqAccepted {
+                                    relay_peer_id: got,
+                                    renewal,
+                                    ..
+                                },
+                            )) => {
+                                assert_eq!(got, relay_peer_id);
+                                assert!(!renewal);
+                                reservation_accepted = true;
+                            }
+                            SwarmEvent::NewListenAddr { address, .. }
+                                if address == expected_listen_addr =>
+                            {
+                                listen_addr_reported = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("relay reservation timeout");
     }
 
     #[test]
