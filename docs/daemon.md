@@ -2,6 +2,8 @@
 
 `rr p2p-sync --watch`는 “주기적으로 pull/push를 반복”하는 긴 실행 프로세스다.
 이 문서는 이를 백그라운드(로그인 시 자동 시작, 죽으면 재시작)로 돌리는 예시를 정리한다.
+현재 CLI 옵션, default, config resolver, signal 처리 세부는 `rr p2p-sync --help`, `rr doctor`, config template, 관련 코드를 직접 확인한다.
+아래 launchd/systemd 단편은 운영 형태 예시이며, 템플릿의 최신 내용은 `contrib/daemon/*`가 소유한다.
 
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
@@ -11,7 +13,7 @@
 - `--watch` 실행 중 중지(SIGTERM/Ctrl-C)를 받으면 빠르게 종료한다(서비스 매니저 stop에 정상 반응).
 - 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.
 
-## 기본 실행 커맨드(예시)
+## 실행 커맨드 예시
 설정 파일을 이미 채워뒀다면:
 
 ```sh

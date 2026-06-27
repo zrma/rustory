@@ -5,9 +5,8 @@
 ## Quick Start
 
 - 빠른 시작: `docs/quickstart.md`
-- 로컬 검증(권장): `scripts/check.sh`
-- Docker relay fallback 수용 테스트 포함: `scripts/check.sh --acceptance`
-- 빠른 검증(smoke 생략): `scripts/check.sh --fast`
+- 로컬 검증 진입점: `scripts/check.sh`
+- 검증 명령 선언: `docs/REPO_MANIFEST.yaml`
 
 ## Agent Navigation
 
@@ -31,8 +30,7 @@
 
 ## Development
 
-- 테스트: `cargo test --workspace`
-- 린트/포맷: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`
-- 로컬 P2P 스모크: `scripts/smoke_p2p_local.sh`
-- Docker relay fallback 수용 테스트: `scripts/check.sh --acceptance` 또는 `bash scripts/acceptance_docker_macos_linux.sh`
-- 보안 점검(권장): `scripts/secret_scan.sh`
+- 개발 플레이북: `docs/dev-playbook.md`
+- 구현/검증 루프: `docs/EXECUTION_LOOP.md`
+- 출고/공유 게이트: `docs/CHANGE_CONTROL.md`
+- 실제 명령/옵션/default는 `scripts/*`, `Cargo.toml`, `docs/REPO_MANIFEST.yaml`, CLI help를 직접 확인한다.

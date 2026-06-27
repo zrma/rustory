@@ -64,14 +64,10 @@ maintenance:
   improvement_log: docs/LESSONS_LOG.md
   notes:
     - "top-level `entrypoint`는 무컨텍스트 시작 시 단일 네비게이션 시작점이고, `repositories[*].entrypoints`는 탐색/검증용 진입 문서 맵이다."
-    - "todo workspace 탐색 규칙은 `maintenance.todo_workspace_glob` 단일 기준을 사용한다. (`scripts/check-release-gates.sh`, `scripts/check-push-gates.sh`, `scripts/finalize-and-push.sh`, `scripts/start-work.sh` 등)"
-    - "비긴급 구현 시작은 `scripts/start-work.sh --work-id <work-id>`를 우선 사용해 todo 초기화 + readiness/open-questions/manifest quick 게이트를 단일 명령으로 실행한다."
-    - "구현 턴 종료는 `scripts/finalize-and-push.sh --message \"<type>: <summary>\" [--work-id <work-id>]` 기본 경로를 우선 사용해 게이트/커밋/푸시/SHA 검증을 원샷으로 닫는다."
-    - "`scripts/check-push-gates.sh`는 `--work-id` 미지정 시 docs/todo-*를 자동 감지하며, 1개는 자동 선택, 2개 이상은 전체 readiness + open-questions 닫힘 상태를 점검하고, 0개는 todo readiness/open-questions 점검을 생략한다."
-    - "`scripts/check-release-gates.sh`, `scripts/finalize-and-push.sh`의 `--work-id` 자동 감지/마감 커밋 예외 상세는 `docs/CHANGE_CONTROL.md` 단일 기준을 따른다."
-    - "`scripts/run-manifest-checks.sh --mode full`은 `<work-id>` placeholder 체크를 해석할 수 없으면 실패한다. (quick 모드만 경고 후 skip)"
-    - "출고/공유 직전에는 `scripts/check-branch-hygiene.sh`로 임시 브랜치(`rewrite/*`, `backup/*`)와 unbookmarked non-empty `jj head` 잔존 여부를 확인한다."
-    - "`.gitmodules`가 없는 저장소에서는 submodule 계열 게이트가 자동 skip 처리된다."
+    - "`maintenance.*`는 gate runner와 todo workspace 탐색 위치의 선언형 포인터다. 옵션/default/실행 분기는 각 `scripts/* --help`와 스크립트 본문이 소유한다."
+    - "`repositories[*].checks`는 로컬/CI 검증 명령의 선언형 목록이다. manifest mode별 필터링과 `<work-id>` 해석은 `scripts/run-manifest-checks.sh`가 소유한다."
+    - "비긴급 구현 시작과 구현 턴 종료의 정책 경계는 `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`를 따른다. 실제 runner 동작은 `maintenance.work_start_runner`, `maintenance.release_gate_runner`, `maintenance.push_gate_runner` 대상 스크립트를 직접 확인한다."
+    - "브랜치, submodule, lessons-log coupling 같은 위생 규칙은 해당 `scripts/check-*`가 검증한다. 문서는 검증 축과 에스컬레이션 경계만 설명한다."
     - "1인 개발 모드에서는 로컬 반복 개발 중 strict 게이트를 강제하지 않고, 배포/공유 직전에 strict 체크를 수행한다."
     - "누락/실패/재작업이 발생하면 `docs/IMPROVEMENT_LOOP.md`를 따라 `docs/LESSONS_LOG.md`를 갱신한다."
     - "고위험 변경 또는 판단 모호 케이스는 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 에스컬레이션한다."

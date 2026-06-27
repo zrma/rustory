@@ -1,5 +1,8 @@
 # P2P Sync (PoC)
 
+이 문서는 P2P 운영 흐름, 관찰 지점, 트러블슈팅 경로를 안내한다.
+현재 protocol id, codec/압축, message size limit, transport stack, CLI default는 `src/p2p.rs`, `src/p2p_codec.rs`, `src/cli.rs`, `Cargo.toml`, CLI help를 직접 확인한다.
+
 ## 범위
 - 단계 1: 수동 multiaddr로 피어를 지정해 pull 기반 동기화를 수행한다.
 - 단계 2: tracker/relay(디스커버리 + 중계) 기반으로 peer 목록을 얻고,
@@ -10,23 +13,11 @@
 - PoC 단계에서는 tracker/relay를 로컬/임시로 띄워도 된다. 내려가면 동기화가 지연될 뿐이고, 로컬 DB가 source of truth라 데이터 유실은 없다.
 - 안정화 이후에는 tracker/relay를 상시 실행하는 것을 권장한다(예: self-hosted k8s 1 replica). relay는 PeerId 고정을 위해 identity key(`~/.config/rustory/relay.key`)를 영속화(PV/Secret 마운트)하는 편이 안전하다.
 
-## 프로토콜
-- pull protocol id:
-  - `/rustory/sync-pull/1.0.1` (zstd 압축 JSON, 우선)
-  - `/rustory/sync-pull/1.0.0` (plain JSON, 폴백)
-- request: `SyncPull { cursor, limit }`
-- response: `SyncBatch { entries, next_cursor }`
-- push protocol id:
-  - `/rustory/entries-push/1.0.1` (zstd 압축 JSON, 우선)
-  - `/rustory/entries-push/1.0.0` (plain JSON, 폴백)
-- request: `EntriesPush { entries }`
-- response: `PushAck { ok }`
-- 직렬화: JSON(serde_json). `1.0.1` 프로토콜은 “JSON bytes를 zstd로 압축”해서 전송한다(양쪽이 지원하면 자동 선택).
-- 전송: libp2p tcp + Noise + Mplex (+ pnet/relay)
-- 메시지 크기 상한(초안): pull req 64KiB, pull resp 32MiB, push req 16MiB, push resp 64KiB.
-  - `1.0.1`은 zstd 압축을 적용한 “wire bytes” 기준으로 상한을 체크한다.
-  - 압축 해제 후 JSON bytes는 별도 상한(현재 wire의 4배)을 두며, 초과 시 `too large` 에러가 날 수 있다.
-  - 이런 경우 sync는 `limit`을 자동으로 줄여 재시도한다(단, 단일 엔트리가 너무 큰 경우는 실패할 수 있으니 필요하면 `--limit`을 조정한다).
+## 프로토콜 확인 위치
+- pull/push request-response는 압축 프로토콜을 우선하고 plain JSON fallback을 유지한다.
+- 정확한 protocol id, request/response struct, wire/decoded size limit, 압축 선택 규칙은 `src/p2p.rs`와 `src/p2p_codec.rs`가 소유한다.
+- transport stack과 libp2p feature 조합은 `src/p2p.rs`와 `Cargo.toml`에서 확인한다.
+- payload size 오류나 batch 축소 동작은 `src/p2p_codec.rs`, `src/sync.rs`, 관련 테스트를 직접 확인한다.
 
 ## 사용 예시
 ### 단계 2: tracker/relay + PSK(pnet) 기반
@@ -69,9 +60,9 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 ```
 
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
-이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다(각 단계는 지수 backoff로 최대 3회 재시도).
-pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 최대 3회 재시도한다(타임아웃/백오프는 attempt마다 지수 증가).
-재시도 정책은 환경에 맞게 튜닝할 수 있다(기본값: attempts=3, timeout base/cap=5s/30s, backoff base=200ms).
+이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다.
+pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 재시도할 수 있다.
+현재 재시도 횟수, 타임아웃, 백오프 default는 `rr p2p-sync --help`, config resolver, 관련 코드를 확인한다.
 - CLI: `--req-attempts`, `--req-timeout-base-sec`, `--req-timeout-cap-sec`, `--req-backoff-base-ms`
 - config.toml: `p2p_request_attempts`, `p2p_request_timeout_base_sec`, `p2p_request_timeout_cap_sec`, `p2p_request_backoff_base_ms`
 - env: `RUSTORY_P2P_REQUEST_ATTEMPTS`, `RUSTORY_P2P_REQUEST_TIMEOUT_BASE_SEC`, `RUSTORY_P2P_REQUEST_TIMEOUT_CAP_SEC`, `RUSTORY_P2P_REQUEST_BACKOFF_BASE_MS`
@@ -115,17 +106,17 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 
 ## PSK(pnet) 키(swarm.key)
 - p2p/relay 관련 명령은 `swarm.key`를 사용해 private network(pnet)로 통신한다.
-- 기본 경로는 `~/.config/rustory/swarm.key` 이고, 없으면 자동 생성된다.
+- 기본 경로와 자동 생성 동작은 `rr init`, `rr swarm-key --help`, `rr doctor`, 관련 코드를 확인한다.
 - 서로 다른 머신에서 통신하려면 **같은 키 파일을 공유**해야 한다.
 - 오버라이드는 `--swarm-key <path>` 또는 `RUSTORY_SWARM_KEY_PATH`로 한다.
 - 키가 동일한지 빠르게 확인하려면 `rr swarm-key`로 fingerprint를 비교한다.
 
 ## Identity Keypair(PeerId)
 - `rr p2p-serve`는 libp2p identity keypair를 디스크에 영속화하여 **재시작해도 PeerId가 유지**되게 한다.
-  - 기본 경로: `~/.config/rustory/identity.key`
+  - 현재 기본 경로는 `rr p2p-serve --help`, `rr doctor`, config template에서 확인한다.
   - 오버라이드: `--identity-key <path>`, `RUSTORY_P2P_IDENTITY_KEY_PATH`, `config.toml`의 `p2p_identity_key_path`
 - `rr relay-serve`도 relay 전용 identity keypair를 별도로 영속화한다.
-  - 기본 경로: `~/.config/rustory/relay.key`
+  - 현재 기본 경로는 `rr relay-serve --help`, `rr doctor`, config template에서 확인한다.
   - 오버라이드: `--identity-key <path>`, `RUSTORY_RELAY_IDENTITY_KEY_PATH`, `config.toml`의 `relay_identity_key_path`
 
 ## 커서 저장
@@ -134,7 +125,7 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
   - 단계 1에서 저장한 multiaddr 키는, 수동 `--peers` 동기화 시 1회 마이그레이션된다.
 
 ## 설정 파일(config.toml)
-- `~/.config/rustory/config.toml`로 기본값을 설정할 수 있다(없으면 CLI/env 폴백).
+- `~/.config/rustory/config.toml`로 runtime 설정을 지속화할 수 있다. 현재 fallback 순서와 default는 `rr doctor`, CLI help, config resolver 코드를 확인한다.
 - 신규 디바이스에서는 `rr init`로 템플릿/키 파일을 먼저 준비하는 것을 권장한다.
 - 예시:
 ```toml
@@ -153,31 +144,22 @@ p2p_watch_start_jitter_sec = 10
 ## peerbook 캐시(tracker fallback)
 - `rr p2p-sync`는 tracker 조회가 성공하면, 받은 peer 목록을 로컬 DB에 캐시한다(`peer_book`).
 - tracker가 일시적으로 다운되거나 결과가 비어 있으면, 최근에 본 peer 캐시를 기반으로 동기화를 시도한다.
-  - 기본 보존 기간: `7d`
+- 기본 보존 기간은 `rr p2p-sync --help`, config resolver, 관련 코드를 확인한다.
   - `user_id`가 설정된 경우 같은 user의 peer만 사용한다.
-- tracker 조회/등록은 일시적인 네트워크 오류(transport error) 및 5xx/429/408에 대해 최대 3회 재시도한다(connect/read timeout은 attempt마다 지수 증가).
+- tracker 조회/등록은 일시적인 네트워크 오류와 재시도 가능한 HTTP 응답을 재시도한다. 현재 retry 분류와 횟수/default는 관련 코드와 CLI help를 확인한다.
 
 ## 트러블슈팅
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
-  - `config status`가 `invalid`이면 `~/.config/rustory/config.toml` 파싱 실패 상태다. 이 경우에도 doctor는 기본값/env 기준으로 나머지 진단을 계속 출력한다.
-  - `hook` 라인은 현재 셸에서 hook 설치 마커가 보이는지, `RUSTORY_HOOK_DISABLE`로 비활성화됐는지, ctrl+r 검색 limit 값이 env/config/default 중 어떤 값으로 해석됐는지 확인한다.
-  - `async upload`/`auto prune`가 활성화된 환경이면 각 기능의 `enabled`, `interval`, `limit/retention`, `marker_path`, `last_trigger_unix`, `next_due_in_sec`도 함께 출력해 실행 타이밍을 점검할 수 있다.
-  - 관련 env 값이 잘못됐으면 해당 섹션을 `invalid: ...`로 표시한다.
-  - key 파일이 손상/파싱 실패 상태여도 doctor 전체는 종료하지 않고, key 라인에 `invalid: ...`를 표시해 원인을 확인할 수 있다.
-  - `rr doctor --json`을 사용하면 같은 정보를 JSON으로 출력해 자동 점검 스크립트에서 파싱할 수 있다.
-- `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬 ingest head, peer별 pull/push cursor, 로컬 디바이스 기준 pending push 건수와 peerbook 기준 `last_seen`/`last_seen_age_sec` 정보를 출력한다.
-  - `--with-tracker`를 주면 설정된 tracker 목록에 `/api/v1/ping`을 호출해 reachable/error 상태를 같이 출력한다.
-  - tracker 출력에는 응답 지연(`latency_ms`)이 포함된다(실패 시 `-`/`null`).
-  - `peer_state`/`peer_push_state`가 아직 없는 peer라도 `peer_book` 캐시에 있으면 `pull_cursor=0`, `push_cursor=0`으로 표시된다.
+  - config 파싱 실패, hook 설치/비활성화, async upload/auto prune 주기, key 파일 상태, tracker/relay 접근성을 한 번에 점검하는 시작점으로 사용한다.
+  - 텍스트/JSON 출력 필드와 오류 표시는 `rr doctor --help`, `rr doctor --json`, 관련 코드가 소유한다.
+- `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
+  - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
   - 예시:
     - `rr sync-status`
     - `rr sync-status --peer 12D3KooW...`
     - `rr sync-status --json`
     - `rr sync-status --with-tracker`
     - `rr sync-status --json --with-tracker`
-  - `--json` 출력 스키마:
-    - 기본: `local_head`, `local_device_id`, `peers[]` (`peer_id`, `pull_cursor`, `push_cursor`, `pending_push`, `last_seen_unix|null`, `last_seen_age_sec|null`)
-    - `--with-tracker` 사용 시: `tracker_status[]` (`base_url`, `reachable`, `latency_ms|null`, `error|null`) 필드가 추가된다.
 
 ## Docker 기반 수용 테스트(macOS host + Linux container)
 루프백만으로는 NAT/프로세스 경계 이슈(특히 relay fallback)가 잘 안 잡힐 수 있어,

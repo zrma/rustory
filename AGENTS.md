@@ -19,6 +19,12 @@
 - 사용자 호출은 `docs/ESCALATION_POLICY.md`의 즉시 에스컬레이션 조건 또는 명시적 사용자 판단이 필요한 경우로 제한한다.
 - 그 외 진행 상황은 간단히 공유하되, 구현/검증/문서화/커밋/푸시를 같은 턴에서 닫는 것을 기본값으로 둔다.
 
+## Workflow: Code-first documentation
+
+- 실행 동작, 옵션, 기본값, 검증 목록은 문서 요약을 신뢰하기 전에 `src/*`, `scripts/*`, `Cargo.toml`, `docs/REPO_MANIFEST.yaml`, CLI help를 직접 확인한다.
+- 문서는 네비게이션, 소유 경계, 안전 불변조건, 결정 근거, 검증 증거처럼 코드만으로 드러나지 않는 판단 재료를 소유한다.
+- 문서가 구현 현황을 재서술하고 있으면 가능한 한 코드/스크립트/매니페스트 포인터로 줄이고, 중복 본문은 `docs/README_OPERATING_POLICY.md` 기준으로 제거한다.
+
 ## Workflow: OpenAI GPT-5.5
 
 - OpenAI 모델/API/프롬프트/에이전트 기준을 갱신할 때는 `openai-docs` 스킬과 공식 OpenAI developer docs를 먼저 확인한다.
@@ -32,15 +38,15 @@
 - 피처별 구현 범위/검증 명령/완료 조건은 `docs/todo-*/spec.md`의 `C1..Cn` 체크리스트를 단일 기준으로 사용한다.
 - 방법론(How)과 피처 스펙(What)의 책임 분리는 `docs/EXECUTION_LOOP.md`를 기준으로 유지한다.
 - 구현 요청 턴은 별도 중단 지시가 없으면 `scripts/finalize-and-push.sh --message "<type>: <summary>" [--work-id <work-id>]` 경로를 기본으로 사용한다.
-- 커밋/원격 동기화/strict 게이트 옵션 상세는 `docs/CHANGE_CONTROL.md`를 단일 기준으로 따른다.
+- 커밋/원격 동기화/strict 게이트의 허용 경계는 `docs/CHANGE_CONTROL.md`를 따르고, 실제 옵션/default/실행 분기는 대상 `scripts/*`와 CLI help를 직접 확인한다.
 
 ## Module-specific guidance
 
 - 저장소 단일 네비 진입점은 `docs/HANDOFF.md`를 사용한다.
 - 운영/문서 경계의 단일 기준은 `docs/README_OPERATING_POLICY.md`를 따른다. (운영 제약: `docs/OPERATING_MODEL.md`, 스킬 경계: `docs/SKILL_OPERATING_GUIDE.md`)
-- 저장소 메타/진입점/검증 명령의 단일 기준은 `docs/REPO_MANIFEST.yaml`, `docs/CHANGE_CONTROL.md`를 따른다.
+- 저장소 메타/진입점/검증 명령 선언의 단일 기준은 `docs/REPO_MANIFEST.yaml`이며, 게이트 실행 방식과 예외 경계는 `docs/CHANGE_CONTROL.md`를 따른다.
 - 루트 문서 변경 시 문서 품질 게이트(Last Verified/링크/인덱스/README 정책)는 `docs/CHANGE_CONTROL.md`의 `표준 흐름 > 2. 출고 전 검증`을 단일 기준으로 따른다.
-- Rust 기본 검증(`cargo fmt/test/clippy`, 필요 시 `scripts/smoke_p2p_local.sh`) 기준은 `docs/EXECUTION_LOOP.md`, `docs/dev-playbook.md`, `docs/REPO_MANIFEST.yaml`을 단일 기준으로 따른다.
+- Rust 기본 검증 기준은 `docs/REPO_MANIFEST.yaml`과 실제 `scripts/*`/`cargo` 명령을 우선 확인하고, 실행 방법론은 `docs/EXECUTION_LOOP.md`, 추가 맥락은 `docs/dev-playbook.md`를 따른다.
 - 완료된 `docs/todo-*` 잔존 여부는 `scripts/check-todo-closure.sh`로 점검한다.
 
 ## 무컨텍스트 다음 순서

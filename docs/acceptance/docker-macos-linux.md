@@ -1,6 +1,8 @@
 # Acceptance Test: Docker (macOS host + Linux container)
 
 목표: k8s/VPS 없이도 `tracker + relay + linux peer` 구성을 docker로 띄우고, macOS host가 `rr p2p-sync`로 동기화하며 **relay fallback**이 실제로 사용되는지 확인한다.
+정확한 컨테이너 구성, 토큰, DB 경로, 검증 문자열은 `scripts/acceptance_docker_macos_linux.sh`와 `contrib/docker/acceptance/*`를 직접 확인한다.
+이 문서는 수동 디버깅을 위한 경로와 관찰 지점을 제공한다.
 
 ## 빠른 실행(권장)
 ```sh
@@ -12,7 +14,7 @@ bash scripts/acceptance_docker_macos_linux.sh
 scripts/check.sh --acceptance
 ```
 
-성공하면 다음을 확인할 수 있다.
+성공하면 대략 다음 축을 확인할 수 있다. 최신 assert와 문자열은 acceptance 스크립트가 소유한다.
 - macOS 측 출력에 `p2p pull summary: ... inserted=...`가 표시된다.
 - macOS에서 기록한 엔트리가(`acceptance-from-mac`) linux peer DB로 push되어 들어간다.
   - 스크립트는 linux peer의 DB(`/tmp/linux.db`)를 snapshot으로 꺼내 `target/acceptance/docker-macos-linux/linux.db`에 저장한 뒤 검증한다.

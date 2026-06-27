@@ -44,18 +44,15 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - E2E smoke: (가능하면) tracker + relay + 2 peer를 띄워 실제 동기화/폴백/업그레이드 관측
 
 ## Definition of Done (네트워크/동기화 계열 기준)
-- `cargo fmt`
-- `cargo test`
-- `cargo clippy --workspace --all-targets -- -D warnings`
-- (권장) `bash ~/.codex/skills/rust-monorepo-maintainer/scripts/workspace_check.sh .`
+- 표준 로컬 검증 진입점은 `scripts/check.sh`다.
+- 현재 검증 명령 선언은 `docs/REPO_MANIFEST.yaml`에서 확인한다.
+- 정확한 cargo 명령, smoke 포함 여부, 옵션 해석은 `scripts/check.sh --help`와 스크립트 본문을 직접 확인한다.
 - spec에 결정 사항이 반영되고, `open-questions.md`는 비어 있어야 한다.
 - 문서(`docs/`)에 사용법/제약이 반영돼야 한다.
 
 ### 원커맨드 점검(권장)
-- CI와 같은 검증을 한 번에 돌리려면:
-  - `scripts/check.sh`
-  - relay fallback까지 포함한 고신뢰 네트워크 검증이 필요하면: `scripts/check.sh --acceptance`
-  - 빠르게 돌리려면: `scripts/check.sh --fast` (smoke 생략)
+- CI와 같은 검증은 `scripts/check.sh`에서 시작한다.
+- relay fallback까지 포함한 고신뢰 네트워크 검증이나 빠른 반복 옵션이 필요하면 `scripts/check.sh --help`에서 현재 옵션을 확인한다.
 
 ## 커밋 메시지 규칙(요약)
 - 형식: `<type>: <summary>`

@@ -1,6 +1,8 @@
 # Rustory MVP Spec (append + dedup + fzf)
 
-이 문서는 Rustory의 MVP 범위/가정/결정 사항을 정리한다.
+이 문서는 Rustory의 MVP 범위/가정/결정 사항을 남긴 역사적 설계 아티팩트다.
+현재 CLI 옵션, default, 데이터 구조, 실행 동작은 `src/*`, `Cargo.toml`, `rr --help`, `rr doctor`, `scripts/*`를 직접 확인한다.
+이 문서의 예시는 결정 배경과 설계 의도를 이해하기 위한 것이며, 현재 구현 현황의 단일 기준이 아니다.
 
 ## 배경/동기
 - atuin: 기능이 많고 무거워서 운영/관리 부담이 큼
@@ -81,13 +83,13 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
   - body: `[Entry]` 또는 `{ "entries": [Entry] }`
   - 동작: entry_id 기준 upsert/ignore (idempotent)
 - GET /api/v1/entries
-  - query: cursor=<cursor>, limit=<n> (기본: cursor=0, limit=1000)
+  - query: cursor=<cursor>, limit=<n> (초안 예시: cursor=0, limit=1000)
   - 동작: cursor 이후 배치 반환 (cursor는 피어 기준 ingest_seq)
   - response: `{ "entries": [Entry], "next_cursor": <cursor|null> }`
 - GET /api/v1/ping
 
 ## 클라이언트 동기화
-- 기본은 pull 기반으로 단순화한다.
+- MVP 설계는 pull 기반으로 단순화한다.
   - 다운로드(pull): `cursor` 기반으로 “피어 기준 ingest_seq” 이후 배치를 반복 요청
   - 업로드(push): PoC에서는 선택 사항(없어도 pull로 수렴 가능)
 - 병합: entry_id 기준 dedup
@@ -102,7 +104,7 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 
 ## fzf UI (ctrl+r)
 - ctrl+r에서 fzf UI 호출
-- 로컬 DB에서 최근 N개 로드 (기본 100k)
+- 로컬 DB에서 최근 N개 로드 (초안 예시: 100k)
 - 선택된 커맨드를 프롬프트에 삽입
 - 대용량 대비: prefix/최근 N 제한 유지
 

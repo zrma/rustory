@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-03
+- Last Verified: 2026-06-27
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
@@ -15,10 +15,12 @@
 
 ## 협업 원칙
 
-- 구두 합의보다 저장소 문서를 단일 진실 원천으로 사용한다.
+- 구두 합의보다 추적되는 저장소 아티팩트(`src/*`, `scripts/*`, `docs/REPO_MANIFEST.yaml`, `docs/*`)를 기준으로 사용한다.
+- 실행 동작/옵션/default는 코드/스크립트/매니페스트를 직접 확인하고, 문서는 진입점/소유 경계/결정 근거/검증 증거를 안내한다.
 - 작업 네비게이션은 `docs/HANDOFF.md -> docs/EXECUTION_LOOP.md -> docs/todo-*/spec.md`를 기본 경로로 사용한다.
 - 결정 사항은 `spec.md`에 유지하고, 미결 항목은 `open-questions.md`에만 유지한다.
 - 동일 규칙/절차를 여러 문서에 중복 작성하지 않는다.
+- 문서가 현재 구현을 설명하려 할 때는 먼저 코드/스크립트/CLI help 링크나 검증 명령으로 대체 가능한지 확인한다.
 - LLM 에이전트는 세부 지시를 기다리지 않고 저장소 문서/스크립트가 정한 경로로 목표 달성까지 진행한다.
 - 사람 호출은 명시적 에스컬레이션 조건 또는 담당 개발자의 판단이 필요한 경우로 제한한다.
 
@@ -26,7 +28,7 @@
 
 1. `README.md`는 저장소 인덱스(개요 + 최소 시작 링크)만 유지한다.
 2. 실행 규칙/가드레일은 `AGENTS.md`가 소유한다.
-3. 상세 절차/체크리스트/런북은 `docs/*`가 소유한다.
+3. `docs/*`는 네비게이션, 소유 경계, 안전 불변조건, 결정 근거, 검증 증거를 소유한다.
 4. 역할 분리 상세 기준은 `docs/README_OPERATING_POLICY.md`를 단일 기준으로 따른다.
 
 ## 버전관리 원칙 (jj 우선)
@@ -39,15 +41,16 @@
 
 ## LLM 운영 규칙
 
-1. 작업 시작 시 최신 문서를 먼저 동기화한다.
+1. 작업 시작 시 `docs/HANDOFF.md`로 라우팅한 뒤 관련 코드/스크립트/매니페스트를 직접 확인한다.
 2. 구현 전 `spec.md` 체크리스트와 검증 명령을 고정한다.
 3. 선택지가 있는 논의는 구현 전에 질문 카드(`description`, `options`, `pros/cons`, `recommended`)로 먼저 고정한다.
 4. 결정된 항목은 같은 턴에서 `spec/open-questions/대상 문서`에 즉시 반영한다.
-5. 동일 게이트 실패가 2회 반복되면 임의 재시도를 중단하고 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 보고한다.
-6. `DEBUG_GATES_OVERRIDE` 계열 우회는 사람 승인 없이 사용하지 않는다.
-7. `scripts/check-doc-last-verified.sh` 실패 시 관련 문서 `Last Verified`를 갱신하고 재검증 전까지 출고/푸시를 진행하지 않는다.
-8. OpenAI 모델/API/프롬프트/에이전트 기준을 갱신할 때는 `openai-docs`와 공식 OpenAI developer docs를 먼저 확인하고, GPT-5.5 변경은 활성 통합 지점과 직접 연결된 prompt/harness 표면으로 좁힌다.
-9. 위 조건에 걸리지 않는 구현/검증/문서화/커밋/푸시는 같은 턴에서 자율적으로 닫는다.
+5. 코드/스크립트로 판별 가능한 사항은 사용자에게 묻지 않고 직접 확인한다.
+6. 동일 게이트 실패가 2회 반복되면 임의 재시도를 중단하고 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 보고한다.
+7. `DEBUG_GATES_OVERRIDE` 계열 우회는 사람 승인 없이 사용하지 않는다.
+8. `scripts/check-doc-last-verified.sh` 실패 시 관련 문서 `Last Verified`를 갱신하고 재검증 전까지 출고/푸시를 진행하지 않는다.
+9. OpenAI 모델/API/프롬프트/에이전트 기준을 갱신할 때는 `openai-docs`와 공식 OpenAI developer docs를 먼저 확인하고, GPT-5.5 변경은 활성 통합 지점과 직접 연결된 prompt/harness 표면으로 좁힌다.
+10. 위 조건에 걸리지 않는 구현/검증/문서화/커밋/푸시는 같은 턴에서 자율적으로 닫는다.
 
 ## 전역 스킬 운영 원칙
 

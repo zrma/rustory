@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-03
+- Last Verified: 2026-06-27
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -26,6 +26,11 @@
 - 진행 상태의 단일 기준은 `docs/todo-*/spec.md`의 `C1..Cn` 체크리스트와 `완료/미완료/다음 액션` 체크포인트다.
 - 핵심 명령/예외 규칙은 소유 문서 링크로만 참조하고 중복 본문을 만들지 않는다.
 
+5. 코드 우선 판단
+- 코드/스크립트/매니페스트에 이미 인코딩된 동작, 옵션, 기본값, 테스트 목록은 문서가 재서술하지 않는다.
+- 문서는 새 진입점, 안전 불변조건, 소유 경계, 결정 근거, 검증 증거처럼 코드만으로 드러나지 않는 판단 재료를 남긴다.
+- 에이전트는 문서가 현재 구현을 요약하길 기다리지 않고 관련 코드/스크립트/CLI help를 직접 확인한다.
+
 ## OpenAI GPT-5.5 적용 기준
 
 OpenAI 모델/API/프롬프트/에이전트 운영 기준을 다루는 작업은 `openai-docs` 스킬과 공식 OpenAI developer docs를 먼저 확인한다. 최신 OpenAI 기준을 요구받으면 `gpt-5.5`를 기준으로 삼되, 변경 범위는 활성 model string과 직접 연결된 prompt/harness 문구로 제한한다.
@@ -39,21 +44,19 @@ reasoning effort, verbosity, Responses API state, tool definitions, structured o
 1. 구현 + 테스트
 - `spec.md`의 `C1..Cn` 항목을 기준으로 구현한다.
 - 권장 시작 경로는 `scripts/start-work.sh --work-id <work-id>`로, todo 초기화(`spec.md`, `open-questions.md`)와 초기 게이트(readiness/open-questions/manifest quick)를 단일 명령으로 실행한다.
-- `work-id` 탐색/선정 규칙은 `docs/HANDOFF.md`의 `work-id 규칙`을 단일 기준으로 따르며, 실제 todo 탐색 glob은 `docs/REPO_MANIFEST.yaml`의 `maintenance.todo_workspace_glob`을 사용한다.
+- 작업 대상 라우팅은 `docs/HANDOFF.md`의 `work-id 라우팅 기준`을 따르며, 실제 todo 탐색 glob과 runner 자동 해석은 `docs/REPO_MANIFEST.yaml`, 대상 스크립트, CLI help를 확인한다.
 - 비긴급 변경은 구현 착수 전에 `scripts/check-todo-readiness.sh docs/todo-<work-id>`를 실행해 `spec/open-questions` 준비 상태를 확인한다.
 - `docs/todo-*` 관련 staged 변경(`spec.md`, `open-questions.md`, todo 삭제 증거 포함)은 `lefthook pre-commit`에서 `scripts/check-todo-readiness.sh`, `scripts/check-todo-closure.sh`를 선검증한다.
-- readiness 게이트는 계획 스냅샷 필수 필드(`목표`, `범위`, `검증 명령`, `완료 기준`) 존재 + placeholder 금지, 체크포인트 섹션(`완료/미완료/다음 액션` + 검증 증거) 존재, `C1..Cn` 체크리스트(`C1` 시작/연속성/상태값/`Verify command` 유효성)를 함께 검사한다.
-- 질문 카드 스키마/닫힘 상태는 `scripts/check-open-questions-schema.sh --require-closed`로 확인해 `open-questions.md` 형식 누락과 미해결 질문 잔존을 함께 차단한다. 닫힘 상태 본문은 정확히 `현재 미결 항목 없음.`이어야 한다.
+- readiness 게이트의 필수 필드, placeholder 차단, 체크포인트, `C1..Cn` 형식은 `scripts/check-todo-readiness.sh`가 소유한다.
+- 질문 카드 스키마/닫힘 상태는 `scripts/check-open-questions-schema.sh --require-closed`로 확인한다. 닫힘 상태의 현재 canonical 문구는 스크립트와 `open-questions.md` 템플릿을 직접 확인한다.
 - 구현 중에는 `scripts/check-todo-closure.sh`로 완료된 `docs/todo-*` 잔존 여부를 점검한다.
 - 완료된 작업은 `docs/todo-*`를 삭제하고 정식 문서/`docs/LESSONS_LOG.md`에만 내재화한다. (`docs/archive-*` 루트 폴더 생성 금지)
 - `todo` 삭제가 포함된 마감 커밋에서는 `todo-<work-id>` 식별자를 `docs/LESSONS_LOG.md` 또는 `docs/LESSONS_ARCHIVE.md`에 남겨 후속 게이트에서 추적 가능하게 유지한다.
 - 구현 중 기본 검증 세트는 `scripts/run-manifest-checks.sh --mode quick --work-id <work-id>`로 실행한다.
-- `scripts/run-manifest-checks.sh --mode quick`은 `scripts/check-*` 게이트만 실행하고, manifest의 일반 로컬 검증(예: `cargo fmt/test/clippy`)은 skip될 수 있다. 전체 검증이 필요하면 `--mode full` 또는 `docs/CHANGE_CONTROL.md`의 출고 게이트를 사용한다.
-- `scripts/run-manifest-checks.sh`는 `<work-id>`, `<repo-key>` 치환 이후에도 미해결 placeholder(`<...>`)가 남아 있으면 경고 스킵 대신 실패 처리한다. (quick 모드에서 스킵된 비대상 명령은 제외)
-- `scripts/run-manifest-checks.sh --mode full`은 `<work-id>` placeholder 체크를 해석할 컨텍스트(work-id 또는 docs/todo-*)가 없으면 실패한다. (quick 모드만 경고 후 skip)
+- quick/full 모드별 필터링, placeholder 처리, repo-key 해석은 `scripts/run-manifest-checks.sh --help`와 스크립트 본문이 소유한다.
+- 전체 로컬 검증이 필요하면 `docs/REPO_MANIFEST.yaml`의 현재 check 목록을 기준으로 `--mode full` 또는 `docs/CHANGE_CONTROL.md`의 출고 게이트를 사용한다.
 - 운영 게이트 스크립트 변경 시에는 `scripts/check-script-smoke.sh`를 함께 실행해 회귀를 조기 감지한다. (`--work-id`는 다중 todo 환경에서 명시적으로 고정이 필요할 때만 전달)
-- 각 항목의 `Verify command`를 우선 실행하고, Rust 기본 검증(`cargo fmt --all --check`, `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`)을 통과시킨다.
-- 네트워크/P2P 변경에는 `scripts/smoke_p2p_local.sh`를 추가 실행한다.
+- 각 항목의 `Verify command`를 우선 실행하고, Rust/P2P 검증 명령은 `docs/REPO_MANIFEST.yaml`, `scripts/check.sh`, `docs/dev-playbook.md`에서 현재 기준을 확인한다.
 
 2. 검수 + 보완
 - 피처 규모와 변경 위험도에 맞는 독립 리뷰를 수행하고 교차 검증한다.
@@ -63,7 +66,7 @@ reasoning effort, verbosity, Responses API state, tool definitions, structured o
 - 구현 요청 턴의 완료 정의는 `원격 푸시 + 원격 SHA 검증`까지이며, 기본 경로는 `scripts/finalize-and-push.sh --message "<type>: <summary>" [--work-id <work-id>]`를 사용한다.
 - `scripts/finalize-and-push.sh`는 기본적으로 `@` non-empty를 요구한다. 빈 작업트리에서 점검이 필요하면 디버그 환경에서만 `DEBUG_GATES_OVERRIDE=1` + `--allow-empty-at` 조합을 사용한다.
 - `jj st`/`jj diff`로 변경 상태를 확인하고 `jj describe -m "<type>: <summary>"`로 메시지를 정리한다.
-- strict 게이트/푸시 안전 경로/디버그 우회 옵션/`--work-id` 자동 감지 및 마감 커밋 예외 규칙은 `docs/CHANGE_CONTROL.md`를 단일 기준으로 따른다.
+- strict 게이트/푸시 안전 경로/디버그 우회의 허용 경계와 마감 커밋 예외 정책은 `docs/CHANGE_CONTROL.md`를 따른다. `--work-id` 자동 감지, 옵션/default, 실제 분기는 runner 스크립트와 CLI help를 직접 확인한다.
 - 루트 저장소(`.jj` 존재)에서 `git commit` 예외 사용/`jj git import` 동기화 규칙, 교훈 로그 coupling 강제 규칙도 `docs/CHANGE_CONTROL.md`를 단일 기준으로 따른다.
 
 ## 검증 증적 기록 규칙

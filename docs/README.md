@@ -1,6 +1,6 @@
 # Rustory Documentation
 
-이 문서는 인덱스 전용이다. 실행 순서/옵션 규칙의 단일 기준은 `docs/HANDOFF.md`, `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`, `docs/REPO_MANIFEST.yaml`을 따른다.
+이 문서는 인덱스 전용이다. 실행 순서/옵션 규칙의 경계는 `docs/HANDOFF.md`, `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`, `docs/REPO_MANIFEST.yaml`을 따르고, 실제 동작은 관련 코드/스크립트/CLI help를 직접 확인한다.
 
 ## 문서 맵 (링크 전용)
 
@@ -29,8 +29,8 @@
 - [Daemon 가이드](daemon.md)
 - [Hook 가이드](hook.md)
 - [개발 플레이북](dev-playbook.md)
-- [MVP 메모](mvp.md)
+- [MVP 결정 메모](mvp.md)
 - [수용 테스트 인덱스](acceptance/README.md)
 
 문서 진입점(추가/이동/삭제) 변경 시 `docs/README.md` 인덱스와 `docs/REPO_MANIFEST.yaml` entrypoint를 같은 턴에서 함께 갱신한다.
-상세 절차/예외/검증 명령은 `docs/CHANGE_CONTROL.md`의 `문서 진입 순서 (무컨텍스트)`를 단일 기준으로 따른다.
+상세 절차/예외 경계는 `docs/CHANGE_CONTROL.md`를 따르고, 실제 검증 명령과 실행 동작은 `docs/REPO_MANIFEST.yaml`, `scripts/*`, CLI help를 직접 확인한다.

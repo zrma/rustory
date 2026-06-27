@@ -3,7 +3,7 @@
 이 문서는 Rustory를 "최소 구성"으로 빠르게 써보는 흐름을 정리한다.
 
 ## 0) 준비
-- Rust 툴체인: `rust-toolchain.toml` 기준(`1.95.0`)
+- Rust 툴체인: `rust-toolchain.toml` 기준
 - ctrl+r 검색 UX를 쓰려면 `fzf`가 `PATH`에 있어야 한다. `rr doctor`에서 `fzf:` 라인을 확인한다.
 
 ### 빌드(로컬)
@@ -66,9 +66,9 @@ rr doctor --json
 `config status: invalid: ...`가 표시되면 `~/.config/rustory/config.toml`을 먼저 고친다. 기존 설정을 버리고 새 템플릿으로 복구하려면 `rr init --force ...`를 사용한다. `--force`는 기존 config를 덮어쓰므로 필요한 값은 먼저 보관한다. `rr doctor`는 설정 파일이 잘못된 상태에서도 계속 실행되어 어떤 파일과 에러를 봐야 하는지 보여준다.
 
 `rr doctor`의 `db status:` 라인에서 로컬 DB 파일 존재 여부, 저장된 entry 수, peer book/sync peer 수를 확인할 수 있다. `entries=0`이면 ctrl+r 검색 후보가 아직 없는 상태다.
-`hook:` 라인에서는 현재 셸에서 hook 설치 마커가 보이는지(`installed`), `RUSTORY_HOOK_DISABLE`로 비활성화됐는지(`disabled`), ctrl+r 검색 limit 값이 어떻게 해석됐는지(`search_limit`: env > config > 기본값)를 확인한다.
+`hook:` 라인에서는 현재 셸에서 hook 설치 마커가 보이는지(`installed`), `RUSTORY_HOOK_DISABLE`로 비활성화됐는지(`disabled`), ctrl+r 검색 limit 값이 어떤 resolver 경로로 해석됐는지 확인한다.
 
-`rr init`는 기본적으로 다음을 준비한다.
+`rr init`가 현재 준비하는 생성물은 명령 출력과 관련 코드를 확인한다. 대표적으로 아래 아티팩트를 점검한다.
 - `~/.config/rustory/config.toml` (설정 템플릿)
 - `~/.config/rustory/swarm.key` (PSK, 같은 swarm 내 디바이스는 동일 파일 공유)
 - `~/.config/rustory/identity.key` (PeerId, 디바이스별 고유)
@@ -113,14 +113,14 @@ export RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|be
 이 옵션은 hook이 호출하는 `rr record`에도 적용된다. 상세는 `docs/hook.md` 참고.
 
 ### 2-5-1) (선택) 기록 직후 비동기 업로드 트리거
-hook 기반 기록 직후 업로드를 자동으로 트리거하려면:
+hook 기반 기록 직후 업로드를 자동으로 트리거하려면 아래처럼 설정한다. 숫자 값은 예시이며, 현재 default와 해석 순서는 `rr doctor`, `docs/hook.md`, 관련 코드를 확인한다.
 ```sh
 export RUSTORY_ASYNC_UPLOAD=1
 export RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC=15
 export RUSTORY_ASYNC_UPLOAD_LIMIT=200
 ```
 
-지속 설정으로 남기려면 `~/.config/rustory/config.toml`에 다음 값을 둘 수 있다. 같은 이름의 `RUSTORY_*` 환경 변수가 있으면 환경 변수가 우선한다.
+지속 설정으로 남기려면 `~/.config/rustory/config.toml`에 같은 형태의 값을 둘 수 있다. 같은 이름의 `RUSTORY_*` 환경 변수가 있으면 환경 변수가 우선한다.
 
 ```toml
 async_upload = true
@@ -132,7 +132,7 @@ async_upload_limit = 200
 설정 해석/주기 상태는 `rr doctor`의 `async upload` 라인에서 즉시 확인할 수 있다.
 
 ### 2-5-2) (선택) 기록 시 자동 보관(prune) 스케줄링
-오래된 로컬 엔트리를 주기적으로 자동 정리하려면:
+오래된 로컬 엔트리를 주기적으로 자동 정리하려면 아래처럼 설정한다. 보존 일수/간격/개수는 예시이며, 현재 default와 해석 순서는 `rr doctor`, `docs/hook.md`, 관련 코드를 확인한다.
 ```sh
 export RUSTORY_AUTO_PRUNE=1
 export RUSTORY_AUTO_PRUNE_DAYS=180
@@ -140,7 +140,7 @@ export RUSTORY_AUTO_PRUNE_INTERVAL_SEC=86400
 export RUSTORY_AUTO_PRUNE_KEEP_RECENT=5000
 ```
 
-지속 설정으로 남기려면 `~/.config/rustory/config.toml`에 다음 값을 둘 수 있다. 같은 이름의 `RUSTORY_*` 환경 변수가 있으면 환경 변수가 우선한다.
+지속 설정으로 남기려면 `~/.config/rustory/config.toml`에 같은 형태의 값을 둘 수 있다. 같은 이름의 `RUSTORY_*` 환경 변수가 있으면 환경 변수가 우선한다.
 
 ```toml
 auto_prune = true
