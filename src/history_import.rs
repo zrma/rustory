@@ -261,8 +261,8 @@ pub struct HishtoryImportRequest<'a> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HishtoryRecord {
-    source_rowid: u64,
     source_entry_id: Option<String>,
+    fallback_source_key: String,
     ts_unix: i64,
     duration_ms: i64,
     cmd: String,
@@ -303,11 +303,8 @@ pub fn import_hishtory_sqlite_into_store(
 
         let entry_id = hishtory_import_entry_id(
             req.user_id,
-            req.device_id,
             r.source_entry_id.as_deref(),
-            r.source_rowid,
-            r.ts_unix,
-            cmd,
+            &r.fallback_source_key,
         );
 
         buf.push(core::Entry::new_with_id(
@@ -356,7 +353,15 @@ SELECT
   COALESCE(exit_code, 0) AS exit_code,
   unixepoch(start_time) AS start_ts,
   unixepoch(end_time) AS end_ts,
-  COALESCE(NULLIF(hostname, ''), ?1) AS hostname
+  COALESCE(NULLIF(hostname, ''), ?1) AS hostname,
+  local_username,
+  hostname AS source_hostname,
+  current_working_directory AS source_cwd,
+  home_directory,
+  start_time,
+  end_time,
+  device_id,
+  exit_code AS source_exit_code
 FROM history_entries
 WHERE command IS NOT NULL
   AND TRIM(command) != ''
@@ -373,7 +378,15 @@ SELECT
   exit_code,
   start_ts,
   end_ts,
-  hostname
+  hostname,
+  local_username,
+  source_hostname,
+  source_cwd,
+  home_directory,
+  start_time,
+  end_time,
+  source_device_id,
+  source_exit_code
 FROM (
   SELECT
     rowid AS source_rowid,
@@ -383,7 +396,15 @@ FROM (
     COALESCE(exit_code, 0) AS exit_code,
     unixepoch(start_time) AS start_ts,
     unixepoch(end_time) AS end_ts,
-    COALESCE(NULLIF(hostname, ''), ?1) AS hostname
+    COALESCE(NULLIF(hostname, ''), ?1) AS hostname,
+    local_username,
+    hostname AS source_hostname,
+    current_working_directory AS source_cwd,
+    home_directory,
+    start_time,
+    end_time,
+    device_id AS source_device_id,
+    exit_code AS source_exit_code
   FROM history_entries
   WHERE command IS NOT NULL
     AND TRIM(command) != ''
@@ -424,8 +445,6 @@ ORDER BY start_ts ASC, source_rowid ASC
 }
 
 fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryRecord> {
-    let source_rowid: i64 = row.get(0)?;
-    let source_rowid = u64::try_from(source_rowid).unwrap_or(0);
     let start_ts: i64 = row.get(5)?;
     let end_ts: Option<i64> = row.get(6)?;
     let duration_ms = end_ts
@@ -433,15 +452,39 @@ fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryR
         .map(|end| end.saturating_sub(start_ts).saturating_mul(1000))
         .unwrap_or(0);
 
+    let cmd: String = row.get(2)?;
+    let cwd: String = row.get(3)?;
+    let exit_code: i32 = row.get(4)?;
+    let hostname: String = row.get(7)?;
+    let local_username: Option<String> = row.get(8)?;
+    let source_hostname: Option<String> = row.get(9)?;
+    let source_cwd: Option<String> = row.get(10)?;
+    let home_directory: Option<String> = row.get(11)?;
+    let start_time: Option<String> = row.get(12)?;
+    let end_time: Option<String> = row.get(13)?;
+    let source_device_id: Option<String> = row.get(14)?;
+    let source_exit_code: Option<i64> = row.get(15)?;
+    let fallback_source_key = hishtory_composite_source_key(HishtoryCompositeSourceKey {
+        local_username: local_username.as_deref(),
+        hostname: source_hostname.as_deref(),
+        cmd: &cmd,
+        cwd: source_cwd.as_deref(),
+        home_directory: home_directory.as_deref(),
+        exit_code: source_exit_code,
+        start_time: start_time.as_deref(),
+        end_time: end_time.as_deref(),
+        source_device_id: source_device_id.as_deref(),
+    });
+
     Ok(HishtoryRecord {
-        source_rowid,
         source_entry_id: row.get(1)?,
+        fallback_source_key,
         ts_unix: start_ts,
         duration_ms,
-        cmd: row.get(2)?,
-        cwd: row.get(3)?,
-        exit_code: row.get(4)?,
-        hostname: row.get(7)?,
+        cmd,
+        cwd,
+        exit_code,
+        hostname,
     })
 }
 
@@ -471,21 +514,50 @@ fn normalize_import_text(value: &str, fallback: &str) -> String {
 
 fn hishtory_import_entry_id(
     user_id: &str,
-    device_id: &str,
     source_entry_id: Option<&str>,
-    source_rowid: u64,
-    ts_unix: i64,
-    cmd: &str,
+    fallback_source_key: &str,
 ) -> core::EntryId {
     let source_key = match source_entry_id.and_then(|id| {
         let trimmed = id.trim();
         (!trimmed.is_empty()).then_some(trimmed)
     }) {
         Some(id) => format!("entry_id\0{id}"),
-        None => format!("fallback\0{device_id}\0{source_rowid}\0{ts_unix}\0{cmd}"),
+        None => format!("fallback\0{fallback_source_key}"),
     };
     let name = format!("rustory:hishtory-import\0{user_id}\0{source_key}");
     uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
+}
+
+struct HishtoryCompositeSourceKey<'a> {
+    local_username: Option<&'a str>,
+    hostname: Option<&'a str>,
+    cmd: &'a str,
+    cwd: Option<&'a str>,
+    home_directory: Option<&'a str>,
+    exit_code: Option<i64>,
+    start_time: Option<&'a str>,
+    end_time: Option<&'a str>,
+    source_device_id: Option<&'a str>,
+}
+
+fn hishtory_composite_source_key(key: HishtoryCompositeSourceKey<'_>) -> String {
+    // Hishtory's SQLite unique index is based on these source fields, not on SQLite rowid.
+    // Using the same composite shape keeps old rows with blank entry_id stable across machines.
+    let exit_code = key.exit_code.map(|v| v.to_string()).unwrap_or_default();
+    let parts = [
+        key.local_username.unwrap_or(""),
+        key.hostname.unwrap_or(""),
+        key.cmd,
+        key.cwd.unwrap_or(""),
+        key.home_directory.unwrap_or(""),
+        key.start_time.unwrap_or(""),
+        key.end_time.unwrap_or(""),
+        key.source_device_id.unwrap_or(""),
+    ];
+    format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+        parts[0], parts[1], parts[2], parts[3], parts[4], exit_code, parts[5], parts[6], parts[7]
+    )
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -735,6 +807,73 @@ mod tests {
         assert_eq!(s2.inserted, 0);
         assert_eq!(s2.ignored, 1);
         assert_eq!(s2.skipped, 2);
+        assert_eq!(store.list_recent(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn import_hishtory_sqlite_blank_entry_id_uses_stable_composite_key() {
+        let first_db = synthetic_hishtory_db(&[HishtoryFixtureRow {
+            entry_id: "",
+            hostname: "",
+            command: "echo old-row",
+            cwd: "/work",
+            exit_code: 0,
+            start_time: "2023-01-01 00:00:00.123456+00:00",
+            end_time: "2023-01-01 00:00:01.123456+00:00",
+        }]);
+        let second_db = synthetic_hishtory_db(&[
+            HishtoryFixtureRow {
+                entry_id: "",
+                hostname: "",
+                command: "rr doctor",
+                cwd: "/work",
+                exit_code: 0,
+                start_time: "2023-01-01 00:00:00.000001+00:00",
+                end_time: "2023-01-01 00:00:00.000002+00:00",
+            },
+            HishtoryFixtureRow {
+                entry_id: "",
+                hostname: "",
+                command: "echo old-row",
+                cwd: "/work",
+                exit_code: 0,
+                start_time: "2023-01-01 00:00:00.123456+00:00",
+                end_time: "2023-01-01 00:00:01.123456+00:00",
+            },
+        ]);
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let s1 = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: first_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-a",
+                hostname: "fallback-host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s1.received, 1);
+        assert_eq!(s1.inserted, 1);
+
+        let s2 = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: second_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-b",
+                hostname: "different-fallback-host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s2.received, 2);
+        assert_eq!(s2.inserted, 0);
+        assert_eq!(s2.ignored, 1);
+        assert_eq!(s2.skipped, 1);
         assert_eq!(store.list_recent(10).unwrap().len(), 1);
     }
 

@@ -78,7 +78,7 @@ Rustory가 보존하는 값:
 Rustory가 migration 목적에 맞게 재해석하는 값:
 - Rustory `device_id`는 현재 머신의 Rustory device id로 저장한다. 그래야 `rr p2p-sync --push`가 import된 entry를 peer로 보낼 수 있다.
 - Hishtory `entry_id`가 있으면 Rustory deterministic entry id의 source key로 사용한다. 같은 Hishtory row를 여러 머신에서 import해도 P2P 수신 측에서 중복을 `ignored`로 처리할 수 있게 하기 위해서다.
-- Hishtory `entry_id`가 없는 row는 현재 Rustory device id, Hishtory rowid, timestamp, command를 fallback source key로 쓴다.
+- Hishtory `entry_id`가 없는 오래된 row는 Hishtory의 원본 composite fields(`local_username`, `hostname`, `command`, `current_working_directory`, `home_directory`, `exit_code`, `start_time`, `end_time`, `device_id`)를 fallback source key로 쓴다. SQLite `rowid`나 현재 Rustory device id는 fallback key에 넣지 않는다.
 
 ## P2P 클러스터로 전파
 
