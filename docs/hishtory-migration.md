@@ -117,7 +117,7 @@ relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문
 - control plane: tracker와 relay를 먼저 띄우고, relay identity key와 swarm key를 영속화한다.
 - peer config: 모든 Rustory peer는 같은 `user_id`와 같은 swarm key fingerprint를 사용하고, `device_id`는 머신마다 고유해야 한다.
 - import safety: 각 머신에서 temp DB smoke를 먼저 실행하고 `inserted/skipped/ignored`를 확인한 뒤 실제 DB import를 진행한다.
-- privacy safety: `record_ignore_regex` 또는 `RUSTORY_RECORD_IGNORE_REGEX`를 import 전에 설정한다. 이미 민감 명령을 import한 뒤 bulk redact/delete하는 운영 경로는 아직 없다.
+- privacy safety: `record_ignore_regex` 또는 `RUSTORY_RECORD_IGNORE_REGEX`를 import 전에 설정한다. 이미 민감 명령을 import했다면 `rr delete --cmd-regex ... --dry-run`으로 각 peer의 local DB에서 삭제 대상을 먼저 확인한다.
 
 ### 2대 기준 절차
 
@@ -170,7 +170,8 @@ relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문
 - import는 삭제 이력이나 tombstone을 옮기지 않는다.
 - Hishtory DB가 실행 중인 Hishtory 프로세스에 의해 갱신 중이면 import는 읽는 시점의 SQLite snapshot 기준으로 수행된다.
 - 서로 다른 `user_id`로 import하면 Hishtory `entry_id`가 같아도 Rustory entry id가 달라진다.
-- 민감 명령을 이미 import한 뒤에는 현재 Rustory에 별도 bulk redact/delete 명령이 없다. 실사용 import 전 `record_ignore_regex`와 temp DB smoke를 먼저 확인한다.
+- `rr delete`는 sync tombstone이 아니라 local-only 삭제다. 이미 다른 peer로 전파된 민감 row는 각 peer에서 같은 삭제를 수행해야 한다.
+- SQLite 파일/WAL에 남은 삭제 흔적까지 줄여야 하면 `rr delete ... --yes --vacuum`을 사용한다.
 
 ## 검증 경로
 

@@ -180,6 +180,22 @@ rr prune --older-than-days 180 --keep-recent 5000 --dry-run
 rr prune --older-than-days 180 --keep-recent 5000
 ```
 
+### 2-7) (선택) 민감 로컬 엔트리 삭제
+`record_ignore_regex`는 기록/import 전 차단이 목적이다. 이미 들어간 로컬 row는 먼저 dry-run으로 확인한다.
+
+```sh
+rr delete --cmd-regex '(?i)(password|token|secret|authorization:|bearer )' --dry-run
+```
+
+결과가 의도와 같으면 명시 확인을 붙여 삭제한다. SQLite 파일/WAL에 남은 삭제 흔적까지 줄여야 하는 경우 `--vacuum`을 같이 쓴다.
+
+```sh
+rr delete --cmd-regex '(?i)(password|token|secret|authorization:|bearer )' --yes --vacuum
+rr delete --entry-id '<entry_id>' --yes --vacuum
+```
+
+`rr delete`는 local-only 작업이다. 이미 다른 peer로 sync된 민감 row는 각 peer에서 같은 삭제를 수행해야 한다.
+
 ## 다음 문서
 - P2P 상세/트러블슈팅: `docs/p2p.md`
 - 데몬/스케줄러: `docs/daemon.md`

@@ -1,7 +1,7 @@
 use crate::core::Entry;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -21,6 +21,12 @@ pub struct InsertStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PruneStats {
+    pub matched: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeleteStats {
     pub matched: usize,
     pub deleted: usize,
 }
@@ -563,6 +569,100 @@ WHERE ts < ?
             matched: matched as usize,
             deleted,
         })
+    }
+
+    pub fn entry_ids_matching_cmd_regex(&self, re: &regex::Regex) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT entry_id, cmd FROM entries ORDER BY ingest_seq ASC")
+            .context("prepare entry id scan by command regex")?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .context("query entry id scan by command regex")?;
+
+        let mut ids = Vec::new();
+        for row in rows {
+            let (entry_id, cmd) = row?;
+            if re.is_match(&cmd) {
+                ids.push(entry_id);
+            }
+        }
+        Ok(ids)
+    }
+
+    pub fn delete_entries_by_ids(
+        &self,
+        entry_ids: &[String],
+        dry_run: bool,
+    ) -> Result<DeleteStats> {
+        let ids: Vec<String> = entry_ids
+            .iter()
+            .map(|id| id.trim())
+            .filter(|id| !id.is_empty())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+
+        if ids.is_empty() {
+            return Ok(DeleteStats {
+                matched: 0,
+                deleted: 0,
+            });
+        }
+
+        let mut matched = 0usize;
+        for id in &ids {
+            let count: i64 = self
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM entries WHERE entry_id = ?",
+                    params![id],
+                    |row| row.get(0),
+                )
+                .context("count entries selected for delete")?;
+            matched += count.max(0) as usize;
+        }
+
+        if dry_run || matched == 0 {
+            return Ok(DeleteStats {
+                matched,
+                deleted: 0,
+            });
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin delete tx")?;
+        let deleted = {
+            let mut stmt = tx
+                .prepare("DELETE FROM entries WHERE entry_id = ?")
+                .context("prepare delete entries by id")?;
+            let mut deleted = 0usize;
+            for id in &ids {
+                deleted += stmt.execute(params![id]).context("delete selected entry")?;
+            }
+            deleted
+        };
+        tx.commit().context("commit delete tx")?;
+
+        Ok(DeleteStats { matched, deleted })
+    }
+
+    pub fn compact_storage(&self) -> Result<()> {
+        self.conn
+            .execute_batch(
+                r#"
+PRAGMA wal_checkpoint(TRUNCATE);
+VACUUM;
+PRAGMA wal_checkpoint(TRUNCATE);
+"#,
+            )
+            .context("compact sqlite storage")
     }
 
     fn prune_keep_floor_seq(&self, keep_recent: usize) -> Result<Option<i64>> {
@@ -1286,6 +1386,71 @@ mod tests {
         let remaining = store.list_recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].entry_id, "id-3");
+    }
+
+    #[test]
+    fn delete_entries_by_ids_supports_dry_run_and_apply() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .insert_entries(&[
+                entry("id-1", 10, "echo 1"),
+                entry("id-2", 20, "echo 2"),
+                entry("id-3", 30, "echo 3"),
+            ])
+            .unwrap();
+
+        let dry = store
+            .delete_entries_by_ids(
+                &[
+                    "id-1".to_string(),
+                    "id-1".to_string(),
+                    "missing".to_string(),
+                ],
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            dry,
+            DeleteStats {
+                matched: 1,
+                deleted: 0
+            }
+        );
+        assert_eq!(store.list_recent(10).unwrap().len(), 3);
+
+        let applied = store
+            .delete_entries_by_ids(&["id-1".to_string(), "id-3".to_string()], false)
+            .unwrap();
+        assert_eq!(
+            applied,
+            DeleteStats {
+                matched: 2,
+                deleted: 2
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-2");
+    }
+
+    #[test]
+    fn entry_ids_matching_cmd_regex_returns_matching_commands() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .insert_entries(&[
+                entry("id-1", 10, "echo safe"),
+                entry("id-2", 20, "curl -H 'Authorization: Bearer secret'"),
+                entry("id-3", 30, "export TOKEN=value"),
+            ])
+            .unwrap();
+
+        let re = regex::Regex::new("(?i)(authorization:|token=)").unwrap();
+        let ids = store.entry_ids_matching_cmd_regex(&re).unwrap();
+
+        assert_eq!(ids, vec!["id-2".to_string(), "id-3".to_string()]);
     }
 
     #[test]

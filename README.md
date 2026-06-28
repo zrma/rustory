@@ -26,7 +26,9 @@
 - P2P 상세/트러블슈팅: `docs/p2p.md`
 - 데몬/스케줄러: `docs/daemon.md`
 - hook 설정: `docs/hook.md`
+- Hishtory 이관: `docs/hishtory-migration.md`
 - 수용 테스트 문서: `docs/acceptance/docker-macos-linux.md`
+- relay-only 수용 테스트: `docs/acceptance/docker-two-peer-relay.md`
 
 ## Development
 

@@ -284,6 +284,39 @@ enum Command {
         )]
         dry_run: bool,
     },
+    #[command(about = "Delete selected local history entries")]
+    Delete {
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Entry id to delete; may be passed multiple times or comma-separated"
+        )]
+        entry_id: Vec<String>,
+
+        #[arg(long, help = "Delete entries whose command matches this regex")]
+        cmd_regex: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Report matching rows without deleting"
+        )]
+        dry_run: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Required for non-dry-run deletion"
+        )]
+        yes: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Run SQLite WAL checkpoint and VACUUM after deletion"
+        )]
+        vacuum: bool,
+    },
     #[command(about = "Show local pull and push cursor status")]
     SyncStatus {
         #[arg(long, help = "Show status for one peer id only")]
@@ -715,6 +748,54 @@ pub fn run() -> Result<()> {
                 println!(
                     "prune: older_than_days={} keep_recent={} cutoff_unix={} matched={} deleted={}",
                     older_than_days, keep_recent, cutoff_unix, stats.matched, stats.deleted
+                );
+            }
+        }
+        Command::Delete {
+            entry_id,
+            cmd_regex,
+            dry_run,
+            yes,
+            vacuum,
+        } => {
+            let cmd_regex = normalize_opt_string(cmd_regex);
+            let has_entry_id = entry_id.iter().any(|id| !id.trim().is_empty());
+            if !has_entry_id && cmd_regex.is_none() {
+                anyhow::bail!("delete requires --entry-id or --cmd-regex");
+            }
+            if !dry_run && !yes {
+                anyhow::bail!(
+                    "refusing to delete without --yes; run --dry-run first or pass --yes"
+                );
+            }
+
+            let store = storage::LocalStore::open(&db_path)?;
+            let mut selected_ids = entry_id;
+            let mut selector_count = usize::from(has_entry_id);
+
+            if let Some(pattern) = cmd_regex.as_deref() {
+                let re = regex::Regex::new(pattern).context("invalid delete command regex")?;
+                let mut regex_ids = store.entry_ids_matching_cmd_regex(&re)?;
+                selected_ids.append(&mut regex_ids);
+                selector_count += 1;
+            }
+
+            let stats = store.delete_entries_by_ids(&selected_ids, dry_run)?;
+            let mut compacted = false;
+            if vacuum && !dry_run {
+                store.compact_storage()?;
+                compacted = true;
+            }
+
+            if dry_run {
+                println!(
+                    "delete dry-run: selectors={} matched={} deleted=0",
+                    selector_count, stats.matched
+                );
+            } else {
+                println!(
+                    "delete: selectors={} matched={} deleted={} compacted={}",
+                    selector_count, stats.matched, stats.deleted, compacted
                 );
             }
         }
@@ -4016,6 +4097,37 @@ mod tests {
                 assert!(dry_run);
             }
             _ => panic!("expected prune"),
+        }
+    }
+
+    #[test]
+    fn delete_parses_selectors_and_safety_flags() {
+        let app = App::parse_from([
+            "rr",
+            "delete",
+            "--entry-id",
+            "id-1,id-2",
+            "--cmd-regex",
+            "(?i)token",
+            "--dry-run",
+            "--yes",
+            "--vacuum",
+        ]);
+        match app.cmd {
+            Command::Delete {
+                entry_id,
+                cmd_regex,
+                dry_run,
+                yes,
+                vacuum,
+            } => {
+                assert_eq!(entry_id, vec!["id-1", "id-2"]);
+                assert_eq!(cmd_regex.as_deref(), Some("(?i)token"));
+                assert!(dry_run);
+                assert!(yes);
+                assert!(vacuum);
+            }
+            _ => panic!("expected delete"),
         }
     }
 
