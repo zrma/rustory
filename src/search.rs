@@ -669,7 +669,7 @@ fn table_visible_rows(term_height: usize, show_help: bool) -> usize {
 
 fn compute_column_widths(
     rows: &[SearchRow],
-    filtered: &[usize],
+    _filtered: &[usize],
     inside_width: usize,
 ) -> [usize; 6] {
     let separator_width = COLUMNS.len().saturating_sub(1);
@@ -682,10 +682,8 @@ fn compute_column_widths(
     });
     let mut wanted = widths;
 
-    for row_index in filtered.iter().take(1000).copied() {
-        let Some(row) = rows.get(row_index) else {
-            continue;
-        };
+    // hishtory처럼 현재 필터 결과가 아니라 넓은 기본 샘플 기준으로 컬럼 anchor를 고정한다.
+    for row in rows.iter().take(1000) {
         for (idx, cell) in row.cells.iter().enumerate() {
             wanted[idx] = wanted[idx].max(display_width(cell));
         }
@@ -1099,6 +1097,38 @@ mod tests {
 
         assert_eq!(widths[CWD_COLUMN], cwd_flex_target(cwd_wanted));
         assert!(widths[COMMAND_COLUMN] > widths[CWD_COLUMN]);
+    }
+
+    #[test]
+    fn column_widths_stay_stable_across_query_changes() {
+        let entries = vec![
+            entry("node0", "/home/user", "which rr"),
+            entry(
+                "user.local",
+                "/Users/user/code/src/rustory",
+                "scripts/finalize-and-push.sh --message 'fix: prefer relay for tracker p2p sync'",
+            ),
+            entry(
+                "samplex.local",
+                "/opt/homebrew/Library/Taps/veeso/homebrew-termscp",
+                "z codex",
+            ),
+        ];
+        let rows = build_search_rows(&entries);
+        let which_matches = filter_rows(&rows, "wh");
+        let finalize_matches = filter_rows(&rows, "finalize");
+        let tap_matches = filter_rows(&rows, "termscp");
+
+        assert_ne!(which_matches, finalize_matches);
+        assert_ne!(finalize_matches, tap_matches);
+        assert_eq!(
+            compute_column_widths(&rows, &which_matches, 220),
+            compute_column_widths(&rows, &finalize_matches, 220)
+        );
+        assert_eq!(
+            compute_column_widths(&rows, &which_matches, 220),
+            compute_column_widths(&rows, &tap_matches, 220)
+        );
     }
 
     #[test]
