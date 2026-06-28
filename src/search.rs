@@ -8,6 +8,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TABLE_MAX_ROWS: usize = 20;
 const TABLE_SCROLL_STEP: usize = 10;
+const MOUSE_SCROLL_STEP: usize = 3;
 const MIN_FRAME_WIDTH: usize = 40;
 const FALLBACK_TERM_WIDTH: usize = 100;
 const FALLBACK_TERM_HEIGHT: usize = 30;
@@ -15,6 +16,8 @@ const CWD_COLUMN: usize = 1;
 const COMMAND_COLUMN: usize = 5;
 const FOOTER: &str = "rustory: Search your shell history  • ctrl+h help";
 const TTY_LINE_ENDING: &str = "\r\n";
+const ENABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000h\x1b[?1006h";
+const DISABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000l\x1b[?1006l";
 
 const COLUMNS: [ColumnSpec; 6] = [
     ColumnSpec {
@@ -81,6 +84,8 @@ enum Key {
     ShiftRight,
     PageUp,
     PageDown,
+    MouseWheelUp,
+    MouseWheelDown,
     Home,
     End,
     Unknown,
@@ -175,6 +180,7 @@ impl<'a> SearchTui<'a> {
     fn finish(&mut self) -> Result<()> {
         self.tty
             .write_all(clear_rendered_frame(self.last_rendered_lines).as_bytes())?;
+        self.tty.write_all(DISABLE_MOUSE_REPORTING)?;
         self.tty.write_all(b"\x1b[?25h\x1b[0m")?;
         self.tty.flush()?;
         self.last_rendered_lines = 0;
@@ -214,6 +220,8 @@ impl<'a> SearchTui<'a> {
             Key::Down => self.move_cursor_down(1),
             Key::PageUp => self.move_cursor_up(self.visible_rows.max(1)),
             Key::PageDown => self.move_cursor_down(self.visible_rows.max(1)),
+            Key::MouseWheelUp => self.move_cursor_up(MOUSE_SCROLL_STEP),
+            Key::MouseWheelDown => self.move_cursor_down(MOUSE_SCROLL_STEP),
             Key::Home => {
                 self.cursor = 0;
                 self.ensure_cursor_visible();
@@ -358,7 +366,9 @@ impl<'a> SearchTui<'a> {
         lines.push(bottom_border(frame_width));
         lines.push(FOOTER.to_string());
         if self.show_help {
-            lines.push("↑/↓ scroll  pgup/pgdn page  enter select  esc exit".to_string());
+            lines.push(
+                "↑/↓ or mouse wheel scroll  pgup/pgdn page  enter select  esc exit".to_string(),
+            );
             lines.push("←/→ edit query  ctrl+←/→ jump word  shift+←/→ scroll table".to_string());
         }
 
@@ -398,7 +408,7 @@ struct Tty {
 
 impl Tty {
     fn open() -> Result<Self> {
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .write(true)
             .open("/dev/tty")
@@ -420,6 +430,15 @@ impl Tty {
 
         if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
             return Err(std::io::Error::last_os_error()).context("tcsetattr raw mode");
+        }
+        if let Err(err) = file
+            .write_all(ENABLE_MOUSE_REPORTING)
+            .and_then(|_| file.flush())
+        {
+            unsafe {
+                libc::tcsetattr(fd, libc::TCSANOW, &original);
+            }
+            return Err(err).context("enable mouse reporting");
         }
 
         Ok(Self { file, original })
@@ -451,7 +470,7 @@ impl Tty {
             return Ok(Key::Quit);
         };
         let mut bytes = vec![first];
-        while bytes.len() < 12 {
+        while bytes.len() < 32 {
             let Some(byte) = self.read_byte_with_timeout(Duration::from_millis(2))? else {
                 break;
             };
@@ -511,6 +530,7 @@ impl Write for Tty {
 
 impl Drop for Tty {
     fn drop(&mut self) {
+        let _ = self.file.write_all(DISABLE_MOUSE_REPORTING);
         let _ = self.file.write_all(b"\x1b[?25h\x1b[0m");
         let _ = self.file.flush();
         unsafe {
@@ -520,6 +540,10 @@ impl Drop for Tty {
 }
 
 fn parse_escape_sequence(bytes: &[u8]) -> Key {
+    if let Some(key) = parse_sgr_mouse_sequence(bytes) {
+        return key;
+    }
+
     match bytes {
         b"[A" | b"OA" => Key::Up,
         b"[B" | b"OB" => Key::Down,
@@ -536,6 +560,35 @@ fn parse_escape_sequence(bytes: &[u8]) -> Key {
         b"[1;5C" | b"[5C" => Key::CtrlRight,
         _ => Key::Unknown,
     }
+}
+
+fn parse_sgr_mouse_sequence(bytes: &[u8]) -> Option<Key> {
+    let body = bytes.strip_prefix(b"[<")?;
+    let (final_byte, payload) = body.split_last()?;
+    if *final_byte != b'M' {
+        return None;
+    }
+
+    let mut parts = payload.split(|byte| *byte == b';');
+    let button = parse_ascii_usize(parts.next()?)?;
+    parts.next()?;
+    parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+
+    if button & 64 == 0 {
+        return None;
+    }
+    match button & 0b11 {
+        0 => Some(Key::MouseWheelUp),
+        1 => Some(Key::MouseWheelDown),
+        _ => None,
+    }
+}
+
+fn parse_ascii_usize(bytes: &[u8]) -> Option<usize> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn terminal_size(fd: RawFd) -> Option<(usize, usize)> {
@@ -1107,6 +1160,15 @@ mod tests {
         assert_eq!(parse_escape_sequence(b"[1;2C"), Key::ShiftRight);
         assert_eq!(parse_escape_sequence(b"[1;5D"), Key::CtrlLeft);
         assert_eq!(parse_escape_sequence(b"[1;5C"), Key::CtrlRight);
+    }
+
+    #[test]
+    fn parse_escape_sequence_supports_sgr_mouse_wheel() {
+        assert_eq!(parse_escape_sequence(b"[<64;12;5M"), Key::MouseWheelUp);
+        assert_eq!(parse_escape_sequence(b"[<65;120;42M"), Key::MouseWheelDown);
+        assert_eq!(parse_escape_sequence(b"[<68;12;5M"), Key::MouseWheelUp);
+        assert_eq!(parse_escape_sequence(b"[<69;12;5M"), Key::MouseWheelDown);
+        assert_eq!(parse_escape_sequence(b"[<64;12;5m"), Key::Unknown);
     }
 
     #[test]
