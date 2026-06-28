@@ -2,10 +2,12 @@ target
 .jj
 .git
 .DS_Store
+.env
+.env.*
 docs/todo-*
 **/*.db
 **/*.sqlite
 **/*.sqlite3
 **/*.key
 **/*.pem
-
+out
