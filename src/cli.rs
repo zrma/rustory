@@ -4,6 +4,9 @@ use clap::{Parser, Subcommand};
 use rand::RngExt;
 
 use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
+use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC: u64 = 15;
@@ -152,6 +155,73 @@ enum Command {
 
         #[arg(long, help = "Bearer token sent to tracker endpoints")]
         tracker_token: Option<String>,
+    },
+    #[command(about = "Run p2p-serve plus p2p-sync watch as one supervised process")]
+    Daemon {
+        #[arg(
+            long,
+            default_value = "/ip4/0.0.0.0/tcp/0",
+            help = "libp2p multiaddr for the embedded p2p-serve listener"
+        )]
+        listen: String,
+
+        #[arg(long, help = "Path to this device's persistent P2P identity key")]
+        identity_key: Option<String>,
+
+        #[arg(long, help = "Path to the shared private swarm key")]
+        swarm_key: Option<String>,
+
+        #[arg(long, help = "Relay multiaddr used for reservation and sync")]
+        relay: Option<String>,
+
+        #[arg(
+            long,
+            value_delimiter = ',',
+            help = "Comma-separated tracker base URLs for peer discovery"
+        )]
+        trackers: Vec<String>,
+
+        #[arg(long, help = "Bearer token sent to tracker endpoints")]
+        tracker_token: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = 1000,
+            help = "Maximum entries per pull or push batch"
+        )]
+        limit: usize,
+
+        #[arg(long = "pull-only", help = "Disable pushing local entries to peers")]
+        pull_only: bool,
+
+        #[arg(
+            long,
+            default_value_t = 60,
+            help = "Seconds between sync watch attempts"
+        )]
+        interval_sec: u64,
+
+        #[arg(long, help = "Random initial delay upper bound for sync watch mode")]
+        start_jitter_sec: Option<u64>,
+
+        #[arg(
+            long,
+            default_value_t = 2,
+            help = "Seconds to wait after p2p-serve starts before starting sync watch"
+        )]
+        sync_start_delay_sec: u64,
+
+        #[arg(long, help = "Request retry attempts per peer operation")]
+        req_attempts: Option<u64>,
+
+        #[arg(long, help = "Initial request timeout in seconds before backoff")]
+        req_timeout_base_sec: Option<u64>,
+
+        #[arg(long, help = "Maximum request timeout in seconds after backoff")]
+        req_timeout_cap_sec: Option<u64>,
+
+        #[arg(long, help = "Base retry backoff in milliseconds")]
+        req_backoff_base_ms: Option<u64>,
     },
     #[command(about = "Create or inspect the shared P2P swarm key")]
     SwarmKey {
@@ -477,6 +547,45 @@ pub fn run() -> Result<()> {
             } else {
                 p2p::sync(&peers, limit, &db_path, sync_cfg, push)?;
             }
+        }
+        Command::Daemon {
+            listen,
+            identity_key,
+            swarm_key,
+            relay,
+            trackers,
+            tracker_token,
+            limit,
+            pull_only,
+            interval_sec,
+            start_jitter_sec,
+            sync_start_delay_sec,
+            req_attempts,
+            req_timeout_base_sec,
+            req_timeout_cap_sec,
+            req_backoff_base_ms,
+        } => {
+            run_daemon(
+                DaemonArgs {
+                    listen,
+                    identity_key,
+                    swarm_key,
+                    relay,
+                    trackers,
+                    tracker_token,
+                    limit,
+                    pull_only,
+                    interval_sec,
+                    start_jitter_sec,
+                    sync_start_delay_sec,
+                    req_attempts,
+                    req_timeout_base_sec,
+                    req_timeout_cap_sec,
+                    req_backoff_base_ms,
+                },
+                &cfg,
+                &db_path,
+            )?;
         }
         Command::SwarmKey { swarm_key } => {
             let path = resolve_swarm_key_path(swarm_key, &cfg);
@@ -829,6 +938,32 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
 }
 
 #[derive(Debug, Clone)]
+struct DaemonArgs {
+    listen: String,
+    identity_key: Option<String>,
+    swarm_key: Option<String>,
+    relay: Option<String>,
+    trackers: Vec<String>,
+    tracker_token: Option<String>,
+    limit: usize,
+    pull_only: bool,
+    interval_sec: u64,
+    start_jitter_sec: Option<u64>,
+    sync_start_delay_sec: u64,
+    req_attempts: Option<u64>,
+    req_timeout_base_sec: Option<u64>,
+    req_timeout_cap_sec: Option<u64>,
+    req_backoff_base_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DaemonChildSpecs {
+    serve_args: Vec<String>,
+    sync_args: Vec<String>,
+    tracker_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct InitArgs {
     force: bool,
     user_id: Option<String>,
@@ -836,6 +971,271 @@ struct InitArgs {
     trackers: Vec<String>,
     relay: Option<String>,
     tracker_token: Option<String>,
+}
+
+fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Result<()> {
+    if args.limit == 0 {
+        anyhow::bail!("daemon --limit must be >= 1");
+    }
+
+    let trackers = resolve_trackers(args.trackers.clone(), cfg)?;
+    if trackers.is_empty() {
+        anyhow::bail!(
+            "daemon requires at least one tracker in --trackers, RUSTORY_TRACKERS, or config.toml"
+        );
+    }
+
+    if resolve_relay_addr(args.relay.clone(), cfg)?.is_none() {
+        anyhow::bail!("daemon requires relay_addr for tracker-based sync");
+    }
+
+    // Fail before spawning children when the durable daily-driver inputs are broken.
+    let _ = resolve_swarm_psk(args.swarm_key.clone(), cfg)?;
+    let _ = resolve_p2p_identity(args.identity_key.clone(), cfg)?;
+    let _ = resolve_tracker_token(args.tracker_token.clone(), cfg)?;
+    let _ = resolve_p2p_watch_start_jitter_sec(args.start_jitter_sec, cfg)?;
+    let _ = resolve_p2p_request_retry_policy(
+        args.req_attempts,
+        args.req_timeout_base_sec,
+        args.req_timeout_cap_sec,
+        args.req_backoff_base_ms,
+        cfg,
+    )?;
+
+    let specs = build_daemon_child_specs(db_path, &args);
+    let exe = std::env::current_exe().context("resolve current executable for daemon")?;
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || {
+            stop.store(true, Ordering::SeqCst);
+        })
+        .context("set Ctrl-C/SIGTERM handler")?;
+    }
+
+    eprintln!(
+        "daemon: starting p2p-serve and p2p-sync watch (push={})",
+        !args.pull_only
+    );
+    let mut serve = spawn_daemon_child(
+        "p2p-serve",
+        &exe,
+        &specs.serve_args,
+        specs.tracker_token_env.as_deref(),
+    )?;
+
+    sleep_with_stop(
+        Duration::from_secs(args.sync_start_delay_sec),
+        stop.as_ref(),
+    );
+    if stop.load(Ordering::SeqCst) {
+        terminate_daemon_child("p2p-serve", &mut serve)?;
+        return Ok(());
+    }
+    if let Some(status) = serve.try_wait().context("poll p2p-serve child")? {
+        anyhow::bail!("daemon child p2p-serve exited before sync start: {status}");
+    }
+
+    let mut sync = spawn_daemon_child(
+        "p2p-sync",
+        &exe,
+        &specs.sync_args,
+        specs.tracker_token_env.as_deref(),
+    )?;
+
+    supervise_daemon_children(&mut serve, &mut sync, stop.as_ref())
+}
+
+fn build_daemon_child_specs(db_path: &str, args: &DaemonArgs) -> DaemonChildSpecs {
+    let mut serve_args = vec![
+        "--db-path".to_string(),
+        db_path.to_string(),
+        "p2p-serve".to_string(),
+        "--listen".to_string(),
+        args.listen.clone(),
+    ];
+    push_optional_arg(
+        &mut serve_args,
+        "--identity-key",
+        args.identity_key.as_deref(),
+    );
+    push_optional_arg(&mut serve_args, "--swarm-key", args.swarm_key.as_deref());
+    push_optional_arg(&mut serve_args, "--relay", args.relay.as_deref());
+    push_trackers_arg(&mut serve_args, &args.trackers);
+
+    let mut sync_args = vec![
+        "--db-path".to_string(),
+        db_path.to_string(),
+        "p2p-sync".to_string(),
+        "--watch".to_string(),
+        "--limit".to_string(),
+        args.limit.to_string(),
+        "--interval-sec".to_string(),
+        args.interval_sec.max(1).to_string(),
+    ];
+    if !args.pull_only {
+        sync_args.push("--push".to_string());
+    }
+    if let Some(v) = args.start_jitter_sec {
+        sync_args.push("--start-jitter-sec".to_string());
+        sync_args.push(v.to_string());
+    }
+    push_optional_arg(&mut sync_args, "--swarm-key", args.swarm_key.as_deref());
+    push_optional_arg(&mut sync_args, "--relay", args.relay.as_deref());
+    push_trackers_arg(&mut sync_args, &args.trackers);
+    push_optional_u64_arg(&mut sync_args, "--req-attempts", args.req_attempts);
+    push_optional_u64_arg(
+        &mut sync_args,
+        "--req-timeout-base-sec",
+        args.req_timeout_base_sec,
+    );
+    push_optional_u64_arg(
+        &mut sync_args,
+        "--req-timeout-cap-sec",
+        args.req_timeout_cap_sec,
+    );
+    push_optional_u64_arg(
+        &mut sync_args,
+        "--req-backoff-base-ms",
+        args.req_backoff_base_ms,
+    );
+
+    DaemonChildSpecs {
+        serve_args,
+        sync_args,
+        tracker_token_env: args.tracker_token.clone(),
+    }
+}
+
+fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
+    if let Some(value) = value {
+        args.push(flag.to_string());
+        args.push(value.to_string());
+    }
+}
+
+fn push_optional_u64_arg(args: &mut Vec<String>, flag: &str, value: Option<u64>) {
+    if let Some(value) = value {
+        args.push(flag.to_string());
+        args.push(value.to_string());
+    }
+}
+
+fn push_trackers_arg(args: &mut Vec<String>, trackers: &[String]) {
+    if trackers.is_empty() {
+        return;
+    }
+    args.push("--trackers".to_string());
+    args.push(trackers.join(","));
+}
+
+fn spawn_daemon_child(
+    label: &str,
+    exe: &std::path::Path,
+    args: &[String],
+    tracker_token_env: Option<&str>,
+) -> Result<Child> {
+    eprintln!("daemon: spawn {label}: {}", redacted_command(exe, args));
+    let mut cmd = ProcessCommand::new(exe);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if let Some(token) = tracker_token_env {
+        cmd.env("RUSTORY_TRACKER_TOKEN", token);
+    }
+    cmd.spawn()
+        .with_context(|| format!("spawn daemon child: {label}"))
+}
+
+fn redacted_command(exe: &std::path::Path, args: &[String]) -> String {
+    let mut parts = Vec::with_capacity(args.len() + 1);
+    parts.push(exe.display().to_string());
+    parts.extend(args.iter().cloned());
+    parts.join(" ")
+}
+
+fn supervise_daemon_children(serve: &mut Child, sync: &mut Child, stop: &AtomicBool) -> Result<()> {
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            eprintln!("daemon: shutdown requested");
+            terminate_daemon_child("p2p-sync", sync)?;
+            terminate_daemon_child("p2p-serve", serve)?;
+            return Ok(());
+        }
+
+        if let Some(status) = serve.try_wait().context("poll p2p-serve child")? {
+            terminate_daemon_child("p2p-sync", sync)?;
+            anyhow::bail!("daemon child p2p-serve exited: {status}");
+        }
+
+        if let Some(status) = sync.try_wait().context("poll p2p-sync child")? {
+            terminate_daemon_child("p2p-serve", serve)?;
+            anyhow::bail!("daemon child p2p-sync exited: {status}");
+        }
+
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+fn sleep_with_stop(duration: Duration, stop: &AtomicBool) {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn terminate_daemon_child(label: &str, child: &mut Child) -> Result<()> {
+    if child.try_wait()?.is_some() {
+        return Ok(());
+    }
+
+    send_child_terminate(child).with_context(|| format!("terminate daemon child: {label}"))?;
+    if let Some(status) = wait_child_timeout(child, Duration::from_secs(5))? {
+        eprintln!("daemon: {label} stopped: {status}");
+        return Ok(());
+    }
+
+    eprintln!("warn: daemon child {label} did not stop after SIGTERM; killing");
+    child
+        .kill()
+        .with_context(|| format!("kill daemon child: {label}"))?;
+    let status = child
+        .wait()
+        .with_context(|| format!("wait killed daemon child: {label}"))?;
+    eprintln!("daemon: {label} killed: {status}");
+    Ok(())
+}
+
+fn wait_child_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(None)
+}
+
+fn send_child_terminate(child: &mut Child) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(());
+        }
+        Err(err)
+    }
+
+    #[cfg(not(unix))]
+    {
+        child.kill()
+    }
 }
 
 fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<()> {
@@ -887,8 +1287,8 @@ fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<(
 
     println!("next:");
     println!("- 설정 확인: rr doctor");
-    println!("- p2p 서버: rr p2p-serve --trackers <tracker> --relay <relay>");
-    println!("- p2p 동기화: rr p2p-sync --trackers <tracker> --relay <relay> --watch --push");
+    println!("- 상시 동기화: rr daemon");
+    println!("- 분리 운영: rr p2p-serve + rr p2p-sync --watch --push");
 
     Ok(())
 }
@@ -2651,6 +3051,7 @@ mod tests {
 
         assert!(help.contains("Write config and create local P2P key files"));
         assert!(help.contains("Diagnose local config, tools, keys, and connectivity"));
+        assert!(help.contains("Run p2p-serve plus p2p-sync watch as one supervised process"));
         assert!(help.contains("Sync with P2P peers, trackers, or cached peers"));
         assert!(help.contains("Print a bash or zsh shell hook"));
         assert!(help.contains("Path to the local SQLite history database"));
@@ -3199,6 +3600,105 @@ mod tests {
             }
             _ => panic!("expected sync-status"),
         }
+    }
+
+    #[test]
+    fn daemon_parses_daily_driver_flags() {
+        let app = App::parse_from([
+            "rr",
+            "daemon",
+            "--trackers",
+            "http://127.0.0.1:8850,http://127.0.0.1:8851",
+            "--relay",
+            "/ip4/127.0.0.1/tcp/4001/p2p/12D3KooWQUL3M8e18xRRXQ1ZHtVYoYoWq7HvM4hFQXQeZDA5B3eB",
+            "--tracker-token",
+            "secret-token",
+            "--interval-sec",
+            "30",
+            "--start-jitter-sec",
+            "5",
+            "--sync-start-delay-sec",
+            "1",
+            "--req-attempts",
+            "4",
+        ]);
+        match app.cmd {
+            Command::Daemon {
+                trackers,
+                relay,
+                tracker_token,
+                limit,
+                pull_only,
+                interval_sec,
+                start_jitter_sec,
+                sync_start_delay_sec,
+                req_attempts,
+                ..
+            } => {
+                assert_eq!(trackers.len(), 2);
+                assert!(relay.as_deref().unwrap().contains("/p2p/"));
+                assert_eq!(tracker_token.as_deref(), Some("secret-token"));
+                assert_eq!(limit, 1000);
+                assert!(!pull_only);
+                assert_eq!(interval_sec, 30);
+                assert_eq!(start_jitter_sec, Some(5));
+                assert_eq!(sync_start_delay_sec, 1);
+                assert_eq!(req_attempts, Some(4));
+            }
+            _ => panic!("expected daemon"),
+        }
+    }
+
+    #[test]
+    fn daemon_child_specs_push_by_default_and_do_not_leak_token() {
+        let args = DaemonArgs {
+            listen: "/ip4/0.0.0.0/tcp/0".to_string(),
+            identity_key: Some("/tmp/identity.key".to_string()),
+            swarm_key: Some("/tmp/swarm.key".to_string()),
+            relay: Some("/ip4/127.0.0.1/tcp/4001/p2p/relay".to_string()),
+            trackers: vec!["http://127.0.0.1:8850".to_string()],
+            tracker_token: Some("secret-token".to_string()),
+            limit: 500,
+            pull_only: false,
+            interval_sec: 0,
+            start_jitter_sec: Some(3),
+            sync_start_delay_sec: 2,
+            req_attempts: Some(4),
+            req_timeout_base_sec: None,
+            req_timeout_cap_sec: None,
+            req_backoff_base_ms: None,
+        };
+
+        let specs = build_daemon_child_specs("/tmp/rustory.db", &args);
+        assert_eq!(specs.tracker_token_env.as_deref(), Some("secret-token"));
+        assert!(specs.sync_args.contains(&"--push".to_string()));
+        assert!(specs.sync_args.contains(&"1".to_string()));
+        assert!(!specs.serve_args.iter().any(|arg| arg == "secret-token"));
+        assert!(!specs.sync_args.iter().any(|arg| arg == "secret-token"));
+    }
+
+    #[test]
+    fn daemon_child_specs_pull_only_omits_push() {
+        let args = DaemonArgs {
+            listen: "/ip4/0.0.0.0/tcp/0".to_string(),
+            identity_key: None,
+            swarm_key: None,
+            relay: None,
+            trackers: Vec::new(),
+            tracker_token: None,
+            limit: 1000,
+            pull_only: true,
+            interval_sec: 60,
+            start_jitter_sec: None,
+            sync_start_delay_sec: 2,
+            req_attempts: None,
+            req_timeout_base_sec: None,
+            req_timeout_cap_sec: None,
+            req_backoff_base_ms: None,
+        };
+
+        let specs = build_daemon_child_specs("/tmp/rustory.db", &args);
+        assert!(!specs.sync_args.contains(&"--push".to_string()));
     }
 
     #[test]

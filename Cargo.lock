@@ -2133,6 +2133,7 @@ dependencies = [
  "clap",
  "ctrlc",
  "futures",
+ "libc",
  "libp2p-core",
  "libp2p-dcutr",
  "libp2p-identify",

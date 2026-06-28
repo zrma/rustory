@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.rustory.daemon</string>
+
+  <!--
+    Notes:
+    - Replace the `rr` path for the target host. (Example: `which rr`)
+    - Prefer config.toml or a separate secret store for tokens and keys.
+      Check file permissions are restricted, for example 0600.
+  -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/PATH/TO/rr</string>
+    <string>daemon</string>
+    <string>--interval-sec</string>
+    <string>60</string>
+    <string>--start-jitter-sec</string>
+    <string>10</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUSTORY_USER_ID</key>
+    <string>YOUR_USER</string>
+    <key>RUSTORY_DEVICE_ID</key>
+    <string>YOUR_DEVICE</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <!-- Restart if the process exits. -->
+  <key>KeepAlive</key>
+  <true/>
+
+  <!-- Adjust log paths for the target host. -->
+  <key>StandardOutPath</key>
+  <string>/tmp/rustory-daemon.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/rustory-daemon.err.log</string>
+</dict>
+</plist>
