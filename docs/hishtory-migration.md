@@ -105,6 +105,47 @@ rr sync-status --json --with-tracker
 처음 이관할 때는 한 머신을 먼저 import + push하고, 두 번째 머신을 import + push한 뒤 `ignored`가 증가하는지 확인한다.
 이 값은 중복 source가 같은 entry id로 수렴하고 있다는 신호다.
 
+## Multi-machine soak runbook
+
+Hishtory 대체 readiness는 loopback이나 direct-only 성공으로 판정하지 않는다.
+최소 soak는 서로 다른 NAT/WiFi/router 뒤에 있는 실제 peer 2대 이상을 tracker + relay로 수렴시키는 것이다.
+relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문서가 소유하며, 이 문서는 실사용 전환 판정 기준만 둔다.
+
+### 준비 조건
+
+- repo gate: `scripts/check.sh --fast --acceptance`가 green이어야 한다.
+- control plane: tracker와 relay를 먼저 띄우고, relay identity key와 swarm key를 영속화한다.
+- peer config: 모든 Rustory peer는 같은 `user_id`와 같은 swarm key fingerprint를 사용하고, `device_id`는 머신마다 고유해야 한다.
+- import safety: 각 머신에서 temp DB smoke를 먼저 실행하고 `inserted/skipped/ignored`를 확인한 뒤 실제 DB import를 진행한다.
+- privacy safety: `record_ignore_regex` 또는 `RUSTORY_RECORD_IGNORE_REGEX`를 import 전에 설정한다. 이미 민감 명령을 import한 뒤 bulk redact/delete하는 운영 경로는 아직 없다.
+
+### 2대 기준 절차
+
+1. Peer A에서 `rr init`, `rr doctor --json`, `rr swarm-key`, temp DB smoke, real import를 수행한다.
+2. Peer A에서 foreground로 `rr p2p-serve`와 `rr p2p-sync --watch --push`를 각각 띄우고, tracker reachable 상태를 확인한다.
+3. Peer B에서 같은 절차를 수행한다. Peer B는 다른 NAT/WiFi/router 뒤에 둔다.
+4. 양쪽에서 `rr record --cmd "rustory-soak-<device>-<timestamp>" --print-id`로 canary entry를 1개 이상 만든다.
+5. 양쪽 `p2p-sync` 로그에서 pull/push summary가 발생하고, 상대 canary가 `inserted` 또는 중복 수렴 시 `ignored`로 처리되는지 확인한다.
+6. relay 로그에서 reservation/circuit이 실제로 발생했는지 확인한다. direct 업그레이드 로그가 있어도 최초 relay circuit 없이 성공한 실행은 cross-NAT readiness 증거로 쓰지 않는다.
+7. `rr sync-status --json --with-tracker` 산출물을 양쪽에서 저장하고, tracker reachable과 peer별 pull/push cursor가 전진했는지 확인한다.
+
+### 합격 기준
+
+- 최소 2개 실제 머신에서 `p2p-serve`와 `p2p-sync --watch --push`가 동시에 실행된다.
+- 각 peer는 tracker에 등록되고 relay reservation/circuit 경로를 실제로 사용한다.
+- 각 peer의 canary entry가 반대편에 수렴한다.
+- Hishtory import를 같은 머신에서 다시 실행했을 때 기존 row가 대량 재삽입되지 않고 `ignored`로 수렴한다.
+- 24시간 이상 foreground 또는 daemon 로그에 반복적인 tracker unreachable, relay reservation 실패, request timeout 폭증이 없다.
+- `rr doctor`와 `rr sync-status --with-tracker`가 전환 전/후 모두 재현 가능한 증거를 남긴다.
+
+### 중단 조건
+
+- tracker/relay가 떠 있는데도 peer가 tracker에 등록되지 않는다.
+- relay circuit 없이 direct 후보만으로 수렴한다.
+- 같은 Hishtory source를 재import했을 때 예상보다 큰 `inserted`가 반복된다.
+- 한 peer의 push summary가 계속 실패하거나 `sync-status` cursor가 전진하지 않는다.
+- config, swarm key, device id, tracker token 중 하나라도 머신 간 기준과 다르다.
+
 ## 운영 전환 순서
 
 1. tracker/relay를 먼저 띄우고 identity key와 swarm key를 고정한다.
@@ -114,6 +155,15 @@ rr sync-status --json --with-tracker
 5. 각 머신의 shell hook을 Rustory로 전환한다.
 6. 충분한 soak 기간 동안 Hishtory는 제거하지 말고 read-only fallback source로 남긴다.
 7. Rustory `doctor`, `sync-status`, P2P 로그가 안정적이면 Hishtory hook/daemon을 비활성화한다.
+
+## 운영 체크리스트
+
+- `rr import --help`, `rr p2p-serve --help`, `rr p2p-sync --help`, `rr sync-status --help`로 현재 CLI surface를 확인했다.
+- tracker URL, relay multiaddr, tracker token, swarm key fingerprint, user/device id를 각 머신별로 기록했다.
+- `docs/daemon.md`의 preflight를 통과한 뒤 launchd/systemd로 전환했다.
+- Hishtory hook/daemon 비활성화 전까지 Rustory와 Hishtory를 dual-run 했다.
+- 전환 후에도 Hishtory DB 파일은 read-only fallback source로 보존했다.
+- 운영 로그에는 최소한 `rr doctor --json`, `rr sync-status --json --with-tracker`, peer별 p2p summary, relay reservation/circuit 증거가 남아 있다.
 
 ## 알려진 경계
 

@@ -17,6 +17,30 @@
 - `--watch` 실행 중 중지(SIGTERM/Ctrl-C)를 받으면 빠르게 종료한다(서비스 매니저 stop에 정상 반응).
 - 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.
 
+## Enable 전 preflight
+
+launchd/systemd에 등록하기 전에 각 머신에서 foreground 실행으로 다음을 확인한다.
+현재 출력 필드와 default는 CLI help와 관련 코드를 직접 확인한다.
+
+```sh
+rr doctor
+rr doctor --json
+rr swarm-key
+rr sync-status --with-tracker
+```
+
+체크할 기준:
+- `rr doctor`가 config invalid 상태로 시작하지 않는다.
+- 같은 swarm에 넣을 머신들의 `rr swarm-key` fingerprint가 같다.
+- `user_id`는 같고 `device_id`는 머신마다 다르다.
+- tracker가 reachable이고, tracker token 설정이 양쪽에서 일치한다.
+- relay multiaddr에는 영속화된 relay PeerId가 들어 있다.
+- `rr p2p-serve`를 켠 뒤 tracker에 peer가 등록되고 relay reservation이 발생한다.
+- `rr p2p-sync --push` 1회 또는 watch 1주기에서 pull/push summary가 출력된다.
+
+실사용 readiness에서는 direct-only 성공을 합격 증거로 보지 않는다.
+서로 다른 NAT/WiFi/router 뒤 peer를 대상으로 tracker + relay circuit 경로가 실제로 쓰였는지 확인한 뒤 daemon으로 전환한다.
+
 ## 실행 커맨드 예시
 설정 파일을 이미 채워뒀다면:
 
@@ -203,3 +227,15 @@ systemctl --user stop rustory.service
 배포/운영 정책에 따라 다르지만, “사용자가 로그아웃해도 user service가 계속 실행”되길 원하면
 Linux에서 `loginctl enable-linger <user>`를 고려할 수 있다.
 환경/보안 정책에 맞게 선택한다.
+
+## Enable 후 운영 확인
+
+서비스 매니저로 전환한 뒤에는 foreground 때와 같은 증거를 다시 남긴다.
+
+```sh
+rr doctor --json
+rr sync-status --json --with-tracker
+```
+
+macOS는 `launchctl print`와 plist의 stderr/stdout 로그를 함께 확인하고, Linux는 `systemctl --user status`와 `journalctl --user -u ...`를 함께 확인한다.
+Hishtory migration 중이면 `docs/hishtory-migration.md`의 soak 합격 기준을 통과하기 전까지 Hishtory hook/daemon을 끄지 않는다.
