@@ -4,6 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::time::Duration;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const TABLE_MAX_ROWS: usize = 20;
 const TABLE_SCROLL_STEP: usize = 10;
@@ -366,7 +367,7 @@ impl<'a> SearchTui<'a> {
 
 fn redraw_prefix(last_rendered_lines: usize) -> String {
     if last_rendered_lines > 0 {
-        format!("\x1b[{last_rendered_lines}F\x1b[J")
+        format!("\r\x1b[{last_rendered_lines}F\x1b[J")
     } else {
         // Shell widgets invoke `rr search` while the prompt line is still active.
         // Start the inline TUI on a fresh line, then redraw in-place from there.
@@ -385,7 +386,7 @@ fn clear_rendered_frame(last_rendered_lines: usize) -> String {
         String::new()
     } else {
         let lines_to_clear = last_rendered_lines + 1;
-        format!("\x1b[{lines_to_clear}F\x1b[J")
+        format!("\r\x1b[{lines_to_clear}F\x1b[J")
     }
 }
 
@@ -622,7 +623,7 @@ fn compute_column_widths(
     let mut widths = std::array::from_fn(|idx| {
         COLUMNS[idx]
             .preferred_width
-            .max(COLUMNS[idx].title.chars().count())
+            .max(display_width(COLUMNS[idx].title))
             .max(COLUMNS[idx].min_width)
     });
     let mut wanted = widths;
@@ -632,7 +633,7 @@ fn compute_column_widths(
             continue;
         };
         for (idx, cell) in row.cells.iter().enumerate() {
-            wanted[idx] = wanted[idx].max(cell.chars().count());
+            wanted[idx] = wanted[idx].max(display_width(cell));
         }
     }
 
@@ -693,12 +694,7 @@ fn max_hscroll(
         .take(visible_rows.max(1) * 2)
         .filter_map(|idx| rows.get(*idx))
         .flat_map(|row| row.cells.iter().zip(widths.iter()))
-        .map(|(cell, width)| {
-            cell.chars()
-                .count()
-                .saturating_sub(*width)
-                .saturating_add(2)
-        })
+        .map(|(cell, width)| display_width(cell).saturating_sub(*width).saturating_add(2))
         .max()
         .unwrap_or(0)
 }
@@ -716,20 +712,20 @@ fn render_cells(
         .collect::<Vec<_>>()
         .join(" ");
 
-    let width = content.chars().count();
+    let width = display_width(&content);
     if width < inside_width {
         content.push_str(&" ".repeat(inside_width - width));
     } else if width > inside_width {
-        content = take_chars(&content, inside_width);
+        content = take_display_width(&content, inside_width);
     }
     content
 }
 
 fn fit_cell(value: &str, width: usize, hscroll: usize) -> String {
-    let len = value.chars().count();
+    let len = display_width(value);
     let visible = if hscroll > 0 && len > width {
         let start = hscroll.min(len.saturating_sub(1));
-        format!("...{}", skip_chars(value, start))
+        format!("...{}", skip_display_width(value, start))
     } else {
         value.to_string()
     };
@@ -737,30 +733,60 @@ fn fit_cell(value: &str, width: usize, hscroll: usize) -> String {
 }
 
 fn truncate_right(value: &str, width: usize) -> String {
-    if value.chars().count() <= width {
+    if display_width(value) <= width {
         return value.to_string();
     }
     if width <= 3 {
-        return take_chars(value, width);
+        return take_display_width(value, width);
     }
-    format!("{}...", take_chars(value, width - 3))
+    format!("{}...", take_display_width(value, width - 3))
 }
 
 fn pad_right(value: &str, width: usize) -> String {
     let mut out = value.to_string();
-    let len = out.chars().count();
+    let len = display_width(&out);
     if len < width {
         out.push_str(&" ".repeat(width - len));
     }
     out
 }
 
-fn take_chars(value: &str, count: usize) -> String {
-    value.chars().take(count).collect()
+fn display_width(value: &str) -> usize {
+    UnicodeWidthStr::width(value)
 }
 
-fn skip_chars(value: &str, count: usize) -> String {
-    value.chars().skip(count).collect()
+fn char_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn take_display_width(value: &str, max_width: usize) -> String {
+    let mut out = String::new();
+    let mut width = 0;
+    for ch in value.chars() {
+        let ch_width = char_width(ch);
+        if ch_width > 0 && width + ch_width > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out
+}
+
+fn skip_display_width(value: &str, columns: usize) -> String {
+    if columns == 0 {
+        return value.to_string();
+    }
+
+    let mut width = 0;
+    for (idx, ch) in value.char_indices() {
+        let ch_width = char_width(ch);
+        if width >= columns {
+            return value[idx..].to_string();
+        }
+        width += ch_width;
+    }
+    String::new()
 }
 
 fn table_line(content: &str, selected: bool) -> String {
@@ -997,6 +1023,34 @@ mod tests {
     }
 
     #[test]
+    fn render_cell_uses_terminal_display_width_for_wide_text() {
+        assert_eq!(display_width("잠 동 사니"), 10);
+        assert_eq!(
+            fit_cell("잠 동 사니/container-manager", 12, 0),
+            "잠 동 사... "
+        );
+        assert_eq!(
+            display_width(&fit_cell("잠 동 사니/container-manager", 12, 0)),
+            12
+        );
+    }
+
+    #[test]
+    fn render_cells_never_exceeds_inside_width_with_wide_text() {
+        let cells = [
+            "user.local".to_string(),
+            "~/SynologyDrive/잠 동 사니/container-manager".to_string(),
+            "2026-06-28 05:31:35 UTC".to_string(),
+            "N/A".to_string(),
+            "0".to_string(),
+            "exit".to_string(),
+        ];
+        let widths = [10, 20, 23, 8, 9, 18];
+        let rendered = render_cells(&cells, &widths, 93, 0);
+        assert_eq!(display_width(&rendered), 93);
+    }
+
+    #[test]
     fn render_uses_tty_line_endings_for_raw_mode() {
         let frame = render_frame_lines(&["Search Query: > ".to_string(), "table".to_string()]);
         assert_eq!(frame, "Search Query: > \r\ntable\r\n");
@@ -1006,13 +1060,13 @@ mod tests {
     #[test]
     fn first_render_starts_below_shell_prompt() {
         assert_eq!(redraw_prefix(0), "\r\n");
-        assert_eq!(redraw_prefix(12), "\x1b[12F\x1b[J");
+        assert_eq!(redraw_prefix(12), "\r\x1b[12F\x1b[J");
     }
 
     #[test]
     fn finish_clear_erases_last_rendered_frame() {
         assert_eq!(clear_rendered_frame(0), "");
-        assert_eq!(clear_rendered_frame(23), "\x1b[24F\x1b[J");
+        assert_eq!(clear_rendered_frame(23), "\r\x1b[24F\x1b[J");
     }
 
     #[test]
