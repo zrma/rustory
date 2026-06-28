@@ -35,6 +35,12 @@ rr relay-serve --listen /ip4/0.0.0.0/tcp/4001
 실행하면 다음 형태의 주소를 출력한다.
 - `relay listen: /ip4/<ip>/tcp/<port>/p2p/<relay_peer_id>`
 
+`rr relay-serve`는 Rustory private swarm의 multi-machine backfill을 daily-driver 기본값으로 보고
+libp2p relay 기본값보다 큰 circuit/reservation/byte limit을 사용한다. 현재 값과 override 플래그는
+`rr relay-serve --help`와 `src/p2p.rs`가 소유한다. 시작 로그에는 `relay config: ...`가 출력되므로,
+운영 중 `Remote reported resource limit exceeded`가 반복되면 실제 relay 프로세스가 새 limit으로
+재시작됐는지 이 로그부터 확인한다.
+
 P2P relay 주소는 `/ip4/...` 또는 `/ip6/...` 형태로 넘긴다. DNS 이름을 써야 하는 환경에서는
 호스트명 해석을 먼저 수행한 뒤 IP 기반 multiaddr를 전달한다. tracker URL은 일반 URL이므로 DNS
 호스트명을 그대로 사용할 수 있다.

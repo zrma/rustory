@@ -412,6 +412,55 @@ enum Command {
 
         #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = p2p::DEFAULT_RELAY_MAX_RESERVATIONS,
+            help = "Maximum active relay reservations"
+        )]
+        max_reservations: usize,
+
+        #[arg(
+            long,
+            default_value_t = p2p::DEFAULT_RELAY_MAX_RESERVATIONS_PER_PEER,
+            help = "Maximum active relay reservations per peer"
+        )]
+        max_reservations_per_peer: usize,
+
+        #[arg(
+            long,
+            default_value_t = p2p::DEFAULT_RELAY_MAX_CIRCUITS,
+            help = "Maximum active relay circuits"
+        )]
+        max_circuits: usize,
+
+        #[arg(
+            long,
+            default_value_t = p2p::DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER,
+            help = "Maximum active relay circuits per peer"
+        )]
+        max_circuits_per_peer: usize,
+
+        #[arg(
+            long,
+            default_value_t = p2p::DEFAULT_RELAY_MAX_CIRCUIT_DURATION_SEC,
+            help = "Maximum seconds a relay circuit may stay open"
+        )]
+        max_circuit_duration_sec: u64,
+
+        #[arg(
+            long,
+            default_value_t = p2p::DEFAULT_RELAY_MAX_CIRCUIT_BYTES,
+            help = "Maximum bytes transferred by a relay circuit; 0 means unlimited"
+        )]
+        max_circuit_bytes: u64,
+
+        #[arg(
+            long = "rate-limits",
+            default_value_t = false,
+            help = "Keep libp2p default relay per-peer/per-IP rate limiters"
+        )]
+        rate_limits: bool,
     },
     #[command(about = "Write config and create local P2P key files")]
     Init {
@@ -694,9 +743,6 @@ pub fn run() -> Result<()> {
             if cmd.is_empty() {
                 return Ok(());
             }
-            if is_self_rr_command(cmd) {
-                return Ok(());
-            }
             if let Some(pattern) = resolve_record_ignore_regex(&cfg) {
                 match should_ignore_record_command(cmd, &pattern) {
                     Ok(true) => return Ok(()),
@@ -969,10 +1015,34 @@ pub fn run() -> Result<()> {
             listen,
             identity_key,
             swarm_key,
+            max_reservations,
+            max_reservations_per_peer,
+            max_circuits,
+            max_circuits_per_peer,
+            max_circuit_duration_sec,
+            max_circuit_bytes,
+            rate_limits,
         } => {
             let psk = resolve_swarm_psk(swarm_key, &cfg)?;
             let identity = resolve_relay_identity(identity_key, &cfg)?;
-            p2p::relay_serve(&listen, p2p::RelayServeConfig { identity, psk })?;
+            p2p::relay_serve(
+                &listen,
+                p2p::RelayServeConfig {
+                    identity,
+                    psk,
+                    limits: p2p::RelayLimits {
+                        max_reservations,
+                        max_reservations_per_peer,
+                        max_circuits,
+                        max_circuits_per_peer,
+                        max_circuit_duration: std::time::Duration::from_secs(
+                            max_circuit_duration_sec,
+                        ),
+                        max_circuit_bytes,
+                        rate_limits,
+                    },
+                },
+            )?;
         }
         Command::Init {
             force,
@@ -3630,13 +3700,6 @@ fn should_ignore_record_command(
     Ok(re.is_match(cmd))
 }
 
-fn is_self_rr_command(cmd: &str) -> bool {
-    let Some(first) = cmd.split_whitespace().next() else {
-        return false;
-    };
-    first == "rr"
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3718,18 +3781,55 @@ mod tests {
         let record_help = record.render_help().to_string();
         assert!(record_help.contains("Shell command line to record"));
         assert!(record_help.contains("Print the inserted entry id"));
+
+        let relay_serve = cmd
+            .find_subcommand_mut("relay-serve")
+            .expect("relay-serve subcommand");
+        let relay_serve_help = relay_serve.render_help().to_string();
+        assert!(relay_serve_help.contains("Maximum active relay circuits"));
+        assert!(relay_serve_help.contains("Maximum bytes transferred by a relay circuit"));
     }
 
     #[test]
-    fn is_self_rr_command_detects_rr_invocation() {
-        assert!(is_self_rr_command("rr"));
-        assert!(is_self_rr_command("rr serve --bind 0.0.0.0:8844"));
-        assert!(is_self_rr_command("  rr  search"));
-
-        assert!(!is_self_rr_command(""));
-        assert!(!is_self_rr_command("echo rr"));
-        assert!(!is_self_rr_command("rrr search"));
-        assert!(!is_self_rr_command("cargo run --bin rr -- serve"));
+    fn relay_serve_parses_capacity_flags() {
+        let app = App::parse_from([
+            "rr",
+            "relay-serve",
+            "--max-reservations",
+            "1024",
+            "--max-reservations-per-peer",
+            "128",
+            "--max-circuits",
+            "512",
+            "--max-circuits-per-peer",
+            "128",
+            "--max-circuit-duration-sec",
+            "1200",
+            "--max-circuit-bytes",
+            "134217728",
+            "--rate-limits",
+        ]);
+        match app.cmd {
+            Command::RelayServe {
+                max_reservations,
+                max_reservations_per_peer,
+                max_circuits,
+                max_circuits_per_peer,
+                max_circuit_duration_sec,
+                max_circuit_bytes,
+                rate_limits,
+                ..
+            } => {
+                assert_eq!(max_reservations, 1024);
+                assert_eq!(max_reservations_per_peer, 128);
+                assert_eq!(max_circuits, 512);
+                assert_eq!(max_circuits_per_peer, 128);
+                assert_eq!(max_circuit_duration_sec, 1200);
+                assert_eq!(max_circuit_bytes, 134217728);
+                assert!(rate_limits);
+            }
+            _ => panic!("expected relay-serve"),
+        }
     }
 
     #[test]

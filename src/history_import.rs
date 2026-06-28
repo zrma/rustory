@@ -492,9 +492,6 @@ fn should_skip_import_command(cmd: &str, ignore_regex: Option<&regex::Regex>) ->
     if cmd.is_empty() {
         return true;
     }
-    if cmd.split_whitespace().next() == Some("rr") {
-        return true;
-    }
     if let Some(re) = ignore_regex
         && re.is_match(cmd)
     {
@@ -775,21 +772,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s1.received, 3);
-        assert_eq!(s1.inserted, 1);
+        assert_eq!(s1.inserted, 2);
         assert_eq!(s1.ignored, 0);
-        assert_eq!(s1.skipped, 2);
+        assert_eq!(s1.skipped, 1);
 
         let entries = store.list_recent(10).unwrap();
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].device_id, "rustory-device-a");
-        assert_eq!(entries[0].user_id, "u1");
-        assert_eq!(entries[0].shell, "hishtory");
-        assert_eq!(entries[0].hostname, "old-host");
-        assert_eq!(entries[0].cmd, "echo ok");
-        assert_eq!(entries[0].cwd, "/work");
-        assert_eq!(entries[0].exit_code, 7);
-        assert_eq!(entries[0].duration_ms, 2000);
-        assert_eq!(entries[0].ts.unix_timestamp(), 1704067200);
+        assert_eq!(entries.len(), 2);
+        let echo_entry = entries.iter().find(|entry| entry.cmd == "echo ok").unwrap();
+        assert_eq!(echo_entry.device_id, "rustory-device-a");
+        assert_eq!(echo_entry.user_id, "u1");
+        assert_eq!(echo_entry.shell, "hishtory");
+        assert_eq!(echo_entry.hostname, "old-host");
+        assert_eq!(echo_entry.cwd, "/work");
+        assert_eq!(echo_entry.exit_code, 7);
+        assert_eq!(echo_entry.duration_ms, 2000);
+        assert_eq!(echo_entry.ts.unix_timestamp(), 1704067200);
+        assert!(entries.iter().any(|entry| entry.cmd == "rr doctor"));
 
         let s2 = import_hishtory_sqlite_into_store(
             &store,
@@ -805,9 +803,9 @@ mod tests {
         .unwrap();
         assert_eq!(s2.received, 3);
         assert_eq!(s2.inserted, 0);
-        assert_eq!(s2.ignored, 1);
-        assert_eq!(s2.skipped, 2);
-        assert_eq!(store.list_recent(10).unwrap().len(), 1);
+        assert_eq!(s2.ignored, 2);
+        assert_eq!(s2.skipped, 1);
+        assert_eq!(store.list_recent(10).unwrap().len(), 2);
     }
 
     #[test]
@@ -871,10 +869,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s2.received, 2);
-        assert_eq!(s2.inserted, 0);
+        assert_eq!(s2.inserted, 1);
         assert_eq!(s2.ignored, 1);
-        assert_eq!(s2.skipped, 1);
-        assert_eq!(store.list_recent(10).unwrap().len(), 1);
+        assert_eq!(s2.skipped, 0);
+        assert_eq!(store.list_recent(10).unwrap().len(), 2);
     }
 
     #[test]

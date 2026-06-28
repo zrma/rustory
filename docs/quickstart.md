@@ -43,6 +43,8 @@ rr relay-serve --listen /ip4/0.0.0.0/tcp/4001
 ```
 
 출력되는 `relay listen: .../p2p/<relay_peer_id>` 주소를 기록한다.
+운영 중 resource limit이 반복되면 `rr relay-serve --help`의 capacity 플래그와 relay 시작 로그의
+`relay config:` 값을 먼저 확인한다.
 
 #### Tracker 서버
 ```sh

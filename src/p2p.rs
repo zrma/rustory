@@ -31,6 +31,13 @@ const PULL_RESP_DECODED_MAX_BYTES: u64 = PULL_RESP_MAX_BYTES * DECODED_MAX_MULTI
 const PUSH_REQ_DECODED_MAX_BYTES: u64 = PUSH_REQ_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 const PUSH_RESP_DECODED_MAX_BYTES: u64 = PUSH_RESP_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 
+pub const DEFAULT_RELAY_MAX_RESERVATIONS: usize = 512;
+pub const DEFAULT_RELAY_MAX_RESERVATIONS_PER_PEER: usize = 64;
+pub const DEFAULT_RELAY_MAX_CIRCUITS: usize = 256;
+pub const DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER: usize = 64;
+pub const DEFAULT_RELAY_MAX_CIRCUIT_DURATION_SEC: u64 = 15 * 60;
+pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
+
 // request-response behaviour 내부 timeout은 request 상태 추적/정리를 위한 용도다.
 // pull/push는 attempt별 timeout을 별도로 구현하므로, 여기서 너무 작은 값을 두면
 // 사용자가 `--req-timeout-cap-sec` 등을 크게 잡았을 때 내부 Timeout이 먼저 터질 수 있다.
@@ -82,6 +89,66 @@ impl Default for RequestRetryPolicy {
 pub struct RelayServeConfig {
     pub identity: libp2p::identity::Keypair,
     pub psk: libp2p::pnet::PreSharedKey,
+    pub limits: RelayLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RelayLimits {
+    pub max_reservations: usize,
+    pub max_reservations_per_peer: usize,
+    pub max_circuits: usize,
+    pub max_circuits_per_peer: usize,
+    pub max_circuit_duration: Duration,
+    pub max_circuit_bytes: u64,
+    pub rate_limits: bool,
+}
+
+impl Default for RelayLimits {
+    fn default() -> Self {
+        Self {
+            max_reservations: DEFAULT_RELAY_MAX_RESERVATIONS,
+            max_reservations_per_peer: DEFAULT_RELAY_MAX_RESERVATIONS_PER_PEER,
+            max_circuits: DEFAULT_RELAY_MAX_CIRCUITS,
+            max_circuits_per_peer: DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER,
+            max_circuit_duration: Duration::from_secs(DEFAULT_RELAY_MAX_CIRCUIT_DURATION_SEC),
+            max_circuit_bytes: DEFAULT_RELAY_MAX_CIRCUIT_BYTES,
+            rate_limits: false,
+        }
+    }
+}
+
+impl RelayLimits {
+    fn to_libp2p_config(self) -> Result<libp2p::relay::Config> {
+        if self.max_reservations == 0 {
+            anyhow::bail!("max_reservations must be greater than 0");
+        }
+        if self.max_reservations_per_peer == 0 {
+            anyhow::bail!("max_reservations_per_peer must be greater than 0");
+        }
+        if self.max_circuits == 0 {
+            anyhow::bail!("max_circuits must be greater than 0");
+        }
+        if self.max_circuits_per_peer == 0 {
+            anyhow::bail!("max_circuits_per_peer must be greater than 0");
+        }
+
+        let mut cfg = libp2p::relay::Config {
+            max_reservations: self.max_reservations,
+            max_reservations_per_peer: self.max_reservations_per_peer,
+            max_circuits: self.max_circuits,
+            max_circuits_per_peer: self.max_circuits_per_peer,
+            max_circuit_duration: self.max_circuit_duration,
+            max_circuit_bytes: self.max_circuit_bytes,
+            ..libp2p::relay::Config::default()
+        };
+
+        if !self.rate_limits {
+            cfg.reservation_rate_limiters.clear();
+            cfg.circuit_src_rate_limiters.clear();
+        }
+
+        Ok(cfg)
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -221,6 +288,7 @@ fn build_rustory_swarm_with_identity(
 fn build_relay_swarm_with_identity(
     identity: libp2p::identity::Keypair,
     psk: libp2p::pnet::PreSharedKey,
+    limits: RelayLimits,
 ) -> Result<Swarm<RelayServerBehaviour>> {
     let local_public_key = identity.public();
     let local_peer_id = identity.public().to_peer_id();
@@ -244,7 +312,7 @@ fn build_relay_swarm_with_identity(
     .with_agent_version(format!("rustory/{}", crate::build_info::VERSION_DISPLAY));
 
     let behaviour = RelayServerBehaviour {
-        relay: libp2p::relay::Behaviour::new(local_peer_id, libp2p::relay::Config::default()),
+        relay: libp2p::relay::Behaviour::new(local_peer_id, limits.to_libp2p_config()?),
         identify: libp2p::identify::Behaviour::new(identify_cfg),
         ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
     };
@@ -268,8 +336,22 @@ pub fn relay_serve(listen: &str, cfg: RelayServeConfig) -> Result<()> {
 }
 
 async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<()> {
-    let RelayServeConfig { identity, psk } = cfg;
-    let mut swarm = build_relay_swarm_with_identity(identity, psk)?;
+    let RelayServeConfig {
+        identity,
+        psk,
+        limits,
+    } = cfg;
+    eprintln!(
+        "relay config: max_reservations={} max_reservations_per_peer={} max_circuits={} max_circuits_per_peer={} max_circuit_duration_sec={} max_circuit_bytes={} rate_limits={}",
+        limits.max_reservations,
+        limits.max_reservations_per_peer,
+        limits.max_circuits,
+        limits.max_circuits_per_peer,
+        limits.max_circuit_duration.as_secs(),
+        limits.max_circuit_bytes,
+        limits.rate_limits
+    );
+    let mut swarm = build_relay_swarm_with_identity(identity, psk, limits)?;
     swarm.listen_on(listen).context("listen_on")?;
     let local_peer_id = *swarm.local_peer_id();
 
@@ -1576,6 +1658,28 @@ mod tests {
     }
 
     #[test]
+    fn relay_limits_default_raise_capacity_and_disable_rate_limiters() {
+        let cfg = RelayLimits::default().to_libp2p_config().unwrap();
+        assert_eq!(cfg.max_reservations, DEFAULT_RELAY_MAX_RESERVATIONS);
+        assert_eq!(
+            cfg.max_reservations_per_peer,
+            DEFAULT_RELAY_MAX_RESERVATIONS_PER_PEER
+        );
+        assert_eq!(cfg.max_circuits, DEFAULT_RELAY_MAX_CIRCUITS);
+        assert_eq!(
+            cfg.max_circuits_per_peer,
+            DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER
+        );
+        assert_eq!(
+            cfg.max_circuit_duration,
+            Duration::from_secs(DEFAULT_RELAY_MAX_CIRCUIT_DURATION_SEC)
+        );
+        assert_eq!(cfg.max_circuit_bytes, DEFAULT_RELAY_MAX_CIRCUIT_BYTES);
+        assert!(cfg.reservation_rate_limiters.is_empty());
+        assert!(cfg.circuit_src_rate_limiters.is_empty());
+    }
+
+    #[test]
     fn split_peer_multiaddr_requires_p2p_suffix() {
         let err = split_peer_multiaddr("/ip4/127.0.0.1/tcp/1234").unwrap_err();
         assert!(err.to_string().contains("must end with /p2p/"));
@@ -2012,9 +2116,12 @@ mod tests {
     async fn p2p_relay_reservation_reports_relays_listen_addr() {
         let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
 
-        let mut relay =
-            build_relay_swarm_with_identity(libp2p::identity::Keypair::generate_ed25519(), psk)
-                .unwrap();
+        let mut relay = build_relay_swarm_with_identity(
+            libp2p::identity::Keypair::generate_ed25519(),
+            psk,
+            RelayLimits::default(),
+        )
+        .unwrap();
         relay
             .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
             .unwrap();

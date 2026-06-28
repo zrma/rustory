@@ -30,6 +30,7 @@ hook runtime 설정은 `~/.config/rustory/config.toml`에도 둘 수 있다. 같
   - 예: `RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|bearer )'`
   - env가 있으면 config.toml의 `record_ignore_regex`보다 우선한다.
   - 정규식이 잘못된 경우는 안전을 위해 기록을 스킵한다(`rr doctor`에서 상태 확인).
+  - `rr doctor`, `rr sync-status`, `rr version` 같은 Rustory 운영 명령도 일반 명령처럼 기록된다. 특정 `rr ...` 명령을 제외하려면 이 regex에 명시적으로 추가한다.
 - `RUSTORY_ASYNC_UPLOAD=1`: `rr record` 성공 후 백그라운드 `rr p2p-sync --push` 트리거를 활성화한다.
 - `RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC=<sec>`: 비동기 업로드 트리거 최소 간격(초).
 - `RUSTORY_ASYNC_UPLOAD_LIMIT=<n>`: 비동기 업로드 1회 실행 시 push 배치 크기(`--limit`).

@@ -49,7 +49,7 @@ rr --db-path /tmp/rustory-hishtory-smoke.db doctor
 
 출력에서 `inserted`, `skipped`, `ignored`를 확인한다.
 - `inserted`: 새 Rustory entry로 들어간 row 수
-- `skipped`: 빈 명령, `rr` 자체 명령, `record_ignore_regex`에 걸린 row 수
+- `skipped`: 빈 명령, `record_ignore_regex`에 걸린 row 수
 - `ignored`: deterministic entry id 기준 중복으로 이미 있던 row 수
 
 ## 실제 import

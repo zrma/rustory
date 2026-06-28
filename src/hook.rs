@@ -110,11 +110,6 @@ __rustory_precmd() {
   fi
   __rustory_last_histnum="$histnum"
 
-  # rr 자체는 기록하지 않는다.
-  case "$cmd" in
-    rr|rr\ *) __rustory_in_hook=""; return 0 ;;
-  esac
-
   local duration_ms=0
   if [[ -n "$__rustory_last_start_ms" && -n "${EPOCHREALTIME:-}" ]]; then
     local end_ms
@@ -218,15 +213,6 @@ __rustory_precmd() {
     return 0
   fi
 
-  # rr 자체는 기록하지 않는다.
-  case "$cmd" in
-  rr|rr\ *)
-    __rustory_last_cmd=""
-    __rustory_last_start_ms=""
-    return 0
-  ;;
-  esac
-
   local duration_ms=0
   if [[ -n "$__rustory_last_start_ms" && -n "${EPOCHREALTIME:-}" ]]; then
     local end_ms
@@ -270,7 +256,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bash_hook_contains_disable_and_ctrl_r_and_rr_filter() {
+    fn bash_hook_contains_disable_and_ctrl_r() {
         let got = render_hook(Shell::Bash);
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
         assert!(got.contains("__rustory_hook_disabled()"));
@@ -285,13 +271,11 @@ mod tests {
         assert!(got.contains("--duration-ms"));
         assert!(got.contains("disown \"$!\""));
 
-        // ensure we skip both `rr` and `rr ...`
-        assert!(got.contains("case \"$cmd\" in"));
-        assert!(got.contains("rr|rr\\ *)"));
+        assert!(!got.contains("rr|rr\\ *)"));
     }
 
     #[test]
-    fn zsh_hook_contains_disable_and_ctrl_r_and_rr_filter() {
+    fn zsh_hook_contains_disable_and_ctrl_r() {
         let got = render_hook(Shell::Zsh);
         assert!(got.contains("RUSTORY_HOOK_DISABLE"));
         assert!(got.contains("__rustory_hook_disabled()"));
@@ -308,8 +292,6 @@ mod tests {
         assert!(got.contains("__rustory_epoch_ms()"));
         assert!(got.contains("frac=\"${frac[1,3]}\""));
 
-        // ensure we skip both `rr` and `rr ...`
-        assert!(got.contains("case \"$cmd\" in"));
-        assert!(got.contains("rr|rr\\ *)"));
+        assert!(!got.contains("rr|rr\\ *)"));
     }
 }
