@@ -1431,6 +1431,17 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
         return true;
     }
 
+    if err.chain().any(|cause| {
+        let msg = cause.to_string().to_ascii_lowercase();
+        msg.starts_with("dial failed:")
+            && (msg.contains("resource limit exceeded")
+                || msg.contains("connection reset by peer")
+                || msg.contains("temporarily unavailable")
+                || msg.contains("timed out"))
+    }) {
+        return true;
+    }
+
     for cause in err.chain() {
         if let Some(of) = cause.downcast_ref::<libp2p_request_response::OutboundFailure>() {
             return match of {
@@ -1960,6 +1971,19 @@ mod tests {
 
         let err = anyhow::anyhow!("p2p request timeout after 5s");
         assert!(is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::anyhow!(
+            "dial failed: Failed to connect to destination.: Remote reported resource limit exceeded."
+        );
+        assert!(is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::anyhow!(
+            "dial failed: Failed to negotiate transport protocol(s): Handshake error: Connection reset by peer (os error 104)"
+        );
+        assert!(is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
+        assert!(!is_retryable_p2p_request_error(&err));
     }
 
     #[test]

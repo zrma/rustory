@@ -38,3 +38,6 @@
 - Canary sync after service install: relay circuit count increased and both DBs contained both peer canary rows.
 - Canary sync after hook guard release reinstall: relay circuit count increased again and both DBs contained both peer canary rows.
 - Final `sync-status`: tracker reachable on both machines, `pending_push=0` on the peer status rows.
+- Hishtory local import: real DB import received 151981 rows, inserted 149672, skipped 2309 by privacy guard; immediate re-import inserted 0 and ignored 149672.
+- Hishtory import propagation: remote Linux peer reached the same entry count as the MacBook after tracker + relay sync; final peer status reported `pending_push=0`.
+- Large import retry hardening: relay resource-limit / reset-style dial failures observed during import propagation are now classified as retryable P2P transient failures.
