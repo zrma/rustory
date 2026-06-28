@@ -2,6 +2,7 @@ use crate::core::Entry;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
 use std::collections::{BTreeSet, HashMap};
+use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -36,6 +37,13 @@ pub struct LocalStore {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorePermissionInspection {
+    pub db_mode: Option<u32>,
+    pub parent_mode: Option<u32>,
+    pub warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreInspection {
     pub path: PathBuf,
     pub exists: bool,
@@ -66,11 +74,13 @@ impl LocalStore {
     pub fn open(path: &str) -> Result<Self> {
         let path = expand_home(path)?;
         ensure_parent_dir(&path)?;
+        ensure_private_db_file(&path)?;
 
-        let conn = Connection::open(path).context("open sqlite db")?;
+        let conn = Connection::open(&path).context("open sqlite db")?;
         conn.busy_timeout(Duration::from_secs(5))
             .context("set sqlite busy_timeout")?;
         init_schema(&conn).context("init schema")?;
+        restrict_sqlite_file_family_permissions(&path)?;
         Ok(Self { conn })
     }
 
@@ -770,6 +780,25 @@ LIMIT ?2
 
         Ok(out)
     }
+
+    pub fn get_peer_book_peer(&self, peer_id: &str) -> Result<Option<PeerBookPeer>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT peer_id, addrs_json, user_id, device_id, last_seen
+FROM peer_book
+WHERE peer_id = ?1
+"#,
+            )
+            .context("prepare get_peer_book_peer")?;
+
+        match stmt.query_row(params![peer_id], row_to_peer_book_peer) {
+            Ok(peer) => Ok(Some(peer)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err).context("query get_peer_book_peer"),
+        }
+    }
 }
 
 pub fn inspect_existing_store(path: &str) -> Result<StoreInspection> {
@@ -850,6 +879,46 @@ pub fn inspect_existing_store(path: &str) -> Result<StoreInspection> {
             error: Some(format!("{err:#}")),
         }),
     }
+}
+
+pub fn inspect_store_permissions(path: &str) -> Result<StorePermissionInspection> {
+    let path = expand_home(path)?;
+    if path == Path::new(":memory:") {
+        return Ok(StorePermissionInspection {
+            db_mode: None,
+            parent_mode: None,
+            warning: None,
+        });
+    }
+
+    let db_mode = file_mode_777(&path);
+    let parent_mode = path.parent().and_then(file_mode_777);
+    let warning = build_store_permission_warning(db_mode, parent_mode);
+    Ok(StorePermissionInspection {
+        db_mode,
+        parent_mode,
+        warning,
+    })
+}
+
+fn build_store_permission_warning(
+    db_mode: Option<u32>,
+    parent_mode: Option<u32>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(mode) = db_mode
+        && mode != 0o600
+    {
+        parts.push(format!("db mode={mode:03o}, want 600"));
+    }
+    if let Some(mode) = parent_mode
+        && mode & 0o077 != 0
+    {
+        parts.push(format!(
+            "parent mode={mode:03o}, want no group/other access"
+        ));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 fn inspect_existing_store_file(path: &Path) -> Result<(usize, i64, usize, usize)> {
@@ -939,8 +1008,100 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
     if parent.as_os_str().is_empty() {
         return Ok(());
     }
+    let existed = parent.exists();
     std::fs::create_dir_all(parent).with_context(|| format!("create dir: {}", parent.display()))?;
+    if !existed {
+        restrict_path_permissions(parent, 0o700)?;
+    }
     Ok(())
+}
+
+fn ensure_private_db_file(path: &Path) -> Result<()> {
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
+
+    if !path.exists() {
+        create_private_file(path)?;
+    }
+    restrict_path_permissions(path, 0o600)
+}
+
+#[cfg(unix)]
+fn create_private_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create sqlite db: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path) -> Result<()> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .with_context(|| format!("create sqlite db: {}", path.display()))?;
+    Ok(())
+}
+
+fn restrict_sqlite_file_family_permissions(path: &Path) -> Result<()> {
+    if path == Path::new(":memory:") {
+        return Ok(());
+    }
+
+    restrict_path_permissions(path, 0o600)?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(path, suffix);
+        if sidecar.exists() {
+            restrict_path_permissions(&sidecar, 0o600)?;
+        }
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
+    let mut raw = path.as_os_str().to_os_string();
+    raw.push(suffix);
+    PathBuf::from(raw)
+}
+
+#[cfg(unix)]
+fn restrict_path_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let perms = std::fs::Permissions::from_mode(mode);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("set permissions {mode:03o}: {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn restrict_path_permissions(path: &Path, mode: u32) -> Result<()> {
+    let _ = (path, mode);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn file_mode_777(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let md = std::fs::metadata(path).ok()?;
+    Some(md.permissions().mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn file_mode_777(path: &Path) -> Option<u32> {
+    let _ = path;
+    None
 }
 
 fn init_schema(conn: &Connection) -> Result<()> {
@@ -1027,7 +1188,12 @@ fn row_to_entry_with_offset(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite:
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::sync::Mutex;
     use time::OffsetDateTime;
+
+    #[cfg(unix)]
+    static UMASK_LOCK: Mutex<()> = Mutex::new(());
 
     fn entry(entry_id: &str, ts: i64, cmd: &str) -> Entry {
         Entry {
@@ -1043,6 +1209,44 @@ mod tests {
             hostname: "host".to_string(),
             version: crate::build_info::VERSION.to_string(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_creates_db_private_even_with_permissive_umask() {
+        let _guard = UMASK_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("private").join("history.db");
+
+        let old_umask = unsafe { libc::umask(0) };
+        let open_result = LocalStore::open(db_path.to_str().unwrap());
+        unsafe {
+            libc::umask(old_umask);
+        }
+        open_result.unwrap();
+
+        assert_eq!(file_mode_777(&db_path), Some(0o600));
+        assert_eq!(file_mode_777(db_path.parent().unwrap()), Some(0o700));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspect_store_permissions_warns_for_permissive_existing_db() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        std::fs::write(&db_path, b"not sqlite").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let got = inspect_store_permissions(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(got.db_mode, Some(0o644));
+        assert!(
+            got.warning
+                .as_deref()
+                .unwrap()
+                .contains("db mode=644, want 600")
+        );
     }
 
     #[test]

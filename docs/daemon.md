@@ -15,6 +15,7 @@
 - `user_id`, `device_id`는 고정값을 사용한다(환경변수 또는 config).
 - `rr daemon`을 쓰면 `p2p-serve`와 `p2p-sync --watch --push`를 한 서비스로 같이 관리한다.
 - 분리 운영 시 `p2p-serve` 없이 `p2p-sync --watch --push`만 실행하면 tracker에 이 디바이스가 등록되지 않는다.
+- inbound P2P 요청은 요청자의 PeerId가 tracker/peerbook의 같은 user scope에 있어야 통과하므로, 분리 운영에서도 `p2p-serve`와 `p2p-sync`가 같은 `p2p_identity_key_path`를 사용해야 한다.
 - `--push`는 **로컬 디바이스 엔트리만** 전송한다(`entry.device_id == local_device_id`).
 - `rr daemon` 중지(SIGTERM/Ctrl-C)는 하위 serve/sync 프로세스까지 종료한다.
 - 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.

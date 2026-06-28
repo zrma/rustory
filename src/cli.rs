@@ -148,6 +148,9 @@ enum Command {
         #[arg(long, help = "Base retry backoff in milliseconds")]
         req_backoff_base_ms: Option<u64>,
 
+        #[arg(long, help = "Path to this device's persistent P2P identity key")]
+        identity_key: Option<String>,
+
         #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
 
@@ -397,6 +400,12 @@ enum Command {
 
         #[arg(long, help = "Bearer token required by tracker clients")]
         token: Option<String>,
+
+        #[arg(
+            long,
+            help = "Allow serving the tracker without a token on non-loopback bind addresses"
+        )]
+        allow_unauthenticated: bool,
     },
     #[command(about = "Run the P2P relay service")]
     RelayServe {
@@ -599,11 +608,13 @@ pub fn run() -> Result<()> {
             req_timeout_base_sec,
             req_timeout_cap_sec,
             req_backoff_base_ms,
+            identity_key,
             swarm_key,
             relay,
             trackers,
             tracker_token,
         } => {
+            let identity = resolve_p2p_identity(identity_key, &cfg)?;
             let psk = resolve_swarm_psk(swarm_key, &cfg)?;
             let relay_addr = resolve_relay_addr(relay, &cfg)?;
             let trackers = resolve_trackers(trackers, &cfg)?;
@@ -619,6 +630,7 @@ pub fn run() -> Result<()> {
             )?;
 
             let sync_cfg = p2p::SyncConfig {
+                identity,
                 psk,
                 relay_addr,
                 trackers,
@@ -1007,8 +1019,10 @@ pub fn run() -> Result<()> {
             bind,
             ttl_sec,
             token,
+            allow_unauthenticated,
         } => {
             let token = resolve_tracker_token(token, &cfg)?;
+            validate_tracker_serve_auth(&bind, token.as_deref(), allow_unauthenticated)?;
             tracker::serve(&bind, ttl_sec, token)?;
         }
         Command::RelayServe {
@@ -1363,6 +1377,11 @@ fn build_daemon_child_specs(db_path: &str, args: &DaemonArgs) -> DaemonChildSpec
         sync_args.push(v.to_string());
     }
     push_optional_arg(&mut sync_args, "--swarm-key", args.swarm_key.as_deref());
+    push_optional_arg(
+        &mut sync_args,
+        "--identity-key",
+        args.identity_key.as_deref(),
+    );
     push_optional_arg(&mut sync_args, "--relay", args.relay.as_deref());
     push_trackers_arg(&mut sync_args, &args.trackers);
     push_optional_u64_arg(&mut sync_args, "--req-attempts", args.req_attempts);
@@ -1852,6 +1871,9 @@ struct DoctorDbStatusReport {
     latest_ingest_seq: Option<i64>,
     peer_book_count: Option<usize>,
     sync_peer_count: Option<usize>,
+    db_mode: Option<u32>,
+    parent_mode: Option<u32>,
+    permission_warning: Option<String>,
     error: Option<String>,
 }
 
@@ -2165,6 +2187,7 @@ fn build_doctor_report(
 
 fn build_db_status_report(db_path: &str) -> Result<DoctorDbStatusReport> {
     let inspection = storage::inspect_existing_store(db_path)?;
+    let permissions = storage::inspect_store_permissions(db_path)?;
     Ok(DoctorDbStatusReport {
         path: inspection.path.display().to_string(),
         exists: inspection.exists,
@@ -2172,6 +2195,9 @@ fn build_db_status_report(db_path: &str) -> Result<DoctorDbStatusReport> {
         latest_ingest_seq: inspection.latest_ingest_seq,
         peer_book_count: inspection.peer_book_count,
         sync_peer_count: inspection.sync_peer_count,
+        db_mode: permissions.db_mode,
+        parent_mode: permissions.parent_mode,
+        permission_warning: permissions.warning,
         error: inspection.error,
     })
 }
@@ -2596,6 +2622,18 @@ fn print_db_status(report: &DoctorDbStatusReport) {
         report.peer_book_count.unwrap_or(0),
         report.sync_peer_count.unwrap_or(0),
     );
+    if let Some(mode) = report.db_mode {
+        let parent = report
+            .parent_mode
+            .map(|value| format!("{value:03o}"))
+            .unwrap_or_else(|| "-".to_string());
+        match report.permission_warning.as_deref() {
+            Some(warning) => {
+                println!("db permissions: db_mode={mode:03o} parent_mode={parent} warn: {warning}")
+            }
+            None => println!("db permissions: db_mode={mode:03o} parent_mode={parent}"),
+        }
+    }
 }
 
 fn print_tracker_token_status(report: &DoctorTrackerTokenReport) {
@@ -3684,6 +3722,20 @@ fn validate_http_sync_serve_auth(
     );
 }
 
+fn validate_tracker_serve_auth(
+    bind: &str,
+    token: Option<&str>,
+    allow_unauthenticated: bool,
+) -> Result<()> {
+    if token.is_some() || allow_unauthenticated || is_loopback_bind(bind) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing to serve unauthenticated tracker on non-loopback bind address {bind}; pass --token or --allow-unauthenticated"
+    );
+}
+
 fn is_loopback_bind(bind: &str) -> bool {
     if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
         return addr.ip().is_loopback();
@@ -3920,6 +3972,19 @@ mod tests {
             }
             _ => panic!("expected p2p-sync"),
         }
+    }
+
+    #[test]
+    fn tracker_serve_auth_guard_rejects_public_no_token() {
+        let err = validate_tracker_serve_auth("0.0.0.0:8850", None, false).unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to serve unauthenticated tracker"));
+    }
+
+    #[test]
+    fn tracker_serve_auth_guard_allows_token_loopback_or_explicit_opt_in() {
+        assert!(validate_tracker_serve_auth("0.0.0.0:8850", Some("secret"), false).is_ok());
+        assert!(validate_tracker_serve_auth("127.0.0.1:8850", None, false).is_ok());
+        assert!(validate_tracker_serve_auth("0.0.0.0:8850", None, true).is_ok());
     }
 
     #[test]

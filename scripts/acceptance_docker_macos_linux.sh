@@ -49,6 +49,7 @@ TOKEN="${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}"
 
 cleanup() {
   set +e
+  if [[ -n "${MAC_P2P_PID:-}" ]]; then kill "$MAC_P2P_PID" 2>/dev/null || true; fi
   if [[ "$KEEP" == "1" ]]; then
     return 0
   fi
@@ -218,11 +219,44 @@ if [[ -z "$MAC_ENTRY_ID" ]]; then
   exit 1
 fi
 
+MAC_P2P_LOG="$ACC_DIR/mac-p2p.log"
+RUSTORY_USER_ID="$USER_ID" \
+RUSTORY_DEVICE_ID="mac" \
+RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
+RUSTORY_TRACKER_TOKEN="$TOKEN" \
+target/debug/rr --db-path "$MAC_DB" p2p-serve \
+  --identity-key "$ACC_DIR/mac.identity.key" \
+  --trackers "$TRACKER_URL" \
+  --relay "$RELAY_ADDR" >"$MAC_P2P_LOG" 2>&1 &
+MAC_P2P_PID=$!
+
+MAC_REGISTERED=0
+for _ in $(seq 1 200); do
+  if curl -fsS -H "Authorization: Bearer ${TOKEN}" "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null | python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+devices = {(peer.get("meta") or {}).get("device_id") for peer in data.get("peers", [])}
+sys.exit(0 if "mac" in devices else 1)'
+  then
+    MAC_REGISTERED=1
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$MAC_REGISTERED" != "1" ]]; then
+  echo "error: mac p2p-serve did not register in tracker" >&2
+  tail -n 120 "$MAC_P2P_LOG" >&2 || true
+  exit 1
+fi
+
 RUSTORY_USER_ID="$USER_ID" \
 RUSTORY_DEVICE_ID="mac" \
 RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
 RUSTORY_TRACKER_TOKEN="$TOKEN" \
 target/debug/rr --db-path "$MAC_DB" p2p-sync \
+  --identity-key "$ACC_DIR/mac.identity.key" \
   --trackers "$TRACKER_URL" \
   --relay "$RELAY_ADDR" \
   --push \

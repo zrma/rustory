@@ -40,6 +40,7 @@ cleanup() {
   set +e
   if [[ -n "${P2P_A_PID:-}" ]]; then kill "$P2P_A_PID" 2>/dev/null; fi
   if [[ -n "${P2P_B_PID:-}" ]]; then kill "$P2P_B_PID" 2>/dev/null; fi
+  if [[ -n "${P2P_C_PID:-}" ]]; then kill "$P2P_C_PID" 2>/dev/null; fi
   if [[ -n "${RELAY_PID:-}" ]]; then kill "$RELAY_PID" 2>/dev/null; fi
   if [[ -n "${TRACKER_PID:-}" ]]; then kill "$TRACKER_PID" 2>/dev/null; fi
   if [[ -n "${TMPDIR:-}" ]]; then rm -rf "$TMPDIR" 2>/dev/null; fi
@@ -229,6 +230,44 @@ if [[ -z "$B_ENTRY_ID" ]]; then
 fi
 
 echo "[5/5] record one entry on client (c)"
+P2P_C_LOG="$TMPDIR/p2p-c.log"
+RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-serve \
+  --swarm-key "$SWARM_KEY" \
+  --identity-key "$TMPDIR/p2p-c.key" \
+  --trackers "$TRACKER_URL" \
+  --relay "$RELAY_ADDR" >"$P2P_C_LOG" 2>&1 &
+P2P_C_PID=$!
+
+PEER_C_ID="$(wait_p2p_peer_id "$P2P_C_LOG" || true)"
+if [[ -z "$PEER_C_ID" ]]; then
+  echo "error: failed to parse peer id from p2p client c listen logs"
+  tail -n 80 "$P2P_C_LOG" || true
+  exit 1
+fi
+
+READY=0
+for _ in $(seq 1 200); do
+  if curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=smoke" 2>/dev/null | python3 -c 'import json,sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+devices = {(peer.get("meta") or {}).get("device_id") for peer in data.get("peers", [])}
+sys.exit(0 if "c" in devices else 1)'
+  then
+    READY=1
+    break
+  fi
+  sleep 0.05
+done
+if [[ "$READY" != "1" ]]; then
+  echo "error: tracker did not receive client c registration"
+  curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=smoke" 2>/dev/null || true
+  echo
+  tail -n 80 "$P2P_C_LOG" || true
+  exit 1
+fi
+
 ENTRY_ID="$(RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" record \
   --cmd "echo smoke-push" \
   --cwd "/tmp" \
@@ -244,6 +283,7 @@ echo "[5/5] run p2p-sync twice with --push (should not gossip a<->b)"
 for _ in 1 2; do
   RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-sync \
     --swarm-key "$SWARM_KEY" \
+    --identity-key "$TMPDIR/p2p-c.key" \
     --trackers "$TRACKER_URL" \
     --relay "$RELAY_ADDR" \
     --push \

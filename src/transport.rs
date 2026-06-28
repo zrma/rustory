@@ -345,7 +345,10 @@ fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, usize)> {
             }
         }
     }
-    Ok((cursor, limit))
+    Ok((
+        cursor,
+        limit.clamp(1, crate::sync::SERVER_SYNC_PULL_LIMIT_MAX),
+    ))
 }
 
 fn respond_text(code: u16, body: &str) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
@@ -440,6 +443,16 @@ mod tests {
             shutdown,
             join: Some(join),
         }
+    }
+
+    #[test]
+    fn parse_cursor_limit_clamps_remote_limit_before_storage() {
+        let (cursor, limit) = parse_cursor_limit(Some("cursor=7&limit=999999")).unwrap();
+        assert_eq!(cursor, 7);
+        assert_eq!(limit, crate::sync::SERVER_SYNC_PULL_LIMIT_MAX);
+
+        let (_, limit) = parse_cursor_limit(Some("limit=0")).unwrap();
+        assert_eq!(limit, 1);
     }
 
     fn entry(entry_id: &str, ts: i64, cmd: &str) -> Entry {

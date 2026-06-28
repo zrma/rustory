@@ -26,6 +26,8 @@
 - `rr p2p-sync --watch --push`: tracker/peerbook에서 peer를 찾아 주기적으로 pull/push 수행
 
 `p2p-sync`만 실행하면 이 디바이스는 tracker에 등록되지 않고, 다른 디바이스가 이 디바이스로 pull/push할 수 없다.
+또한 inbound P2P pull/push는 요청자의 PeerId가 `peer_book` 또는 tracker의 같은 user scope에 있어야 통과한다.
+실사용에서는 `p2p-serve`와 `p2p-sync`가 같은 `p2p_identity_key_path`를 쓰는 `rr daemon` 경로를 기본으로 둔다.
 
 #### 1) Relay 서버
 ```sh
@@ -47,12 +49,13 @@ P2P relay 주소는 `/ip4/...` 또는 `/ip6/...` 형태로 넘긴다. DNS 이름
 
 #### 2) Tracker 서버
 ```sh
-rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
+RUSTORY_TRACKER_TOKEN="secret" rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
 ```
 
-토큰을 쓰려면:
+토큰 없이 tracker를 띄우려면 loopback bind를 쓰거나 명시적으로 unsafe opt-in을 해야 한다.
 ```sh
-RUSTORY_TRACKER_TOKEN="secret" rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
+rr tracker-serve --bind 127.0.0.1:8850 --ttl-sec 60
+rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --allow-unauthenticated
 ```
 
 운영 서비스에서는 토큰이 process args에 남지 않도록 `RUSTORY_TRACKER_TOKEN` 또는
@@ -78,7 +81,7 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 이때 `--relay`가 설정되어 있으면 NAT/공유기 뒤 peer를 기본값으로 보고 relay circuit을 먼저 시도한다.
 tracker가 relay circuit 주소를 광고한 peer는 현재 sync 실행 환경에서 지정한 relay 주소로 다시 구성해 dial한다.
 이렇게 해야 tracker에 저장된 Docker/LAN/private IP가 현재 머신에서 직접 dial 불가능해도 같은 relay PeerId를 통해 연결할 수 있다.
-relay 연결이 실패하면 tracker/peerbook의 direct 후보로 fallback 한다.
+relay 연결이 실패하면 tracker/peerbook의 direct 후보로 fallback 하되, loopback/private/link-local 같은 주소는 blind dial 후보에서 제외한다.
 pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 재시도할 수 있다.
 현재 재시도 횟수, 타임아웃, 백오프 default는 `rr p2p-sync --help`, config resolver, 관련 코드를 확인한다.
 - CLI: `--req-attempts`, `--req-timeout-base-sec`, `--req-timeout-cap-sec`, `--req-backoff-base-ms`
@@ -137,6 +140,7 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 - `rr p2p-serve`는 libp2p identity keypair를 디스크에 영속화하여 **재시작해도 PeerId가 유지**되게 한다.
   - 현재 기본 경로는 `rr p2p-serve --help`, `rr doctor`, config template에서 확인한다.
   - 오버라이드: `--identity-key <path>`, `RUSTORY_P2P_IDENTITY_KEY_PATH`, `config.toml`의 `p2p_identity_key_path`
+- `rr p2p-sync`도 같은 identity resolver를 사용한다. 서버는 inbound request의 libp2p PeerId를 `peer_book`/tracker metadata와 대조하고, push entry의 `user_id`/`device_id`가 그 PeerId에 묶인 값과 다르면 거부한다.
 - `rr relay-serve`도 relay 전용 identity keypair를 별도로 영속화한다.
   - 현재 기본 경로는 `rr relay-serve --help`, `rr doctor`, config template에서 확인한다.
   - 오버라이드: `--identity-key <path>`, `RUSTORY_RELAY_IDENTITY_KEY_PATH`, `config.toml`의 `relay_identity_key_path`

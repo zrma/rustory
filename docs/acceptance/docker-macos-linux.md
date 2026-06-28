@@ -39,12 +39,24 @@ RUSTORY_ACCEPTANCE_DIR="$PWD/target/acceptance/docker-macos-linux" \
 docker compose -f contrib/docker/acceptance/compose.yml up -d linux-peer
 ```
 
-4) macOS host에서 동기화 실행
+4) macOS host에서 p2p-serve 등록 후 동기화 실행
 필요하면 로컬에 엔트리를 하나 만들고(push 검증):
 ```sh
 RUSTORY_USER_ID=acceptance RUSTORY_DEVICE_ID=mac \
 target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" record \
   --cmd "echo acceptance-from-mac" --cwd "/tmp" --shell zsh --hostname mac --print-id
+```
+
+같은 identity key로 macOS host도 tracker에 등록한다. 새 P2P auth 정책에서는 Linux peer가 이 PeerId를 tracker/peerbook에서 확인한 뒤 inbound push를 허용한다.
+```sh
+RUSTORY_USER_ID=acceptance \
+RUSTORY_DEVICE_ID=mac \
+RUSTORY_SWARM_KEY_PATH="$PWD/target/acceptance/docker-macos-linux/swarm.key" \
+RUSTORY_TRACKER_TOKEN="acceptance-token" \
+target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" p2p-serve \
+  --identity-key "$PWD/target/acceptance/docker-macos-linux/mac.identity.key" \
+  --trackers "http://127.0.0.1:8850" \
+  --relay "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>"
 ```
 
 ```sh
@@ -53,6 +65,7 @@ RUSTORY_DEVICE_ID=mac \
 RUSTORY_SWARM_KEY_PATH="$PWD/target/acceptance/docker-macos-linux/swarm.key" \
 RUSTORY_TRACKER_TOKEN="acceptance-token" \
 target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" p2p-sync \
+  --identity-key "$PWD/target/acceptance/docker-macos-linux/mac.identity.key" \
   --trackers "http://127.0.0.1:8850" \
   --relay "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>" \
   --push \

@@ -181,6 +181,7 @@ run_sync() {
       relay_ip="$(getent hosts relay | awk '"'"'{print $1; exit}'"'"')"
       test -n "$relay_ip"
       rr --db-path "$DB" p2p-sync \
+        --identity-key "/data/${DEVICE}.identity.key" \
         --trackers http://tracker:8850 \
         --relay "/ip4/${relay_ip}/tcp/4001/p2p/${RELAY_PEER_ID}" \
         --push \

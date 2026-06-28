@@ -56,6 +56,7 @@ pub struct ServeConfig {
 
 #[derive(Clone)]
 pub struct SyncConfig {
+    pub identity: libp2p::identity::Keypair,
     pub psk: libp2p::pnet::PreSharedKey,
     pub relay_addr: Option<Multiaddr>,
     pub trackers: Vec<String>,
@@ -175,6 +176,13 @@ struct PushAck {
     ignored: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+struct AuthorizedPeer {
+    peer_id: String,
+    user_id: Option<String>,
+    device_id: Option<String>,
+}
+
 #[derive(libp2p_swarm::NetworkBehaviour)]
 #[behaviour(prelude = "libp2p_swarm::derive_prelude")]
 struct RustoryBehaviour {
@@ -194,6 +202,7 @@ struct RelayServerBehaviour {
     ping: libp2p::ping::Behaviour,
 }
 
+#[cfg(test)]
 fn build_rustory_swarm(psk: libp2p::pnet::PreSharedKey) -> Result<Swarm<RustoryBehaviour>> {
     let identity = libp2p::identity::Keypair::generate_ed25519();
     build_rustory_swarm_with_identity(identity, psk)
@@ -486,9 +495,19 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         }
                     }
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
-                        libp2p_request_response::Event::Message { message, .. } => match message {
+                        libp2p_request_response::Event::Message { peer, message, .. } => match message {
                             libp2p_request_response::Message::Request { request, channel, .. } => {
-                                let batch = store.pull_since_cursor(request.cursor, request.limit)?;
+                                if let Err(err) =
+                                    authorize_inbound_peer(&store, peer, &meta, &trackers)
+                                {
+                                    eprintln!("warn: p2p pull rejected: peer={peer} error={err:#}");
+                                    continue;
+                                }
+
+                                let batch = store.pull_since_cursor(
+                                    request.cursor,
+                                    clamp_remote_pull_limit(request.limit),
+                                )?;
                                 let resp = SyncBatch {
                                     entries: batch.entries,
                                     next_cursor: batch.next_cursor,
@@ -502,16 +521,25 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         libp2p_request_response::Event::ResponseSent { .. } => {}
                     },
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
-                        libp2p_request_response::Event::Message { message, .. } => match message {
+                        libp2p_request_response::Event::Message { peer, message, .. } => match message {
                             libp2p_request_response::Message::Request { request, channel, .. } => {
-                                let resp = match store.insert_entries_with_stats(&request.entries) {
+                                let resp = match authorize_inbound_peer(
+                                    &store,
+                                    peer,
+                                    &meta,
+                                    &trackers,
+                                )
+                                .and_then(|authorized| {
+                                    validate_push_provenance(&request.entries, &authorized)?;
+                                    store.insert_entries_with_stats(&request.entries)
+                                }) {
                                     Ok(stats) => PushAck {
                                         ok: true,
                                         inserted: Some(stats.inserted),
                                         ignored: Some(stats.ignored),
                                     },
                                     Err(err) => {
-                                        eprintln!("warn: p2p push insert failed: {err:#}");
+                                        eprintln!("warn: p2p push rejected: peer={peer} error={err:#}");
                                         PushAck {
                                             ok: false,
                                             inserted: None,
@@ -653,6 +681,119 @@ fn spawn_register_all(
     }));
 }
 
+fn authorize_inbound_peer(
+    store: &LocalStore,
+    peer: PeerId,
+    local_meta: &crate::tracker::PeerMeta,
+    trackers: &[crate::tracker::TrackerClient],
+) -> Result<AuthorizedPeer> {
+    let peer_id = peer.to_string();
+    if let Some(peer) = store.get_peer_book_peer(&peer_id)? {
+        return validate_authorized_peer_record(peer, local_meta);
+    }
+
+    if let Some(peer) = refresh_peer_book_peer_from_trackers(
+        store,
+        trackers,
+        &peer_id,
+        local_meta.user_id.as_deref(),
+    )? {
+        return validate_authorized_peer_record(peer, local_meta);
+    }
+
+    anyhow::bail!("peer is not present in peer_book or tracker: {peer_id}");
+}
+
+fn refresh_peer_book_peer_from_trackers(
+    store: &LocalStore,
+    trackers: &[crate::tracker::TrackerClient],
+    peer_id: &str,
+    user_id: Option<&str>,
+) -> Result<Option<PeerBookPeer>> {
+    for tracker in trackers {
+        let list = match tracker.list(user_id) {
+            Ok(list) => list,
+            Err(err) => {
+                eprintln!("warn: tracker peer authorization lookup failed: {err:#}");
+                continue;
+            }
+        };
+
+        for peer in list.peers {
+            if peer.peer_id != peer_id {
+                continue;
+            }
+
+            let peer_book = PeerBookPeer {
+                peer_id: peer.peer_id,
+                addrs: peer.addrs,
+                user_id: peer.meta.as_ref().and_then(|m| m.user_id.clone()),
+                device_id: peer.meta.as_ref().and_then(|m| m.device_id.clone()),
+                last_seen_unix: peer.last_seen_unix,
+            };
+            store.upsert_peer_book(&peer_book)?;
+            return Ok(Some(peer_book));
+        }
+    }
+
+    Ok(None)
+}
+
+fn validate_authorized_peer_record(
+    peer: PeerBookPeer,
+    local_meta: &crate::tracker::PeerMeta,
+) -> Result<AuthorizedPeer> {
+    if let Some(local_user_id) = local_meta.user_id.as_deref()
+        && peer.user_id.as_deref() != Some(local_user_id)
+    {
+        anyhow::bail!(
+            "peer user_id mismatch: peer={} got={:?} want={local_user_id}",
+            peer.peer_id,
+            peer.user_id
+        );
+    }
+
+    Ok(AuthorizedPeer {
+        peer_id: peer.peer_id,
+        user_id: peer.user_id,
+        device_id: peer.device_id,
+    })
+}
+
+fn validate_push_provenance(entries: &[crate::core::Entry], peer: &AuthorizedPeer) -> Result<()> {
+    let user_id = peer
+        .user_id
+        .as_deref()
+        .context("authorized peer is missing user_id")?;
+    let device_id = peer
+        .device_id
+        .as_deref()
+        .context("authorized peer is missing device_id")?;
+
+    for entry in entries {
+        if entry.user_id != user_id {
+            anyhow::bail!(
+                "entry user_id mismatch for peer {}: got={} want={user_id}",
+                peer.peer_id,
+                entry.user_id
+            );
+        }
+        if entry.device_id != device_id {
+            anyhow::bail!(
+                "entry device_id mismatch for peer {}: got={} want={device_id}",
+                peer.peer_id,
+                entry.device_id
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn clamp_remote_pull_limit(limit: usize) -> usize {
+    limit.clamp(1, crate::sync::SERVER_SYNC_PULL_LIMIT_MAX)
+}
+
 fn ensure_p2p_suffix(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
     match addr.iter().last() {
         Some(Protocol::P2p(got)) if got == peer_id => {}
@@ -761,6 +902,7 @@ async fn sync_async(
             t.peer_id,
             t.dial_addrs,
             t.relay_addr,
+            cfg.identity.clone(),
             cfg.psk,
             cfg.request_retry_policy.clone(),
         ) {
@@ -1091,11 +1233,8 @@ fn direct_candidate_addrs_from_tracker(addrs: &[String]) -> Vec<Multiaddr> {
             continue;
         };
 
-        // 0.0.0.0/:: 리슨 주소는 상대가 dial 가능한 direct 후보가 아니다.
-        if addr.iter().any(|p| {
-            matches!(p, Protocol::Ip4(ip) if ip.is_unspecified())
-                || matches!(p, Protocol::Ip6(ip) if ip.is_unspecified())
-        }) {
+        // tracker/peerbook에서 온 direct 주소는 blind dial 표면이므로 공인 routable 후보만 허용한다.
+        if is_disallowed_tracker_direct_addr(&addr) {
             continue;
         }
 
@@ -1116,6 +1255,27 @@ fn direct_candidate_addrs_from_tracker(addrs: &[String]) -> Vec<Multiaddr> {
     }
 
     out
+}
+
+fn is_disallowed_tracker_direct_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| match p {
+        Protocol::Ip4(ip) => {
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_private()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+        }
+        Protocol::Ip6(ip) => {
+            ip.is_unspecified()
+                || ip.is_loopback()
+                || ip.is_unique_local()
+                || ip.is_unicast_link_local()
+                || ip.is_multicast()
+        }
+        _ => false,
+    })
 }
 
 fn addrs_include_relay_circuit(addrs: &[Multiaddr]) -> bool {
@@ -1151,10 +1311,11 @@ impl P2pClient {
         peer_id: PeerId,
         dial_addrs: Vec<Multiaddr>,
         relay_addr: Option<Multiaddr>,
+        identity: libp2p::identity::Keypair,
         psk: libp2p::pnet::PreSharedKey,
         request_retry_policy: RequestRetryPolicy,
     ) -> Result<Self> {
-        let mut swarm = build_rustory_swarm(psk)?;
+        let mut swarm = build_rustory_swarm_with_identity(identity, psk)?;
         let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0"
             .parse()
             .context("parse ephemeral listen multiaddr")?;
@@ -1690,12 +1851,28 @@ mod tests {
         let peer_id = PeerId::random();
         let relay_id = PeerId::random();
 
-        let direct = format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}");
+        let direct = format!("/ip4/198.51.100.10/tcp/1234/p2p/{peer_id}");
         let relay = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{peer_id}");
         let invalid = "not a multiaddr".to_string();
 
         let got = direct_candidate_addrs_from_tracker(&[direct, relay, invalid]);
-        assert_eq!(got, vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]);
+        assert_eq!(got, vec!["/ip4/198.51.100.10/tcp/1234".parse().unwrap()]);
+    }
+
+    #[test]
+    fn direct_candidate_addrs_from_tracker_rejects_private_loopback_and_link_local() {
+        let peer_id = PeerId::random();
+        let got = direct_candidate_addrs_from_tracker(&[
+            format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}"),
+            format!("/ip4/10.0.0.5/tcp/1234/p2p/{peer_id}"),
+            format!("/ip4/172.19.0.5/tcp/1234/p2p/{peer_id}"),
+            format!("/ip4/192.168.1.5/tcp/1234/p2p/{peer_id}"),
+            format!("/ip4/169.254.1.5/tcp/1234/p2p/{peer_id}"),
+            format!("/ip6/::1/tcp/1234/p2p/{peer_id}"),
+            format!("/ip6/fd00::1/tcp/1234/p2p/{peer_id}"),
+            format!("/ip6/fe80::1/tcp/1234/p2p/{peer_id}"),
+        ]);
+        assert!(got.is_empty());
     }
 
     #[test]
@@ -1778,10 +1955,7 @@ mod tests {
         let (dial_addrs, relay_addr) =
             tracker_target_addrs(&[advertised_direct], peer_id, &configured_relay);
 
-        assert_eq!(
-            dial_addrs,
-            vec!["/ip4/172.19.0.5/tcp/1234".parse().unwrap()]
-        );
+        assert!(dial_addrs.is_empty());
         assert_eq!(relay_addr, Some(configured_relay));
     }
 
@@ -1863,6 +2037,7 @@ mod tests {
 
         let relay_id = PeerId::random();
         let cfg = SyncConfig {
+            identity: libp2p::identity::Keypair::generate_ed25519(),
             psk: libp2p::pnet::PreSharedKey::new([0; 32]),
             relay_addr: Some(
                 format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
@@ -1881,10 +2056,8 @@ mod tests {
         let got = discover_targets(&store, &cfg).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].peer_key, peer_id);
-        assert_eq!(
-            got[0].dial_addrs,
-            vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]
-        );
+        assert!(got[0].dial_addrs.is_empty());
+        assert!(got[0].relay_addr.is_some());
     }
 
     #[test]
@@ -1924,6 +2097,77 @@ mod tests {
     }
 
     #[test]
+    fn inbound_peer_authorization_rejects_unknown_peer() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer = PeerId::random();
+        let meta = crate::tracker::PeerMeta {
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            hostname: None,
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        };
+
+        let err = authorize_inbound_peer(&store, peer, &meta, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("not present in peer_book or tracker"));
+    }
+
+    #[test]
+    fn inbound_peer_authorization_requires_same_user_scope() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer = PeerId::random();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: peer.to_string(),
+                addrs: vec![],
+                user_id: Some("other-user".to_string()),
+                device_id: Some("dev-remote".to_string()),
+                last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            })
+            .unwrap();
+        let meta = crate::tracker::PeerMeta {
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            hostname: None,
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        };
+
+        let err = authorize_inbound_peer(&store, peer, &meta, &[]).unwrap_err();
+        assert!(format!("{err:#}").contains("peer user_id mismatch"));
+    }
+
+    #[test]
+    fn inbound_push_provenance_requires_peer_user_and_device() {
+        let authorized = AuthorizedPeer {
+            peer_id: "peer-1".to_string(),
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-remote".to_string()),
+        };
+        let mut good = entry("id-1", 1, "echo ok");
+        good.user_id = "u1".to_string();
+        good.device_id = "dev-remote".to_string();
+        validate_push_provenance(&[good.clone()], &authorized).unwrap();
+
+        let mut bad = good;
+        bad.device_id = "forged-device".to_string();
+        let err = validate_push_provenance(&[bad], &authorized).unwrap_err();
+        assert!(format!("{err:#}").contains("entry device_id mismatch"));
+    }
+
+    #[test]
+    fn remote_pull_limit_is_clamped_before_storage_read() {
+        assert_eq!(clamp_remote_pull_limit(0), 1);
+        assert_eq!(clamp_remote_pull_limit(10), 10);
+        assert_eq!(
+            clamp_remote_pull_limit(usize::MAX),
+            crate::sync::SERVER_SYNC_PULL_LIMIT_MAX
+        );
+    }
+
+    #[test]
     fn discover_targets_skips_invalid_cached_peer_ids() {
         let store = LocalStore::open(":memory:").unwrap();
 
@@ -1945,6 +2189,7 @@ mod tests {
 
         let relay_id = PeerId::random();
         let cfg = SyncConfig {
+            identity: libp2p::identity::Keypair::generate_ed25519(),
             psk: libp2p::pnet::PreSharedKey::new([0; 32]),
             relay_addr: Some(
                 format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")

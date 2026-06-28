@@ -2,6 +2,8 @@ use crate::storage::{LocalStore, PullBatch};
 use anyhow::{Context, Result};
 use std::{future::Future, pin::Pin};
 
+pub const SERVER_SYNC_PULL_LIMIT_MAX: usize = 1000;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullStats {
     pub received: usize,

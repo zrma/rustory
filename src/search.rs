@@ -918,7 +918,21 @@ fn is_word_break(ch: char) -> bool {
 }
 
 fn sanitize_one_line(value: &str) -> String {
-    value.replace(['\n', '\r', '\t'], " ")
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\n' | '\r' | '\t' => out.push(' '),
+            '\u{1b}' => out.push_str("\\x1b"),
+            '\u{00}'..='\u{1f}' | '\u{7f}' => {
+                out.push_str(&format!("\\x{:02x}", ch as u32));
+            }
+            '\u{80}'..='\u{9f}' => {
+                out.push_str(&format!("\\u{{{:02x}}}", ch as u32));
+            }
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn format_search_text(entry: &Entry) -> String {
@@ -1029,6 +1043,15 @@ mod tests {
     #[test]
     fn sanitize_one_line_replaces_control_separators() {
         assert_eq!(sanitize_one_line("a\nb\rc\td"), "a b c d");
+    }
+
+    #[test]
+    fn sanitize_one_line_escapes_terminal_control_sequences() {
+        let got = sanitize_one_line("safe\x1b]52;c;AAAA\x07cmd\u{85}");
+        assert!(!got.contains('\x1b'));
+        assert!(!got.contains('\x07'));
+        assert!(!got.contains('\u{85}'));
+        assert!(got.contains("\\x1b]52;c;AAAA\\x07cmd\\u{85}"));
     }
 
     #[test]
