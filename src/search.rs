@@ -171,8 +171,11 @@ impl<'a> SearchTui<'a> {
     }
 
     fn finish(&mut self) -> Result<()> {
+        self.tty
+            .write_all(clear_rendered_frame(self.last_rendered_lines).as_bytes())?;
         self.tty.write_all(b"\x1b[?25h\x1b[0m")?;
         self.tty.flush()?;
+        self.last_rendered_lines = 0;
         Ok(())
     }
 
@@ -375,6 +378,14 @@ fn render_frame_lines(lines: &[String]) -> String {
     let mut frame = lines.join(TTY_LINE_ENDING);
     frame.push_str(TTY_LINE_ENDING);
     frame
+}
+
+fn clear_rendered_frame(last_rendered_lines: usize) -> String {
+    if last_rendered_lines == 0 {
+        String::new()
+    } else {
+        format!("\x1b[{last_rendered_lines}F\x1b[J")
+    }
 }
 
 struct Tty {
@@ -995,6 +1006,12 @@ mod tests {
     fn first_render_starts_below_shell_prompt() {
         assert_eq!(redraw_prefix(0), "\r\n");
         assert_eq!(redraw_prefix(12), "\x1b[12F\x1b[J");
+    }
+
+    #[test]
+    fn finish_clear_erases_last_rendered_frame() {
+        assert_eq!(clear_rendered_frame(0), "");
+        assert_eq!(clear_rendered_frame(23), "\x1b[23F\x1b[J");
     }
 
     #[test]
