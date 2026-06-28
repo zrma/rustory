@@ -247,6 +247,7 @@ add-zsh-hook precmd __rustory_precmd
 
 __rustory_widget_ctrl_r() {
   __rustory_hook_disabled && return 0
+  zle -I
   local selected
   # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
   selected="$(rr search)" || return 0
@@ -300,6 +301,7 @@ mod tests {
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
         assert!(got.contains("bindkey '^R'"));
+        assert!(got.contains("zle -I"));
         assert!(got.contains("[[ -o interactive ]]"));
         assert!(got.contains("(( $+widgets ))"));
         assert!(got.contains("zle -N __rustory_ctrl_r_widget"));

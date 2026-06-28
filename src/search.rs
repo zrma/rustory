@@ -12,6 +12,7 @@ const FALLBACK_TERM_WIDTH: usize = 100;
 const FALLBACK_TERM_HEIGHT: usize = 30;
 const COMMAND_COLUMN: usize = 5;
 const FOOTER: &str = "rustory: Search your shell history  • ctrl+h help";
+const TTY_LINE_ENDING: &str = "\r\n";
 
 const COLUMNS: [ColumnSpec; 6] = [
     ColumnSpec {
@@ -290,9 +291,8 @@ impl<'a> SearchTui<'a> {
             terminal_size(self.tty.fd()).unwrap_or((FALLBACK_TERM_WIDTH, FALLBACK_TERM_HEIGHT));
         let frame = self.render_frame(term_width, term_height);
 
-        if self.last_rendered_lines > 0 {
-            write!(self.tty, "\x1b[{}F\x1b[J", self.last_rendered_lines)?;
-        }
+        self.tty
+            .write_all(redraw_prefix(self.last_rendered_lines).as_bytes())?;
         self.tty.write_all(b"\x1b[?25l")?;
         self.tty.write_all(frame.as_bytes())?;
         self.tty.flush()?;
@@ -357,10 +357,24 @@ impl<'a> SearchTui<'a> {
             lines.push("←/→ edit query  ctrl+←/→ jump word  shift+←/→ scroll table".to_string());
         }
 
-        let mut frame = lines.join("\n");
-        frame.push('\n');
-        frame
+        render_frame_lines(&lines)
     }
+}
+
+fn redraw_prefix(last_rendered_lines: usize) -> String {
+    if last_rendered_lines > 0 {
+        format!("\x1b[{last_rendered_lines}F\x1b[J")
+    } else {
+        // Shell widgets invoke `rr search` while the prompt line is still active.
+        // Start the inline TUI on a fresh line, then redraw in-place from there.
+        TTY_LINE_ENDING.to_string()
+    }
+}
+
+fn render_frame_lines(lines: &[String]) -> String {
+    let mut frame = lines.join(TTY_LINE_ENDING);
+    frame.push_str(TTY_LINE_ENDING);
+    frame
 }
 
 struct Tty {
@@ -968,6 +982,19 @@ mod tests {
     fn render_cell_supports_horizontal_scroll() {
         assert_eq!(fit_cell("abcdefghijklmnopqrstuvwxyz", 10, 0), "abcdefg...");
         assert_eq!(fit_cell("abcdefghijklmnopqrstuvwxyz", 10, 10), "...klmn...");
+    }
+
+    #[test]
+    fn render_uses_tty_line_endings_for_raw_mode() {
+        let frame = render_frame_lines(&["Search Query: > ".to_string(), "table".to_string()]);
+        assert_eq!(frame, "Search Query: > \r\ntable\r\n");
+        assert!(!frame.contains(" \ntable"));
+    }
+
+    #[test]
+    fn first_render_starts_below_shell_prompt() {
+        assert_eq!(redraw_prefix(0), "\r\n");
+        assert_eq!(redraw_prefix(12), "\x1b[12F\x1b[J");
     }
 
     #[test]
