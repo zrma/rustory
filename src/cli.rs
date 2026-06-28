@@ -897,6 +897,7 @@ pub fn run() -> Result<()> {
             ttl_sec,
             token,
         } => {
+            let token = resolve_tracker_token(token, &cfg)?;
             tracker::serve(&bind, ttl_sec, token)?;
         }
         Command::RelayServe {

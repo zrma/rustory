@@ -46,8 +46,11 @@ rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
 
 토큰을 쓰려면:
 ```sh
-rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --token "secret"
+RUSTORY_TRACKER_TOKEN="secret" rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
 ```
+
+운영 서비스에서는 토큰이 process args에 남지 않도록 `RUSTORY_TRACKER_TOKEN` 또는
+`config.toml`의 `tracker_token`을 우선한다. `--token`은 임시 실행/테스트용으로만 쓴다.
 
 #### 3) Peer A (서버 역할)
 ```sh
