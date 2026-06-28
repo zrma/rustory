@@ -41,3 +41,4 @@
 - Hishtory local import: real DB import received 151981 rows, inserted 149672, skipped 2309 by privacy guard; immediate re-import inserted 0 and ignored 149672.
 - Hishtory import propagation: remote Linux peer reached the same entry count as the MacBook after tracker + relay sync; final peer status reported `pending_push=0`.
 - Large import retry hardening: relay resource-limit / reset-style dial failures observed during import propagation are now classified as retryable P2P transient failures.
+- Shell handoff cleanup: active Hishtory profile hooks were disabled while preserving Hishtory files/DB as fallback, a stale zsh-only profile on the bash-only Linux peer was removed, and Rustory hook startup noise was fixed.

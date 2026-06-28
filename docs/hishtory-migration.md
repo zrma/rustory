@@ -105,6 +105,55 @@ rr sync-status --json --with-tracker
 처음 이관할 때는 한 머신을 먼저 import + push하고, 두 번째 머신을 import + push한 뒤 `ignored`가 증가하는지 확인한다.
 이 값은 중복 source가 같은 entry id로 수렴하고 있다는 신호다.
 
+## Shell hook handoff
+
+Hishtory에서 Rustory로 실제 전환할 때는 import 성공만으로 끝내지 않는다.
+기존 Hishtory hook이 남아 있으면 같은 명령을 두 시스템이 동시에 기록하거나, `Ctrl-R` 검색 키가 로딩 순서에 따라 다시 Hishtory로 넘어갈 수 있다.
+
+전환 순서:
+
+1. Hishtory DB 파일과 `~/.hishtory/` 디렉터리는 fallback source로 보존한다.
+2. `~/.zshrc`, `~/.zprofile`, `~/.zshenv`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`에서 active Hishtory `source`/PATH block을 주석 처리한다.
+3. `/etc/profile`, `/etc/bash.bashrc`, `/etc/profile.d/*.sh`, `/etc/zsh/*` 같은 system profile에 Hishtory hook이 없는지 확인한다.
+4. bash만 쓰는 Linux host에 Hishtory 설치 과정에서 생긴 `~/.zshrc`가 있고 내용이 Hishtory block뿐이면, 백업을 남긴 뒤 파일 자체를 삭제해도 된다.
+5. Rustory hook block은 shell별 시작 파일에 남긴다. 예: `source <(rr hook --shell zsh)` 또는 `source <(rr hook --shell bash)`.
+6. 새 shell을 열거나 `source ~/.zshrc` / `source ~/.bashrc` 후 hook 상태를 확인한다.
+7. 마지막으로 `rr p2p-sync --push`와 `rr sync-status --json --with-tracker`를 실행해 `pending_push=0` 수렴을 확인한다.
+
+확인 예:
+
+```sh
+rr doctor --json
+rr sync-status --json --with-tracker
+```
+
+zsh:
+
+```sh
+zsh -ic 'bindkey "^R"; print -l -- "preexec_functions:" ${preexec_functions[@]-}; print -l -- "precmd_functions:" ${precmd_functions[@]-}'
+```
+
+기대 상태:
+- `^R`이 Rustory widget에 바인딩된다.
+- `preexec_functions` / `precmd_functions`에 `__rustory_*` hook이 있고 `_hishtory_*` hook은 없다.
+
+bash:
+
+```sh
+bash -ic 'command -v rr; bind -X | grep rustory || true; rr doctor --json'
+```
+
+기대 상태:
+- `rr`가 user-local install 경로에서 발견된다.
+- `rr doctor`의 `hook.installed=true`, `fzf.available=true`가 나온다.
+- 새 prompt마다 `[1]+ Done ... rr record ...` 같은 background job completion message가 나오지 않는다.
+
+잔여 Hishtory hook 검색:
+
+```sh
+grep -RIn "hishtory" ~/.zshrc ~/.zprofile ~/.zshenv ~/.zlogin ~/.bashrc ~/.bash_profile ~/.bash_login ~/.profile /etc/profile /etc/profile.d /etc/bash.bashrc /etc/zsh 2>/dev/null
+```
+
 ## Multi-machine soak runbook
 
 Hishtory 대체 readiness는 loopback이나 direct-only 성공으로 판정하지 않는다.
@@ -154,7 +203,7 @@ relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문
 4. 나머지 머신을 같은 방식으로 추가한다.
 5. 각 머신의 shell hook을 Rustory로 전환한다.
 6. 충분한 soak 기간 동안 Hishtory는 제거하지 말고 read-only fallback source로 남긴다.
-7. Rustory `doctor`, `sync-status`, P2P 로그가 안정적이면 Hishtory hook/daemon을 비활성화한다.
+7. Rustory `doctor`, `sync-status`, P2P 로그가 안정적이면 Hishtory hook/daemon을 비활성화한다. 구체 절차는 `Shell hook handoff`를 따른다.
 
 ## 운영 체크리스트
 

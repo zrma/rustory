@@ -36,7 +36,7 @@ export RUSTORY_HOOK_INSTALLED=1
 
 __rustory_last_histnum=""
 __rustory_last_start_histnum=""
-__rustory_last_start_us=""
+__rustory_last_start_ms=""
 __rustory_last_start_sec=""
 __rustory_in_hook=""
 
@@ -45,6 +45,24 @@ __rustory_hook_disabled() {
     ""|0|false|False|FALSE|no|No|NO|off|Off|OFF) return 1 ;;
     *) return 0 ;;
   esac
+}
+
+__rustory_epoch_ms() {
+  local ts="${EPOCHREALTIME:-}"
+  [[ -z "$ts" ]] && return 1
+
+  local sec="${ts%%.*}"
+  local frac=""
+  if [[ "$ts" == *.* ]]; then
+    frac="${ts#*.}"
+  fi
+  frac="${frac}000"
+  frac="${frac:0:3}"
+
+  case "$sec$frac" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$(( sec * 1000 + 10#$frac ))"
 }
 
 __rustory_preexec() {
@@ -61,9 +79,9 @@ __rustory_preexec() {
   __rustory_last_start_histnum="$histnum"
 
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    __rustory_last_start_us="${EPOCHREALTIME/./}"
+    __rustory_last_start_ms="$(__rustory_epoch_ms 2>/dev/null || true)"
   else
-    __rustory_last_start_us=""
+    __rustory_last_start_ms=""
     __rustory_last_start_sec="${SECONDS:-0}"
   fi
 }
@@ -98,10 +116,11 @@ __rustory_precmd() {
   esac
 
   local duration_ms=0
-  if [[ -n "$__rustory_last_start_us" && -n "${EPOCHREALTIME:-}" ]]; then
-    local end_us="${EPOCHREALTIME/./}"
-    if [[ "$end_us" -ge "$__rustory_last_start_us" ]]; then
-      duration_ms=$(( (end_us - __rustory_last_start_us) / 1000 ))
+  if [[ -n "$__rustory_last_start_ms" && -n "${EPOCHREALTIME:-}" ]]; then
+    local end_ms
+    end_ms="$(__rustory_epoch_ms 2>/dev/null || true)"
+    if [[ -n "$end_ms" && "$end_ms" -ge "$__rustory_last_start_ms" ]]; then
+      duration_ms=$(( end_ms - __rustory_last_start_ms ))
     fi
   elif [[ -n "$__rustory_last_start_sec" ]]; then
     local end_sec="${SECONDS:-0}"
@@ -109,11 +128,12 @@ __rustory_precmd() {
       duration_ms=$(( (end_sec - __rustory_last_start_sec) * 1000 ))
     fi
   fi
-  __rustory_last_start_us=""
+  __rustory_last_start_ms=""
   __rustory_last_start_sec=""
   __rustory_in_hook=""
 
   ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "bash" --hostname "${HOSTNAME:-}" >/dev/null 2>&1 ) &
+  disown "$!" 2>/dev/null || true
 }
 
 # PROMPT_COMMAND에 1회만 주입
@@ -152,7 +172,7 @@ export RUSTORY_HOOK_INSTALLED=1
 autoload -Uz add-zsh-hook
 
 typeset -g __rustory_last_cmd=""
-typeset -g __rustory_last_start_us=""
+typeset -g __rustory_last_start_ms=""
 
 __rustory_hook_disabled() {
   case "${RUSTORY_HOOK_DISABLE:-}" in
@@ -161,12 +181,30 @@ __rustory_hook_disabled() {
   esac
 }
 
+__rustory_epoch_ms() {
+  local ts="${EPOCHREALTIME:-}"
+  [[ -z "$ts" ]] && return 1
+
+  local sec="${ts%%.*}"
+  local frac=""
+  if [[ "$ts" == *.* ]]; then
+    frac="${ts#*.}"
+  fi
+  frac="${frac}000"
+  frac="${frac[1,3]}"
+
+  case "$sec$frac" in
+    ""|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$(( sec * 1000 + 10#$frac ))"
+}
+
 __rustory_preexec() {
   __rustory_last_cmd="$1"
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
-    __rustory_last_start_us="${EPOCHREALTIME/./}"
+    __rustory_last_start_ms="$(__rustory_epoch_ms 2>/dev/null || true)"
   else
-    __rustory_last_start_us=""
+    __rustory_last_start_ms=""
   fi
 }
 
@@ -184,21 +222,22 @@ __rustory_precmd() {
   case "$cmd" in
   rr|rr\ *)
     __rustory_last_cmd=""
-    __rustory_last_start_us=""
+    __rustory_last_start_ms=""
     return 0
   ;;
   esac
 
   local duration_ms=0
-  if [[ -n "$__rustory_last_start_us" && -n "${EPOCHREALTIME:-}" ]]; then
-    local end_us="${EPOCHREALTIME/./}"
-    if [[ "$end_us" -ge "$__rustory_last_start_us" ]]; then
-      duration_ms=$(( (end_us - __rustory_last_start_us) / 1000 ))
+  if [[ -n "$__rustory_last_start_ms" && -n "${EPOCHREALTIME:-}" ]]; then
+    local end_ms
+    end_ms="$(__rustory_epoch_ms 2>/dev/null || true)"
+    if [[ -n "$end_ms" && "$end_ms" -ge "$__rustory_last_start_ms" ]]; then
+      duration_ms=$(( end_ms - __rustory_last_start_ms ))
     fi
   fi
 
   __rustory_last_cmd=""
-  __rustory_last_start_us=""
+  __rustory_last_start_ms=""
 
   ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "zsh" --hostname "${HOST:-}" >/dev/null 2>&1 ) &!
 }
@@ -241,7 +280,9 @@ mod tests {
         assert!(!got.contains("rr search --limit"));
         assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
         assert!(got.contains("trap '__rustory_preexec' DEBUG"));
+        assert!(got.contains("__rustory_epoch_ms()"));
         assert!(got.contains("--duration-ms"));
+        assert!(got.contains("disown \"$!\""));
 
         // ensure we skip both `rr` and `rr ...`
         assert!(got.contains("case \"$cmd\" in"));
@@ -262,6 +303,8 @@ mod tests {
         assert!(got.contains("[[ -o interactive ]]"));
         assert!(got.contains("(( $+widgets ))"));
         assert!(got.contains("zle -N __rustory_ctrl_r_widget"));
+        assert!(got.contains("__rustory_epoch_ms()"));
+        assert!(got.contains("frac=\"${frac[1,3]}\""));
 
         // ensure we skip both `rr` and `rr ...`
         assert!(got.contains("case \"$cmd\" in"));
