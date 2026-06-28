@@ -11,6 +11,8 @@ const TIMESTAMP_WIDTH: usize = 23;
 const RUNTIME_WIDTH: usize = 8;
 const EXIT_CODE_WIDTH: usize = 9;
 const DISPLAY_ROW_MIN_WIDTH: usize = 240;
+const COMMAND_COLUMN_OFFSET: usize =
+    HOST_WIDTH + 1 + CWD_WIDTH + 1 + TIMESTAMP_WIDTH + 1 + RUNTIME_WIDTH + 1 + EXIT_CODE_WIDTH + 1;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct FzfCapabilities {
@@ -28,6 +30,7 @@ pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
     };
 
     Ok(selected_command_from_line(entries, &selected_line)
+        .or_else(|| parse_display_row_cmd(&selected_line))
         .or_else(|| parse_legacy_selected_cmd(&selected_line)))
 }
 
@@ -270,6 +273,17 @@ fn parse_selected_entry_id(selected_line: &str) -> Option<&str> {
     (!entry_id.is_empty()).then_some(entry_id)
 }
 
+fn parse_display_row_cmd(selected_line: &str) -> Option<String> {
+    let line = selected_line.trim_end_matches(['\n', '\r']);
+    let cmd = line.chars().skip(COMMAND_COLUMN_OFFSET).collect::<String>();
+    let cmd = cmd.trim_end();
+    if cmd.is_empty() {
+        None
+    } else {
+        Some(cmd.to_string())
+    }
+}
+
 fn parse_legacy_selected_cmd(selected_line: &str) -> Option<String> {
     let line = selected_line.trim_end_matches(['\n', '\r']);
     if line.is_empty() {
@@ -391,6 +405,33 @@ mod tests {
         assert_eq!(
             parse_selected_entry_id("id-1\tsearch text\tdisplay row"),
             Some("id-1")
+        );
+    }
+
+    #[test]
+    fn parse_display_row_cmd_extracts_transformed_fzf_output() {
+        let entries = vec![Entry {
+            entry_id: "id-1".to_string(),
+            device_id: "dev1".to_string(),
+            user_id: "user1".to_string(),
+            ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
+            cmd: "cat ./sample-project/docs/README.md".to_string(),
+            cwd: "/tmp/sample-project".to_string(),
+            exit_code: 0,
+            duration_ms: 12,
+            shell: "zsh".to_string(),
+            hostname: "host".to_string(),
+            version: crate::build_info::VERSION.to_string(),
+        }];
+        let line = format_display_row(&entries[0]);
+
+        assert_eq!(
+            parse_display_row_cmd(&line),
+            Some("cat ./sample-project/docs/README.md".to_string())
+        );
+        assert_eq!(
+            selected_command_from_line(&entries, &line).or_else(|| parse_display_row_cmd(&line)),
+            Some("cat ./sample-project/docs/README.md".to_string())
         );
     }
 
