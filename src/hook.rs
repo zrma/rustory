@@ -217,8 +217,10 @@ __rustory_widget_ctrl_r() {
   zle redisplay
 }
 
-zle -N __rustory_ctrl_r_widget __rustory_widget_ctrl_r
-bindkey '^R' __rustory_ctrl_r_widget
+if [[ -o interactive ]] && (( $+widgets )) && command -v bindkey >/dev/null 2>&1; then
+  zle -N __rustory_ctrl_r_widget __rustory_widget_ctrl_r
+  bindkey '^R' __rustory_ctrl_r_widget
+fi
 "#
     .to_string()
 }
@@ -257,6 +259,9 @@ mod tests {
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
         assert!(got.contains("bindkey '^R'"));
+        assert!(got.contains("[[ -o interactive ]]"));
+        assert!(got.contains("(( $+widgets ))"));
+        assert!(got.contains("zle -N __rustory_ctrl_r_widget"));
 
         // ensure we skip both `rr` and `rr ...`
         assert!(got.contains("case \"$cmd\" in"));

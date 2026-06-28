@@ -18,12 +18,23 @@
 | --- | --- | --- | --- | --- |
 | C1 | done | codex | `cargo test daemon_ --workspace` | `rr daemon --preflight`로 configured tracker ping을 자식 프로세스 시작 전에 검증한다. |
 | C2 | done | codex | `scripts/check.sh --fast --acceptance` | Docker macOS/Linux acceptance와 two-peer relay-only acceptance를 재실행해 relay circuit 사용과 DB 수렴을 확인한다. |
-| C3 | in_progress | codex | `rr daemon --preflight` | 로컬 MacBook과 `node0`에서 실제 tracker/token/relay 설정을 preflight로 확인하고 canary sync 증거를 남긴다. |
-| C4 | todo | codex | `rr sync-status --json --with-tracker` | 24시간 soak 또는 사용자가 승인한 축약 soak에서 반복 실패/timeout 폭증이 없는지 확인한다. |
+| C3 | done | codex | `rr doctor --json`, `rr sync-status --json --with-tracker`, canary sync | 로컬 MacBook과 원격 Linux peer에서 실제 tracker/token/relay 설정을 preflight로 확인하고 canary sync 증거를 남긴다. |
+| C4 | in_progress | codex | `rr sync-status --json --with-tracker` | 24시간 soak 또는 사용자가 승인한 축약 soak에서 반복 실패/timeout 폭증이 없는지 확인한다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: daemon preflight guard 구현, 문서 반영, Docker relay acceptance 재검증.
-- 미완료: 실제 MacBook + `node0` preflight/canary sync와 24시간 또는 축약 soak 증거.
-- 다음 액션: 현재 배포된 tracker/relay 주소와 token으로 양쪽 머신에서 `rr daemon --preflight`, canary record, `rr sync-status --json --with-tracker`를 수행한다.
+- 완료: daemon preflight guard 구현, 문서 반영, Docker relay acceptance 재검증, MacBook + 원격 Linux peer 실제 tracker/token/relay 설정과 canary sync.
+- 미완료: 24시간 soak 증거.
+- 다음 액션: MacBook LaunchAgent와 원격 Linux peer systemd user service를 24시간 관찰하고, 양쪽 `rr sync-status --json --with-tracker`와 relay journal의 circuit 증거를 보존한다.
 - 검증 증거: `cargo fmt --all --check`, `cargo test daemon_ --workspace`, `scripts/check.sh --fast --acceptance`.
+
+## 2026-06-28 MacBook + Remote Linux Peer Evidence
+
+- Remote Linux peer: tracker, relay, and peer daemon enabled/running under systemd user service with linger enabled.
+- MacBook: `~/Library/LaunchAgents/com.rustory.daemon.plist` loaded/running via launchd.
+- Tracker auth: unauthenticated `/api/v1/ping` returned 401; bearer-token `/api/v1/ping` returned 200.
+- Shared swarm fingerprint matched on both peers.
+- Relay addr used a persistent relay identity and a private network address; exact value is intentionally not committed.
+- Canary sync after service install: relay circuit count increased and both DBs contained both peer canary rows.
+- Canary sync after hook guard release reinstall: relay circuit count increased again and both DBs contained both peer canary rows.
+- Final `sync-status`: tracker reachable on both machines, `pending_push=0` on the peer status rows.

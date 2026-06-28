@@ -50,6 +50,9 @@ echo "[1/5] build rr"
 cargo build --bin rr >/dev/null
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustory-smoke.XXXXXX")"
+SMOKE_HOME="$TMPDIR/home"
+mkdir -p "$SMOKE_HOME"
+export HOME="$SMOKE_HOME"
 SWARM_KEY="$TMPDIR/swarm.key"
 
 TRACKER_PORT="$(pick_port)"
