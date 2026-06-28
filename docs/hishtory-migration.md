@@ -145,7 +145,7 @@ bash -ic 'command -v rr; bind -X | grep rustory || true; rr doctor --json'
 
 기대 상태:
 - `rr`가 user-local install 경로에서 발견된다.
-- `rr doctor`의 `hook.installed=true`, `fzf.available=true`가 나온다.
+- `rr doctor`의 `hook.installed=true`가 나오고 `db status`에 검색 후보 entry가 보인다.
 - 새 prompt마다 `[1]+ Done ... rr record ...` 같은 background job completion message가 나오지 않는다.
 
 잔여 Hishtory hook 검색:

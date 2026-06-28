@@ -1,22 +1,86 @@
 use crate::core::Entry;
 use anyhow::{Context, Result};
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::time::Duration;
 
-const FZF_HEADER: &str =
-    "Hostname       CWD                    Timestamp               Runtime Exit Code Command";
-const HOST_WIDTH: usize = 14;
-const CWD_WIDTH: usize = 22;
-const TIMESTAMP_WIDTH: usize = 23;
-const RUNTIME_WIDTH: usize = 8;
-const EXIT_CODE_WIDTH: usize = 9;
-const DISPLAY_ROW_MIN_WIDTH: usize = 240;
-const COMMAND_COLUMN_OFFSET: usize =
-    HOST_WIDTH + 1 + CWD_WIDTH + 1 + TIMESTAMP_WIDTH + 1 + RUNTIME_WIDTH + 1 + EXIT_CODE_WIDTH + 1;
+const TABLE_MAX_ROWS: usize = 20;
+const TABLE_SCROLL_STEP: usize = 10;
+const MIN_FRAME_WIDTH: usize = 40;
+const FALLBACK_TERM_WIDTH: usize = 100;
+const FALLBACK_TERM_HEIGHT: usize = 30;
+const COMMAND_COLUMN: usize = 5;
+const FOOTER: &str = "rustory: Search your shell history  • ctrl+h help";
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct FzfCapabilities {
-    highlight_line: bool,
+const COLUMNS: [ColumnSpec; 6] = [
+    ColumnSpec {
+        title: "Hostname",
+        min_width: 8,
+        preferred_width: 14,
+    },
+    ColumnSpec {
+        title: "CWD",
+        min_width: 6,
+        preferred_width: 22,
+    },
+    ColumnSpec {
+        title: "Timestamp",
+        min_width: 19,
+        preferred_width: 23,
+    },
+    ColumnSpec {
+        title: "Runtime",
+        min_width: 7,
+        preferred_width: 8,
+    },
+    ColumnSpec {
+        title: "Exit Code",
+        min_width: 4,
+        preferred_width: 9,
+    },
+    ColumnSpec {
+        title: "Command",
+        min_width: 10,
+        preferred_width: 28,
+    },
+];
+
+#[derive(Debug, Clone, Copy)]
+struct ColumnSpec {
+    title: &'static str,
+    min_width: usize,
+    preferred_width: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SearchRow {
+    entry_index: usize,
+    search_text_lower: String,
+    cells: [String; 6],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key {
+    Char(char),
+    Backspace,
+    Delete,
+    Enter,
+    Quit,
+    Help,
+    Up,
+    Down,
+    Left,
+    Right,
+    CtrlLeft,
+    CtrlRight,
+    ShiftLeft,
+    ShiftRight,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Unknown,
 }
 
 pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
@@ -24,28 +88,714 @@ pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    let lines = format_fzf_lines(entries);
-    let Some(selected_line) = run_fzf(&lines)? else {
-        return Ok(None);
-    };
-
-    Ok(selected_command_from_line(entries, &selected_line)
-        .or_else(|| parse_display_row_cmd(&selected_line))
-        .or_else(|| parse_legacy_selected_cmd(&selected_line)))
+    let rows = build_search_rows(entries);
+    let mut tui = SearchTui::new(entries, rows)?;
+    tui.run()
 }
 
-fn format_fzf_lines(entries: &[Entry]) -> Vec<String> {
+fn build_search_rows(entries: &[Entry]) -> Vec<SearchRow> {
     entries
         .iter()
-        .map(|e| {
-            format!(
-                "{}\t{}\t{}",
-                sanitize_one_line(&e.entry_id),
-                format_search_text(e),
-                format_display_row(e)
-            )
+        .enumerate()
+        .map(|(entry_index, entry)| {
+            let search_text = format_search_text(entry);
+            SearchRow {
+                entry_index,
+                search_text_lower: search_text.to_lowercase(),
+                cells: [
+                    sanitize_one_line(&entry.hostname),
+                    compact_cwd(&entry.cwd),
+                    format_timestamp(entry.ts),
+                    format_duration(entry.duration_ms),
+                    entry.exit_code.to_string(),
+                    sanitize_one_line(&entry.cmd),
+                ],
+            }
         })
         .collect()
+}
+
+struct SearchTui<'a> {
+    entries: &'a [Entry],
+    rows: Vec<SearchRow>,
+    filtered: Vec<usize>,
+    query: Vec<char>,
+    query_cursor: usize,
+    cursor: usize,
+    scroll_top: usize,
+    hscroll: usize,
+    visible_rows: usize,
+    show_help: bool,
+    tty: Tty,
+    last_rendered_lines: usize,
+}
+
+impl<'a> SearchTui<'a> {
+    fn new(entries: &'a [Entry], rows: Vec<SearchRow>) -> Result<Self> {
+        let tty = Tty::open().context("open controlling terminal for search TUI")?;
+        let mut tui = Self {
+            entries,
+            rows,
+            filtered: Vec::new(),
+            query: Vec::new(),
+            query_cursor: 0,
+            cursor: 0,
+            scroll_top: 0,
+            hscroll: 0,
+            visible_rows: TABLE_MAX_ROWS,
+            show_help: false,
+            tty,
+            last_rendered_lines: 0,
+        };
+        tui.refresh_matches(true);
+        Ok(tui)
+    }
+
+    fn run(&mut self) -> Result<Option<String>> {
+        self.render()?;
+        loop {
+            match self.tty.read_key().context("read search TUI key")? {
+                Key::Enter => {
+                    self.finish()?;
+                    return Ok(self.selected_command());
+                }
+                Key::Quit => {
+                    self.finish()?;
+                    return Ok(None);
+                }
+                key => self.handle_key(key),
+            }
+            self.render()?;
+        }
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.tty.write_all(b"\x1b[?25h\x1b[0m")?;
+        self.tty.flush()?;
+        Ok(())
+    }
+
+    fn selected_command(&self) -> Option<String> {
+        let row_index = *self.filtered.get(self.cursor)?;
+        let entry_index = self.rows.get(row_index)?.entry_index;
+        Some(self.entries.get(entry_index)?.cmd.clone())
+    }
+
+    fn handle_key(&mut self, key: Key) {
+        match key {
+            Key::Char(ch) => {
+                self.query.insert(self.query_cursor, ch);
+                self.query_cursor += 1;
+                self.refresh_matches(true);
+            }
+            Key::Backspace => {
+                if self.query_cursor > 0 {
+                    self.query_cursor -= 1;
+                    self.query.remove(self.query_cursor);
+                    self.refresh_matches(true);
+                }
+            }
+            Key::Delete => {
+                if self.query_cursor < self.query.len() {
+                    self.query.remove(self.query_cursor);
+                    self.refresh_matches(true);
+                }
+            }
+            Key::Help => {
+                self.show_help = !self.show_help;
+            }
+            Key::Up => self.move_cursor_up(1),
+            Key::Down => self.move_cursor_down(1),
+            Key::PageUp => self.move_cursor_up(self.visible_rows.max(1)),
+            Key::PageDown => self.move_cursor_down(self.visible_rows.max(1)),
+            Key::Home => {
+                self.cursor = 0;
+                self.ensure_cursor_visible();
+            }
+            Key::End => {
+                self.cursor = self.filtered.len().saturating_sub(1);
+                self.ensure_cursor_visible();
+            }
+            Key::Left => {
+                self.query_cursor = self.query_cursor.saturating_sub(1);
+            }
+            Key::Right => {
+                self.query_cursor = (self.query_cursor + 1).min(self.query.len());
+            }
+            Key::CtrlLeft => {
+                self.query_cursor = previous_word_boundary(&self.query, self.query_cursor);
+            }
+            Key::CtrlRight => {
+                self.query_cursor = next_word_boundary(&self.query, self.query_cursor);
+            }
+            Key::ShiftLeft => {
+                self.hscroll = self.hscroll.saturating_sub(TABLE_SCROLL_STEP);
+            }
+            Key::ShiftRight => {
+                self.hscroll = self.hscroll.saturating_add(TABLE_SCROLL_STEP);
+            }
+            Key::Enter | Key::Quit | Key::Unknown => {}
+        }
+    }
+
+    fn move_cursor_up(&mut self, n: usize) {
+        self.cursor = self.cursor.saturating_sub(n);
+        self.ensure_cursor_visible();
+    }
+
+    fn move_cursor_down(&mut self, n: usize) {
+        if self.filtered.is_empty() {
+            self.cursor = 0;
+        } else {
+            self.cursor = (self.cursor + n).min(self.filtered.len() - 1);
+        }
+        self.ensure_cursor_visible();
+    }
+
+    fn refresh_matches(&mut self, reset_cursor: bool) {
+        let query = self.query_string();
+        self.filtered = filter_rows(&self.rows, &query);
+        if reset_cursor {
+            self.cursor = 0;
+            self.scroll_top = 0;
+        } else {
+            self.cursor = self.cursor.min(self.filtered.len().saturating_sub(1));
+        }
+        self.ensure_cursor_visible();
+    }
+
+    fn query_string(&self) -> String {
+        self.query.iter().collect()
+    }
+
+    fn ensure_cursor_visible(&mut self) {
+        if self.filtered.is_empty() {
+            self.cursor = 0;
+            self.scroll_top = 0;
+            return;
+        }
+        self.cursor = self.cursor.min(self.filtered.len() - 1);
+        if self.cursor < self.scroll_top {
+            self.scroll_top = self.cursor;
+        }
+        if self.cursor >= self.scroll_top.saturating_add(self.visible_rows) {
+            self.scroll_top = self
+                .cursor
+                .saturating_sub(self.visible_rows.saturating_sub(1));
+        }
+    }
+
+    fn render(&mut self) -> Result<()> {
+        let (term_width, term_height) =
+            terminal_size(self.tty.fd()).unwrap_or((FALLBACK_TERM_WIDTH, FALLBACK_TERM_HEIGHT));
+        let frame = self.render_frame(term_width, term_height);
+
+        if self.last_rendered_lines > 0 {
+            write!(self.tty, "\x1b[{}F\x1b[J", self.last_rendered_lines)?;
+        }
+        self.tty.write_all(b"\x1b[?25l")?;
+        self.tty.write_all(frame.as_bytes())?;
+        self.tty.flush()?;
+        self.last_rendered_lines = frame.bytes().filter(|b| *b == b'\n').count();
+        Ok(())
+    }
+
+    fn render_frame(&mut self, term_width: usize, term_height: usize) -> String {
+        let frame_width = term_width.saturating_sub(1).max(MIN_FRAME_WIDTH);
+        let inside_width = frame_width.saturating_sub(2).max(1);
+        self.visible_rows = table_visible_rows(term_height, self.show_help);
+        self.ensure_cursor_visible();
+
+        let column_widths = compute_column_widths(&self.rows, &self.filtered, inside_width);
+        self.hscroll = self.hscroll.min(max_hscroll(
+            &self.rows,
+            &self.filtered,
+            &column_widths,
+            self.scroll_top,
+            self.visible_rows,
+        ));
+
+        let mut lines = vec![
+            format!(
+                "Search Query: {}",
+                render_query(&self.query, self.query_cursor)
+            ),
+            String::new(),
+            top_border(frame_width),
+            table_line(
+                &render_cells(
+                    COLUMNS.map(|col| col.title.to_string()).as_ref(),
+                    &column_widths,
+                    inside_width,
+                    0,
+                ),
+                false,
+            ),
+            separator_border(frame_width),
+        ];
+
+        for display_row in 0..self.visible_rows {
+            let filtered_index = self.scroll_top + display_row;
+            if let Some(row_index) = self.filtered.get(filtered_index).copied() {
+                let selected = filtered_index == self.cursor;
+                let content = render_cells(
+                    &self.rows[row_index].cells,
+                    &column_widths,
+                    inside_width,
+                    self.hscroll,
+                );
+                lines.push(table_line(&content, selected));
+            } else {
+                lines.push(table_line(&" ".repeat(inside_width), false));
+            }
+        }
+
+        lines.push(bottom_border(frame_width));
+        lines.push(FOOTER.to_string());
+        if self.show_help {
+            lines.push("↑/↓ scroll  pgup/pgdn page  enter select  esc exit".to_string());
+            lines.push("←/→ edit query  ctrl+←/→ jump word  shift+←/→ scroll table".to_string());
+        }
+
+        let mut frame = lines.join("\n");
+        frame.push('\n');
+        frame
+    }
+}
+
+struct Tty {
+    file: File,
+    original: libc::termios,
+}
+
+impl Tty {
+    fn open() -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .context("open /dev/tty")?;
+        let fd = file.as_raw_fd();
+
+        let mut original = unsafe { std::mem::zeroed::<libc::termios>() };
+        if unsafe { libc::tcgetattr(fd, &mut original) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("tcgetattr /dev/tty");
+        }
+
+        let mut raw = original;
+        raw.c_iflag &= !(libc::BRKINT | libc::ICRNL | libc::INPCK | libc::ISTRIP | libc::IXON);
+        raw.c_oflag &= !libc::OPOST;
+        raw.c_cflag |= libc::CS8;
+        raw.c_lflag &= !(libc::ECHO | libc::ICANON | libc::IEXTEN | libc::ISIG);
+        raw.c_cc[libc::VMIN] = 1;
+        raw.c_cc[libc::VTIME] = 0;
+
+        if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("tcsetattr raw mode");
+        }
+
+        Ok(Self { file, original })
+    }
+
+    fn fd(&self) -> RawFd {
+        self.file.as_raw_fd()
+    }
+
+    fn read_key(&mut self) -> std::io::Result<Key> {
+        let byte = self.read_byte_blocking()?;
+        Ok(match byte {
+            b'\r' | b'\n' => Key::Enter,
+            0x01 => Key::Home,
+            0x03 | 0x04 => Key::Quit,
+            0x05 => Key::End,
+            0x08 => Key::Help,
+            0x0e => Key::Down,
+            0x10 => Key::Up,
+            0x1b => self.read_escape_sequence()?,
+            0x7f => Key::Backspace,
+            byte if byte.is_ascii_graphic() || byte == b' ' => Key::Char(byte as char),
+            _ => Key::Unknown,
+        })
+    }
+
+    fn read_escape_sequence(&mut self) -> std::io::Result<Key> {
+        let Some(first) = self.read_byte_with_timeout(Duration::from_millis(30))? else {
+            return Ok(Key::Quit);
+        };
+        let mut bytes = vec![first];
+        while bytes.len() < 12 {
+            let Some(byte) = self.read_byte_with_timeout(Duration::from_millis(2))? else {
+                break;
+            };
+            bytes.push(byte);
+            if byte.is_ascii_alphabetic() || byte == b'~' {
+                break;
+            }
+        }
+        Ok(parse_escape_sequence(&bytes))
+    }
+
+    fn read_byte_blocking(&mut self) -> std::io::Result<u8> {
+        let mut buf = [0_u8; 1];
+        self.file.read_exact(&mut buf)?;
+        Ok(buf[0])
+    }
+
+    fn read_byte_with_timeout(&mut self, timeout: Duration) -> std::io::Result<Option<u8>> {
+        let fd = self.fd();
+        let mut readfds = unsafe { std::mem::zeroed::<libc::fd_set>() };
+        unsafe {
+            libc::FD_ZERO(&mut readfds);
+            libc::FD_SET(fd, &mut readfds);
+        }
+        let mut tv = libc::timeval {
+            tv_sec: timeout.as_secs() as libc::time_t,
+            tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+        };
+        let ready = unsafe {
+            libc::select(
+                fd + 1,
+                &mut readfds,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut tv,
+            )
+        };
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if ready == 0 {
+            return Ok(None);
+        }
+        self.read_byte_blocking().map(Some)
+    }
+}
+
+impl Write for Tty {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl Drop for Tty {
+    fn drop(&mut self) {
+        let _ = self.file.write_all(b"\x1b[?25h\x1b[0m");
+        let _ = self.file.flush();
+        unsafe {
+            libc::tcsetattr(self.fd(), libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+fn parse_escape_sequence(bytes: &[u8]) -> Key {
+    match bytes {
+        b"[A" | b"OA" => Key::Up,
+        b"[B" | b"OB" => Key::Down,
+        b"[C" | b"OC" => Key::Right,
+        b"[D" | b"OD" => Key::Left,
+        b"[H" | b"OH" | b"[1~" => Key::Home,
+        b"[F" | b"OF" | b"[4~" => Key::End,
+        b"[3~" => Key::Delete,
+        b"[5~" => Key::PageUp,
+        b"[6~" => Key::PageDown,
+        b"[1;2D" | b"[2D" => Key::ShiftLeft,
+        b"[1;2C" | b"[2C" => Key::ShiftRight,
+        b"[1;5D" | b"[5D" => Key::CtrlLeft,
+        b"[1;5C" | b"[5C" => Key::CtrlRight,
+        _ => Key::Unknown,
+    }
+}
+
+fn terminal_size(fd: RawFd) -> Option<(usize, usize)> {
+    let mut size = unsafe { std::mem::zeroed::<libc::winsize>() };
+    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return None;
+    }
+    let width = usize::from(size.ws_col);
+    let height = usize::from(size.ws_row);
+    if width == 0 || height == 0 {
+        None
+    } else {
+        Some((width, height))
+    }
+}
+
+fn filter_rows(rows: &[SearchRow], query: &str) -> Vec<usize> {
+    let tokens = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+
+    rows.iter()
+        .enumerate()
+        .filter_map(|(idx, row)| {
+            tokens
+                .iter()
+                .all(|token| fuzzy_token_matches(&row.search_text_lower, token))
+                .then_some(idx)
+        })
+        .collect()
+}
+
+fn fuzzy_token_matches(haystack: &str, token: &str) -> bool {
+    if token.is_empty() || haystack.contains(token) {
+        return true;
+    }
+
+    let mut needle = token.chars();
+    let mut wanted = needle.next();
+    for ch in haystack.chars() {
+        if Some(ch) == wanted {
+            wanted = needle.next();
+            if wanted.is_none() {
+                return true;
+            }
+        }
+    }
+    wanted.is_none()
+}
+
+fn render_query(query: &[char], cursor: usize) -> String {
+    let mut out = String::from("\x1b[90m> \x1b[0m");
+    for idx in 0..=query.len() {
+        if idx == cursor {
+            if let Some(ch) = query.get(idx) {
+                out.push_str("\x1b[7m");
+                out.push(*ch);
+                out.push_str("\x1b[0m");
+            } else {
+                out.push_str("\x1b[7m \x1b[0m");
+            }
+        }
+        if idx < query.len() && idx != cursor {
+            out.push(query[idx]);
+        }
+    }
+    out
+}
+
+fn table_visible_rows(term_height: usize, show_help: bool) -> usize {
+    let reserved = if show_help { 10 } else { 8 };
+    term_height
+        .saturating_sub(reserved)
+        .clamp(3, TABLE_MAX_ROWS)
+}
+
+fn compute_column_widths(
+    rows: &[SearchRow],
+    filtered: &[usize],
+    inside_width: usize,
+) -> [usize; 6] {
+    let separator_width = COLUMNS.len().saturating_sub(1);
+    let available = inside_width.saturating_sub(separator_width);
+    let mut widths = std::array::from_fn(|idx| {
+        COLUMNS[idx]
+            .preferred_width
+            .max(COLUMNS[idx].title.chars().count())
+            .max(COLUMNS[idx].min_width)
+    });
+    let mut wanted = widths;
+
+    for row_index in filtered.iter().take(1000).copied() {
+        let Some(row) = rows.get(row_index) else {
+            continue;
+        };
+        for (idx, cell) in row.cells.iter().enumerate() {
+            wanted[idx] = wanted[idx].max(cell.chars().count());
+        }
+    }
+
+    let mut total: usize = widths.iter().sum();
+    while total < available {
+        let mut progressed = false;
+        for idx in 0..widths.len() {
+            let target = if idx == COMMAND_COLUMN {
+                wanted[idx].max(widths[idx] + available.saturating_sub(total))
+            } else {
+                wanted[idx].saturating_add(5)
+            };
+            if widths[idx] < target {
+                widths[idx] += 1;
+                total += 1;
+                progressed = true;
+                if total >= available {
+                    break;
+                }
+            }
+        }
+        if !progressed {
+            widths[COMMAND_COLUMN] += available - total;
+            break;
+        }
+    }
+
+    while total > available {
+        let Some(idx) = widest_shrinkable_column(&widths) else {
+            break;
+        };
+        widths[idx] -= 1;
+        total -= 1;
+    }
+
+    widths
+}
+
+fn widest_shrinkable_column(widths: &[usize; 6]) -> Option<usize> {
+    widths
+        .iter()
+        .enumerate()
+        .filter(|(idx, width)| **width > COLUMNS[*idx].min_width)
+        .max_by_key(|(idx, width)| (**width, *idx == COMMAND_COLUMN || *idx == 1))
+        .map(|(idx, _)| idx)
+}
+
+fn max_hscroll(
+    rows: &[SearchRow],
+    filtered: &[usize],
+    widths: &[usize; 6],
+    scroll_top: usize,
+    visible_rows: usize,
+) -> usize {
+    filtered
+        .iter()
+        .skip(scroll_top)
+        .take(visible_rows.max(1) * 2)
+        .filter_map(|idx| rows.get(*idx))
+        .flat_map(|row| row.cells.iter().zip(widths.iter()))
+        .map(|(cell, width)| {
+            cell.chars()
+                .count()
+                .saturating_sub(*width)
+                .saturating_add(2)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+fn render_cells(
+    cells: &[String],
+    widths: &[usize; 6],
+    inside_width: usize,
+    hscroll: usize,
+) -> String {
+    let mut content = cells
+        .iter()
+        .zip(widths.iter())
+        .map(|(cell, width)| fit_cell(cell, *width, hscroll))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let width = content.chars().count();
+    if width < inside_width {
+        content.push_str(&" ".repeat(inside_width - width));
+    } else if width > inside_width {
+        content = take_chars(&content, inside_width);
+    }
+    content
+}
+
+fn fit_cell(value: &str, width: usize, hscroll: usize) -> String {
+    let len = value.chars().count();
+    let visible = if hscroll > 0 && len > width {
+        let start = hscroll.min(len.saturating_sub(1));
+        format!("...{}", skip_chars(value, start))
+    } else {
+        value.to_string()
+    };
+    pad_right(&truncate_right(&visible, width), width)
+}
+
+fn truncate_right(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    if width <= 3 {
+        return take_chars(value, width);
+    }
+    format!("{}...", take_chars(value, width - 3))
+}
+
+fn pad_right(value: &str, width: usize) -> String {
+    let mut out = value.to_string();
+    let len = out.chars().count();
+    if len < width {
+        out.push_str(&" ".repeat(width - len));
+    }
+    out
+}
+
+fn take_chars(value: &str, count: usize) -> String {
+    value.chars().take(count).collect()
+}
+
+fn skip_chars(value: &str, count: usize) -> String {
+    value.chars().skip(count).collect()
+}
+
+fn table_line(content: &str, selected: bool) -> String {
+    if selected {
+        format!("│\x1b[7m{content}\x1b[0m│")
+    } else {
+        format!("│{content}│")
+    }
+}
+
+fn top_border(width: usize) -> String {
+    format!("┌{}┐", "─".repeat(width.saturating_sub(2)))
+}
+
+fn separator_border(width: usize) -> String {
+    format!("├{}┤", "─".repeat(width.saturating_sub(2)))
+}
+
+fn bottom_border(width: usize) -> String {
+    format!("└{}┘", "─".repeat(width.saturating_sub(2)))
+}
+
+fn previous_word_boundary(query: &[char], cursor: usize) -> usize {
+    let mut last_boundary = 0;
+    for boundary in word_boundaries(query) {
+        if boundary >= cursor {
+            return last_boundary;
+        }
+        last_boundary = boundary;
+    }
+    last_boundary
+}
+
+fn next_word_boundary(query: &[char], cursor: usize) -> usize {
+    word_boundaries(query)
+        .into_iter()
+        .find(|boundary| *boundary > cursor)
+        .unwrap_or(query.len())
+}
+
+fn word_boundaries(query: &[char]) -> Vec<usize> {
+    let mut boundaries = vec![0];
+    let mut prev_was_break = false;
+    for (idx, ch) in query.iter().enumerate() {
+        if is_word_break(*ch) {
+            if !prev_was_break {
+                boundaries.push(idx);
+            }
+            prev_was_break = true;
+        } else {
+            prev_was_break = false;
+        }
+    }
+    if !prev_was_break {
+        boundaries.push(query.len());
+    }
+    boundaries
+}
+
+fn is_word_break(ch: char) -> bool {
+    ch == ' ' || ch == '-'
 }
 
 fn sanitize_one_line(value: &str) -> String {
@@ -66,27 +816,6 @@ fn format_search_text(entry: &Entry) -> String {
     ))
 }
 
-fn format_display_row(entry: &Entry) -> String {
-    let row = format!(
-        "{host} {cwd} {timestamp:<TIMESTAMP_WIDTH$} {runtime:>RUNTIME_WIDTH$} {exit_code:>EXIT_CODE_WIDTH$} {cmd}",
-        host = fit_tail(&entry.hostname, HOST_WIDTH),
-        cwd = fit_tail(&compact_cwd(&entry.cwd), CWD_WIDTH),
-        timestamp = format_timestamp(entry.ts),
-        runtime = format_duration(entry.duration_ms),
-        exit_code = entry.exit_code,
-        cmd = sanitize_one_line(&entry.cmd),
-    );
-    pad_display_row(row, DISPLAY_ROW_MIN_WIDTH)
-}
-
-fn pad_display_row(mut row: String, min_width: usize) -> String {
-    let len = row.chars().count();
-    if len < min_width {
-        row.push_str(&" ".repeat(min_width - len));
-    }
-    row
-}
-
 fn compact_cwd(cwd: &str) -> String {
     let cwd = sanitize_one_line(cwd);
     if cwd.is_empty() {
@@ -105,22 +834,6 @@ fn compact_cwd(cwd: &str) -> String {
     }
 
     cwd
-}
-
-fn fit_tail(value: &str, width: usize) -> String {
-    let value = sanitize_one_line(value);
-    if value.chars().count() <= width {
-        return format!("{value:<width$}");
-    }
-
-    if width <= 3 {
-        return value.chars().take(width).collect();
-    }
-
-    let keep = width - 3;
-    let mut tail = value.chars().rev().take(keep).collect::<Vec<_>>();
-    tail.reverse();
-    format!("...{}", tail.into_iter().collect::<String>())
 }
 
 fn format_timestamp(ts: time::OffsetDateTime) -> String {
@@ -173,137 +886,26 @@ fn format_seconds_part(seconds: u64, millis: u16) -> String {
     format!("{seconds}.{fractional}")
 }
 
-fn run_fzf(lines: &[String]) -> Result<Option<String>> {
-    let capabilities = detect_fzf_capabilities();
-    let args = fzf_args(capabilities);
-    let mut child = Command::new("fzf")
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                anyhow::anyhow!("fzf not found (install fzf and ensure it's in PATH)")
-            } else {
-                anyhow::anyhow!("spawn fzf: {err}")
-            }
-        })?;
-
-    {
-        let mut stdin = child.stdin.take().context("open fzf stdin")?;
-        for line in lines {
-            stdin
-                .write_all(line.as_bytes())
-                .with_context(|| format!("write fzf stdin: {line:?}"))?;
-            stdin.write_all(b"\n").context("write fzf stdin newline")?;
-        }
-        // drop stdin to signal EOF
-    }
-
-    let out = child.wait_with_output().context("wait fzf")?;
-
-    // fzf exit code:
-    // - 0: selection made
-    // - 1: no match
-    // - 130: interrupted (ESC/C-c)
-    match out.status.code() {
-        Some(0) => {
-            let selected = String::from_utf8_lossy(&out.stdout);
-            let selected = selected.trim_end_matches(['\n', '\r']).to_string();
-            if selected.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(selected))
-            }
-        }
-        Some(1) | Some(130) => Ok(None),
-        Some(code) => anyhow::bail!("fzf exited with status code {code}"),
-        None => anyhow::bail!("fzf terminated by signal"),
-    }
-}
-
-fn detect_fzf_capabilities() -> FzfCapabilities {
-    let Ok(output) = Command::new("fzf").arg("--help").output() else {
-        return FzfCapabilities::default();
-    };
-
-    let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
-    help.push_str(&String::from_utf8_lossy(&output.stderr));
-
-    FzfCapabilities {
-        highlight_line: help.contains("--highlight-line"),
-    }
-}
-
-fn fzf_args(capabilities: FzfCapabilities) -> Vec<&'static str> {
-    let mut args = vec![
-        "--no-sort",
-        "--height=~100%",
-        "--layout=reverse",
-        "--border=sharp",
-        "--info=hidden",
-        "--no-separator",
-        "--no-hscroll",
-        "--pointer= ",
-        "--marker= ",
-        "--prompt=Search Query: > ",
-        "--header",
-        FZF_HEADER,
-        "--delimiter=\t",
-        "--with-nth=3..",
-        "--tiebreak=index",
-    ];
-    if capabilities.highlight_line {
-        args.push("--highlight-line");
-    }
-    args
-}
-
-fn selected_command_from_line(entries: &[Entry], selected_line: &str) -> Option<String> {
-    let entry_id = parse_selected_entry_id(selected_line)?;
-    entries
-        .iter()
-        .find(|entry| entry.entry_id == entry_id)
-        .map(|entry| entry.cmd.clone())
-}
-
-fn parse_selected_entry_id(selected_line: &str) -> Option<&str> {
-    let line = selected_line.trim_end_matches(['\n', '\r']);
-    let (entry_id, _) = line.split_once('\t')?;
-    (!entry_id.is_empty()).then_some(entry_id)
-}
-
-fn parse_display_row_cmd(selected_line: &str) -> Option<String> {
-    let line = selected_line.trim_end_matches(['\n', '\r']);
-    let cmd = line.chars().skip(COMMAND_COLUMN_OFFSET).collect::<String>();
-    let cmd = cmd.trim_end();
-    if cmd.is_empty() {
-        None
-    } else {
-        Some(cmd.to_string())
-    }
-}
-
-fn parse_legacy_selected_cmd(selected_line: &str) -> Option<String> {
-    let line = selected_line.trim_end_matches(['\n', '\r']);
-    if line.is_empty() {
-        return None;
-    }
-
-    let mut parts = line.splitn(2, '\t');
-    let _id = parts.next();
-    let cmd = parts.next().unwrap_or(line);
-    if cmd.is_empty() {
-        None
-    } else {
-        Some(cmd.to_string())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use time::OffsetDateTime;
+
+    fn entry(hostname: &str, cwd: &str, cmd: &str) -> Entry {
+        Entry {
+            entry_id: format!("{hostname}-{cmd}"),
+            device_id: "macbook".to_string(),
+            user_id: "user1".to_string(),
+            ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
+            cmd: cmd.to_string(),
+            cwd: cwd.to_string(),
+            exit_code: 0,
+            duration_ms: 4139,
+            shell: "zsh".to_string(),
+            hostname: hostname.to_string(),
+            version: crate::build_info::VERSION.to_string(),
+        }
+    }
 
     #[test]
     fn sanitize_one_line_replaces_control_separators() {
@@ -311,144 +913,76 @@ mod tests {
     }
 
     #[test]
-    fn format_fzf_lines_include_hishtory_style_search_metadata() {
-        let entries = vec![Entry {
-            entry_id: "id-1".to_string(),
-            device_id: "macbook".to_string(),
-            user_id: "user1".to_string(),
-            ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
-            cmd: "cat ./sample-project/docs/README.md".to_string(),
-            cwd: "/Users/user/code/src/sample-project".to_string(),
-            exit_code: 0,
-            duration_ms: 4139,
-            shell: "zsh".to_string(),
-            hostname: "sample-node".to_string(),
-            version: crate::build_info::VERSION.to_string(),
-        }];
+    fn search_rows_include_hishtory_style_metadata() {
+        let entries = vec![entry(
+            "sample-node",
+            "/Users/user/code/src/sample-project",
+            "cat ./sample-project/docs/README.md",
+        )];
 
-        let lines = format_fzf_lines(&entries);
-        assert_eq!(lines.len(), 1);
-
-        let fields = lines[0].split('\t').collect::<Vec<_>>();
-        assert_eq!(fields.len(), 3);
-        assert_eq!(fields[0], "id-1");
-        assert!(fields[1].contains("sample-node"));
-        assert!(fields[1].contains("macbook"));
-        assert!(fields[1].contains("/Users/user/code/src/sample-project"));
-        assert!(fields[1].contains("cat ./sample-project/docs/README.md"));
-        assert!(fields[1].contains("4.139s"));
-        assert!(fields[2].contains("sample-node"));
-        assert!(fields[2].contains("1970-01-01 00:00:01 UTC"));
-        assert!(fields[2].contains("4.139s"));
-        assert!(fields[2].contains("cat ./sample-project/docs/README.md"));
-        assert!(fields[2].chars().count() >= DISPLAY_ROW_MIN_WIDTH);
-    }
-
-    #[test]
-    fn pad_display_row_extends_short_rows_for_legacy_fzf_highlight() {
-        let row = pad_display_row("host cwd cmd".to_string(), 16);
-        assert_eq!(row, "host cwd cmd    ");
-        assert_eq!(
-            pad_display_row("host cwd command".to_string(), 8),
-            "host cwd command"
+        let rows = build_search_rows(&entries);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].search_text_lower.contains("sample-node"));
+        assert!(rows[0].search_text_lower.contains("macbook"));
+        assert!(
+            rows[0]
+                .search_text_lower
+                .contains("/users/user/code/src/sample-project")
         );
-    }
-
-    #[test]
-    fn fzf_args_use_inline_hishtory_like_layout() {
-        let args = fzf_args(FzfCapabilities {
-            highlight_line: false,
-        });
-        assert!(args.contains(&"--height=~100%"));
-        assert!(args.contains(&"--border=sharp"));
-        assert!(args.contains(&"--info=hidden"));
-        assert!(args.contains(&"--no-separator"));
-        assert!(args.contains(&"--no-hscroll"));
-        assert!(args.contains(&"--pointer= "));
-        assert!(args.contains(&"--marker= "));
-        assert!(!args.contains(&"--highlight-line"));
-    }
-
-    #[test]
-    fn fzf_args_enable_full_row_highlight_when_supported() {
-        let args = fzf_args(FzfCapabilities {
-            highlight_line: true,
-        });
-        assert!(args.contains(&"--highlight-line"));
-    }
-
-    #[test]
-    fn selected_command_from_line_uses_entry_id_to_preserve_original_command() {
-        let entries = vec![Entry {
-            entry_id: "id-1".to_string(),
-            device_id: "dev1".to_string(),
-            user_id: "user1".to_string(),
-            ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
-            cmd: "printf 'a\tb'".to_string(),
-            cwd: "/tmp".to_string(),
-            exit_code: 0,
-            duration_ms: 12,
-            shell: "zsh".to_string(),
-            hostname: "host".to_string(),
-            version: crate::build_info::VERSION.to_string(),
-        }];
-
-        let selected = "id-1\thost /tmp printf a b\thost /tmp printf a b";
-        assert_eq!(
-            selected_command_from_line(&entries, selected),
-            Some("printf 'a\tb'".to_string())
+        assert!(
+            rows[0]
+                .search_text_lower
+                .contains("cat ./sample-project/docs/readme.md")
         );
+        assert_eq!(rows[0].cells[0], "sample-node");
+        assert!(rows[0].cells[2].contains("1970-01-01 00:00:01 UTC"));
+        assert_eq!(rows[0].cells[3], "4.139s");
     }
 
     #[test]
-    fn parse_selected_entry_id_extracts_first_field() {
-        assert_eq!(
-            parse_selected_entry_id("id-1\tsearch text\tdisplay row"),
-            Some("id-1")
-        );
+    fn filter_rows_matches_split_fuzzy_metadata_tokens() {
+        let entries = vec![
+            entry(
+                "sample-node",
+                "/Users/user/code/src/sample-project",
+                "docker compose up docs",
+            ),
+            entry("node0", "/home/user", "ls -lah"),
+        ];
+        let rows = build_search_rows(&entries);
+
+        let matches = filter_rows(&rows, "smp pro doc");
+        assert_eq!(matches, vec![0]);
+
+        let matches = filter_rows(&rows, "pro doc");
+        assert_eq!(matches, vec![0]);
     }
 
     #[test]
-    fn parse_display_row_cmd_extracts_transformed_fzf_output() {
-        let entries = vec![Entry {
-            entry_id: "id-1".to_string(),
-            device_id: "dev1".to_string(),
-            user_id: "user1".to_string(),
-            ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
-            cmd: "cat ./sample-project/docs/README.md".to_string(),
-            cwd: "/tmp/sample-project".to_string(),
-            exit_code: 0,
-            duration_ms: 12,
-            shell: "zsh".to_string(),
-            hostname: "host".to_string(),
-            version: crate::build_info::VERSION.to_string(),
-        }];
-        let line = format_display_row(&entries[0]);
-
-        assert_eq!(
-            parse_display_row_cmd(&line),
-            Some("cat ./sample-project/docs/README.md".to_string())
-        );
-        assert_eq!(
-            selected_command_from_line(&entries, &line).or_else(|| parse_display_row_cmd(&line)),
-            Some("cat ./sample-project/docs/README.md".to_string())
-        );
+    fn table_height_stays_inline_on_tall_terminals() {
+        assert_eq!(table_visible_rows(60, false), 20);
+        assert!(table_visible_rows(12, false) < 20);
     }
 
     #[test]
-    fn parse_legacy_selected_cmd_extracts_cmd_after_tab() {
-        assert_eq!(
-            parse_legacy_selected_cmd("id-1\techo 1"),
-            Some("echo 1".to_string())
-        );
+    fn render_cell_supports_horizontal_scroll() {
+        assert_eq!(fit_cell("abcdefghijklmnopqrstuvwxyz", 10, 0), "abcdefg...");
+        assert_eq!(fit_cell("abcdefghijklmnopqrstuvwxyz", 10, 10), "...klmn...");
     }
 
     #[test]
-    fn parse_legacy_selected_cmd_accepts_plain_line() {
-        assert_eq!(
-            parse_legacy_selected_cmd("echo 1"),
-            Some("echo 1".to_string())
-        );
+    fn parse_escape_sequence_supports_table_scroll_keys() {
+        assert_eq!(parse_escape_sequence(b"[1;2D"), Key::ShiftLeft);
+        assert_eq!(parse_escape_sequence(b"[1;2C"), Key::ShiftRight);
+        assert_eq!(parse_escape_sequence(b"[1;5D"), Key::CtrlLeft);
+        assert_eq!(parse_escape_sequence(b"[1;5C"), Key::CtrlRight);
+    }
+
+    #[test]
+    fn word_boundaries_match_hishtory_style_breaks() {
+        let query = "cargo test --workspace".chars().collect::<Vec<_>>();
+        assert_eq!(previous_word_boundary(&query, query.len()), 10);
+        assert_eq!(next_word_boundary(&query, 0), 5);
     }
 
     #[test]

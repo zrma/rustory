@@ -17,7 +17,6 @@ const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
 const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
 const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
 const DEFAULT_HOOK_SEARCH_LIMIT: usize = 100_000;
-const FZF_PURPOSE: &str = "ctrl+r search";
 
 #[derive(Parser)]
 #[command(name = "rr", version = crate::build_info::VERSION_DISPLAY, about = "Rustory CLI")]
@@ -264,9 +263,9 @@ enum Command {
         #[arg(long, default_value_t = false, help = "Print the inserted entry id")]
         print_id: bool,
     },
-    #[command(about = "Search local history with fzf")]
+    #[command(about = "Search local history with the inline TUI")]
     Search {
-        #[arg(long, help = "Maximum recent entries to offer to fzf")]
+        #[arg(long, help = "Maximum recent entries to offer to the search TUI")]
         limit: Option<usize>,
     },
     #[command(about = "Delete old local history entries")]
@@ -1705,7 +1704,6 @@ struct DoctorReport {
     db: DoctorDbStatusReport,
     user_id: String,
     device_id: String,
-    fzf: DoctorToolStatusReport,
     hook: DoctorHookStatusReport,
     p2p_request_retry: DoctorP2pRequestRetryReport,
     record_ignore_regex: DoctorRecordIgnoreRegexReport,
@@ -1737,14 +1735,6 @@ struct DoctorP2pRequestRetryReport {
     timeout_cap_sec: Option<u64>,
     backoff_base_ms: Option<u64>,
     error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-struct DoctorToolStatusReport {
-    command: String,
-    available: bool,
-    path: Option<String>,
-    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -1865,7 +1855,6 @@ fn build_doctor_report(
     let db = build_db_status_report(db_path)?;
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
-    let fzf = build_tool_status_report("fzf", FZF_PURPOSE);
     let hook = build_hook_status_report(cfg);
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
 
@@ -2033,7 +2022,6 @@ fn build_doctor_report(
         db,
         user_id,
         device_id,
-        fzf,
         hook,
         p2p_request_retry,
         record_ignore_regex,
@@ -2221,7 +2209,6 @@ fn run_doctor(
     print_db_status(&db);
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
-    print_tool_status(&build_tool_status_report("fzf", FZF_PURPOSE));
     print_hook_status(&build_hook_status_report(cfg));
     match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
         Ok(request_retry_policy) => {
@@ -2368,78 +2355,6 @@ fn run_doctor(
     }
 
     Ok(())
-}
-
-fn build_tool_status_report(command: &str, purpose: &str) -> DoctorToolStatusReport {
-    let path_env = std::env::var_os("PATH");
-    build_tool_status_report_with_path(command, purpose, path_env.as_deref())
-}
-
-fn build_tool_status_report_with_path(
-    command: &str,
-    purpose: &str,
-    path_env: Option<&std::ffi::OsStr>,
-) -> DoctorToolStatusReport {
-    let path = find_executable_on_path(command, path_env);
-    match path {
-        Some(path) => DoctorToolStatusReport {
-            command: command.to_string(),
-            available: true,
-            path: Some(path.display().to_string()),
-            warning: None,
-        },
-        None => DoctorToolStatusReport {
-            command: command.to_string(),
-            available: false,
-            path: None,
-            warning: Some(format!("missing from PATH; {purpose} requires {command}")),
-        },
-    }
-}
-
-fn find_executable_on_path(
-    command: &str,
-    path_env: Option<&std::ffi::OsStr>,
-) -> Option<std::path::PathBuf> {
-    let paths = path_env?;
-    for dir in std::env::split_paths(paths) {
-        let candidate = dir.join(command);
-        if is_executable_file(&candidate) {
-            return Some(candidate);
-        }
-    }
-    None
-}
-
-fn is_executable_file(path: &std::path::Path) -> bool {
-    let Ok(md) = std::fs::metadata(path) else {
-        return false;
-    };
-    if !md.is_file() {
-        return false;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        md.permissions().mode() & 0o111 != 0
-    }
-
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
-fn print_tool_status(report: &DoctorToolStatusReport) {
-    if report.available {
-        let path = report.path.as_deref().unwrap_or("available");
-        println!("{}: {path}", report.command);
-    } else if let Some(warning) = report.warning.as_deref() {
-        println!("{}: missing ({warning})", report.command);
-    } else {
-        println!("{}: missing", report.command);
-    }
 }
 
 fn build_hook_status_report(cfg: &config::FileConfig) -> DoctorHookStatusReport {
@@ -3627,7 +3542,6 @@ mod tests {
         assert!(report.config_error.is_none());
         assert!(!report.db.exists);
         assert!(report.config_warning.is_none());
-        assert_eq!(report.fzf.command, "fzf");
         assert!(!report.tracker_token.configured);
         assert!(report.trackers.is_empty());
         assert!(report.p2p_request_retry.error.is_none());
@@ -3637,7 +3551,6 @@ mod tests {
         assert!(json.contains("\"db\""));
         assert!(json.contains("\"config_error\""));
         assert!(json.contains("\"config_warning\""));
-        assert!(json.contains("\"fzf\""));
         assert!(json.contains("\"hook\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
@@ -3746,38 +3659,6 @@ mod tests {
         assert_eq!(report.db.peer_book_count, Some(1));
         assert_eq!(report.db.sync_peer_count, Some(1));
         assert!(report.db.error.is_none());
-    }
-
-    #[test]
-    fn fzf_status_reports_missing_when_path_is_empty() {
-        let report =
-            build_tool_status_report_with_path("fzf", FZF_PURPOSE, Some(std::ffi::OsStr::new("")));
-
-        assert_eq!(report.command, "fzf");
-        assert!(!report.available);
-        assert!(report.path.is_none());
-        assert!(report.warning.unwrap().contains("ctrl+r search"));
-    }
-
-    #[test]
-    fn fzf_status_finds_executable_on_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let fzf = dir.path().join("fzf");
-        std::fs::write(&fzf, "#!/bin/sh\nexit 0\n").unwrap();
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fzf, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let report =
-            build_tool_status_report_with_path("fzf", FZF_PURPOSE, Some(dir.path().as_os_str()));
-
-        assert_eq!(report.command, "fzf");
-        assert!(report.available);
-        assert_eq!(report.path.as_deref(), Some(fzf.to_str().unwrap()));
-        assert!(report.warning.is_none());
     }
 
     #[test]

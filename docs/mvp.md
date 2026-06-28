@@ -1,4 +1,4 @@
-# Rustory MVP Spec (append + dedup + fzf)
+# Rustory MVP Spec (append + dedup + inline search TUI)
 
 이 문서는 Rustory의 MVP 범위/가정/결정 사항을 남긴 역사적 설계 아티팩트다.
 현재 CLI 옵션, default, 데이터 구조, 실행 동작은 `src/*`, `Cargo.toml`, `rr --help`, `rr doctor`, `scripts/*`를 직접 확인한다.
@@ -12,7 +12,7 @@
 ## 핵심 목표
 - 안정적 동기화 (오프라인/재시도/중복 제거에 강함)
 - 가벼운 시스템 (최소 기능만 제공)
-- ctrl+r 기반의 빠른 fzf 검색 UX
+- ctrl+r 기반의 빠른 inline 검색 UX
 - CLI 커맨드: `rr`
 - 바이너리 구성: 단일 바이너리
 - 로컬 DB: SQLite
@@ -27,12 +27,12 @@
 ## 목표
 - 각 디바이스에서 히스토리를 append-only로 수집
 - entry_id 기반 dedup 동기화
-- fzf 기반 로컬 검색 UI 제공
+- inline 로컬 검색 UI 제공
 - bash/zsh 훅으로 자동 수집
 
 ## 범위 (MVP)
 - 피어: 단순 저장/조회 API
-- 클라이언트: 로컬 큐 + 피어 동기화 + fzf UI
+- 클라이언트: 로컬 큐 + 피어 동기화 + inline search UI
 - 삭제/정리: 수동 정리 명령(`rr prune --older-than-days <n> [--keep-recent <n>]`) + opt-in 자동 보관 스케줄링(`RUSTORY_AUTO_PRUNE=1`) 제공
 - 정확한 글로벌 순서: 보장하지 않음 (timestamp 정렬)
 
@@ -102,8 +102,8 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
 - peer_state 테이블에 peer별 last_cursor를 저장한다
 - 운영자가 수동으로 오래된 엔트리를 정리할 수 있도록 `rr prune --older-than-days <n> [--keep-recent <n>] [--dry-run]`를 제공한다
 
-## fzf UI (ctrl+r)
-- ctrl+r에서 fzf UI 호출
+## Inline search UI (ctrl+r)
+- ctrl+r에서 `rr search` inline TUI 호출
 - 로컬 DB에서 최근 N개 로드 (초안 예시: 100k)
 - 선택된 커맨드를 프롬프트에 삽입
 - 대용량 대비: prefix/최근 N 제한 유지
