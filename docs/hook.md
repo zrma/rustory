@@ -63,7 +63,7 @@ auto_prune_marker_path = "~/.config/rustory/auto-prune.last"
 - 기록: 커맨드 종료 시 `rr record`를 백그라운드로 호출해 SQLite에 append-only 저장
 - 업로드(선택): `RUSTORY_ASYNC_UPLOAD=1`이면 `rr record`가 주기 제한(`RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC`)을 적용해 백그라운드 push를 트리거한다.
 - 보관(선택): `RUSTORY_AUTO_PRUNE=1`이면 `rr record`가 주기 제한(`RUSTORY_AUTO_PRUNE_INTERVAL_SEC`)을 적용해 오래된 로컬 엔트리를 정리하고, 필요 시 최신 N개(`RUSTORY_AUTO_PRUNE_KEEP_RECENT`)를 보존한다.
-- 검색: `ctrl+r`에서 `rr search`(fzf)로 선택한 커맨드를 현재 입력 버퍼에 삽입한다. 검색 UI는 hishtory-like metadata table로 hostname, CWD, timestamp, runtime, exit code, command를 표시한다. 쿼리는 command뿐 아니라 hostname/device/CWD 메타데이터도 함께 대상으로 삼으므로 `pro doc`처럼 CWD와 command에 흩어진 토큰도 검색 후보를 좁힐 수 있다. limit 해석 순서는 `rr doctor`와 관련 resolver 코드를 확인한다.
+- 검색: `ctrl+r`에서 `rr search`(fzf)로 선택한 커맨드를 현재 입력 버퍼에 삽입한다. 검색 UI는 기존 화면을 fullscreen으로 덮지 않는 inline fzf panel로 열리며, hishtory-like metadata table로 hostname, CWD, timestamp, runtime, exit code, command를 표시한다. 쿼리는 command뿐 아니라 hostname/device/CWD 메타데이터도 함께 대상으로 삼으므로 `pro doc`처럼 CWD와 command에 흩어진 토큰도 검색 후보를 좁힐 수 있다. 신형 fzf에서는 full-row highlight를 켜고, 구형 fzf에서는 지원 옵션만 사용해 검색 실패를 피한다. limit 해석 순서는 `rr doctor`와 관련 resolver 코드를 확인한다.
 
 ### duration_ms(소요 시간)
 - zsh: `EPOCHREALTIME` 기반으로 `duration_ms`를 기록한다.

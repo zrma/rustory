@@ -22,6 +22,7 @@
 | C4 | in_progress | codex | `rr sync-status --json --with-tracker` | 24시간 soak 또는 사용자가 승인한 축약 soak에서 반복 실패/timeout 폭증이 없는지 확인한다. |
 | C5 | done | codex | `rr --version`, `rr version --json`, `rr doctor --json`, `scripts/check-script-smoke.sh --work-id daily-driver-readiness` | daily-driver production 기준점의 package version과 build revision 추적 경로를 제공하고, Codex-authored commit trailer 누락을 finalize 경로에서 차단한다. |
 | C6 | done | codex | `cargo test search::tests --workspace`, `cargo test --workspace`, fzf `--filter` metadata query smoke | ctrl+r 검색을 hishtory-like metadata table로 바꾸고 hostname/CWD/command를 함께 검색 대상으로 삼는다. |
+| C7 | done | codex | `cargo test search::tests --workspace`, fzf `--filter` metadata query smoke | ctrl+r 검색 TUI를 fullscreen 대신 inline panel로 열고, row alignment/full-row highlight 동작을 fzf capability에 맞춰 정리한다. |
 
 ## 완료/미완료/다음 액션
 
@@ -47,3 +48,4 @@
 - Relay restart hardening: `p2p-serve` removes closed relay-circuit listen addresses from tracker registration and immediately re-listens on the configured relay, so relay restart does not leave stale peer records until TTL expiry.
 - Release identity: `rr --version` now reports `1.0.0 (rev <build_revision>)`; `rr version --json` and `rr doctor --json` expose `version`, `build_revision`, `build_revision_source`, and `build_dirty`; `scripts/finalize-and-push.sh` uses `describe_with_attribution.sh` and verifies the `Co-authored-by` trailer before push.
 - Ctrl+r search UX: `rr search` now uses a hishtory-like table that displays hostname, CWD, timestamp, runtime, exit code, and command while searching across hostname/device/full-CWD/command metadata; fzf filter smoke matched `smp pro doc` and `pro doc` style queries against split hostname/CWD/command tokens.
+- Ctrl+r TUI polish: `rr search` now asks fzf for an inline height instead of fullscreen, hides fzf's count/separator noise, disables horizontal scroll for stable metadata columns, hides the pointer gutter, pads rows for legacy highlight behavior, and enables full-row highlight only when the installed fzf supports it.

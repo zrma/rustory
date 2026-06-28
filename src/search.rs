@@ -10,6 +10,12 @@ const CWD_WIDTH: usize = 22;
 const TIMESTAMP_WIDTH: usize = 23;
 const RUNTIME_WIDTH: usize = 8;
 const EXIT_CODE_WIDTH: usize = 9;
+const DISPLAY_ROW_MIN_WIDTH: usize = 240;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct FzfCapabilities {
+    highlight_line: bool,
+}
 
 pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
     if entries.is_empty() {
@@ -58,7 +64,7 @@ fn format_search_text(entry: &Entry) -> String {
 }
 
 fn format_display_row(entry: &Entry) -> String {
-    format!(
+    let row = format!(
         "{host} {cwd} {timestamp:<TIMESTAMP_WIDTH$} {runtime:>RUNTIME_WIDTH$} {exit_code:>EXIT_CODE_WIDTH$} {cmd}",
         host = fit_tail(&entry.hostname, HOST_WIDTH),
         cwd = fit_tail(&compact_cwd(&entry.cwd), CWD_WIDTH),
@@ -66,7 +72,16 @@ fn format_display_row(entry: &Entry) -> String {
         runtime = format_duration(entry.duration_ms),
         exit_code = entry.exit_code,
         cmd = sanitize_one_line(&entry.cmd),
-    )
+    );
+    pad_display_row(row, DISPLAY_ROW_MIN_WIDTH)
+}
+
+fn pad_display_row(mut row: String, min_width: usize) -> String {
+    let len = row.chars().count();
+    if len < min_width {
+        row.push_str(&" ".repeat(min_width - len));
+    }
+    row
 }
 
 fn compact_cwd(cwd: &str) -> String {
@@ -156,18 +171,10 @@ fn format_seconds_part(seconds: u64, millis: u16) -> String {
 }
 
 fn run_fzf(lines: &[String]) -> Result<Option<String>> {
+    let capabilities = detect_fzf_capabilities();
+    let args = fzf_args(capabilities);
     let mut child = Command::new("fzf")
-        .args([
-            "--no-sort",
-            "--layout=reverse",
-            "--border",
-            "--prompt=Search Query: > ",
-            "--header",
-            FZF_HEADER,
-            "--delimiter=\t",
-            "--with-nth=3..",
-            "--tiebreak=index",
-        ])
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -210,6 +217,43 @@ fn run_fzf(lines: &[String]) -> Result<Option<String>> {
         Some(code) => anyhow::bail!("fzf exited with status code {code}"),
         None => anyhow::bail!("fzf terminated by signal"),
     }
+}
+
+fn detect_fzf_capabilities() -> FzfCapabilities {
+    let Ok(output) = Command::new("fzf").arg("--help").output() else {
+        return FzfCapabilities::default();
+    };
+
+    let mut help = String::from_utf8_lossy(&output.stdout).into_owned();
+    help.push_str(&String::from_utf8_lossy(&output.stderr));
+
+    FzfCapabilities {
+        highlight_line: help.contains("--highlight-line"),
+    }
+}
+
+fn fzf_args(capabilities: FzfCapabilities) -> Vec<&'static str> {
+    let mut args = vec![
+        "--no-sort",
+        "--height=~100%",
+        "--layout=reverse",
+        "--border=sharp",
+        "--info=hidden",
+        "--no-separator",
+        "--no-hscroll",
+        "--pointer= ",
+        "--marker= ",
+        "--prompt=Search Query: > ",
+        "--header",
+        FZF_HEADER,
+        "--delimiter=\t",
+        "--with-nth=3..",
+        "--tiebreak=index",
+    ];
+    if capabilities.highlight_line {
+        args.push("--highlight-line");
+    }
+    args
 }
 
 fn selected_command_from_line(entries: &[Entry], selected_line: &str) -> Option<String> {
@@ -283,6 +327,40 @@ mod tests {
         assert!(fields[2].contains("1970-01-01 00:00:01 UTC"));
         assert!(fields[2].contains("4.139s"));
         assert!(fields[2].contains("cat ./sample-project/docs/README.md"));
+        assert!(fields[2].chars().count() >= DISPLAY_ROW_MIN_WIDTH);
+    }
+
+    #[test]
+    fn pad_display_row_extends_short_rows_for_legacy_fzf_highlight() {
+        let row = pad_display_row("host cwd cmd".to_string(), 16);
+        assert_eq!(row, "host cwd cmd    ");
+        assert_eq!(
+            pad_display_row("host cwd command".to_string(), 8),
+            "host cwd command"
+        );
+    }
+
+    #[test]
+    fn fzf_args_use_inline_hishtory_like_layout() {
+        let args = fzf_args(FzfCapabilities {
+            highlight_line: false,
+        });
+        assert!(args.contains(&"--height=~100%"));
+        assert!(args.contains(&"--border=sharp"));
+        assert!(args.contains(&"--info=hidden"));
+        assert!(args.contains(&"--no-separator"));
+        assert!(args.contains(&"--no-hscroll"));
+        assert!(args.contains(&"--pointer= "));
+        assert!(args.contains(&"--marker= "));
+        assert!(!args.contains(&"--highlight-line"));
+    }
+
+    #[test]
+    fn fzf_args_enable_full_row_highlight_when_supported() {
+        let args = fzf_args(FzfCapabilities {
+            highlight_line: true,
+        });
+        assert!(args.contains(&"--highlight-line"));
     }
 
     #[test]
