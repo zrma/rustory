@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-27
+- Last Verified: 2026-06-28
 
 이 문서는 전역 스킬과 레포 문서의 책임 경계를 분리해, 전역 오염 없이 재사용 가능한 스킬만 유지하기 위한 기준이다.
 

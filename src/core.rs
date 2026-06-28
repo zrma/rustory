@@ -44,7 +44,7 @@ impl Entry {
             duration_ms: input.duration_ms,
             shell: input.shell,
             hostname: input.hostname,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::build_info::VERSION.to_string(),
         }
     }
 
@@ -60,7 +60,7 @@ impl Entry {
             duration_ms: input.duration_ms,
             shell: input.shell,
             hostname: input.hostname,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::build_info::VERSION.to_string(),
         }
     }
 }
@@ -120,7 +120,7 @@ mod tests {
         });
 
         let _uuid = Uuid::parse_str(&e.entry_id).unwrap();
-        assert_eq!(e.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(e.version, crate::build_info::VERSION);
         assert_eq!(e.cmd, "echo 1");
     }
 

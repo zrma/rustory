@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-03
+- Last Verified: 2026-06-28
 
 이 문서는 LLM 에이전트 작업 중 사람(담당 개발자)에게 즉시 에스컬레이션해야 하는 조건을 정의한다.
 

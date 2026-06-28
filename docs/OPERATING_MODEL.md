@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-27
+- Last Verified: 2026-06-28
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
@@ -33,7 +33,7 @@
 
 ## 버전관리 원칙 (jj 우선)
 
-1. 로컬 변경 정리는 `jj st`, `jj describe -m`, `jj bookmark`를 기본으로 사용한다.
+1. 로컬 변경 정리는 `jj st`, `jj diff`, `scripts/finalize-and-push.sh` 또는 `~/.codex/skills/vcs-jj/scripts/describe_with_attribution.sh`, `jj bookmark`를 기본으로 사용한다.
 2. 원격 동기화는 `scripts/jj-git-push-safe.sh` 또는 `jj git push`를 기본으로 사용한다.
 3. 루트(`.jj`)에서는 `git commit`을 기본 차단하고, 예외 사용 시 `ALLOW_GIT_COMMIT_IN_JJ_ROOT=1` + 즉시 `jj git import`를 사용한다.
 4. 출고/공유 직전에는 `docs/CHANGE_CONTROL.md`의 절차를 기준으로 `scripts/check-release-gates.sh --manifest-mode full`를 수행한다.

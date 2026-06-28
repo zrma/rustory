@@ -51,6 +51,11 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - spec에 결정 사항이 반영되고, `open-questions.md`는 비어 있어야 한다.
 - 문서(`docs/`)에 사용법/제약이 반영돼야 한다.
 
+## 배포 바이너리 식별
+- 사람이 빠르게 확인할 때는 `rr --version`을 사용한다. 출력에는 package version과 build revision이 함께 들어가야 한다.
+- 운영 스크립트나 배포 점검에서는 `rr version --json`을 사용해 `version`, `build_revision`, `build_revision_source`, `build_dirty`를 파싱한다.
+- `rr doctor --json`도 동일한 `build` 블록을 포함해야 하며, 장애 triage에서 설정/DB 상태와 바이너리 revision을 같이 확인하는 경로로 쓴다.
+
 ### 원커맨드 점검(권장)
 - CI와 같은 검증은 `scripts/check.sh`에서 시작한다.
 - relay/cross-network까지 포함한 고신뢰 네트워크 검증이나 빠른 반복 옵션이 필요하면 `scripts/check.sh --help`에서 현재 옵션을 확인한다.

@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-27
+- Last Verified: 2026-06-28
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -65,7 +65,7 @@ reasoning effort, verbosity, Responses API state, tool definitions, structured o
 3. 커밋 정리 + 푸시
 - 구현 요청 턴의 완료 정의는 `원격 푸시 + 원격 SHA 검증`까지이며, 기본 경로는 `scripts/finalize-and-push.sh --message "<type>: <summary>" [--work-id <work-id>]`를 사용한다.
 - `scripts/finalize-and-push.sh`는 기본적으로 `@` non-empty를 요구한다. 빈 작업트리에서 점검이 필요하면 디버그 환경에서만 `DEBUG_GATES_OVERRIDE=1` + `--allow-empty-at` 조합을 사용한다.
-- `jj st`/`jj diff`로 변경 상태를 확인하고 `jj describe -m "<type>: <summary>"`로 메시지를 정리한다.
+- `jj st`/`jj diff`로 변경 상태를 확인하고, Codex-authored change description은 `scripts/finalize-and-push.sh` 또는 `~/.codex/skills/vcs-jj/scripts/describe_with_attribution.sh`로 trailer까지 함께 정리한다.
 - strict 게이트/푸시 안전 경로/디버그 우회의 허용 경계와 마감 커밋 예외 정책은 `docs/CHANGE_CONTROL.md`를 따른다. `--work-id` 자동 감지, 옵션/default, 실제 분기는 runner 스크립트와 CLI help를 직접 확인한다.
 - 루트 저장소(`.jj` 존재)에서 `git commit` 예외 사용/`jj git import` 동기화 규칙, 교훈 로그 coupling 강제 규칙도 `docs/CHANGE_CONTROL.md`를 단일 기준으로 따른다.
 

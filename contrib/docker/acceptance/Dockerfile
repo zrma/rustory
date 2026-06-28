@@ -7,7 +7,7 @@ RUN apt-get update -y \
 WORKDIR /app
 
 # 캐시 힌트(의존성 레이어)
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml build.rs ./
 COPY src ./src
 
 RUN cargo build --release --locked --bin rr
@@ -21,4 +21,3 @@ RUN apt-get update -y \
 COPY --from=builder /app/target/release/rr /usr/local/bin/rr
 
 CMD ["rr"]
-

@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-27
+- Last Verified: 2026-06-28
 
 이 문서는 반복 개발에서 누락/회귀를 줄이기 위한 경량 운영 루프를 정의한다.
 

@@ -194,8 +194,11 @@ fn build_rustory_swarm_with_identity(
         .multiplex(libp2p_mplex::Config::default())
         .boxed();
 
-    let identify_cfg = libp2p::identify::Config::new("rustory/0.1.0".to_string(), local_public_key)
-        .with_agent_version(format!("rustory/{}", env!("CARGO_PKG_VERSION")));
+    let identify_cfg = libp2p::identify::Config::new(
+        format!("rustory/{}", crate::build_info::VERSION),
+        local_public_key,
+    )
+    .with_agent_version(format!("rustory/{}", crate::build_info::VERSION_DISPLAY));
 
     let behaviour = RustoryBehaviour {
         relay: relay_behaviour,
@@ -233,9 +236,11 @@ fn build_relay_swarm_with_identity(
         .multiplex(libp2p_mplex::Config::default())
         .boxed();
 
-    let identify_cfg =
-        libp2p::identify::Config::new("rustory-relay/0.1.0".to_string(), local_public_key)
-            .with_agent_version(format!("rustory/{}", env!("CARGO_PKG_VERSION")));
+    let identify_cfg = libp2p::identify::Config::new(
+        format!("rustory-relay/{}", crate::build_info::VERSION),
+        local_public_key,
+    )
+    .with_agent_version(format!("rustory/{}", crate::build_info::VERSION_DISPLAY));
 
     let behaviour = RelayServerBehaviour {
         relay: libp2p::relay::Behaviour::new(local_peer_id, libp2p::relay::Config::default()),
@@ -874,6 +879,8 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
                         hostname: None,
                         user_id: peer.user_id,
                         version: None,
+                        build_revision: None,
+                        build_dirty: None,
                     }),
                     last_seen_unix: peer.last_seen_unix,
                 },
@@ -1538,7 +1545,7 @@ mod tests {
             duration_ms: 12,
             shell: "zsh".to_string(),
             hostname: "host".to_string(),
-            version: "0.1.0".to_string(),
+            version: crate::build_info::VERSION.to_string(),
         }
     }
 

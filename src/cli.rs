@@ -20,7 +20,7 @@ const DEFAULT_HOOK_SEARCH_LIMIT: usize = 100_000;
 const FZF_PURPOSE: &str = "ctrl+r search";
 
 #[derive(Parser)]
-#[command(name = "rr", version, about = "Rustory CLI")]
+#[command(name = "rr", version = crate::build_info::VERSION_DISPLAY, about = "Rustory CLI")]
 pub struct App {
     #[arg(
         long,
@@ -331,6 +331,15 @@ enum Command {
             help = "Ping configured trackers and include reachability"
         )]
         with_tracker: bool,
+    },
+    #[command(about = "Print Rustory version and build revision")]
+    Version {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Print version info as pretty JSON"
+        )]
+        json: bool,
     },
     #[command(about = "Print a bash or zsh shell hook")]
     Hook {
@@ -887,6 +896,9 @@ pub fn run() -> Result<()> {
                 }
             }
         }
+        Command::Version { json } => {
+            print_build_info(json)?;
+        }
         Command::Hook { shell } => {
             let shell = hook::Shell::parse(shell.as_str())?;
             let content = hook::render_hook(shell);
@@ -1024,7 +1036,7 @@ pub fn run() -> Result<()> {
 fn can_continue_after_config_load_error(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Doctor { .. } | Command::Init { force: true, .. }
+        Command::Doctor { .. } | Command::Version { .. } | Command::Init { force: true, .. }
     )
 }
 
@@ -1683,6 +1695,7 @@ fn compute_next_due_in_sec(
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct DoctorReport {
+    build: BuildInfoReport,
     config_path: String,
     config_exists: bool,
     config_mode: Option<u32>,
@@ -1797,6 +1810,42 @@ struct DoctorTrackerTokenReport {
     length: Option<usize>,
     warning: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct BuildInfoReport {
+    version: String,
+    build_revision: String,
+    build_revision_source: String,
+    build_dirty: bool,
+}
+
+fn build_info_report() -> BuildInfoReport {
+    BuildInfoReport {
+        version: crate::build_info::VERSION.to_string(),
+        build_revision: crate::build_info::BUILD_REVISION.to_string(),
+        build_revision_source: crate::build_info::BUILD_REVISION_SOURCE.to_string(),
+        build_dirty: crate::build_info::build_dirty(),
+    }
+}
+
+fn print_build_info(json: bool) -> Result<()> {
+    let report = build_info_report();
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).context("serialize version json")?
+        );
+        return Ok(());
+    }
+
+    println!("version: {}", report.version);
+    println!("build_revision: {}", report.build_revision);
+    println!("build_revision_source: {}", report.build_revision_source);
+    println!("build_dirty: {}", report.build_dirty);
+
+    Ok(())
 }
 
 fn build_doctor_report(
@@ -1974,6 +2023,7 @@ fn build_doctor_report(
     let trackers = build_tracker_status_report(&trackers, tracker_token.as_deref());
 
     Ok(DoctorReport {
+        build: build_info_report(),
         config_path: cfg_path.display().to_string(),
         config_exists: cfg_exists,
         config_mode,
@@ -2144,6 +2194,12 @@ fn run_doctor(
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
     let db = build_db_status_report(db_path)?;
+    let build = build_info_report();
+
+    println!(
+        "build status: version={} revision={} source={} dirty={}",
+        build.version, build.build_revision, build.build_revision_source, build.build_dirty
+    );
 
     println!("config path: {} (exists: {cfg_exists})", cfg_path.display());
     match config_error {
@@ -3257,7 +3313,9 @@ fn resolve_peer_meta(cfg: &config::FileConfig) -> crate::tracker::PeerMeta {
         device_id: Some(device_id),
         hostname: Some(hostname),
         user_id: Some(user_id),
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        version: Some(crate::build_info::VERSION.to_string()),
+        build_revision: Some(crate::build_info::BUILD_REVISION.to_string()),
+        build_dirty: Some(crate::build_info::build_dirty()),
     }
 }
 
@@ -3529,6 +3587,28 @@ mod tests {
     }
 
     #[test]
+    fn version_command_parses_and_ignores_config_load_errors() {
+        let app = App::parse_from(["rr", "version", "--json"]);
+
+        match app.cmd {
+            Command::Version { json } => assert!(json),
+            _ => panic!("expected version"),
+        }
+        assert!(can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn clap_version_includes_build_revision() {
+        use clap::CommandFactory;
+
+        let cmd = App::command();
+        let version = cmd.get_version().expect("version");
+
+        assert!(version.contains(crate::build_info::VERSION));
+        assert!(version.contains(crate::build_info::BUILD_REVISION));
+    }
+
+    #[test]
     fn config_load_error_policy_allows_only_force_init() {
         let force_app = App::parse_from(["rr", "init", "--force"]);
         let non_force_app = App::parse_from(["rr", "init"]);
@@ -3553,6 +3633,7 @@ mod tests {
         assert!(report.p2p_request_retry.error.is_none());
 
         let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"build\""));
         assert!(json.contains("\"db\""));
         assert!(json.contains("\"config_error\""));
         assert!(json.contains("\"config_warning\""));
@@ -3638,7 +3719,7 @@ mod tests {
                 duration_ms: 10,
                 shell: "zsh".to_string(),
                 hostname: "host".to_string(),
-                version: "0.1.0".to_string(),
+                version: crate::build_info::VERSION.to_string(),
             }])
             .unwrap();
         store
@@ -4148,7 +4229,7 @@ mod tests {
                 duration_ms: 10,
                 shell: "zsh".to_string(),
                 hostname: "host".to_string(),
-                version: "0.1.0".to_string(),
+                version: crate::build_info::VERSION.to_string(),
             }
         }
 

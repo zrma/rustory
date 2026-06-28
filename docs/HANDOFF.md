@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-27
+- Last Verified: 2026-06-28
 
 이 문서는 `rustory` 루트에서 작업 시작 시 사용하는 단일 네비게이션 문서다.
 

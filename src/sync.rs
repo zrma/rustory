@@ -360,7 +360,7 @@ mod tests {
             duration_ms: 12,
             shell: "zsh".to_string(),
             hostname: "host".to_string(),
-            version: "0.1.0".to_string(),
+            version: crate::build_info::VERSION.to_string(),
         }
     }
 

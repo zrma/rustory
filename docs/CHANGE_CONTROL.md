@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-27
+- Last Verified: 2026-06-28
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
@@ -64,7 +64,7 @@
 원격 브랜치가 없는 첫 push는 remote SHA 조회를 재시도한 뒤 검증하며, 조회 성공 후 SHA mismatch는 기존과 동일하게 차단한다.
 `--manifest-mode quick`은 디버그 전용이며 `--allow-quick-manifest`와 `DEBUG_GATES_OVERRIDE=1`(non-CI 환경)을 함께 주지 않으면 차단된다.
 `scripts/finalize-and-push.sh`는 기본적으로 `@` non-empty를 요구한다. 빈 작업트리에서 점검이 필요할 때만 디버그 환경에서 `DEBUG_GATES_OVERRIDE=1` + `--allow-empty-at` 조합을 사용한다. (CI 환경 불가)
-수동 경로가 필요하면 `jj describe -m`, `jj bookmark move`, `scripts/jj-git-push-safe.sh`, `git ls-remote --heads origin <bookmark>` 순서로 수행한다.
+수동 경로가 필요하면 `~/.codex/skills/vcs-jj/scripts/describe_with_attribution.sh`, `jj bookmark move`, `scripts/jj-git-push-safe.sh`, `git ls-remote --heads origin <bookmark>` 순서로 수행한다. Codex-authored change description은 `Co-authored-by` trailer가 마지막 non-empty line에 정확히 1회 있어야 한다.
 
 추가 강제:
 - `lefthook` `pre-push`에서 `scripts/check-release-gates.sh --manifest-mode full`와 `scripts/check-lessons-log-range.sh --remote origin --bookmark main`를 실행해 release/push 게이트 및 교훈 로그 range coupling을 재확인한다.

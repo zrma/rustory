@@ -95,6 +95,47 @@ run_argv() {
   (cd "$ROOT" && "$@")
 }
 
+describe_current_change() {
+  local message="$1"
+  local helper="${CODEX_JJ_DESCRIBE_HELPER:-$HOME/.codex/skills/vcs-jj/scripts/describe_with_attribution.sh}"
+
+  if [[ ! -x "$helper" ]]; then
+    fail "Codex jj describe helper not found or not executable: $helper"
+  fi
+
+  run_argv "$helper" -r @ -- "$message"
+}
+
+verify_current_description_attribution() {
+  local attribution=""
+  attribution="$(
+    sed -nE 's/^[[:space:]]*commit_attribution[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*$/\1/p' \
+      "$HOME/.codex/config.toml" | head -n 1
+  )"
+  if [[ -z "$attribution" ]]; then
+    fail "commit_attribution is not configured in $HOME/.codex/config.toml"
+  fi
+
+  local trailer="Co-authored-by: $attribution"
+  local description=""
+  description="$(cd "$ROOT" && jj log -r @ --no-graph -T 'description')"
+  DESC="$description" TRAILER="$trailer" python3 - <<'PY'
+import os
+import sys
+
+desc = os.environ["DESC"]
+trailer = os.environ["TRAILER"]
+nonempty = [line.rstrip() for line in desc.splitlines() if line.strip()]
+count = sum(1 for line in nonempty if line == trailer)
+
+if count != 1 or not nonempty or nonempty[-1] != trailer:
+    print("attribution verification failed", file=sys.stderr)
+    print(f"expected final trailer: {trailer}", file=sys.stderr)
+    print(f"trailer count: {count}", file=sys.stderr)
+    sys.exit(1)
+PY
+}
+
 parse_opt_value() {
   local opt_name="$1"
   local opt_value="${2:-}"
@@ -299,8 +340,11 @@ fi
 run_argv "${gate_args[@]}"
 ok "release gates passed"
 
-run_argv jj describe -m "$MESSAGE"
-ok "jj describe updated"
+describe_current_change "$MESSAGE"
+if (( DRY_RUN == 0 )); then
+  verify_current_description_attribution
+fi
+ok "jj describe updated with Codex attribution"
 
 run_argv jj bookmark move "$BOOKMARK" --to @
 ok "bookmark moved: $BOOKMARK"

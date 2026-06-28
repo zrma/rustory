@@ -12,6 +12,8 @@ pub struct PeerMeta {
     pub hostname: Option<String>,
     pub user_id: Option<String>,
     pub version: Option<String>,
+    pub build_revision: Option<String>,
+    pub build_dirty: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -451,7 +453,9 @@ mod tests {
                 user_id: Some(user_id.to_string()),
                 device_id: Some("d1".to_string()),
                 hostname: None,
-                version: Some("0.1.0".to_string()),
+                version: Some(crate::build_info::VERSION.to_string()),
+                build_revision: Some(crate::build_info::BUILD_REVISION.to_string()),
+                build_dirty: Some(crate::build_info::build_dirty()),
             }),
         };
         let resp = client.register(&req).unwrap();
