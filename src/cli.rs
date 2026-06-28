@@ -1318,6 +1318,9 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     let tracker_token = normalize_opt_string(args.tracker_token.clone())
         .or_else(|| normalize_opt_string(cfg.tracker_token.clone()))
         .or_else(|| env_nonempty("RUSTORY_TRACKER_TOKEN"));
+    if let Some(token) = tracker_token.as_deref() {
+        tracker::validate_tracker_token_value(token, "tracker token")?;
+    }
 
     let swarm_key_path = normalize_opt_string(cfg.swarm_key_path.clone())
         .unwrap_or_else(|| config::DEFAULT_SWARM_KEY_PATH.to_string());
@@ -1538,6 +1541,8 @@ fn compute_next_due_in_sec(
 struct DoctorReport {
     config_path: String,
     config_exists: bool,
+    config_mode: Option<u32>,
+    config_warning: Option<String>,
     config_error: Option<String>,
     db_path: String,
     db: DoctorDbStatusReport,
@@ -1553,6 +1558,7 @@ struct DoctorReport {
     p2p_identity_key: DoctorKeyStatusReport,
     relay_identity_key: DoctorKeyStatusReport,
     relay_addr: DoctorRelayAddrReport,
+    tracker_token: DoctorTrackerTokenReport,
     trackers: Vec<SyncStatusTrackerReport>,
 }
 
@@ -1641,6 +1647,14 @@ struct DoctorRelayAddrReport {
     error: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorTrackerTokenReport {
+    configured: bool,
+    length: Option<usize>,
+    warning: Option<String>,
+    error: Option<String>,
+}
+
 fn build_doctor_report(
     cfg: &config::FileConfig,
     db_path: &str,
@@ -1652,6 +1666,8 @@ fn build_doctor_report(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(_) => false,
     };
+    let config_mode = file_mode_777(&cfg_path);
+    let config_warning = build_config_file_warning(cfg_exists, config_mode);
 
     let db = build_db_status_report(db_path)?;
     let user_id = resolve_user_id(cfg);
@@ -1805,12 +1821,19 @@ fn build_doctor_report(
     };
 
     let trackers = resolve_trackers(Vec::new(), cfg)?;
-    let tracker_token = resolve_tracker_token(None, cfg)?;
+    let tracker_token_raw = resolve_tracker_token_raw(None, cfg);
+    let tracker_token = validate_resolved_tracker_token(tracker_token_raw.clone())
+        .ok()
+        .flatten();
+    let tracker_token_report =
+        build_tracker_token_report(tracker_token_raw.as_deref(), !trackers.is_empty());
     let trackers = build_tracker_status_report(&trackers, tracker_token.as_deref());
 
     Ok(DoctorReport {
         config_path: cfg_path.display().to_string(),
         config_exists: cfg_exists,
+        config_mode,
+        config_warning,
         config_error: config_error.map(|err| err.to_string()),
         db_path: db.path.clone(),
         db,
@@ -1826,6 +1849,7 @@ fn build_doctor_report(
         p2p_identity_key,
         relay_identity_key,
         relay_addr,
+        tracker_token: tracker_token_report,
         trackers,
     })
 }
@@ -1841,6 +1865,70 @@ fn build_db_status_report(db_path: &str) -> Result<DoctorDbStatusReport> {
         sync_peer_count: inspection.sync_peer_count,
         error: inspection.error,
     })
+}
+
+fn build_config_file_warning(exists: bool, mode: Option<u32>) -> Option<String> {
+    if !exists {
+        return None;
+    }
+
+    let mode = mode?;
+    if mode != 0o600 {
+        return Some(format!(
+            "mode={mode:03o}, want 600 because config.toml can contain tracker_token"
+        ));
+    }
+
+    None
+}
+
+fn build_tracker_token_report(
+    token: Option<&str>,
+    trackers_configured: bool,
+) -> DoctorTrackerTokenReport {
+    let Some(token) = token else {
+        return DoctorTrackerTokenReport {
+            configured: false,
+            length: None,
+            warning: if trackers_configured {
+                Some(
+                    "missing; tracker requests will be unauthenticated unless the tracker also has no token"
+                        .to_string(),
+                )
+            } else {
+                None
+            },
+            error: None,
+        };
+    };
+
+    let error = tracker::validate_tracker_token_value(token, "tracker token")
+        .err()
+        .map(|err| format!("{err:#}"));
+    let mut warnings = Vec::new();
+    if token.len() < 32 {
+        warnings.push("short; use at least 32 random characters for production".to_string());
+    }
+    if token.to_ascii_lowercase().starts_with("bearer ") {
+        warnings.push("contains Bearer prefix; configure only the raw token".to_string());
+    }
+    if token.chars().any(char::is_whitespace) {
+        warnings.push(
+            "contains whitespace; quote exactly and prefer tokens without whitespace".to_string(),
+        );
+    }
+    if !token.is_ascii() {
+        warnings.push(
+            "contains non-ASCII characters; HTTP clients or proxies may reject it".to_string(),
+        );
+    }
+
+    DoctorTrackerTokenReport {
+        configured: true,
+        length: Some(token.len()),
+        warning: (!warnings.is_empty()).then(|| warnings.join("; ")),
+        error,
+    }
 }
 
 fn build_key_status_report(
@@ -1918,6 +2006,16 @@ fn run_doctor(
         Some(err) => println!("config status: invalid: {err}"),
         None if cfg_exists => println!("config status: ok"),
         None => println!("config status: missing (using defaults/env)"),
+    }
+    if cfg_exists {
+        let config_mode = file_mode_777(&cfg_path);
+        let mode = config_mode
+            .map(|value| format!("{value:03o}"))
+            .unwrap_or_else(|| "-".to_string());
+        match build_config_file_warning(cfg_exists, config_mode) {
+            Some(warning) => println!("config permissions: mode={mode} warn: {warning}"),
+            None => println!("config permissions: mode={mode}"),
+        }
     }
     println!("db path: {}", db.path);
     print_db_status(&db);
@@ -2041,12 +2139,25 @@ fn run_doctor(
     }
 
     let trackers = resolve_trackers(Vec::new(), cfg)?;
+    let token_raw = resolve_tracker_token_raw(None, cfg);
+    print_tracker_token_status(&build_tracker_token_report(
+        token_raw.as_deref(),
+        !trackers.is_empty(),
+    ));
     if trackers.is_empty() {
         println!("trackers: (none)");
         return Ok(());
     }
 
-    let token = resolve_tracker_token(None, cfg)?;
+    let token = match validate_resolved_tracker_token(token_raw) {
+        Ok(token) => token,
+        Err(err) => {
+            for base_url in trackers {
+                println!("- {base_url} (ping: skipped: invalid tracker token: {err:#})");
+            }
+            return Ok(());
+        }
+    };
     println!("trackers:");
     for base_url in trackers {
         let ping = tracker_ping(&base_url, token.as_deref());
@@ -2243,6 +2354,25 @@ fn print_db_status(report: &DoctorDbStatusReport) {
         report.peer_book_count.unwrap_or(0),
         report.sync_peer_count.unwrap_or(0),
     );
+}
+
+fn print_tracker_token_status(report: &DoctorTrackerTokenReport) {
+    let length = report
+        .length
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "-".to_string());
+    let mut parts = vec![
+        format!("configured={}", report.configured),
+        format!("length={length}"),
+    ];
+    if let Some(warning) = report.warning.as_deref() {
+        parts.push(format!("warning={warning}"));
+    }
+    if let Some(error) = report.error.as_deref() {
+        parts.push(format!("error={error}"));
+    }
+
+    println!("tracker token: {}", parts.join(" "));
 }
 
 fn print_key_status(
@@ -2956,10 +3086,22 @@ fn resolve_trackers(cli: Vec<String>, cfg: &config::FileConfig) -> Result<Vec<St
         .collect())
 }
 
-fn resolve_tracker_token(cli: Option<String>, cfg: &config::FileConfig) -> Result<Option<String>> {
-    Ok(normalize_opt_string(cli)
+fn resolve_tracker_token_raw(cli: Option<String>, cfg: &config::FileConfig) -> Option<String> {
+    normalize_opt_string(cli)
         .or_else(|| env_nonempty("RUSTORY_TRACKER_TOKEN"))
-        .or_else(|| normalize_opt_string(cfg.tracker_token.clone())))
+        .or_else(|| normalize_opt_string(cfg.tracker_token.clone()))
+}
+
+fn validate_resolved_tracker_token(token: Option<String>) -> Result<Option<String>> {
+    if let Some(token) = token.as_deref() {
+        tracker::validate_tracker_token_value(token, "tracker token")?;
+    }
+
+    Ok(token)
+}
+
+fn resolve_tracker_token(cli: Option<String>, cfg: &config::FileConfig) -> Result<Option<String>> {
+    validate_resolved_tracker_token(resolve_tracker_token_raw(cli, cfg))
 }
 
 fn resolve_peer_meta(cfg: &config::FileConfig) -> crate::tracker::PeerMeta {
@@ -3260,18 +3402,60 @@ mod tests {
         assert_eq!(report.db.path, ":memory:");
         assert!(report.config_error.is_none());
         assert!(!report.db.exists);
+        assert!(report.config_warning.is_none());
         assert_eq!(report.fzf.command, "fzf");
+        assert!(!report.tracker_token.configured);
         assert!(report.trackers.is_empty());
         assert!(report.p2p_request_retry.error.is_none());
 
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"db\""));
         assert!(json.contains("\"config_error\""));
+        assert!(json.contains("\"config_warning\""));
         assert!(json.contains("\"fzf\""));
         assert!(json.contains("\"hook\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
         assert!(json.contains("\"relay_addr\""));
+        assert!(json.contains("\"tracker_token\""));
+    }
+
+    #[test]
+    fn doctor_report_includes_tracker_token_status_without_value() {
+        let cfg = config::FileConfig {
+            tracker_token: Some("short-secret".to_string()),
+            ..Default::default()
+        };
+
+        let report = build_doctor_report(&cfg, ":memory:", None).unwrap();
+        assert!(report.tracker_token.configured);
+        assert_eq!(report.tracker_token.length, Some("short-secret".len()));
+        assert!(
+            report
+                .tracker_token
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("short")
+        );
+        assert!(report.tracker_token.error.is_none());
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"length\""));
+        assert!(!json.contains("short-secret"));
+    }
+
+    #[test]
+    fn tracker_token_report_warns_when_trackers_have_no_token() {
+        let report = build_tracker_token_report(None, true);
+        assert!(!report.configured);
+        assert!(
+            report
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("unauthenticated")
+        );
     }
 
     #[test]
@@ -3549,6 +3733,17 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn doctor_text_output_keeps_running_when_tracker_token_is_invalid() {
+        let cfg = config::FileConfig {
+            trackers: Some(vec!["http://127.0.0.1:1".to_string()]),
+            tracker_token: Some("abc\nxyz".to_string()),
+            ..Default::default()
+        };
+
+        assert!(run_doctor(&cfg, ":memory:", false, None).is_ok());
     }
 
     #[test]
@@ -4145,6 +4340,13 @@ mod tests {
         assert!(text.contains("record_ignore_regex"));
         assert!(text.contains("async_upload"));
         assert!(text.contains("auto_prune"));
+    }
+
+    #[test]
+    fn resolve_tracker_token_rejects_control_characters() {
+        let cfg = config::FileConfig::default();
+        let err = resolve_tracker_token(Some("abc\nxyz".to_string()), &cfg).unwrap_err();
+        assert!(format!("{err:#}").contains("must not contain control characters"));
     }
 
     #[test]

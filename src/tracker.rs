@@ -241,11 +241,21 @@ fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Opti
     };
 
     let token = token.trim();
+    validate_tracker_token_value(token, label)?;
+
+    Ok(Some(token.to_string()))
+}
+
+pub fn validate_tracker_token_value(token: &str, label: &str) -> Result<()> {
     if token.is_empty() {
         anyhow::bail!("{label} must not be empty");
     }
 
-    Ok(Some(token.to_string()))
+    if token.chars().any(char::is_control) {
+        anyhow::bail!("{label} must not contain control characters");
+    }
+
+    Ok(())
 }
 
 fn header_value(req: &tiny_http::Request, name: &'static str) -> Option<String> {
@@ -510,6 +520,13 @@ mod tests {
         assert_ureq_status(&err, 401);
 
         server.shutdown();
+    }
+
+    #[test]
+    fn tracker_rejects_control_characters_in_configured_token() {
+        let err =
+            normalize_configured_token(Some("abc\nxyz".to_string()), "tracker token").unwrap_err();
+        assert!(format!("{err:#}").contains("must not contain control characters"));
     }
 
     #[test]
