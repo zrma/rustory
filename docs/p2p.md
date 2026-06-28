@@ -6,8 +6,8 @@
 ## 범위
 - 단계 1: 수동 multiaddr로 피어를 지정해 pull 기반 동기화를 수행한다.
 - 단계 2: tracker/relay(디스커버리 + 중계) 기반으로 peer 목록을 얻고,
-  - direct 연결을 우선 시도하고(direct-first),
-  - 실패 시 relay로 fallback 한다.
+  - relay 주소가 설정되어 있으면 relay circuit을 우선 시도하고,
+  - relay 실패 시 tracker/peerbook의 direct 후보로 fallback 한다.
 
 ## 운영 가이드(PoC vs 안정화)
 - PoC 단계에서는 tracker/relay를 로컬/임시로 띄워도 된다. 내려가면 동기화가 지연될 뿐이고, 로컬 DB가 source of truth라 데이터 유실은 없다.
@@ -66,7 +66,10 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 ```
 
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
-이때 tracker가 가진 peer의 `addrs`를 direct 후보로 먼저 시도하고, 실패하면 `--relay`로 relay 경유 dial을 시도한다.
+이때 `--relay`가 설정되어 있으면 NAT/공유기 뒤 peer를 기본값으로 보고 relay circuit을 먼저 시도한다.
+tracker가 relay circuit 주소를 광고한 peer는 현재 sync 실행 환경에서 지정한 relay 주소로 다시 구성해 dial한다.
+이렇게 해야 tracker에 저장된 Docker/LAN/private IP가 현재 머신에서 직접 dial 불가능해도 같은 relay PeerId를 통해 연결할 수 있다.
+relay 연결이 실패하면 tracker/peerbook의 direct 후보로 fallback 한다.
 pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 재시도할 수 있다.
 현재 재시도 횟수, 타임아웃, 백오프 default는 `rr p2p-sync --help`, config resolver, 관련 코드를 확인한다.
 - CLI: `--req-attempts`, `--req-timeout-base-sec`, `--req-timeout-cap-sec`, `--req-backoff-base-ms`
@@ -87,7 +90,7 @@ push 응답(ack)에는 (가능하면) `inserted`/`ignored` 카운트가 포함�
 - push: `p2p push summary: <peer>: sent=<n> inserted=<n> ignored=<n>`
 
 `rr p2p-serve`는 listen 주소뿐 아니라 libp2p가 발견한 **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)도 tracker에 같이 등록한다.
-따라서 같은 LAN/같은 네트워크 등에서 direct-first 성공 확률이 올라간다.
+따라서 relay 실패 후 direct fallback 또는 DCUtR 업그레이드가 가능한 환경에서는 direct 경로도 활용할 수 있다.
 
 ## Hole Punching(DCUtR)
 - relay 경유로 연결이 수립되면(libp2p `/p2p-circuit`), **가능하면 direct 연결로 업그레이드**(hole punching)한다.
@@ -175,3 +178,12 @@ Docker Desktop을 이용해 macOS host + Linux 컨테이너 조합으로 최소 
 - smoke는 생략하고 Docker acceptance만 더 보고 싶으면: `scripts/check.sh --fast --acceptance`
 - 원커맨드: `bash scripts/acceptance_docker_macos_linux.sh`
 - 절차 문서: `docs/acceptance/docker-macos-linux.md`
+
+## Docker 기반 수용 테스트(two peer relay-only)
+실사용에 가까운 NAT/공유기 분리 조건은 두 peer 사이 direct 경로가 없어야 검증된다.
+`scripts/acceptance_docker_two_peer_relay.sh`는 `peer-a`와 `peer-b`를 서로 다른 Docker network에 분리하고,
+tracker/relay만 양쪽 network에 붙여 relay circuit 없이는 수렴할 수 없는 구성을 만든다.
+
+- 전체 acceptance 경로: `scripts/check.sh --acceptance`
+- relay-only 시나리오만 실행: `bash scripts/acceptance_docker_two_peer_relay.sh`
+- 절차 문서: `docs/acceptance/docker-two-peer-relay.md`

@@ -4,3 +4,4 @@
 정확한 실행 단계와 검증 조건은 각 `scripts/acceptance_*` 스크립트가 소유하며, 문서는 시나리오 라우팅과 디버깅 위치만 안내한다.
 
 - [Docker macOS/Linux 수용 테스트](docker-macos-linux.md)
+- [Docker two-peer relay-only 수용 테스트](docker-two-peer-relay.md)

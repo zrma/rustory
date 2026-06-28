@@ -578,7 +578,7 @@ pub fn sync(
 struct SyncTarget {
     peer_id: PeerId,
     peer_key: String,
-    direct_addrs: Vec<Multiaddr>,
+    dial_addrs: Vec<Multiaddr>,
     relay_addr: Option<Multiaddr>,
 }
 
@@ -620,7 +620,7 @@ async fn sync_async(
     for t in targets {
         let mut client = match P2pClient::new(
             t.peer_id,
-            t.direct_addrs,
+            t.dial_addrs,
             t.relay_addr,
             cfg.psk,
             cfg.request_retry_policy.clone(),
@@ -749,7 +749,7 @@ fn build_manual_targets(
         out.push(SyncTarget {
             peer_id,
             peer_key,
-            direct_addrs: vec![base_addr],
+            dial_addrs: vec![base_addr],
             relay_addr: relay_addr.clone(),
         });
     }
@@ -850,12 +850,13 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
                 continue;
             }
         };
-        let direct_addrs = direct_candidate_addrs_from_tracker(&peer.addrs);
+        let (dial_addrs, target_relay_addr) =
+            tracker_target_addrs(&peer.addrs, peer_id, &relay_addr);
         out.push(SyncTarget {
             peer_id,
             peer_key: peer_id_str,
-            direct_addrs,
-            relay_addr: Some(relay_addr.clone()),
+            dial_addrs,
+            relay_addr: target_relay_addr,
         });
     }
 
@@ -864,6 +865,56 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
     }
 
     Ok(out)
+}
+
+fn tracker_target_addrs(
+    addrs: &[String],
+    peer_id: PeerId,
+    relay_addr: &Multiaddr,
+) -> (Vec<Multiaddr>, Option<Multiaddr>) {
+    let relay_addrs = relay_candidate_addrs_from_tracker(addrs, peer_id, relay_addr);
+    if !relay_addrs.is_empty() {
+        return (relay_addrs, None);
+    }
+
+    (
+        direct_candidate_addrs_from_tracker(addrs),
+        Some(relay_addr.clone()),
+    )
+}
+
+fn relay_candidate_addrs_from_tracker(
+    addrs: &[String],
+    peer_id: PeerId,
+    configured_relay_addr: &Multiaddr,
+) -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for raw in addrs {
+        let Ok(addr) = raw.parse::<Multiaddr>() else {
+            continue;
+        };
+
+        if !addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)) {
+            continue;
+        }
+
+        let Some(Protocol::P2p(got)) = addr.iter().last() else {
+            continue;
+        };
+        if got != peer_id {
+            continue;
+        }
+
+        let configured = configured_relay_addr.clone().with(Protocol::P2pCircuit);
+        let key = configured.to_string();
+        if seen.insert(key) {
+            out.push(configured);
+        }
+    }
+
+    out
 }
 
 fn direct_candidate_addrs_from_tracker(addrs: &[String]) -> Vec<Multiaddr> {
@@ -902,6 +953,12 @@ fn direct_candidate_addrs_from_tracker(addrs: &[String]) -> Vec<Multiaddr> {
     out
 }
 
+fn addrs_include_relay_circuit(addrs: &[Multiaddr]) -> bool {
+    addrs
+        .iter()
+        .any(|addr| addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+}
+
 fn split_peer_multiaddr(value: &str) -> Result<(PeerId, Multiaddr)> {
     let mut addr: Multiaddr = value.parse().context("parse peer multiaddr")?;
     let Some(last) = addr.pop() else {
@@ -915,7 +972,7 @@ fn split_peer_multiaddr(value: &str) -> Result<(PeerId, Multiaddr)> {
 
 struct P2pClient {
     peer_id: PeerId,
-    direct_addrs: Vec<Multiaddr>,
+    dial_addrs: Vec<Multiaddr>,
     relay_addr: Option<Multiaddr>,
     request_retry_policy: RequestRetryPolicy,
     push_ack_stats_known: bool,
@@ -927,7 +984,7 @@ struct P2pClient {
 impl P2pClient {
     fn new(
         peer_id: PeerId,
-        direct_addrs: Vec<Multiaddr>,
+        dial_addrs: Vec<Multiaddr>,
         relay_addr: Option<Multiaddr>,
         psk: libp2p::pnet::PreSharedKey,
         request_retry_policy: RequestRetryPolicy,
@@ -940,7 +997,7 @@ impl P2pClient {
 
         Ok(Self {
             peer_id,
-            direct_addrs,
+            dial_addrs,
             relay_addr,
             request_retry_policy,
             push_ack_stats_known: false,
@@ -974,23 +1031,46 @@ impl P2pClient {
             return Ok(());
         }
 
-        if !self.direct_addrs.is_empty()
-            && self
-                .dial_with_retries(self.direct_addrs.clone(), DIRECT_BASE_TIMEOUT, None)
-                .await
-                .is_ok()
-        {
-            return Ok(());
-        }
+        let mut relay_err: Option<anyhow::Error> = None;
 
         if let Some(relay_addr) = self.relay_addr.clone() {
             let addr = relay_addr.with(Protocol::P2pCircuit);
-            self.dial_with_retries(vec![addr], RELAY_BASE_TIMEOUT, Some(RELAY_TIMEOUT_CAP))
-                .await?;
-            return Ok(());
+            match self
+                .dial_with_retries(vec![addr], RELAY_BASE_TIMEOUT, Some(RELAY_TIMEOUT_CAP))
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => relay_err = Some(err),
+            }
         }
 
-        anyhow::bail!("dial failed: no relay addr and direct dial failed");
+        if !self.dial_addrs.is_empty() {
+            let (timeout_base, timeout_cap) = if addrs_include_relay_circuit(&self.dial_addrs) {
+                (RELAY_BASE_TIMEOUT, Some(RELAY_TIMEOUT_CAP))
+            } else {
+                (DIRECT_BASE_TIMEOUT, None)
+            };
+            match self
+                .dial_with_retries(self.dial_addrs.clone(), timeout_base, timeout_cap)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if let Some(relay_err) = relay_err {
+                        return Err(err).with_context(|| {
+                            format!("dial addrs failed after relay dial failed: {relay_err:#}")
+                        });
+                    }
+                    return Err(err);
+                }
+            }
+        }
+
+        if let Some(relay_err) = relay_err {
+            return Err(relay_err);
+        }
+
+        anyhow::bail!("dial failed: no relay addr and no dial addrs");
     }
 
     async fn dial_with_retries(
@@ -1026,7 +1106,7 @@ impl P2pClient {
             return Ok(());
         }
 
-        // direct-first dial이 timeout/부분 실패하는 동안에도 relay dial을 시작할 수 있게,
+        // 같은 peer에 대한 이전 시도 실패 후에도 다음 relay/direct 후보를 바로 시도할 수 있게,
         // dial 조건에서 NotDialing을 제거한다.
         let opts = DialOpts::peer_id(self.peer_id)
             .condition(libp2p::swarm::dial_opts::PeerCondition::Disconnected)
@@ -1421,6 +1501,107 @@ mod tests {
     }
 
     #[test]
+    fn relay_candidate_addrs_from_tracker_prefers_configured_relay() {
+        let peer_id = PeerId::random();
+        let relay_id = PeerId::random();
+        let configured_relay: Multiaddr = format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+        let advertised =
+            format!("/ip4/172.19.0.3/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{peer_id}");
+        let direct = format!("/ip4/172.19.0.5/tcp/1234/p2p/{peer_id}");
+
+        let got =
+            relay_candidate_addrs_from_tracker(&[direct, advertised], peer_id, &configured_relay);
+
+        assert_eq!(
+            got,
+            vec![
+                format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}/p2p-circuit")
+                    .parse()
+                    .unwrap()
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_candidate_addrs_from_tracker_ignores_wrong_target_peer() {
+        let peer_id = PeerId::random();
+        let other_peer = PeerId::random();
+        let relay_id = PeerId::random();
+        let configured_relay: Multiaddr = format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+        let advertised =
+            format!("/ip4/172.19.0.3/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{other_peer}");
+
+        let got = relay_candidate_addrs_from_tracker(&[advertised], peer_id, &configured_relay);
+
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn tracker_target_addrs_uses_configured_relay_when_tracker_advertises_circuit() {
+        let peer_id = PeerId::random();
+        let relay_id = PeerId::random();
+        let configured_relay: Multiaddr = format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+        let advertised_relay =
+            format!("/ip4/172.19.0.3/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{peer_id}");
+        let advertised_direct = format!("/ip4/172.19.0.5/tcp/1234/p2p/{peer_id}");
+
+        let (dial_addrs, relay_addr) = tracker_target_addrs(
+            &[advertised_direct, advertised_relay],
+            peer_id,
+            &configured_relay,
+        );
+
+        assert_eq!(
+            dial_addrs,
+            vec![
+                format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}/p2p-circuit")
+                    .parse()
+                    .unwrap()
+            ]
+        );
+        assert!(relay_addr.is_none());
+    }
+
+    #[test]
+    fn tracker_target_addrs_keeps_relay_first_fallback_for_direct_only_tracker_records() {
+        let peer_id = PeerId::random();
+        let relay_id = PeerId::random();
+        let configured_relay: Multiaddr = format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+        let advertised_direct = format!("/ip4/172.19.0.5/tcp/1234/p2p/{peer_id}");
+
+        let (dial_addrs, relay_addr) =
+            tracker_target_addrs(&[advertised_direct], peer_id, &configured_relay);
+
+        assert_eq!(
+            dial_addrs,
+            vec!["/ip4/172.19.0.5/tcp/1234".parse().unwrap()]
+        );
+        assert_eq!(relay_addr, Some(configured_relay));
+    }
+
+    #[test]
+    fn addrs_include_relay_circuit_detects_manual_and_tracker_relay_targets() {
+        let relay_id = PeerId::random();
+        let target_peer = PeerId::random();
+        let direct: Multiaddr = "/ip4/127.0.0.1/tcp/1234".parse().unwrap();
+        let relay: Multiaddr =
+            format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{target_peer}")
+                .parse()
+                .unwrap();
+
+        assert!(!addrs_include_relay_circuit(&[direct]));
+        assert!(addrs_include_relay_circuit(&[relay]));
+    }
+
+    #[test]
     fn dialable_tracker_addr_from_external_candidate_filters_unspecified_and_relay() {
         let peer_id = PeerId::random();
 
@@ -1482,7 +1663,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].peer_key, peer_id);
         assert_eq!(
-            got[0].direct_addrs,
+            got[0].dial_addrs,
             vec!["/ip4/127.0.0.1/tcp/1234".parse().unwrap()]
         );
     }

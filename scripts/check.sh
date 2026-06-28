@@ -13,10 +13,11 @@ Runs the same Rust checks as CI:
 
 Optional heavy check:
   - scripts/acceptance_docker_macos_linux.sh
+  - scripts/acceptance_docker_two_peer_relay.sh
 
 Options:
   --fast, --no-smoke  Skip the smoke test.
-  --acceptance        Run the Docker relay fallback acceptance after the base checks.
+  --acceptance        Run Docker relay/network acceptance after the base checks.
   --secret-scan       Run TruffleHog scan (Docker): scripts/secret_scan.sh
 EOF
 }
@@ -70,4 +71,5 @@ fi
 
 if [[ "$acceptance" -eq 1 ]]; then
 	bash scripts/acceptance_docker_macos_linux.sh
+	bash scripts/acceptance_docker_two_peer_relay.sh
 fi

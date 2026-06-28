@@ -48,7 +48,7 @@
 ## 아키텍처 개요
 - 클라이언트는 로컬 DB에 append-only 저장
 - peer는 tracker에 등록하고, tracker에서 peer 목록을 받아 여러 peer와 연결한다
-- direct 연결을 우선 시도하고, 불가하면 relay 경유로 통신한다(direct-first, relay fallback)
+- relay가 설정된 tracker 기반 동기화에서는 relay 경유를 우선 시도하고, 실패 시 direct 후보로 fallback 한다.
 - 저장소는 entry_id 유니크 인덱스로 dedup
 - peer 간 동기화는 “append + dedup + cursor”로 점진적으로 수렴한다
 
@@ -70,7 +70,7 @@
 ### P2P (PoC 기본)
 - libp2p 기반의 peer-to-peer 통신
 - k8s 서버는 tracker(디스커버리) + relay(중계) 역할을 수행
-- 동기화는 direct-first로 시도하되, direct 실패 시 relay 경유 dial로 fallback 한다.
+- 동기화는 relay가 설정되어 있으면 relay 경유 dial을 우선 시도하고, 실패 시 direct 후보로 fallback 한다.
 - relay 경유 연결이 수립되면, 가능하면 dcutr(DCUtR)로 direct 업그레이드(hole punching)를 시도한다(실패해도 relay로 계속 진행).
 - 동기화 메시지(개념):
   - `SyncPull { cursor, limit } -> SyncBatch { entries, next_cursor }`

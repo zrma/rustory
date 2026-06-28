@@ -80,7 +80,7 @@ enum Command {
         #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
 
-        #[arg(long, help = "Relay multiaddr used for relay fallback")]
+        #[arg(long, help = "Relay multiaddr used for relay reservation")]
         relay: Option<String>,
 
         #[arg(
@@ -140,7 +140,7 @@ enum Command {
         #[arg(long, help = "Path to the shared private swarm key")]
         swarm_key: Option<String>,
 
-        #[arg(long, help = "Relay multiaddr used for tracker-discovered peers")]
+        #[arg(long, help = "Relay multiaddr preferred for tracker-discovered peers")]
         relay: Option<String>,
 
         #[arg(
@@ -2710,7 +2710,7 @@ mod tests {
         let p2p_sync_help = p2p_sync.render_help().to_string();
         assert!(p2p_sync_help.contains("Comma-separated peer multiaddrs to dial directly"));
         assert!(p2p_sync_help.contains("Run sync repeatedly until interrupted"));
-        assert!(p2p_sync_help.contains("Relay multiaddr used for tracker-discovered peers"));
+        assert!(p2p_sync_help.contains("Relay multiaddr preferred for tracker-discovered peers"));
 
         let record = cmd
             .find_subcommand_mut("record")

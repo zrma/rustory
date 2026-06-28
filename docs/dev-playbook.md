@@ -30,7 +30,8 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - 재시작 테스트(상태 파일/identity를 디스크에 쓰고 다시 로드)
 - smoke 시나리오 문서 + 실행 커맨드(사람이 그대로 따라하면 재현되는 수준)
   - 예: `scripts/smoke_p2p_local.sh` (tracker+relay+p2p-serve 2개+p2p-sync 스모크)
-  - 예: `scripts/acceptance_docker_macos_linux.sh` (macOS host + Linux container, relay fallback 확인)
+  - 예: `scripts/acceptance_docker_macos_linux.sh` (macOS host + Linux container, relay circuit 확인)
+  - 예: `scripts/acceptance_docker_two_peer_relay.sh` (분리된 Docker network 2개에서 relay-only 수렴 확인)
 
 ### 버그/이슈를 발견하면: 재현 -> 테스트화 -> 수정
 1. 최소 재현 절차를 만든다(테스트 or 스모크 커맨드).
@@ -52,7 +53,7 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 
 ### 원커맨드 점검(권장)
 - CI와 같은 검증은 `scripts/check.sh`에서 시작한다.
-- relay fallback까지 포함한 고신뢰 네트워크 검증이나 빠른 반복 옵션이 필요하면 `scripts/check.sh --help`에서 현재 옵션을 확인한다.
+- relay/cross-network까지 포함한 고신뢰 네트워크 검증이나 빠른 반복 옵션이 필요하면 `scripts/check.sh --help`에서 현재 옵션을 확인한다.
 
 ## 커밋 메시지 규칙(요약)
 - 형식: `<type>: <summary>`
@@ -70,4 +71,4 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - 새로운 네트워크 입력(쿼리/헤더/주소)이 추가되었는가? 그러면 특수문자/비정상 입력 테스트가 있는가?
 - partial failure(일부 실패) 시 동작이 정의됐는가? 로그로 확인 가능한가?
 - 최소 1개의 수용 테스트(재시작 또는 e2e)가 추가됐는가?
-- relay/direct-first 변경이면 `scripts/check.sh --acceptance` 또는 `bash scripts/acceptance_docker_macos_linux.sh`로 host/container 경계까지 확인했는가?
+- relay/direct 선택 로직 변경이면 `scripts/check.sh --acceptance` 또는 `bash scripts/acceptance_docker_two_peer_relay.sh`로 direct가 막힌 relay-only 경계까지 확인했는가?
