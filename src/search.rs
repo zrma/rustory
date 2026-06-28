@@ -384,7 +384,8 @@ fn clear_rendered_frame(last_rendered_lines: usize) -> String {
     if last_rendered_lines == 0 {
         String::new()
     } else {
-        format!("\x1b[{last_rendered_lines}F\x1b[J")
+        let lines_to_clear = last_rendered_lines + 1;
+        format!("\x1b[{lines_to_clear}F\x1b[J")
     }
 }
 
@@ -1011,7 +1012,7 @@ mod tests {
     #[test]
     fn finish_clear_erases_last_rendered_frame() {
         assert_eq!(clear_rendered_frame(0), "");
-        assert_eq!(clear_rendered_frame(23), "\x1b[23F\x1b[J");
+        assert_eq!(clear_rendered_frame(23), "\x1b[24F\x1b[J");
     }
 
     #[test]
