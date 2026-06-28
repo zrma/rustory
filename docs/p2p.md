@@ -21,6 +21,12 @@
 
 ## 사용 예시
 ### 단계 2: tracker/relay + PSK(pnet) 기반
+실사용 디바이스는 보통 두 역할을 함께 띄운다.
+- `rr p2p-serve`: tracker 등록 + inbound pull/push 응답
+- `rr p2p-sync --watch --push`: tracker/peerbook에서 peer를 찾아 주기적으로 pull/push 수행
+
+`p2p-sync`만 실행하면 이 디바이스는 tracker에 등록되지 않고, 다른 디바이스가 이 디바이스로 pull/push할 수 없다.
+
 #### 1) Relay 서버
 ```sh
 rr relay-serve --listen /ip4/0.0.0.0/tcp/4001

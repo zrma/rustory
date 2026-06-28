@@ -887,6 +887,7 @@ fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<(
 
     println!("next:");
     println!("- 설정 확인: rr doctor");
+    println!("- p2p 서버: rr p2p-serve --trackers <tracker> --relay <relay>");
     println!("- p2p 동기화: rr p2p-sync --trackers <tracker> --relay <relay> --watch --push");
 
     Ok(())

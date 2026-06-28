@@ -1,14 +1,18 @@
-# Daemon / Scheduler (`p2p-sync --watch`)
+# Daemon / Scheduler (`p2p-serve` + `p2p-sync --watch`)
 
-`rr p2p-sync --watch`는 “주기적으로 pull/push를 반복”하는 긴 실행 프로세스다.
+실사용 디바이스는 보통 두 긴 실행 프로세스를 함께 운영한다.
+- `rr p2p-serve`: 이 디바이스를 tracker에 등록하고 inbound pull/push 요청에 응답한다.
+- `rr p2p-sync --watch --push`: 주기적으로 peer를 찾아 pull/push를 반복한다.
+
 이 문서는 이를 백그라운드(로그인 시 자동 시작, 죽으면 재시작)로 돌리는 예시를 정리한다.
-현재 CLI 옵션, default, config resolver, signal 처리 세부는 `rr p2p-sync --help`, `rr doctor`, config template, 관련 코드를 직접 확인한다.
+현재 CLI 옵션, default, config resolver, signal 처리 세부는 `rr p2p-serve --help`, `rr p2p-sync --help`, `rr doctor`, config template, 관련 코드를 직접 확인한다.
 아래 launchd/systemd 단편은 운영 형태 예시이며, 템플릿의 최신 내용은 `contrib/daemon/*`가 소유한다.
 
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
   - `trackers`, `relay_addr`, `swarm_key_path`, `p2p_identity_key_path`, `tracker_token` 등
 - `user_id`, `device_id`는 고정값을 사용한다(환경변수 또는 config).
+- `p2p-serve` 없이 `p2p-sync --watch --push`만 실행하면 tracker에 이 디바이스가 등록되지 않는다.
 - `--push`는 **로컬 디바이스 엔트리만** 전송한다(`entry.device_id == local_device_id`).
 - `--watch` 실행 중 중지(SIGTERM/Ctrl-C)를 받으면 빠르게 종료한다(서비스 매니저 stop에 정상 반응).
 - 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.
@@ -17,10 +21,21 @@
 설정 파일을 이미 채워뒀다면:
 
 ```sh
+rr p2p-serve
+```
+
+```sh
 rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
 ```
 
 CLI로 다 넣는 형태(예시):
+
+```sh
+rr --db-path "$HOME/.rustory/history.db" p2p-serve \
+  --swarm-key "$HOME/.config/rustory/swarm.key" \
+  --trackers "http://<tracker-host>:8850" \
+  --relay "/ip4/<relay-ip>/tcp/<port>/p2p/<relay_peer_id>"
+```
 
 ```sh
 rr --db-path "$HOME/.rustory/history.db" p2p-sync \
@@ -35,13 +50,28 @@ rr --db-path "$HOME/.rustory/history.db" p2p-sync \
 ## macOS (launchd, user agent)
 
 ### 1) plist 예시
-파일: `~/Library/LaunchAgents/com.rustory.p2p-sync.plist`
+파일:
+- `~/Library/LaunchAgents/com.rustory.p2p-serve.plist`
+- `~/Library/LaunchAgents/com.rustory.p2p-sync.plist`
 
-레포에는 템플릿이 포함되어 있다:
+레포에는 `p2p-serve`와 `p2p-sync` 템플릿이 포함되어 있다:
+- `contrib/daemon/launchd/com.rustory.p2p-serve.plist`
 - `contrib/daemon/launchd/com.rustory.p2p-sync.plist`
 
-가장 빠른 방법은 위 템플릿을 복사해서 `ProgramArguments`의 `rr` 경로와
+가장 빠른 방법은 위 템플릿들을 복사해서 `ProgramArguments`의 `rr` 경로와
 `RUSTORY_USER_ID`/`RUSTORY_DEVICE_ID`를 환경에 맞게 수정하는 것이다.
+
+`p2p-serve` 예시:
+
+```xml
+<key>ProgramArguments</key>
+<array>
+  <string>/Users/YOU/.cargo/bin/rr</string>
+  <string>p2p-serve</string>
+</array>
+```
+
+`p2p-sync` 예시:
 
 ```xml
 <?xml version="1.0" encoding="UTF-8"?>
@@ -85,29 +115,57 @@ rr --db-path "$HOME/.rustory/history.db" p2p-sync \
 ### 2) 시작/중지/로그
 ```sh
 # 로드(활성화)
+launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.rustory.p2p-serve.plist
 launchctl bootstrap "gui/$UID" ~/Library/LaunchAgents/com.rustory.p2p-sync.plist
+launchctl enable "gui/$UID/com.rustory.p2p-serve"
 launchctl enable "gui/$UID/com.rustory.p2p-sync"
 
 # 즉시 시작(재시작 강제는 -k)
+launchctl kickstart -k "gui/$UID/com.rustory.p2p-serve"
 launchctl kickstart -k "gui/$UID/com.rustory.p2p-sync"
 
 # 상태 확인
+launchctl print "gui/$UID/com.rustory.p2p-serve"
 launchctl print "gui/$UID/com.rustory.p2p-sync"
 
 # 언로드(비활성화)
+launchctl bootout "gui/$UID" ~/Library/LaunchAgents/com.rustory.p2p-serve.plist
 launchctl bootout "gui/$UID" ~/Library/LaunchAgents/com.rustory.p2p-sync.plist
 
 # 로그 확인(위 plist 경로 기준)
+tail -f /tmp/rustory-p2p-serve.err.log
 tail -f /tmp/rustory-p2p-sync.err.log
 ```
 
 ## Linux (systemd --user)
 
 ### 1) unit 예시
-파일: `~/.config/systemd/user/rustory.service`
+파일:
+- `~/.config/systemd/user/rustory-p2p-serve.service`
+- `~/.config/systemd/user/rustory.service`
 
-레포에는 템플릿이 포함되어 있다:
+레포에는 `p2p-serve`와 `p2p-sync` 템플릿이 포함되어 있다:
+- `contrib/daemon/systemd/rustory-p2p-serve.service`
 - `contrib/daemon/systemd/rustory.service`
+
+`p2p-serve` 예시:
+
+```ini
+[Unit]
+Description=Rustory p2p-serve
+
+[Service]
+ExecStart=%h/.cargo/bin/rr p2p-serve
+Restart=always
+RestartSec=5
+Environment=RUSTORY_USER_ID=zrma
+Environment=RUSTORY_DEVICE_ID=laptop
+
+[Install]
+WantedBy=default.target
+```
+
+`p2p-sync` 예시:
 
 ```ini
 [Unit]
@@ -127,12 +185,17 @@ WantedBy=default.target
 ### 2) 시작/중지/로그
 ```sh
 systemctl --user daemon-reload
+systemctl --user enable --now rustory-p2p-serve.service
 systemctl --user enable --now rustory.service
 
+systemctl --user status rustory-p2p-serve.service
 systemctl --user status rustory.service
+journalctl --user -u rustory-p2p-serve.service -f
 journalctl --user -u rustory.service -f
 
+systemctl --user restart rustory-p2p-serve.service
 systemctl --user restart rustory.service
+systemctl --user stop rustory-p2p-serve.service
 systemctl --user stop rustory.service
 ```
 

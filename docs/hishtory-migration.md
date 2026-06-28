@@ -82,7 +82,13 @@ Rustory가 migration 목적에 맞게 재해석하는 값:
 
 ## P2P 클러스터로 전파
 
-import 후 각 머신에서 sync를 실행한다.
+import 후 각 머신에서 `p2p-serve`와 `p2p-sync --watch --push`를 함께 실행한다.
+`p2p-serve`는 이 머신을 tracker에 등록하고 inbound pull/push를 받는 서버 역할이고,
+`p2p-sync`는 주기적으로 다른 peer에서 pull하고 현재 디바이스 entry를 push하는 클라이언트 루프다.
+
+```sh
+rr p2p-serve
+```
 
 ```sh
 rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
@@ -102,8 +108,8 @@ rr sync-status --json --with-tracker
 ## 운영 전환 순서
 
 1. tracker/relay를 먼저 띄우고 identity key와 swarm key를 고정한다.
-2. 한 머신에서 `rr init`, temp DB smoke, real import, `p2p-sync --push`를 수행한다.
-3. 두 번째 머신에서 같은 절차를 수행하고 `sync-status`와 `ignored` 카운트를 확인한다.
+2. 한 머신에서 `rr init`, temp DB smoke, real import, `p2p-serve`, `p2p-sync --push`를 수행한다.
+3. 두 번째 머신에서 같은 절차를 수행하고 tracker 등록, `sync-status`, `ignored` 카운트를 확인한다.
 4. 나머지 머신을 같은 방식으로 추가한다.
 5. 각 머신의 shell hook을 Rustory로 전환한다.
 6. 충분한 soak 기간 동안 Hishtory는 제거하지 말고 read-only fallback source로 남긴다.

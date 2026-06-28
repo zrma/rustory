@@ -94,7 +94,14 @@ rr import --shell hishtory
 import는 `RUSTORY_RECORD_IGNORE_REGEX` / `record_ignore_regex`를 존중한다.
 Hishtory에서 Rustory P2P 클러스터로 점진 이관하려면 `docs/hishtory-migration.md`를 먼저 확인한다.
 
-### 2-3) 주기 동기화 실행(추천: 데몬/스케줄러)
+### 2-3) P2P 멤버 실행(추천: 데몬/스케줄러)
+각 디바이스가 클러스터 멤버로 보이려면 `p2p-serve`가 tracker에 등록되고 inbound pull/push를 받아야 한다.
+`p2p-sync --watch --push`는 주기적으로 다른 peer에 접속하는 클라이언트 루프이므로, 실사용 디바이스에서는 두 프로세스를 같이 운영한다.
+
+```sh
+rr p2p-serve
+```
+
 ```sh
 rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
 ```

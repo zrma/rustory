@@ -935,6 +935,53 @@ mod tests {
         assert_eq!(commands, vec!["echo three", "echo two"]);
     }
 
+    #[test]
+    fn import_hishtory_sqlite_entries_are_pushable_for_import_device() {
+        let hishtory_db = synthetic_hishtory_db(&[HishtoryFixtureRow {
+            entry_id: "hist-1",
+            hostname: "old-host",
+            command: "echo migrate-me",
+            cwd: "/work",
+            exit_code: 0,
+            start_time: "2024-01-01 00:00:00+00:00",
+            end_time: "2024-01-01 00:00:01+00:00",
+        }]);
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        let stats = import_hishtory_sqlite_into_store(
+            &local,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-a",
+                hostname: "fallback-host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(stats.inserted, 1);
+
+        let pushed = crate::sync::sync_push_to_peer(
+            &local,
+            "peer-1",
+            100,
+            Some("rustory-device-a"),
+            |entries| {
+                remote.insert_entries(&entries)?;
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(pushed, 1);
+
+        let remote_entries = remote.list_recent(10).unwrap();
+        assert_eq!(remote_entries.len(), 1);
+        assert_eq!(remote_entries[0].cmd, "echo migrate-me");
+        assert_eq!(remote_entries[0].device_id, "rustory-device-a");
+    }
+
     #[derive(Clone, Copy)]
     struct HishtoryFixtureRow<'a> {
         entry_id: &'a str,
