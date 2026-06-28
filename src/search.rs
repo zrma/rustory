@@ -11,6 +11,7 @@ const TABLE_SCROLL_STEP: usize = 10;
 const MIN_FRAME_WIDTH: usize = 40;
 const FALLBACK_TERM_WIDTH: usize = 100;
 const FALLBACK_TERM_HEIGHT: usize = 30;
+const CWD_COLUMN: usize = 1;
 const COMMAND_COLUMN: usize = 5;
 const FOOTER: &str = "rustory: Search your shell history  • ctrl+h help";
 const TTY_LINE_ENDING: &str = "\r\n";
@@ -643,6 +644,8 @@ fn compute_column_widths(
         for idx in 0..widths.len() {
             let target = if idx == COMMAND_COLUMN {
                 wanted[idx].max(widths[idx] + available.saturating_sub(total))
+            } else if idx == CWD_COLUMN {
+                cwd_flex_target(wanted[idx])
             } else {
                 wanted[idx].saturating_add(5)
             };
@@ -670,6 +673,19 @@ fn compute_column_widths(
     }
 
     widths
+}
+
+fn cwd_flex_target(wanted_width: usize) -> usize {
+    let preferred = COLUMNS[CWD_COLUMN]
+        .preferred_width
+        .max(display_width(COLUMNS[CWD_COLUMN].title))
+        .max(COLUMNS[CWD_COLUMN].min_width);
+    wanted_width
+        .saturating_add(5)
+        .saturating_mul(2)
+        .checked_div(3)
+        .unwrap_or(usize::MAX)
+        .max(preferred)
 }
 
 fn widest_shrinkable_column(widths: &[usize; 6]) -> Option<usize> {
@@ -1014,6 +1030,22 @@ mod tests {
     fn table_height_stays_inline_on_tall_terminals() {
         assert_eq!(table_visible_rows(60, false), 20);
         assert!(table_visible_rows(12, false) < 20);
+    }
+
+    #[test]
+    fn cwd_column_uses_reduced_flex_width_and_leaves_room_for_command() {
+        let entries = vec![entry(
+            "user.local",
+            "/home/user/very/long/project/path/with/many/components/that/should/not/dominate",
+            "cargo test --workspace --all-targets --features production-daily-driver-readiness",
+        )];
+        let rows = build_search_rows(&entries);
+        let filtered = [0];
+        let widths = compute_column_widths(&rows, &filtered, 220);
+        let cwd_wanted = display_width(&rows[0].cells[CWD_COLUMN]);
+
+        assert_eq!(widths[CWD_COLUMN], cwd_flex_target(cwd_wanted));
+        assert!(widths[COMMAND_COLUMN] > widths[CWD_COLUMN]);
     }
 
     #[test]
