@@ -29,6 +29,7 @@ rr doctor
 rr doctor --json
 rr swarm-key
 rr sync-status --with-tracker
+rr daemon --preflight
 ```
 
 체크할 기준:
@@ -37,6 +38,7 @@ rr sync-status --with-tracker
 - `user_id`는 같고 `device_id`는 머신마다 다르다.
 - tracker가 reachable이고, tracker token 설정이 양쪽에서 일치한다.
 - relay multiaddr에는 영속화된 relay PeerId가 들어 있다.
+- `rr daemon --preflight`가 자식 프로세스를 띄우기 전에 configured tracker ping을 통과한다.
 - `rr daemon` foreground 실행 후 tracker에 peer가 등록되고 relay reservation이 발생한다.
 - `rr daemon`의 sync watch 1주기에서 pull/push summary가 출력된다.
 
@@ -48,6 +50,14 @@ rr sync-status --with-tracker
 
 ```sh
 rr daemon
+```
+
+전환 직전에는 다음처럼 tracker reachable/token mismatch를 먼저 실패시킬 수 있다.
+부팅 직후 네트워크가 늦게 붙는 서비스 매니저 환경에서는 기본 `rr daemon`을 유지하고,
+수동 검증이나 배포 전 체크에서만 `--preflight`를 쓰는 편이 운영상 안전하다.
+
+```sh
+rr daemon --preflight
 ```
 
 분리 운영이 필요하면 다음 두 명령을 별도 서비스로 관리한다.

@@ -211,6 +211,13 @@ enum Command {
         )]
         sync_start_delay_sec: u64,
 
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Ping configured trackers before spawning daemon children"
+        )]
+        preflight: bool,
+
         #[arg(long, help = "Request retry attempts per peer operation")]
         req_attempts: Option<u64>,
 
@@ -560,6 +567,7 @@ pub fn run() -> Result<()> {
             interval_sec,
             start_jitter_sec,
             sync_start_delay_sec,
+            preflight,
             req_attempts,
             req_timeout_base_sec,
             req_timeout_cap_sec,
@@ -578,6 +586,7 @@ pub fn run() -> Result<()> {
                     interval_sec,
                     start_jitter_sec,
                     sync_start_delay_sec,
+                    preflight,
                     req_attempts,
                     req_timeout_base_sec,
                     req_timeout_cap_sec,
@@ -950,6 +959,7 @@ struct DaemonArgs {
     interval_sec: u64,
     start_jitter_sec: Option<u64>,
     sync_start_delay_sec: u64,
+    preflight: bool,
     req_attempts: Option<u64>,
     req_timeout_base_sec: Option<u64>,
     req_timeout_cap_sec: Option<u64>,
@@ -992,7 +1002,7 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
     // Fail before spawning children when the durable daily-driver inputs are broken.
     let _ = resolve_swarm_psk(args.swarm_key.clone(), cfg)?;
     let _ = resolve_p2p_identity(args.identity_key.clone(), cfg)?;
-    let _ = resolve_tracker_token(args.tracker_token.clone(), cfg)?;
+    let tracker_token = resolve_tracker_token(args.tracker_token.clone(), cfg)?;
     let _ = resolve_p2p_watch_start_jitter_sec(args.start_jitter_sec, cfg)?;
     let _ = resolve_p2p_request_retry_policy(
         args.req_attempts,
@@ -1001,6 +1011,10 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         args.req_backoff_base_ms,
         cfg,
     )?;
+
+    if args.preflight {
+        run_daemon_preflight(&trackers, tracker_token.as_deref())?;
+    }
 
     let specs = build_daemon_child_specs(db_path, &args);
     let exe = std::env::current_exe().context("resolve current executable for daemon")?;
@@ -1044,6 +1058,54 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
     )?;
 
     supervise_daemon_children(&mut serve, &mut sync, stop.as_ref())
+}
+
+fn run_daemon_preflight(trackers: &[String], tracker_token: Option<&str>) -> Result<()> {
+    eprintln!("daemon preflight: ping {} tracker(s)", trackers.len());
+    let statuses = build_tracker_status_report(trackers, tracker_token);
+    for status in &statuses {
+        if status.reachable {
+            let latency_ms = status
+                .latency_ms
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            eprintln!(
+                "daemon preflight: tracker {} ok latency_ms={latency_ms}",
+                status.base_url
+            );
+        } else {
+            let error = status.error.as_deref().unwrap_or("unknown error");
+            eprintln!(
+                "daemon preflight: tracker {} failed: {error}",
+                status.base_url
+            );
+        }
+    }
+    validate_daemon_preflight_statuses(&statuses)
+}
+
+fn validate_daemon_preflight_statuses(statuses: &[SyncStatusTrackerReport]) -> Result<()> {
+    let failures = statuses
+        .iter()
+        .filter(|status| !status.reachable)
+        .collect::<Vec<_>>();
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let details = failures
+        .iter()
+        .map(|status| {
+            let error = status.error.as_deref().unwrap_or("unknown error");
+            format!("{} ({error})", status.base_url)
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    anyhow::bail!(
+        "daemon preflight failed: {}/{} tracker ping(s) failed: {details}",
+        failures.len(),
+        statuses.len()
+    );
 }
 
 fn build_daemon_child_specs(db_path: &str, args: &DaemonArgs) -> DaemonChildSpecs {
@@ -3814,6 +3876,7 @@ mod tests {
             "5",
             "--sync-start-delay-sec",
             "1",
+            "--preflight",
             "--req-attempts",
             "4",
         ]);
@@ -3827,6 +3890,7 @@ mod tests {
                 interval_sec,
                 start_jitter_sec,
                 sync_start_delay_sec,
+                preflight,
                 req_attempts,
                 ..
             } => {
@@ -3838,10 +3902,42 @@ mod tests {
                 assert_eq!(interval_sec, 30);
                 assert_eq!(start_jitter_sec, Some(5));
                 assert_eq!(sync_start_delay_sec, 1);
+                assert!(preflight);
                 assert_eq!(req_attempts, Some(4));
             }
             _ => panic!("expected daemon"),
         }
+    }
+
+    #[test]
+    fn daemon_preflight_status_validation_requires_all_trackers_reachable() {
+        let ok = vec![SyncStatusTrackerReport {
+            base_url: "http://tracker-a".to_string(),
+            reachable: true,
+            latency_ms: Some(1),
+            error: None,
+        }];
+        assert!(validate_daemon_preflight_statuses(&ok).is_ok());
+
+        let mixed = vec![
+            SyncStatusTrackerReport {
+                base_url: "http://tracker-a".to_string(),
+                reachable: true,
+                latency_ms: Some(1),
+                error: None,
+            },
+            SyncStatusTrackerReport {
+                base_url: "http://tracker-b".to_string(),
+                reachable: false,
+                latency_ms: None,
+                error: Some("status 401".to_string()),
+            },
+        ];
+        let err = validate_daemon_preflight_statuses(&mixed).unwrap_err();
+        let text = format!("{err:#}");
+        assert!(text.contains("daemon preflight failed"));
+        assert!(text.contains("http://tracker-b"));
+        assert!(text.contains("status 401"));
     }
 
     #[test]
@@ -3858,6 +3954,7 @@ mod tests {
             interval_sec: 0,
             start_jitter_sec: Some(3),
             sync_start_delay_sec: 2,
+            preflight: false,
             req_attempts: Some(4),
             req_timeout_base_sec: None,
             req_timeout_cap_sec: None,
@@ -3886,6 +3983,7 @@ mod tests {
             interval_sec: 60,
             start_jitter_sec: None,
             sync_start_delay_sec: 2,
+            preflight: false,
             req_attempts: None,
             req_timeout_base_sec: None,
             req_timeout_cap_sec: None,
