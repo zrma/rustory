@@ -21,6 +21,7 @@
 | C3 | done | codex | `rr doctor --json`, `rr sync-status --json --with-tracker`, canary sync | 로컬 MacBook과 원격 Linux peer에서 실제 tracker/token/relay 설정을 preflight로 확인하고 canary sync 증거를 남긴다. |
 | C4 | in_progress | codex | `rr sync-status --json --with-tracker` | 24시간 soak 또는 사용자가 승인한 축약 soak에서 반복 실패/timeout 폭증이 없는지 확인한다. |
 | C5 | done | codex | `rr --version`, `rr version --json`, `rr doctor --json`, `scripts/check-script-smoke.sh --work-id daily-driver-readiness` | daily-driver production 기준점의 package version과 build revision 추적 경로를 제공하고, Codex-authored commit trailer 누락을 finalize 경로에서 차단한다. |
+| C6 | done | codex | `cargo test search::tests --workspace`, `cargo test --workspace`, fzf `--filter` metadata query smoke | ctrl+r 검색을 hishtory-like metadata table로 바꾸고 hostname/CWD/command를 함께 검색 대상으로 삼는다. |
 
 ## 완료/미완료/다음 액션
 
@@ -45,3 +46,4 @@
 - Shell handoff cleanup: active Hishtory profile hooks were disabled while preserving Hishtory files/DB as fallback, a stale zsh-only profile on the bash-only Linux peer was removed, and Rustory hook startup noise was fixed.
 - Relay restart hardening: `p2p-serve` removes closed relay-circuit listen addresses from tracker registration and immediately re-listens on the configured relay, so relay restart does not leave stale peer records until TTL expiry.
 - Release identity: `rr --version` now reports `1.0.0 (rev <build_revision>)`; `rr version --json` and `rr doctor --json` expose `version`, `build_revision`, `build_revision_source`, and `build_dirty`; `scripts/finalize-and-push.sh` uses `describe_with_attribution.sh` and verifies the `Co-authored-by` trailer before push.
+- Ctrl+r search UX: `rr search` now uses a hishtory-like table that displays hostname, CWD, timestamp, runtime, exit code, and command while searching across hostname/device/full-CWD/command metadata; fzf filter smoke matched `smp pro doc` and `pro doc` style queries against split hostname/CWD/command tokens.

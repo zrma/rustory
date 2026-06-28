@@ -3,6 +3,14 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+const FZF_HEADER: &str =
+    "Hostname       CWD                    Timestamp               Runtime Exit Code Command";
+const HOST_WIDTH: usize = 14;
+const CWD_WIDTH: usize = 22;
+const TIMESTAMP_WIDTH: usize = 23;
+const RUNTIME_WIDTH: usize = 8;
+const EXIT_CODE_WIDTH: usize = 9;
+
 pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
     if entries.is_empty() {
         return Ok(None);
@@ -13,26 +21,151 @@ pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
         return Ok(None);
     };
 
-    Ok(parse_selected_cmd(&selected_line))
+    Ok(selected_command_from_line(entries, &selected_line)
+        .or_else(|| parse_legacy_selected_cmd(&selected_line)))
 }
 
 fn format_fzf_lines(entries: &[Entry]) -> Vec<String> {
     entries
         .iter()
-        .map(|e| format!("{}\t{}", e.entry_id, sanitize_one_line(&e.cmd)))
+        .map(|e| {
+            format!(
+                "{}\t{}\t{}",
+                sanitize_one_line(&e.entry_id),
+                format_search_text(e),
+                format_display_row(e)
+            )
+        })
         .collect()
 }
 
 fn sanitize_one_line(value: &str) -> String {
-    value.replace(['\n', '\r'], " ")
+    value.replace(['\n', '\r', '\t'], " ")
+}
+
+fn format_search_text(entry: &Entry) -> String {
+    sanitize_one_line(&format!(
+        "{} {} {} {} {} {} {} {}",
+        entry.hostname,
+        entry.device_id,
+        entry.cwd,
+        compact_cwd(&entry.cwd),
+        format_timestamp(entry.ts),
+        format_duration(entry.duration_ms),
+        entry.exit_code,
+        entry.cmd
+    ))
+}
+
+fn format_display_row(entry: &Entry) -> String {
+    format!(
+        "{host} {cwd} {timestamp:<TIMESTAMP_WIDTH$} {runtime:>RUNTIME_WIDTH$} {exit_code:>EXIT_CODE_WIDTH$} {cmd}",
+        host = fit_tail(&entry.hostname, HOST_WIDTH),
+        cwd = fit_tail(&compact_cwd(&entry.cwd), CWD_WIDTH),
+        timestamp = format_timestamp(entry.ts),
+        runtime = format_duration(entry.duration_ms),
+        exit_code = entry.exit_code,
+        cmd = sanitize_one_line(&entry.cmd),
+    )
+}
+
+fn compact_cwd(cwd: &str) -> String {
+    let cwd = sanitize_one_line(cwd);
+    if cwd.is_empty() {
+        return "-".to_string();
+    }
+
+    if let Ok(home) = std::env::var("HOME")
+        && !home.is_empty()
+    {
+        if cwd == home {
+            return "~".to_string();
+        }
+        if let Some(rest) = cwd.strip_prefix(&(home + "/")) {
+            return format!("~/{rest}");
+        }
+    }
+
+    cwd
+}
+
+fn fit_tail(value: &str, width: usize) -> String {
+    let value = sanitize_one_line(value);
+    if value.chars().count() <= width {
+        return format!("{value:<width$}");
+    }
+
+    if width <= 3 {
+        return value.chars().take(width).collect();
+    }
+
+    let keep = width - 3;
+    let mut tail = value.chars().rev().take(keep).collect::<Vec<_>>();
+    tail.reverse();
+    format!("...{}", tail.into_iter().collect::<String>())
+}
+
+fn format_timestamp(ts: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        ts.year(),
+        u8::from(ts.month()),
+        ts.day(),
+        ts.hour(),
+        ts.minute(),
+        ts.second()
+    )
+}
+
+fn format_duration(duration_ms: i64) -> String {
+    if duration_ms <= 0 {
+        return "N/A".to_string();
+    }
+
+    let total_ms = duration_ms as u64;
+    if total_ms < 1000 {
+        return format!("{total_ms}ms");
+    }
+
+    let total_sec = total_ms / 1000;
+    let millis = (total_ms % 1000) as u16;
+    let seconds = total_sec % 60;
+    let minutes = (total_sec / 60) % 60;
+    let hours = total_sec / 3600;
+
+    let seconds_part = format_seconds_part(seconds, millis);
+    if hours > 0 {
+        format!("{hours}h{minutes}m{seconds_part}s")
+    } else if minutes > 0 {
+        format!("{minutes}m{seconds_part}s")
+    } else {
+        format!("{seconds_part}s")
+    }
+}
+
+fn format_seconds_part(seconds: u64, millis: u16) -> String {
+    if millis == 0 {
+        return seconds.to_string();
+    }
+
+    let mut fractional = format!("{millis:03}");
+    while fractional.ends_with('0') {
+        fractional.pop();
+    }
+    format!("{seconds}.{fractional}")
 }
 
 fn run_fzf(lines: &[String]) -> Result<Option<String>> {
     let mut child = Command::new("fzf")
         .args([
             "--no-sort",
-            "--with-nth=2..",
+            "--layout=reverse",
+            "--border",
+            "--prompt=Search Query: > ",
+            "--header",
+            FZF_HEADER,
             "--delimiter=\t",
+            "--with-nth=3..",
             "--tiebreak=index",
         ])
         .stdin(Stdio::piped())
@@ -79,7 +212,21 @@ fn run_fzf(lines: &[String]) -> Result<Option<String>> {
     }
 }
 
-fn parse_selected_cmd(selected_line: &str) -> Option<String> {
+fn selected_command_from_line(entries: &[Entry], selected_line: &str) -> Option<String> {
+    let entry_id = parse_selected_entry_id(selected_line)?;
+    entries
+        .iter()
+        .find(|entry| entry.entry_id == entry_id)
+        .map(|entry| entry.cmd.clone())
+}
+
+fn parse_selected_entry_id(selected_line: &str) -> Option<&str> {
+    let line = selected_line.trim_end_matches(['\n', '\r']);
+    let (entry_id, _) = line.split_once('\t')?;
+    (!entry_id.is_empty()).then_some(entry_id)
+}
+
+fn parse_legacy_selected_cmd(selected_line: &str) -> Option<String> {
     let line = selected_line.trim_end_matches(['\n', '\r']);
     if line.is_empty() {
         return None;
@@ -101,18 +248,51 @@ mod tests {
     use time::OffsetDateTime;
 
     #[test]
-    fn sanitize_one_line_replaces_newlines() {
-        assert_eq!(sanitize_one_line("a\nb\rc"), "a b c");
+    fn sanitize_one_line_replaces_control_separators() {
+        assert_eq!(sanitize_one_line("a\nb\rc\td"), "a b c d");
     }
 
     #[test]
-    fn format_fzf_lines_prefixes_entry_id_and_tab() {
+    fn format_fzf_lines_include_hishtory_style_search_metadata() {
+        let entries = vec![Entry {
+            entry_id: "id-1".to_string(),
+            device_id: "macbook".to_string(),
+            user_id: "user1".to_string(),
+            ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
+            cmd: "cat ./sample-project/docs/README.md".to_string(),
+            cwd: "/Users/user/code/src/sample-project".to_string(),
+            exit_code: 0,
+            duration_ms: 4139,
+            shell: "zsh".to_string(),
+            hostname: "sample-node".to_string(),
+            version: crate::build_info::VERSION.to_string(),
+        }];
+
+        let lines = format_fzf_lines(&entries);
+        assert_eq!(lines.len(), 1);
+
+        let fields = lines[0].split('\t').collect::<Vec<_>>();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0], "id-1");
+        assert!(fields[1].contains("sample-node"));
+        assert!(fields[1].contains("macbook"));
+        assert!(fields[1].contains("/Users/user/code/src/sample-project"));
+        assert!(fields[1].contains("cat ./sample-project/docs/README.md"));
+        assert!(fields[1].contains("4.139s"));
+        assert!(fields[2].contains("sample-node"));
+        assert!(fields[2].contains("1970-01-01 00:00:01 UTC"));
+        assert!(fields[2].contains("4.139s"));
+        assert!(fields[2].contains("cat ./sample-project/docs/README.md"));
+    }
+
+    #[test]
+    fn selected_command_from_line_uses_entry_id_to_preserve_original_command() {
         let entries = vec![Entry {
             entry_id: "id-1".to_string(),
             device_id: "dev1".to_string(),
             user_id: "user1".to_string(),
             ts: OffsetDateTime::from_unix_timestamp(1).unwrap(),
-            cmd: "echo 1".to_string(),
+            cmd: "printf 'a\tb'".to_string(),
             cwd: "/tmp".to_string(),
             exit_code: 0,
             duration_ms: 12,
@@ -121,20 +301,42 @@ mod tests {
             version: crate::build_info::VERSION.to_string(),
         }];
 
-        let lines = format_fzf_lines(&entries);
-        assert_eq!(lines, vec!["id-1\techo 1".to_string()]);
+        let selected = "id-1\thost /tmp printf a b\thost /tmp printf a b";
+        assert_eq!(
+            selected_command_from_line(&entries, selected),
+            Some("printf 'a\tb'".to_string())
+        );
     }
 
     #[test]
-    fn parse_selected_cmd_extracts_cmd_after_tab() {
+    fn parse_selected_entry_id_extracts_first_field() {
         assert_eq!(
-            parse_selected_cmd("id-1\techo 1"),
+            parse_selected_entry_id("id-1\tsearch text\tdisplay row"),
+            Some("id-1")
+        );
+    }
+
+    #[test]
+    fn parse_legacy_selected_cmd_extracts_cmd_after_tab() {
+        assert_eq!(
+            parse_legacy_selected_cmd("id-1\techo 1"),
             Some("echo 1".to_string())
         );
     }
 
     #[test]
-    fn parse_selected_cmd_accepts_plain_line() {
-        assert_eq!(parse_selected_cmd("echo 1"), Some("echo 1".to_string()));
+    fn parse_legacy_selected_cmd_accepts_plain_line() {
+        assert_eq!(
+            parse_legacy_selected_cmd("echo 1"),
+            Some("echo 1".to_string())
+        );
+    }
+
+    #[test]
+    fn format_duration_matches_human_shell_history_shape() {
+        assert_eq!(format_duration(0), "N/A");
+        assert_eq!(format_duration(919), "919ms");
+        assert_eq!(format_duration(2180), "2.18s");
+        assert_eq!(format_duration(291694), "4m51.694s");
     }
 }
