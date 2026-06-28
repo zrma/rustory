@@ -499,9 +499,43 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         eprintln!(
                             "warn: p2p listener closed: addresses={addresses:?} reason={reason:?}"
                         );
+                        let had_relay_listener =
+                            addresses.iter().any(is_relay_circuit_addr);
+                        if remove_known_listen_addrs(&mut known_addrs, &addresses, local_peer_id)
+                            && !trackers.is_empty()
+                        {
+                            spawn_register_all(
+                                trackers.clone(),
+                                local_peer_id,
+                                known_addrs.iter().cloned().collect(),
+                                meta.clone(),
+                            );
+                        }
+                        if had_relay_listener
+                            && let Some(relay_addr) = relay_addr.clone()
+                        {
+                            let relay_listen = relay_addr.with(Protocol::P2pCircuit);
+                            eprintln!(
+                                "p2p relay listener closed; re-listen requested: {relay_listen}"
+                            );
+                            if let Err(err) = swarm.listen_on(relay_listen) {
+                                eprintln!("warn: p2p relay re-listen failed: {err:#}");
+                            }
+                        }
                     }
                     SwarmEvent::ListenerError { error, .. } => {
                         eprintln!("warn: p2p listener error: {error}");
+                    }
+                    SwarmEvent::ExpiredListenAddr { address, .. } => {
+                        let full = ensure_p2p_suffix(address, local_peer_id);
+                        if known_addrs.remove(&full.to_string()) && !trackers.is_empty() {
+                            spawn_register_all(
+                                trackers.clone(),
+                                local_peer_id,
+                                known_addrs.iter().cloned().collect(),
+                                meta.clone(),
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -541,6 +575,22 @@ fn ensure_p2p_suffix(mut addr: Multiaddr, peer_id: PeerId) -> Multiaddr {
         _ => addr.push(Protocol::P2p(peer_id)),
     }
     addr
+}
+
+fn is_relay_circuit_addr(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+}
+
+fn remove_known_listen_addrs(
+    known_addrs: &mut HashSet<String>,
+    addrs: &[Multiaddr],
+    peer_id: PeerId,
+) -> bool {
+    let mut removed = false;
+    for addr in addrs {
+        removed |= known_addrs.remove(&ensure_p2p_suffix(addr.clone(), peer_id).to_string());
+    }
+    removed
 }
 
 fn dialable_tracker_addr_from_external_candidate(
@@ -1610,6 +1660,26 @@ mod tests {
 
         assert!(!addrs_include_relay_circuit(&[direct]));
         assert!(addrs_include_relay_circuit(&[relay]));
+    }
+
+    #[test]
+    fn remove_known_listen_addrs_drops_relay_circuit_after_listener_close() {
+        let relay_id = PeerId::random();
+        let peer_id = PeerId::random();
+        let direct: Multiaddr = "/ip4/127.0.0.1/tcp/1234".parse().unwrap();
+        let relay: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}/p2p-circuit")
+            .parse()
+            .unwrap();
+        let relay_full = relay.clone().with(Protocol::P2p(peer_id));
+
+        let direct_full = ensure_p2p_suffix(direct.clone(), peer_id).to_string();
+        let relay_full_string = relay_full.to_string();
+        let mut known = HashSet::from([direct_full.clone(), relay_full_string.clone()]);
+
+        assert!(is_relay_circuit_addr(&relay_full));
+        assert!(remove_known_listen_addrs(&mut known, &[relay], peer_id));
+        assert!(known.contains(&direct_full));
+        assert!(!known.contains(&relay_full_string));
     }
 
     #[test]
