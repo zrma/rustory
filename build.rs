@@ -55,21 +55,43 @@ fn main() {
 }
 
 fn detect_revision() -> Option<(String, String, bool)> {
-    if let Some(revision) = command_stdout(
-        "jj",
-        &["log", "-r", "@", "--no-graph", "-T", "commit_id.short(12)"],
-    ) {
+    if let Some((revision, dirty)) = git_revision() {
+        return Some(("git".to_string(), revision, dirty));
+    }
+
+    if let Some(revision) = jj_revision("@ & ~empty()") {
+        return Some(("jj".to_string(), revision, true));
+    }
+
+    if let Some(revision) = jj_revision("@-").or_else(|| jj_revision("@")) {
         return Some(("jj".to_string(), revision, false));
     }
 
+    None
+}
+
+fn git_revision() -> Option<(String, bool)> {
     let revision = command_stdout("git", &["rev-parse", "--short=12", "HEAD"])?;
-    let dirty = Command::new("git")
-        .args(["diff-index", "--quiet", "HEAD", "--"])
-        .status()
-        .map(|status| !status.success())
+    let dirty = command_stdout("git", &["status", "--porcelain=v1"])
+        .map(|status| !status.is_empty())
         .unwrap_or(false);
 
-    Some(("git".to_string(), revision, dirty))
+    Some((revision, dirty))
+}
+
+fn jj_revision(revset: &str) -> Option<String> {
+    command_stdout(
+        "jj",
+        &[
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            revset,
+            "--no-graph",
+            "-T",
+            "commit_id.short(12)",
+        ],
+    )
 }
 
 fn command_stdout(program: &str, args: &[&str]) -> Option<String> {
