@@ -24,6 +24,7 @@
 | C6 | done | codex | `cargo test search::tests --workspace`, `cargo test --workspace`, metadata query unit smoke | ctrl+r 검색을 hishtory-like metadata table로 바꾸고 hostname/CWD/command를 함께 검색 대상으로 삼는다. |
 | C7 | done | codex | `cargo test search::tests --workspace`, fzf `--filter` metadata query smoke | ctrl+r 검색 TUI를 fullscreen 대신 inline panel로 열고, row alignment/full-row highlight 동작을 fzf capability에 맞춰 정리한다. |
 | C8 | done | codex | `cargo test search::tests --workspace`, local/node0 interactive smoke | fzf 한계로 남은 fullscreen-like frame, 구형 fzf highlight 제약, long command horizontal scroll 부재를 custom inline TUI로 대체한다. |
+| C9 | done | codex | `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check.sh --fast --acceptance` | `sync-status`의 outbound backlog 의미를 명확히 하고 watch TUI와 tracker peer fan-out 제한을 추가한다. |
 
 ## 완료/미완료/다음 액션
 
@@ -50,3 +51,4 @@
 - Release identity: `rr --version` now reports `1.0.1 (rev <build_revision>)`; `rr version --json` and `rr doctor --json` expose `version`, `build_revision`, `build_revision_source`, and `build_dirty`; `scripts/finalize-and-push.sh` uses `describe_with_attribution.sh` and verifies the `Co-authored-by` trailer before push.
 - Ctrl+r search UX: `rr search` now uses a hishtory-like table that displays hostname, CWD, timestamp, runtime, exit code, and command while searching across hostname/device/full-CWD/command metadata; unit smoke covers `smp pro doc` and `pro doc` style queries against split hostname/CWD/command tokens.
 - Ctrl+r TUI polish: the fzf-based attempt still rendered too much like fullscreen and could not support full-row highlight or horizontal table scrolling on node0's legacy fzf, so it was replaced with a custom inline TUI that draws to `/dev/tty`, keeps stdout reserved for the selected command, and supports `shift+left` / `shift+right` horizontal table scrolling. Local MacBook and node0 PTY smoke verified query filtering, full-width selected-row background, horizontal table scroll, and selected-command stdout.
+- Sync observability and fan-out: `sync-status` now labels local push cursor backlog as `outbound_push_pending`, keeps `pending_push` as a compatibility alias, adds `--watch` for a tracker/peer progress TUI, and lets daemon sync limit tracker-discovered fan-out per tick.

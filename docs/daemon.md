@@ -18,6 +18,7 @@
 - `--push`는 **로컬 디바이스 엔트리만** 전송한다(`entry.device_id == local_device_id`).
 - `rr daemon` 중지(SIGTERM/Ctrl-C)는 하위 serve/sync 프로세스까지 종료한다.
 - 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.
+- tracker-discovered peer가 여러 개일 때는 작은 self-hosted relay에 fan-out이 몰리지 않도록 `rr daemon` 기본값처럼 tick당 1 peer sync를 유지한다.
 
 ## Enable 전 preflight
 
@@ -67,7 +68,7 @@ rr p2p-serve
 ```
 
 ```sh
-rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --push
+rr p2p-sync --watch --interval-sec 60 --start-jitter-sec 10 --max-peers-per-tick 1 --push
 ```
 
 CLI로 다 넣는 형태(예시):
@@ -76,6 +77,7 @@ CLI로 다 넣는 형태(예시):
 rr --db-path "$HOME/.rustory/history.db" daemon \
   --interval-sec 60 \
   --start-jitter-sec 10 \
+  --max-peers-per-tick 1 \
   --swarm-key "$HOME/.config/rustory/swarm.key" \
   --trackers "http://<tracker-host>:8850" \
   --relay "/ip4/<relay-ip>/tcp/<port>/p2p/<relay_peer_id>"

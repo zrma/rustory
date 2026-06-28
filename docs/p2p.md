@@ -82,6 +82,10 @@ pull/push request-response도 timeout/connection closed 같은 일시 오류에 
 주기적으로 동기화를 계속 돌리려면 `--watch --interval-sec 60` 옵션을 사용한다.
 여러 디바이스에서 같은 `--interval-sec`으로 동시에 데몬을 띄우면 요청이 몰릴 수 있으니,
 시작 시점을 흩뿌리려면 `--start-jitter-sec 10` 같은 옵션을 함께 쓰는 것을 권장한다.
+tracker에서 발견한 모든 peer를 매 tick마다 동시에 dial하면 작은 relay에서 resource limit에 걸릴 수 있다.
+`--max-peers-per-tick <n>`으로 한 tick에 시도할 tracker-discovered peer 수를 제한할 수 있으며,
+`0`은 제한 없음이다. 수동 `--peers` 대상은 명시적 운영 의도이므로 이 제한을 적용하지 않는다.
+`rr daemon`은 daily-driver 기본값으로 sync tick당 tracker peer 1개만 시도한다.
 
 pull뿐 아니라 로컬 신규 엔트리를 peer로 업로드(push)하려면 `--push`를 켠다.
 이때 push는 **현재 디바이스의 엔트리만** 전송한다(`entry.device_id == local_device_id`).
@@ -165,6 +169,8 @@ p2p_watch_start_jitter_sec = 10
   - config 파싱 실패, hook 설치/비활성화, async upload/auto prune 주기, key 파일 상태, tracker/relay 접근성을 한 번에 점검하는 시작점으로 사용한다.
   - 텍스트/JSON 출력 필드와 오류 표시는 `rr doctor --help`, `rr doctor --json`, 관련 코드가 소유한다.
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
+  - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push 커서가 전진하지 않은 로컬 엔트리 수다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
+  - `--watch`는 alternate screen TUI로 peer별 pull/push cursor 변화율, outbound backlog drain rate, progress bar, tracker 상태를 계속 갱신한다.
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
   - 예시:
     - `rr sync-status`
@@ -172,6 +178,7 @@ p2p_watch_start_jitter_sec = 10
     - `rr sync-status --json`
     - `rr sync-status --with-tracker`
     - `rr sync-status --json --with-tracker`
+    - `rr sync-status --watch --with-tracker`
 
 ## Docker 기반 수용 테스트(macOS host + Linux container)
 루프백만으로는 NAT/프로세스 경계 이슈(특히 relay fallback)가 잘 안 잡힐 수 있어,

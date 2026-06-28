@@ -56,6 +56,7 @@ pub struct SyncConfig {
     pub user_id: Option<String>,
     pub device_id: Option<String>,
     pub request_retry_policy: RequestRetryPolicy,
+    pub max_peers_per_tick: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -653,7 +654,8 @@ async fn sync_async(
     let targets = if !peers.is_empty() {
         build_manual_targets(&store, peers, cfg.relay_addr.clone())?
     } else {
-        discover_targets(&store, &cfg)?
+        let discovered = discover_targets(&store, &cfg)?;
+        limit_targets_per_tick(discovered, cfg.max_peers_per_tick)
     };
 
     if targets.is_empty() {
@@ -809,6 +811,30 @@ fn build_manual_targets(
         });
     }
     Ok(out)
+}
+
+fn limit_targets_per_tick(
+    mut targets: Vec<SyncTarget>,
+    max_peers_per_tick: usize,
+) -> Vec<SyncTarget> {
+    if max_peers_per_tick == 0 || targets.len() <= max_peers_per_tick {
+        return targets;
+    }
+
+    targets.sort_by(|a, b| a.peer_key.cmp(&b.peer_key));
+    let tick = OffsetDateTime::now_utc().unix_timestamp().max(0) as usize / 60;
+    let offset = tick % targets.len();
+    let mut selected = Vec::with_capacity(max_peers_per_tick);
+    for idx in 0..max_peers_per_tick {
+        selected.push(targets[(offset + idx) % targets.len()].clone());
+    }
+    eprintln!(
+        "p2p-sync tick: selected {}/{} peers (max_peers_per_tick={})",
+        selected.len(),
+        targets.len(),
+        max_peers_per_tick
+    );
+    selected
 }
 
 fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarget>> {
@@ -1745,6 +1771,7 @@ mod tests {
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
             request_retry_policy: RequestRetryPolicy::default(),
+            max_peers_per_tick: 0,
         };
 
         let got = discover_targets(&store, &cfg).unwrap();
@@ -1771,6 +1798,25 @@ mod tests {
         assert_eq!(targets[0].peer_key, peer_key);
         assert_eq!(store.get_last_cursor(&targets[0].peer_key).unwrap(), 11);
         assert_eq!(store.get_last_pushed_seq(&targets[0].peer_key).unwrap(), 7);
+    }
+
+    #[test]
+    fn limit_targets_per_tick_caps_tracker_fanout() {
+        let targets = (0..3)
+            .map(|idx| {
+                let peer_id = PeerId::random();
+                SyncTarget {
+                    peer_id,
+                    peer_key: format!("peer-{idx}"),
+                    dial_addrs: Vec::new(),
+                    relay_addr: None,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(limit_targets_per_tick(targets.clone(), 0).len(), 3);
+        let limited = limit_targets_per_tick(targets, 1);
+        assert_eq!(limited.len(), 1);
     }
 
     #[test]
@@ -1806,6 +1852,7 @@ mod tests {
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
             request_retry_policy: RequestRetryPolicy::default(),
+            max_peers_per_tick: 0,
         };
 
         let got = discover_targets(&store, &cfg).unwrap();

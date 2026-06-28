@@ -4,6 +4,8 @@ use clap::{Parser, Subcommand};
 use rand::RngExt;
 
 use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
+use std::collections::HashMap;
+use std::io::{self, Write};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -127,6 +129,13 @@ enum Command {
         #[arg(long, help = "Random initial delay upper bound for watch mode")]
         start_jitter_sec: Option<u64>,
 
+        #[arg(
+            long,
+            default_value_t = 0,
+            help = "Maximum tracker-discovered peers to sync per watch tick; 0 means all peers"
+        )]
+        max_peers_per_tick: usize,
+
         #[arg(long, help = "Request retry attempts per peer operation")]
         req_attempts: Option<u64>,
 
@@ -209,6 +218,13 @@ enum Command {
             help = "Seconds to wait after p2p-serve starts before starting sync watch"
         )]
         sync_start_delay_sec: u64,
+
+        #[arg(
+            long,
+            default_value_t = 1,
+            help = "Maximum tracker-discovered peers to sync per daemon tick; 0 means all peers"
+        )]
+        max_peers_per_tick: usize,
 
         #[arg(
             long,
@@ -330,6 +346,20 @@ enum Command {
             help = "Ping configured trackers and include reachability"
         )]
         with_tracker: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Continuously redraw sync status"
+        )]
+        watch: bool,
+
+        #[arg(
+            long,
+            default_value_t = 2,
+            help = "Seconds between sync-status watch refreshes"
+        )]
+        interval_sec: u64,
     },
     #[command(about = "Print Rustory version and build revision")]
     Version {
@@ -515,6 +545,7 @@ pub fn run() -> Result<()> {
             watch,
             interval_sec,
             start_jitter_sec,
+            max_peers_per_tick,
             req_attempts,
             req_timeout_base_sec,
             req_timeout_cap_sec,
@@ -546,6 +577,7 @@ pub fn run() -> Result<()> {
                 user_id: Some(user_id),
                 device_id: Some(device_id),
                 request_retry_policy,
+                max_peers_per_tick,
             };
 
             if watch {
@@ -608,6 +640,7 @@ pub fn run() -> Result<()> {
             interval_sec,
             start_jitter_sec,
             sync_start_delay_sec,
+            max_peers_per_tick,
             preflight,
             req_attempts,
             req_timeout_base_sec,
@@ -627,6 +660,7 @@ pub fn run() -> Result<()> {
                     interval_sec,
                     start_jitter_sec,
                     sync_start_delay_sec,
+                    max_peers_per_tick,
                     preflight,
                     req_attempts,
                     req_timeout_base_sec,
@@ -811,25 +845,43 @@ pub fn run() -> Result<()> {
             peer,
             json,
             with_tracker,
+            watch,
+            interval_sec,
         } => {
+            if watch && json {
+                anyhow::bail!("sync-status --watch does not support --json");
+            }
             let peer = normalize_opt_string(peer);
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
-            let tracker_status = if with_tracker {
-                let trackers = resolve_trackers(Vec::new(), &cfg)?;
-                let tracker_token = resolve_tracker_token(None, &cfg)?;
-                Some(build_tracker_status_report(
-                    &trackers,
-                    tracker_token.as_deref(),
-                ))
+            let trackers = if with_tracker {
+                Some(resolve_trackers(Vec::new(), &cfg)?)
             } else {
                 None
             };
-            let report = build_sync_status_report(
+            let tracker_token = if with_tracker {
+                resolve_tracker_token(None, &cfg)?
+            } else {
+                None
+            };
+            if watch {
+                run_sync_status_watch(
+                    &store,
+                    &local_device_id,
+                    peer.as_deref(),
+                    trackers.as_deref(),
+                    tracker_token.as_deref(),
+                    interval_sec.max(1),
+                )?;
+                return Ok(());
+            }
+
+            let report = build_sync_status_report_for_cli(
                 &store,
                 &local_device_id,
                 peer.as_deref(),
-                tracker_status,
+                trackers.as_deref(),
+                tracker_token.as_deref(),
             )?;
 
             if json {
@@ -860,10 +912,12 @@ pub fn run() -> Result<()> {
                         .map(|age| age.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "peer={} pull_cursor={} push_cursor={} pending_push={} last_seen_unix={} last_seen_age_sec={}",
+                        "peer={} device={} pull_cursor={} push_cursor={} outbound_push_pending={} pending_push={} last_seen_unix={} last_seen_age_sec={}",
                         status.peer_id,
+                        status.peer_device_id.as_deref().unwrap_or("-"),
                         status.pull_cursor,
                         status.push_cursor,
+                        status.outbound_push_pending,
                         status.pending_push,
                         last_seen,
                         last_seen_age
@@ -1052,6 +1106,7 @@ struct DaemonArgs {
     interval_sec: u64,
     start_jitter_sec: Option<u64>,
     sync_start_delay_sec: u64,
+    max_peers_per_tick: usize,
     preflight: bool,
     req_attempts: Option<u64>,
     req_timeout_base_sec: Option<u64>,
@@ -1227,6 +1282,8 @@ fn build_daemon_child_specs(db_path: &str, args: &DaemonArgs) -> DaemonChildSpec
         args.limit.to_string(),
         "--interval-sec".to_string(),
         args.interval_sec.max(1).to_string(),
+        "--max-peers-per-tick".to_string(),
+        args.max_peers_per_tick.to_string(),
     ];
     if !args.pull_only {
         sync_args.push("--push".to_string());
@@ -2585,8 +2642,11 @@ fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<u64,
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct SyncStatusPeerReport {
     peer_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_device_id: Option<String>,
     pull_cursor: i64,
     push_cursor: i64,
+    outbound_push_pending: usize,
     pending_push: usize,
     last_seen_unix: Option<i64>,
     last_seen_age_sec: Option<i64>,
@@ -2621,6 +2681,11 @@ fn build_sync_status_report(
 ) -> Result<SyncStatusReport> {
     let local_head = store.latest_ingest_seq()?;
     let peer_last_seen = store.list_peer_book_last_seen_map()?;
+    let peer_device_ids = store
+        .list_peer_book(None, 0, 1000)?
+        .into_iter()
+        .filter_map(|peer| peer.device_id.map(|device_id| (peer.peer_id, device_id)))
+        .collect::<HashMap<_, _>>();
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut statuses = store.list_peer_sync_status()?;
     if let Some(peer_id) = peer_filter {
@@ -2634,9 +2699,11 @@ fn build_sync_status_report(
         let last_seen_unix = peer_last_seen.get(&peer_id).copied();
         let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
         peers.push(SyncStatusPeerReport {
+            peer_device_id: peer_device_ids.get(&peer_id).cloned(),
             peer_id,
             pull_cursor: status.last_cursor,
             push_cursor: status.last_pushed_seq,
+            outbound_push_pending: pending_push,
             pending_push,
             last_seen_unix,
             last_seen_age_sec,
@@ -2649,6 +2716,279 @@ fn build_sync_status_report(
         peers,
         tracker_status,
     })
+}
+
+fn build_sync_status_report_for_cli(
+    store: &storage::LocalStore,
+    local_device_id: &str,
+    peer_filter: Option<&str>,
+    trackers: Option<&[String]>,
+    tracker_token: Option<&str>,
+) -> Result<SyncStatusReport> {
+    let tracker_status =
+        trackers.map(|trackers| build_tracker_status_report(trackers, tracker_token));
+    build_sync_status_report(store, local_device_id, peer_filter, tracker_status)
+}
+
+#[derive(Default)]
+struct SyncStatusWatchState {
+    peers: HashMap<String, SyncStatusWatchPeerState>,
+    frame: usize,
+}
+
+#[derive(Debug, Clone)]
+struct SyncStatusWatchPeerState {
+    last_pull_cursor: i64,
+    last_push_cursor: i64,
+    last_outbound_push_pending: usize,
+    max_outbound_push_pending: usize,
+    last_sample: Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncStatusWatchPeerRates {
+    pull_per_sec: f64,
+    push_per_sec: f64,
+    pending_drain_per_sec: f64,
+}
+
+fn run_sync_status_watch(
+    store: &storage::LocalStore,
+    local_device_id: &str,
+    peer_filter: Option<&str>,
+    trackers: Option<&[String]>,
+    tracker_token: Option<&str>,
+    interval_sec: u64,
+) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || {
+            stop.store(true, Ordering::SeqCst);
+        })
+        .context("set Ctrl-C/SIGTERM handler")?;
+    }
+
+    let mut state = SyncStatusWatchState::default();
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b[?1049h\x1b[?25l")?;
+    stdout.flush()?;
+
+    while !stop.load(Ordering::SeqCst) {
+        let report = match build_sync_status_report_for_cli(
+            store,
+            local_device_id,
+            peer_filter,
+            trackers,
+            tracker_token,
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                restore_sync_status_watch_terminal(&mut stdout)?;
+                return Err(err);
+            }
+        };
+        let frame = render_sync_status_watch_frame(&mut state, &report, Instant::now());
+        write!(stdout, "\x1b[H\x1b[2J{frame}")?;
+        stdout.flush()?;
+        sleep_with_stop(Duration::from_secs(interval_sec.max(1)), stop.as_ref());
+    }
+
+    restore_sync_status_watch_terminal(&mut stdout)?;
+    Ok(())
+}
+
+fn restore_sync_status_watch_terminal(stdout: &mut impl Write) -> Result<()> {
+    write!(stdout, "\x1b[?25h\x1b[?1049l")?;
+    stdout.flush()?;
+    Ok(())
+}
+
+fn render_sync_status_watch_frame(
+    state: &mut SyncStatusWatchState,
+    report: &SyncStatusReport,
+    now: Instant,
+) -> String {
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    let spinner = SPINNER[state.frame % SPINNER.len()];
+    state.frame = state.frame.wrapping_add(1);
+
+    let mut out = String::new();
+    let total_outbound_pending: usize = report
+        .peers
+        .iter()
+        .map(|peer| peer.outbound_push_pending)
+        .sum();
+    out.push_str(&format!(
+        "{spinner} rustory sync-status watch  device={}  head={}  peers={}  outbound_pending={}\n",
+        report.local_device_id,
+        report.local_head,
+        report.peers.len(),
+        total_outbound_pending
+    ));
+
+    if let Some(trackers) = report.tracker_status.as_ref() {
+        for tracker in trackers {
+            let status = if tracker.reachable { "ok" } else { "fail" };
+            let latency = tracker
+                .latency_ms
+                .map(|value| format!("{value}ms"))
+                .unwrap_or_else(|| "-".to_string());
+            let error = tracker
+                .error
+                .as_deref()
+                .map(|value| format!(" error={value}"))
+                .unwrap_or_default();
+            out.push_str(&format!(
+                "tracker {status:<4} {latency:>6}  {}{error}\n",
+                tracker.base_url
+            ));
+        }
+    }
+
+    out.push_str("\nPeer                         Pull        Outbound push\n");
+    out.push_str(
+        "───────────────────────────  ──────────  ─────────────────────────────────────────\n",
+    );
+
+    for peer in &report.peers {
+        let rates = sync_status_watch_peer_rates(state, peer, now);
+        let peer_name = sync_status_peer_display_name(peer);
+        let baseline = state
+            .peers
+            .get(&peer.peer_id)
+            .map(|state| state.max_outbound_push_pending)
+            .unwrap_or(peer.outbound_push_pending);
+        let progress = outbound_push_progress_percent(peer.outbound_push_pending, baseline);
+        let bar = progress_bar(progress, 12);
+        let last_seen = peer
+            .last_seen_age_sec
+            .map(|age| format!("{age}s"))
+            .unwrap_or_else(|| "-".to_string());
+        out.push_str(&format!(
+            "{peer_name:<27}  {:>9}/s  [{}] {:>3}% {:>8} left  drain {:>9}/s  seen {}\n",
+            format_rate(rates.pull_per_sec),
+            bar,
+            progress,
+            peer.outbound_push_pending,
+            format_rate(rates.pending_drain_per_sec),
+            last_seen
+        ));
+        out.push_str(&format!(
+            "{:27}  cursor={:<10}  push_cursor={:<10} push_rate={:>9}/s\n",
+            "",
+            peer.pull_cursor,
+            peer.push_cursor,
+            format_rate(rates.push_per_sec)
+        ));
+    }
+
+    out.push_str(
+        "\nctrl+c to exit  •  outbound_pending is this device's not-yet-pushed cursor backlog\n",
+    );
+    out
+}
+
+fn sync_status_watch_peer_rates(
+    state: &mut SyncStatusWatchState,
+    peer: &SyncStatusPeerReport,
+    now: Instant,
+) -> SyncStatusWatchPeerRates {
+    let Some(previous) = state.peers.get_mut(&peer.peer_id) else {
+        state.peers.insert(
+            peer.peer_id.clone(),
+            SyncStatusWatchPeerState {
+                last_pull_cursor: peer.pull_cursor,
+                last_push_cursor: peer.push_cursor,
+                last_outbound_push_pending: peer.outbound_push_pending,
+                max_outbound_push_pending: peer.outbound_push_pending,
+                last_sample: now,
+            },
+        );
+        return SyncStatusWatchPeerRates {
+            pull_per_sec: 0.0,
+            push_per_sec: 0.0,
+            pending_drain_per_sec: 0.0,
+        };
+    };
+
+    let elapsed = now
+        .duration_since(previous.last_sample)
+        .as_secs_f64()
+        .max(0.001);
+    let pull_per_sec = peer
+        .pull_cursor
+        .saturating_sub(previous.last_pull_cursor)
+        .max(0) as f64
+        / elapsed;
+    let push_per_sec = peer
+        .push_cursor
+        .saturating_sub(previous.last_push_cursor)
+        .max(0) as f64
+        / elapsed;
+    let pending_drain_per_sec =
+        previous.last_outbound_push_pending as f64 - peer.outbound_push_pending as f64;
+    let pending_drain_per_sec = pending_drain_per_sec / elapsed;
+
+    previous.last_pull_cursor = peer.pull_cursor;
+    previous.last_push_cursor = peer.push_cursor;
+    previous.last_outbound_push_pending = peer.outbound_push_pending;
+    previous.max_outbound_push_pending = previous
+        .max_outbound_push_pending
+        .max(peer.outbound_push_pending);
+    previous.last_sample = now;
+
+    SyncStatusWatchPeerRates {
+        pull_per_sec,
+        push_per_sec,
+        pending_drain_per_sec,
+    }
+}
+
+fn sync_status_peer_display_name(peer: &SyncStatusPeerReport) -> String {
+    let peer_id = short_peer_id(&peer.peer_id);
+    if let Some(device_id) = peer.peer_device_id.as_deref() {
+        format!("{device_id} {peer_id}")
+    } else {
+        peer_id
+    }
+}
+
+fn short_peer_id(peer_id: &str) -> String {
+    let prefix = peer_id.chars().take(10).collect::<String>();
+    if peer_id.chars().count() <= 10 {
+        prefix
+    } else {
+        format!("{prefix}…")
+    }
+}
+
+fn outbound_push_progress_percent(pending: usize, baseline: usize) -> usize {
+    if pending == 0 {
+        return 100;
+    }
+    if baseline == 0 {
+        return 0;
+    }
+    baseline.saturating_sub(pending).saturating_mul(100) / baseline
+}
+
+fn progress_bar(percent: usize, width: usize) -> String {
+    let filled = percent.min(100).saturating_mul(width) / 100;
+    format!(
+        "{}{}",
+        "█".repeat(filled),
+        "░".repeat(width.saturating_sub(filled))
+    )
+}
+
+fn format_rate(value: f64) -> String {
+    if value.abs() >= 1000.0 {
+        format!("{:.1}k", value / 1000.0)
+    } else {
+        format!("{value:.0}")
+    }
 }
 
 fn build_tracker_status_report(
@@ -3394,17 +3734,27 @@ mod tests {
 
     #[test]
     fn p2p_sync_watch_parses_flags() {
-        let app = App::parse_from(["rr", "p2p-sync", "--watch", "--interval-sec", "5"]);
+        let app = App::parse_from([
+            "rr",
+            "p2p-sync",
+            "--watch",
+            "--interval-sec",
+            "5",
+            "--max-peers-per-tick",
+            "2",
+        ]);
         match app.cmd {
             Command::P2pSync {
                 watch,
                 interval_sec,
                 start_jitter_sec,
+                max_peers_per_tick,
                 ..
             } => {
                 assert!(watch);
                 assert_eq!(interval_sec, 5);
                 assert!(start_jitter_sec.is_none());
+                assert_eq!(max_peers_per_tick, 2);
             }
             _ => panic!("expected p2p-sync"),
         }
@@ -3860,10 +4210,14 @@ mod tests {
                 peer,
                 json,
                 with_tracker,
+                watch,
+                interval_sec,
             } => {
                 assert_eq!(peer.as_deref(), Some("peer-a"));
                 assert!(!json);
                 assert!(!with_tracker);
+                assert!(!watch);
+                assert_eq!(interval_sec, 2);
             }
             _ => panic!("expected sync-status"),
         }
@@ -3877,10 +4231,14 @@ mod tests {
                 peer,
                 json,
                 with_tracker,
+                watch,
+                interval_sec,
             } => {
                 assert!(peer.is_none());
                 assert!(json);
                 assert!(!with_tracker);
+                assert!(!watch);
+                assert_eq!(interval_sec, 2);
             }
             _ => panic!("expected sync-status"),
         }
@@ -3894,10 +4252,35 @@ mod tests {
                 peer,
                 json,
                 with_tracker,
+                watch,
+                interval_sec,
             } => {
                 assert!(peer.is_none());
                 assert!(!json);
                 assert!(with_tracker);
+                assert!(!watch);
+                assert_eq!(interval_sec, 2);
+            }
+            _ => panic!("expected sync-status"),
+        }
+    }
+
+    #[test]
+    fn sync_status_parses_watch_flags() {
+        let app = App::parse_from(["rr", "sync-status", "--watch", "--interval-sec", "5"]);
+        match app.cmd {
+            Command::SyncStatus {
+                peer,
+                json,
+                with_tracker,
+                watch,
+                interval_sec,
+            } => {
+                assert!(peer.is_none());
+                assert!(!json);
+                assert!(!with_tracker);
+                assert!(watch);
+                assert_eq!(interval_sec, 5);
             }
             _ => panic!("expected sync-status"),
         }
@@ -3920,6 +4303,8 @@ mod tests {
             "5",
             "--sync-start-delay-sec",
             "1",
+            "--max-peers-per-tick",
+            "3",
             "--preflight",
             "--req-attempts",
             "4",
@@ -3934,6 +4319,7 @@ mod tests {
                 interval_sec,
                 start_jitter_sec,
                 sync_start_delay_sec,
+                max_peers_per_tick,
                 preflight,
                 req_attempts,
                 ..
@@ -3946,6 +4332,7 @@ mod tests {
                 assert_eq!(interval_sec, 30);
                 assert_eq!(start_jitter_sec, Some(5));
                 assert_eq!(sync_start_delay_sec, 1);
+                assert_eq!(max_peers_per_tick, 3);
                 assert!(preflight);
                 assert_eq!(req_attempts, Some(4));
             }
@@ -3998,6 +4385,7 @@ mod tests {
             interval_sec: 0,
             start_jitter_sec: Some(3),
             sync_start_delay_sec: 2,
+            max_peers_per_tick: 1,
             preflight: false,
             req_attempts: Some(4),
             req_timeout_base_sec: None,
@@ -4008,7 +4396,12 @@ mod tests {
         let specs = build_daemon_child_specs("/tmp/rustory.db", &args);
         assert_eq!(specs.tracker_token_env.as_deref(), Some("secret-token"));
         assert!(specs.sync_args.contains(&"--push".to_string()));
-        assert!(specs.sync_args.contains(&"1".to_string()));
+        assert!(
+            specs
+                .sync_args
+                .windows(2)
+                .any(|pair| pair == ["--max-peers-per-tick", "1"])
+        );
         assert!(!specs.serve_args.iter().any(|arg| arg == "secret-token"));
         assert!(!specs.sync_args.iter().any(|arg| arg == "secret-token"));
     }
@@ -4027,6 +4420,7 @@ mod tests {
             interval_sec: 60,
             start_jitter_sec: None,
             sync_start_delay_sec: 2,
+            max_peers_per_tick: 1,
             preflight: false,
             req_attempts: None,
             req_timeout_base_sec: None,
@@ -4149,6 +4543,8 @@ mod tests {
             .unwrap();
         assert_eq!(peer_a.pull_cursor, 2);
         assert_eq!(peer_a.push_cursor, 1);
+        assert_eq!(peer_a.peer_device_id.as_deref(), Some("dev-remote"));
+        assert_eq!(peer_a.outbound_push_pending, 1);
         assert_eq!(peer_a.pending_push, 1);
         assert_eq!(peer_a.last_seen_unix, Some(99));
         assert!(peer_a.last_seen_age_sec.is_some());
@@ -4158,6 +4554,7 @@ mod tests {
             .iter()
             .find(|peer| peer.peer_id == "peer-b")
             .unwrap();
+        assert_eq!(peer_b.outbound_push_pending, 0);
         assert_eq!(peer_b.pending_push, 0);
         assert_eq!(peer_b.last_seen_unix, None);
         assert_eq!(peer_b.last_seen_age_sec, None);
@@ -4169,9 +4566,25 @@ mod tests {
         let json = serde_json::to_string(&filtered).unwrap();
         assert!(json.contains("\"local_head\""));
         assert!(json.contains("\"local_device_id\""));
+        assert!(json.contains("\"peer_device_id\""));
+        assert!(json.contains("\"outbound_push_pending\""));
         assert!(json.contains("\"pending_push\""));
         assert!(json.contains("\"last_seen_unix\""));
         assert!(json.contains("\"last_seen_age_sec\""));
+    }
+
+    #[test]
+    fn sync_status_watch_progress_helpers_are_stable() {
+        assert_eq!(outbound_push_progress_percent(0, 0), 100);
+        assert_eq!(outbound_push_progress_percent(50, 100), 50);
+        assert_eq!(outbound_push_progress_percent(150, 100), 0);
+
+        assert_eq!(progress_bar(0, 4), "░░░░");
+        assert_eq!(progress_bar(50, 4), "██░░");
+        assert_eq!(progress_bar(100, 4), "████");
+
+        assert_eq!(format_rate(42.4), "42");
+        assert_eq!(format_rate(1200.0), "1.2k");
     }
 
     #[test]
