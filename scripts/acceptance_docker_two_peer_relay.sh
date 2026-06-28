@@ -107,6 +107,16 @@ count_relay_circuits() {
   docker logs "$RELAY" 2>&1 | awk '/relay: circuit accepted:/ {n++} END {print n + 0}'
 }
 
+copy_sqlite_snapshot() {
+  local container="$1"
+  local remote_db="$2"
+  local local_db="$3"
+
+  docker cp "${container}:${remote_db}" "$local_db" >/dev/null
+  docker cp "${container}:${remote_db}-wal" "${local_db}-wal" >/dev/null 2>&1 || true
+  docker cp "${container}:${remote_db}-shm" "${local_db}-shm" >/dev/null 2>&1 || true
+}
+
 start_peer() {
   local container="$1"
   local device="$2"
@@ -318,9 +328,14 @@ fi
 echo "relay_circuits_before=${CIRCUITS_BEFORE} relay_circuits_after=${CIRCUITS_AFTER}"
 
 echo "[10/11] snapshot peer databases"
-docker stop "$PEER_A" "$PEER_B" >/dev/null
-docker cp "${PEER_A}:/tmp/peer-a.db" "$ACC_DIR/peer-a.db" >/dev/null
-docker cp "${PEER_B}:/tmp/peer-b.db" "$ACC_DIR/peer-b.db" >/dev/null
+# SQLite WAL 모드에서는 최신 write가 main db 파일이 아니라 -wal에 남을 수 있다.
+# Docker Desktop bind-mount 가시성도 피하기 위해 컨테이너 내부 FS(/tmp)를 쓰므로,
+# snapshot 검증 시 main db와 WAL/SHM 파일을 함께 복사한다.
+if [[ "$KEEP" != "1" ]]; then
+  docker stop "$PEER_A" "$PEER_B" >/dev/null
+fi
+copy_sqlite_snapshot "$PEER_A" /tmp/peer-a.db "$ACC_DIR/peer-a.db"
+copy_sqlite_snapshot "$PEER_B" /tmp/peer-b.db "$ACC_DIR/peer-b.db"
 
 echo "[11/11] verify both peers converged"
 python3 - <<'PY' "$ACC_DIR/peer-a.db" "$ACC_DIR/peer-b.db"
