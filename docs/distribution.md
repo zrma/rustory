@@ -80,7 +80,7 @@ rr init --tracker-token "$RUSTORY_TRACKER_TOKEN" --trackers "<tracker-url>"
 
 ```sh
 rr update
-rr update --version v1.0.2
+rr update --version v1.0.4
 rr update --dry-run
 ```
 
@@ -88,7 +88,7 @@ rr update --dry-run
 테스트 또는 사설 release mirror를 써야 하면 exact URL이나 base URL을 지정한다.
 
 ```sh
-rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.2"
+rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.4"
 rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256 "<sha256>"
 ```
 

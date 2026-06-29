@@ -1,6 +1,6 @@
 use crate::{core, storage::LocalStore};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
 use std::path::Path;
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -452,17 +452,17 @@ fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryR
         .map(|end| end.saturating_sub(start_ts).saturating_mul(1000))
         .unwrap_or(0);
 
-    let cmd: String = row.get(2)?;
-    let cwd: String = row.get(3)?;
+    let cmd = row_lossy_string(row, 2)?;
+    let cwd = row_lossy_string(row, 3)?;
     let exit_code: i32 = row.get(4)?;
-    let hostname: String = row.get(7)?;
-    let local_username: Option<String> = row.get(8)?;
-    let source_hostname: Option<String> = row.get(9)?;
-    let source_cwd: Option<String> = row.get(10)?;
-    let home_directory: Option<String> = row.get(11)?;
-    let start_time: Option<String> = row.get(12)?;
-    let end_time: Option<String> = row.get(13)?;
-    let source_device_id: Option<String> = row.get(14)?;
+    let hostname = row_lossy_string(row, 7)?;
+    let local_username = row_lossy_opt_string(row, 8)?;
+    let source_hostname = row_lossy_opt_string(row, 9)?;
+    let source_cwd = row_lossy_opt_string(row, 10)?;
+    let home_directory = row_lossy_opt_string(row, 11)?;
+    let start_time = row_lossy_opt_string(row, 12)?;
+    let end_time = row_lossy_opt_string(row, 13)?;
+    let source_device_id = row_lossy_opt_string(row, 14)?;
     let source_exit_code: Option<i64> = row.get(15)?;
     let fallback_source_key = hishtory_composite_source_key(HishtoryCompositeSourceKey {
         local_username: local_username.as_deref(),
@@ -477,7 +477,7 @@ fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryR
     });
 
     Ok(HishtoryRecord {
-        source_entry_id: row.get(1)?,
+        source_entry_id: row_lossy_opt_string(row, 1)?,
         fallback_source_key,
         ts_unix: start_ts,
         duration_ms,
@@ -486,6 +486,29 @@ fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryR
         exit_code,
         hostname,
     })
+}
+
+fn row_lossy_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
+    Ok(sqlite_value_ref_to_lossy_string(row.get_ref(index)?))
+}
+
+fn row_lossy_opt_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
+    let value = row.get_ref(index)?;
+    Ok(match value {
+        ValueRef::Null => None,
+        _ => Some(sqlite_value_ref_to_lossy_string(value)),
+    })
+}
+
+fn sqlite_value_ref_to_lossy_string(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => String::new(),
+        ValueRef::Integer(value) => value.to_string(),
+        ValueRef::Real(value) => value.to_string(),
+        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
+            String::from_utf8_lossy(bytes).into_owned()
+        }
+    }
 }
 
 fn should_skip_import_command(cmd: &str, ignore_regex: Option<&regex::Regex>) -> bool {
@@ -806,6 +829,90 @@ mod tests {
         assert_eq!(s2.ignored, 2);
         assert_eq!(s2.skipped, 1);
         assert_eq!(store.list_recent(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn import_hishtory_sqlite_decodes_invalid_utf8_lossily() {
+        let hishtory_db = synthetic_hishtory_db(&[]);
+        let conn = Connection::open(hishtory_db.path()).unwrap();
+        conn.execute_batch(
+            r#"
+INSERT INTO history_entries (
+  local_username,
+  hostname,
+  command,
+  current_working_directory,
+  home_directory,
+  exit_code,
+  start_time,
+  end_time,
+  device_id,
+  custom_columns,
+  entry_id
+) VALUES (
+  CAST(x'6c6f63616cff' AS TEXT),
+  CAST(x'686f7374ff' AS TEXT),
+  CAST(x'6563686f20ff' AS TEXT),
+  CAST(x'2f776f726bff' AS TEXT),
+  CAST(x'2f686f6d65ff' AS TEXT),
+  0,
+  '2024-01-01 00:00:00+00:00',
+  '2024-01-01 00:00:01+00:00',
+  CAST(x'646576ff' AS TEXT),
+  X'',
+  CAST(x'68697374ff' AS TEXT)
+);
+"#,
+        )
+        .unwrap();
+        drop(conn);
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let s1 = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-a",
+                hostname: "fallback-host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s1.received, 1);
+        assert_eq!(s1.inserted, 1);
+
+        let entries = store.list_recent(10).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].cmd,
+            String::from_utf8_lossy(b"echo \xff").as_ref()
+        );
+        assert_eq!(
+            entries[0].cwd,
+            String::from_utf8_lossy(b"/work\xff").as_ref()
+        );
+        assert_eq!(
+            entries[0].hostname,
+            String::from_utf8_lossy(b"host\xff").as_ref()
+        );
+
+        let s2 = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: None,
+                user_id: "u1",
+                device_id: "rustory-device-b",
+                hostname: "fallback-host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(s2.received, 1);
+        assert_eq!(s2.inserted, 0);
+        assert_eq!(s2.ignored, 1);
     }
 
     #[test]

@@ -276,7 +276,10 @@ def run_import_hishtory(install_path: Path, args: argparse.Namespace) -> None:
     if args.hishtory_limit:
         cmd += ["--limit", args.hishtory_limit]
     print(f"hishtory_import=running path={source_path}")
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise SystemExit(f"hishtory_import=failed exit_code={exc.returncode}") from None
 
 
 def remove_hishtory_hooks() -> None:

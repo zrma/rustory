@@ -9,6 +9,7 @@
 - `rr import --shell hishtory`는 로컬 Hishtory SQLite DB를 read-only로 읽어 Rustory 로컬 DB에 추가한다.
 - 기본 Hishtory DB 경로는 `~/.hishtory/.hishtory.db`이다. 다른 경로는 `--path`로 지정한다.
 - import는 additive/idempotent다. 같은 source를 다시 import하면 이미 들어간 row는 `ignored`로 집계된다.
+- Hishtory SQLite TEXT 값에 invalid UTF-8 byte가 있어도 import는 중단하지 않고 lossless byte 보존 대신 UTF-8 replacement 문자로 변환해 계속 진행한다.
 
 ## 이관 전 확인
 
