@@ -41,7 +41,7 @@ Options:
 Examples:
   scripts/release-version.sh --profile current --dry-run
   scripts/release-version.sh --profile daily-driver --work-id release-automation
-  scripts/release-version.sh --version v1.0.9 --profile daily-driver --gate none
+  scripts/release-version.sh --version v1.0.10 --profile daily-driver --gate none
 USAGE
 }
 
@@ -175,6 +175,28 @@ check_remote_main() {
   ok "remote main matches release target: $REMOTE/main $remote_sha"
 }
 
+check_remote_tag_target() {
+  if [[ "$REMOTE_CHECK" -eq 0 || "$DRY_RUN" -eq 1 || "$SKIP_UPLOAD" -eq 1 ]]; then
+    return 0
+  fi
+  need_cmd git
+
+  local tag_sha=""
+  tag_sha="$(cd "$ROOT" && git ls-remote --tags "$REMOTE" "refs/tags/$TAG^{}" | awk '{print $1}' | tr -d '\r\n ')"
+  if [[ -z "$tag_sha" ]]; then
+    tag_sha="$(cd "$ROOT" && git ls-remote --tags "$REMOTE" "refs/tags/$TAG" | awk '{print $1}' | tr -d '\r\n ')"
+  fi
+
+  if [[ -z "$tag_sha" ]]; then
+    return 0
+  fi
+
+  if [[ "$tag_sha" != "$COMMIT_SHA" ]]; then
+    fail "$REMOTE tag $TAG ($tag_sha) does not match release target $TARGET_REF ($COMMIT_SHA)"
+  fi
+  ok "remote tag matches release target: $TAG $tag_sha"
+}
+
 run_gate() {
   case "$GATE" in
     none)
@@ -231,6 +253,12 @@ build_or_collect_assets() {
     fi
     ASSETS+=("$asset" "$checksum")
   done
+
+  local checksums="$DIST_PATH/checksums.txt"
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    [[ -f "$checksums" ]] || fail "missing release checksums file: $checksums"
+  fi
+  ASSETS+=("$checksums")
 }
 
 release_exists() {
@@ -432,6 +460,7 @@ echo "profile=$PROFILE targets=${TARGETS[*]} dist_dir=$DIST_DIR repo=$REPO gate=
 check_clean_worktree
 run_gate
 check_remote_main
+check_remote_tag_target
 build_or_collect_assets
 publish_release
 verify_update_plan
