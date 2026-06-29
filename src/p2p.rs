@@ -1763,7 +1763,9 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
             && (msg.contains("resource limit exceeded")
                 || msg.contains("connection reset by peer")
                 || msg.contains("temporarily unavailable")
-                || msg.contains("timed out"))
+                || msg.contains("timed out")
+                || msg.contains("oneshot canceled")
+                || msg.contains("response from behaviour was canceled"))
     }) {
         return true;
     }
@@ -2455,6 +2457,11 @@ mod tests {
 
         let err = anyhow::anyhow!(
             "dial failed: Failed to negotiate transport protocol(s): Handshake error: Connection reset by peer (os error 104)"
+        );
+        assert!(is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::anyhow!(
+            "dial failed: Failed to negotiate transport protocol(s): [(/ip4/192.0.2.1/tcp/4001/p2p/12D3KooW/p2p-circuit/p2p/12D3KooT: : Response from behaviour was canceled: oneshot canceled)]"
         );
         assert!(is_retryable_p2p_request_error(&err));
 

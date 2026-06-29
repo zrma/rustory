@@ -54,6 +54,10 @@ token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증�
 `--import-hishtory`는 기본 Hishtory DB(`~/.hishtory/.hishtory.db`)가 있으면 import하고,
 성공 후 user startup files에서 Hishtory hook/PATH/source 라인을 삭제한다.
 Hishtory hook을 유지해야 하면 `--keep-hishtory-hooks`를 함께 넘긴다.
+installer는 binary/config/hook/import만 처리하며 daemon을 자동 시작하지 않는다. 설치 직후 이
+디바이스를 tracker/relay grid의 상시 멤버로 등록하려면 별도 셸에서 `rr daemon`을 실행한다.
+`rr p2p-sync --push`만 단발 실행하면 tracker에서 다른 peer는 발견할 수 있지만, 이 디바이스의
+`p2p-serve` 등록은 유지되지 않는다.
 
 installer는 다음 순서로 동작한다.
 
@@ -90,7 +94,7 @@ rr init --tracker-token "$RUSTORY_TRACKER_TOKEN" --trackers "<tracker-url>"
 
 ```sh
 rr update
-rr update --version v1.0.5
+rr update --version v1.0.6
 rr update --dry-run
 ```
 
@@ -98,7 +102,7 @@ rr update --dry-run
 테스트 또는 사설 release mirror를 써야 하면 exact URL이나 base URL을 지정한다.
 
 ```sh
-rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.5"
+rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.6"
 rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256 "<sha256>"
 ```
 
