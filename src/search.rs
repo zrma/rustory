@@ -1,5 +1,6 @@
 use crate::core::Entry;
 use anyhow::{Context, Result};
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -128,17 +129,19 @@ enum Key {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchAction {
     Select(String),
-    Delete { entry_id: String },
 }
 
-pub fn select_action(entries: &[Entry]) -> Result<Option<SearchAction>> {
+pub fn select_action(
+    entries: &[Entry],
+    mut delete_entry: impl FnMut(&str) -> Result<()>,
+) -> Result<Option<SearchAction>> {
     if entries.is_empty() {
         return Ok(None);
     }
 
     let rows = build_search_rows(entries);
     let mut tui = SearchTui::new(entries, rows)?;
-    tui.run()
+    tui.run(&mut delete_entry)
 }
 
 fn build_search_rows(entries: &[Entry]) -> Vec<SearchRow> {
@@ -184,6 +187,7 @@ struct SearchTui<'a> {
     show_help: bool,
     tty: Tty,
     last_rendered_lines: usize,
+    deleted_entry_ids: HashSet<String>,
 }
 
 impl<'a> SearchTui<'a> {
@@ -202,12 +206,16 @@ impl<'a> SearchTui<'a> {
             show_help: false,
             tty,
             last_rendered_lines: 0,
+            deleted_entry_ids: HashSet::new(),
         };
         tui.refresh_matches(true);
         Ok(tui)
     }
 
-    fn run(&mut self) -> Result<Option<SearchAction>> {
+    fn run(
+        &mut self,
+        delete_entry: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<Option<SearchAction>> {
         self.render()?;
         loop {
             match self.tty.read_key().context("read search TUI key")? {
@@ -217,9 +225,10 @@ impl<'a> SearchTui<'a> {
                     return Ok(action);
                 }
                 Key::DeleteSelected => {
-                    if let Some(action) = self.selected_delete_action() {
-                        self.finish()?;
-                        return Ok(Some(action));
+                    if let Some(entry_id) = self.selected_delete_entry_id() {
+                        delete_entry(&entry_id)?;
+                        self.deleted_entry_ids.insert(entry_id);
+                        self.refresh_matches(false);
                     }
                 }
                 Key::Quit => {
@@ -246,10 +255,8 @@ impl<'a> SearchTui<'a> {
         Some(self.selected_entry()?.cmd.clone())
     }
 
-    fn selected_delete_action(&self) -> Option<SearchAction> {
-        Some(SearchAction::Delete {
-            entry_id: self.selected_entry()?.entry_id.clone(),
-        })
+    fn selected_delete_entry_id(&self) -> Option<String> {
+        Some(self.selected_entry()?.entry_id.clone())
     }
 
     fn selected_entry(&self) -> Option<&Entry> {
@@ -331,7 +338,12 @@ impl<'a> SearchTui<'a> {
 
     fn refresh_matches(&mut self, reset_cursor: bool) {
         let query = self.query_string();
-        self.filtered = filter_rows(&self.rows, &query);
+        self.filtered = filter_rows_excluding_deleted(
+            self.entries,
+            &self.rows,
+            &query,
+            &self.deleted_entry_ids,
+        );
         if reset_cursor {
             self.cursor = 0;
             self.scroll_top = 0;
@@ -695,6 +707,25 @@ fn filter_rows(rows: &[SearchRow], query: &str) -> Vec<usize> {
             .then_with(|| left_idx.cmp(right_idx))
     });
     scored.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn filter_rows_excluding_deleted(
+    entries: &[Entry],
+    rows: &[SearchRow],
+    query: &str,
+    deleted_entry_ids: &HashSet<String>,
+) -> Vec<usize> {
+    let mut filtered = filter_rows(rows, query);
+    if deleted_entry_ids.is_empty() {
+        return filtered;
+    }
+
+    filtered.retain(|row_index| {
+        rows.get(*row_index)
+            .and_then(|row| entries.get(row.entry_index))
+            .is_some_and(|entry| !deleted_entry_ids.contains(&entry.entry_id))
+    });
+    filtered
 }
 
 fn parse_search_terms(query: &str) -> Vec<SearchTerm> {
@@ -1628,6 +1659,24 @@ mod tests {
 
         assert_eq!(got.entry_id, entries[1].entry_id);
         assert_eq!(got.cmd, "cargo test search");
+    }
+
+    #[test]
+    fn filter_rows_excluding_deleted_hides_deleted_entries() {
+        let entries = vec![
+            entry("node0", "/home/user", "which rr"),
+            entry(
+                "macbook",
+                "/Users/user/code/src/rustory",
+                "cargo test search",
+            ),
+        ];
+        let rows = build_search_rows(&entries);
+        let deleted = HashSet::from([entries[1].entry_id.clone()]);
+
+        let got = filter_rows_excluding_deleted(&entries, &rows, "cargo", &deleted);
+
+        assert!(got.is_empty());
     }
 
     #[test]
