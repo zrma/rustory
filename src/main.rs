@@ -2,6 +2,7 @@ mod build_info;
 mod cli;
 mod config;
 mod core;
+mod hishtory_cleanup;
 mod history_import;
 mod hook;
 mod http_retry;

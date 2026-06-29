@@ -165,6 +165,43 @@ curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.p
 이 경로는 Hishtory DB/디렉터리는 삭제하지 않고, import 성공 후 user startup files의 Hishtory hook 라인만 제거한다.
 Hishtory hook을 임시 유지해야 하는 디버깅 상황에서는 `--keep-hishtory-hooks`를 추가한다.
 
+## 안정화 후 Hishtory 찌꺼기 정리
+
+초기 전환과 삭제는 분리한다.
+`rr import --shell hishtory`와 installer의 `--import-hishtory` 경로는 Hishtory DB/디렉터리를 fallback source로 남긴다.
+몇 주 동안 Rustory 검색, 기록, tracker/relay sync가 안정적으로 동작한 뒤에만 명시적으로 정리한다.
+
+먼저 삭제 계획만 확인한다.
+
+```sh
+rr cleanup-hishtory
+```
+
+기본 dry-run은 파일을 지우지 않고 다음 대상을 보여준다.
+- `~/.hishtory`
+- `~/.config/hishtory`
+- `~/.local/bin/hishtory`
+- user startup files(`~/.zshrc`, `~/.zprofile`, `~/.zshenv`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`) 안의 Hishtory hook 라인
+
+실제 삭제는 archive 경로를 명시한 경우를 기본으로 한다.
+
+```sh
+rr cleanup-hishtory --apply --archive-dir ~/SynologyDrive/rustory/hishtory-backups
+```
+
+`--archive-dir`를 쓰면 삭제 전에 영향을 받는 Hishtory 디렉터리와 startup file을 `hishtory-backup-<unix>` 디렉터리 아래에 복사한다.
+startup file은 Hishtory 관련 라인만 제거하고, 제거 후 공백만 남는 파일은 삭제한다.
+따라서 bash만 쓰는 Linux host에 Hishtory 때문에 생긴 `~/.zshrc` 같은 파일은 backup 후 사라진다.
+
+외부 백업을 이미 확보했고 로컬 archive를 만들지 않으려면 아래처럼 명시한다.
+
+```sh
+rr cleanup-hishtory --apply --no-archive
+```
+
+이 명령은 system profile(`/etc/profile`, `/etc/profile.d`, `/etc/zsh` 등)이나 package manager 설치 상태는 건드리지 않는다.
+system-wide Hishtory hook이 남아 있으면 관리자 권한으로 별도 점검한다.
+
 ## Multi-machine soak runbook
 
 Hishtory 대체 readiness는 loopback이나 direct-only 성공으로 판정하지 않는다.
@@ -215,6 +252,7 @@ relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문
 5. 각 머신의 shell hook을 Rustory로 전환한다.
 6. 충분한 soak 기간 동안 Hishtory는 제거하지 말고 read-only fallback source로 남긴다.
 7. Rustory `doctor`, `sync-status`, P2P 로그가 안정적이면 Hishtory hook/daemon을 비활성화한다. 구체 절차는 `Shell hook handoff`를 따른다.
+8. 몇 주간 fallback이 필요 없었다는 것이 확인되면 `rr cleanup-hishtory` dry-run과 archive-backed apply로 Hishtory 찌꺼기를 정리한다.
 
 ## 운영 체크리스트
 

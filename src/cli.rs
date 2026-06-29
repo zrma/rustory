@@ -3,7 +3,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use rand::RngExt;
 
-use crate::{config, history_import, hook, p2p, search, storage, tracker, transport};
+use crate::{
+    config, hishtory_cleanup, history_import, hook, p2p, search, storage, tracker, transport,
+};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
@@ -582,6 +584,37 @@ enum Command {
 
         #[arg(long, help = "Hostname for imported entries")]
         hostname: Option<String>,
+    },
+    #[command(about = "Remove old Hishtory files and startup hooks after migration")]
+    CleanupHishtory {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Actually remove files; default is a dry-run plan"
+        )]
+        apply: bool,
+
+        #[arg(
+            long,
+            conflicts_with = "no_archive",
+            help = "Directory where a backup copy is written before --apply deletion"
+        )]
+        archive_dir: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            conflicts_with = "archive_dir",
+            help = "Allow --apply without writing a backup copy"
+        )]
+        no_archive: bool,
+
+        #[arg(
+            long,
+            hide = true,
+            help = "Home directory override for tests and scripted cleanup"
+        )]
+        home: Option<String>,
     },
 }
 
@@ -1241,6 +1274,30 @@ pub fn run() -> Result<()> {
                 stats.skipped
             );
         }
+        Command::CleanupHishtory {
+            apply,
+            archive_dir,
+            no_archive,
+            home,
+        } => {
+            let home_dir = match normalize_opt_string(home) {
+                Some(path) => config::expand_home_path(&path)?,
+                None => std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .context("HOME env var not set")?,
+            };
+            let archive_dir = normalize_opt_string(archive_dir)
+                .map(|path| config::expand_home_path(&path))
+                .transpose()?;
+            let report = hishtory_cleanup::cleanup_hishtory(hishtory_cleanup::CleanupOptions {
+                home_dir,
+                apply,
+                archive_dir,
+                no_archive,
+                backup_name: None,
+            })?;
+            hishtory_cleanup::print_report(&report, io::stdout())?;
+        }
     }
 
     Ok(())
@@ -1252,6 +1309,7 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
         Command::Doctor { .. }
             | Command::Version { .. }
             | Command::Update { .. }
+            | Command::CleanupHishtory { .. }
             | Command::Init { force: true, .. }
     )
 }
@@ -5285,6 +5343,30 @@ mod tests {
                 assert_eq!(shell, "hishtory");
             }
             _ => panic!("expected import"),
+        }
+    }
+
+    #[test]
+    fn cleanup_hishtory_parses_safety_flags() {
+        let app = App::parse_from([
+            "rr",
+            "cleanup-hishtory",
+            "--apply",
+            "--archive-dir",
+            "/tmp/hishtory-backups",
+        ]);
+        match app.cmd {
+            Command::CleanupHishtory {
+                apply,
+                archive_dir,
+                no_archive,
+                ..
+            } => {
+                assert!(apply);
+                assert_eq!(archive_dir.as_deref(), Some("/tmp/hishtory-backups"));
+                assert!(!no_archive);
+            }
+            _ => panic!("expected cleanup-hishtory"),
         }
     }
 }
