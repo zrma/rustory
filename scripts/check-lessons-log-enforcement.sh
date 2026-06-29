@@ -90,6 +90,9 @@ collect_worktree_files() {
   {
     git diff --name-only 2>/dev/null || true
     git diff --cached --name-only 2>/dev/null || true
+    if command -v jj >/dev/null 2>&1 && jj root >/dev/null 2>&1; then
+      jj diff --name-only 2>/dev/null || true
+    fi
   } | awk 'NF && !seen[$0]++ { print }'
 }
 

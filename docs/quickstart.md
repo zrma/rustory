@@ -101,6 +101,7 @@ rr doctor --json
 ```
 
 `config status: invalid: ...`가 표시되면 `~/.config/rustory/config.toml`을 먼저 고친다. 기존 설정을 버리고 새 템플릿으로 복구하려면 `rr init --force ...`를 사용한다. `--force`는 기존 config를 덮어쓰므로 필요한 값은 먼저 보관한다. `rr doctor`는 설정 파일이 잘못된 상태에서도 계속 실행되어 어떤 파일과 에러를 봐야 하는지 보여준다.
+`db permissions`, `config permissions`, key 파일 권한, 기본 `record_ignore_regex` 누락처럼 안전하게 자동 보정 가능한 로컬 hygiene은 `rr doctor --auto-fix`로 정리할 수 있다. relay 주소 변경, token 변경, 손상된 config 수정처럼 운영 판단이 필요한 항목은 자동으로 바꾸지 않는다.
 
 `rr doctor`의 `db status:`/`db permissions:` 라인에서 로컬 DB 파일 존재 여부, 저장된 entry 수, peer book/sync peer 수, 파일 권한 경고를 확인할 수 있다. `entries=0`이면 ctrl+r 검색 후보가 아직 없는 상태다.
 `hook:` 라인에서는 현재 셸에서 hook 설치 마커가 보이는지(`installed`), `RUSTORY_HOOK_DISABLE`로 비활성화됐는지(`disabled`), ctrl+r 검색 limit 값이 어떤 resolver 경로로 해석됐는지 확인한다.

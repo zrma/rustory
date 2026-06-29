@@ -179,10 +179,12 @@ p2p_watch_start_jitter_sec = 10
 ## 트러블슈팅
 - `rr doctor`: 이 머신에서 해석된 설정/키/트래커/릴레이 상태를 요약해서 출력한다.
   - config 파싱 실패, hook 설치/비활성화, async upload/auto prune 주기, key 파일 상태, tracker/relay 접근성을 한 번에 점검하는 시작점으로 사용한다.
+  - `rr doctor --auto-fix`는 config/db/key 경로의 private permission과 누락된 기본 secret-filter regex처럼 안전하게 자동 보정 가능한 로컬 hygiene만 고친다.
   - 텍스트/JSON 출력 필드와 오류 표시는 `rr doctor --help`, `rr doctor --json`, 관련 코드가 소유한다.
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
   - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push 커서가 전진하지 않은 로컬 엔트리 수다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
-  - `--watch`는 alternate screen TUI로 peer별 pull/push cursor 변화율, outbound backlog drain rate, progress bar, tracker 상태를 계속 갱신한다.
+  - `--watch`는 alternate screen TUI로 local-known flow map과 peer별 pull/push cursor 변화율, outbound backlog drain rate, progress bar, tracker 상태를 계속 갱신한다.
+  - watch 화면의 `peer => local`은 이 노드가 해당 peer에서 pull한 cursor/rate이고, `local => peer`는 이 노드의 로컬 엔트리를 해당 peer로 push해야 하는 backlog다. 다른 peer끼리 실제로 주고받는 global active flow는 아직 원격 telemetry가 없으므로 표시하지 않는다.
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
   - 예시:
     - `rr sync-status`

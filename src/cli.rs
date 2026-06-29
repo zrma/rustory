@@ -9,6 +9,7 @@ use crate::{
 };
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,6 +23,7 @@ const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
 const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
 const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
 const DEFAULT_HOOK_SEARCH_LIMIT: usize = 100_000;
+const DEFAULT_RECORD_IGNORE_REGEX: &str = r"(?i)(password|passwd|token|secret|authorization:|bearer |api[_-]?key|access[_-]?key|private[_-]?key)";
 
 #[derive(Parser)]
 #[command(name = "rr", version = crate::build_info::VERSION_DISPLAY, about = "Rustory CLI")]
@@ -561,6 +563,13 @@ enum Command {
             help = "Print diagnostics as pretty JSON"
         )]
         json: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Safely fix local permissions and missing privacy defaults before reporting"
+        )]
+        auto_fix: bool,
     },
     #[command(about = "Import existing shell history into the local store")]
     Import {
@@ -1192,8 +1201,8 @@ pub fn run() -> Result<()> {
                 &db_path,
             )?;
         }
-        Command::Doctor { json } => {
-            run_doctor(&cfg, &db_path, json, config_load_error.as_deref())?;
+        Command::Doctor { json, auto_fix } => {
+            run_doctor(&cfg, &db_path, json, auto_fix, config_load_error.as_deref())?;
         }
         Command::Import {
             shell,
@@ -1825,7 +1834,9 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push_str("# p2p_request_timeout_cap_sec = 30 # optional\n");
     out.push_str("# p2p_request_backoff_base_ms = 200 # optional\n");
     out.push_str("# search_limit_default = 100000 # optional\n");
-    out.push_str("# record_ignore_regex = \"(?i)(password|token|secret)\" # optional\n");
+    let record_ignore_regex = normalize_opt_string(cfg.record_ignore_regex.clone())
+        .unwrap_or_else(|| DEFAULT_RECORD_IGNORE_REGEX.to_string());
+    out.push_str(&format!("record_ignore_regex = {record_ignore_regex:?}\n"));
     out.push_str("# async_upload = false # optional; env RUSTORY_ASYNC_UPLOAD overrides\n");
     out.push_str("# async_upload_interval_sec = 15 # optional\n");
     out.push_str("# async_upload_limit = 200 # optional\n");
@@ -2451,12 +2462,49 @@ fn build_key_status_report(
     })
 }
 
+#[derive(Debug, Default)]
+struct DoctorAutoFixReport {
+    actions: Vec<DoctorAutoFixAction>,
+}
+
+#[derive(Debug)]
+struct DoctorAutoFixAction {
+    target: String,
+    status: DoctorAutoFixStatus,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorAutoFixStatus {
+    Fixed,
+    Ok,
+    Skipped,
+}
+
 fn run_doctor(
     cfg: &config::FileConfig,
     db_path: &str,
     json: bool,
+    auto_fix: bool,
     config_error: Option<&str>,
 ) -> Result<()> {
+    if json && auto_fix {
+        anyhow::bail!("doctor --auto-fix does not support --json");
+    }
+
+    let fixed_cfg;
+    let cfg = if auto_fix {
+        let report = run_doctor_auto_fix(cfg, db_path, config_error)?;
+        print_doctor_auto_fix_report(&report);
+        fixed_cfg = match config::load_default() {
+            Ok(cfg) => cfg,
+            Err(_) => cfg.clone(),
+        };
+        &fixed_cfg
+    } else {
+        cfg
+    };
+
     if json {
         let report = build_doctor_report(cfg, db_path, config_error)?;
         println!(
@@ -2658,6 +2706,204 @@ fn run_doctor(
     }
 
     Ok(())
+}
+
+fn run_doctor_auto_fix(
+    cfg: &config::FileConfig,
+    db_path: &str,
+    config_error: Option<&str>,
+) -> Result<DoctorAutoFixReport> {
+    let mut report = DoctorAutoFixReport::default();
+    let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+
+    if let Some(parent) = cfg_path.parent() {
+        fix_path_mode(parent, 0o700, "config parent", &mut report)?;
+    }
+    fix_path_mode(&cfg_path, 0o600, "config file", &mut report)?;
+    fix_default_record_ignore_regex(cfg, &cfg_path, config_error, &mut report)?;
+
+    let db_path = expand_db_path_for_auto_fix(db_path)?;
+    if let Some(parent) = db_path.parent() {
+        fix_path_mode(parent, 0o700, "db parent", &mut report)?;
+    }
+    fix_path_mode(&db_path, 0o600, "db file", &mut report)?;
+
+    for (label, key_path) in [
+        ("swarm key", resolve_swarm_key_path(None, cfg)),
+        ("p2p identity key", resolve_p2p_identity_key_path(None, cfg)),
+        (
+            "relay identity key",
+            resolve_relay_identity_key_path(None, cfg),
+        ),
+    ] {
+        let key_path = config::expand_home_path(&key_path)?;
+        if let Some(parent) = key_path.parent() {
+            fix_path_mode(parent, 0o700, &format!("{label} parent"), &mut report)?;
+        }
+        fix_path_mode(&key_path, 0o600, label, &mut report)?;
+    }
+
+    Ok(report)
+}
+
+fn expand_db_path_for_auto_fix(path: &str) -> Result<PathBuf> {
+    if path == ":memory:" {
+        return Ok(PathBuf::from(path));
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        let home = std::env::var_os("HOME").context("HOME env var not set")?;
+        return Ok(Path::new(&home).join(rest));
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn fix_path_mode(
+    path: &Path,
+    wanted_mode: u32,
+    target: &str,
+    report: &mut DoctorAutoFixReport,
+) -> Result<()> {
+    if path == Path::new(":memory:") {
+        report.actions.push(DoctorAutoFixAction {
+            target: target.to_string(),
+            status: DoctorAutoFixStatus::Skipped,
+            detail: "path=:memory:".to_string(),
+        });
+        return Ok(());
+    }
+
+    let mode = match file_mode_777(path) {
+        Some(mode) => mode,
+        None => {
+            report.actions.push(DoctorAutoFixAction {
+                target: target.to_string(),
+                status: DoctorAutoFixStatus::Skipped,
+                detail: format!("missing path={}", path.display()),
+            });
+            return Ok(());
+        }
+    };
+
+    if mode == wanted_mode {
+        report.actions.push(DoctorAutoFixAction {
+            target: target.to_string(),
+            status: DoctorAutoFixStatus::Ok,
+            detail: format!("path={} mode={mode:03o}", path.display()),
+        });
+        return Ok(());
+    }
+
+    set_path_mode(path, wanted_mode)
+        .with_context(|| format!("chmod {wanted_mode:03o}: {}", path.display()))?;
+    report.actions.push(DoctorAutoFixAction {
+        target: target.to_string(),
+        status: DoctorAutoFixStatus::Fixed,
+        detail: format!("path={} mode={mode:03o}->{wanted_mode:03o}", path.display()),
+    });
+    Ok(())
+}
+
+fn set_path_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(mode);
+        std::fs::set_permissions(path, perms)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+fn fix_default_record_ignore_regex(
+    cfg: &config::FileConfig,
+    cfg_path: &Path,
+    config_error: Option<&str>,
+    report: &mut DoctorAutoFixReport,
+) -> Result<()> {
+    if let Some(error) = config_error {
+        report.actions.push(DoctorAutoFixAction {
+            target: "record_ignore_regex".to_string(),
+            status: DoctorAutoFixStatus::Skipped,
+            detail: format!("invalid config: {error}"),
+        });
+        return Ok(());
+    }
+
+    if let Some(pattern) = normalize_opt_string(cfg.record_ignore_regex.clone()) {
+        match regex::Regex::new(&pattern) {
+            Ok(_) => {
+                report.actions.push(DoctorAutoFixAction {
+                    target: "record_ignore_regex".to_string(),
+                    status: DoctorAutoFixStatus::Ok,
+                    detail: "configured".to_string(),
+                });
+            }
+            Err(err) => {
+                report.actions.push(DoctorAutoFixAction {
+                    target: "record_ignore_regex".to_string(),
+                    status: DoctorAutoFixStatus::Skipped,
+                    detail: format!("configured pattern is invalid: {err}"),
+                });
+            }
+        }
+        return Ok(());
+    }
+
+    if let Some(parent) = cfg_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create dir: {}", parent.display()))?;
+        set_path_mode(parent, 0o700).with_context(|| format!("chmod 700: {}", parent.display()))?;
+    }
+
+    let mut content = match std::fs::read_to_string(cfg_path) {
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read config: {}", cfg_path.display()));
+        }
+    };
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    if !content.is_empty() {
+        content.push('\n');
+    }
+    content.push_str(&format!(
+        "record_ignore_regex = {DEFAULT_RECORD_IGNORE_REGEX:?}\n"
+    ));
+    std::fs::write(cfg_path, content)
+        .with_context(|| format!("write config: {}", cfg_path.display()))?;
+    set_path_mode(cfg_path, 0o600).with_context(|| format!("chmod 600: {}", cfg_path.display()))?;
+    report.actions.push(DoctorAutoFixAction {
+        target: "record_ignore_regex".to_string(),
+        status: DoctorAutoFixStatus::Fixed,
+        detail: "set default secret-filter pattern".to_string(),
+    });
+    Ok(())
+}
+
+fn print_doctor_auto_fix_report(report: &DoctorAutoFixReport) {
+    if report.actions.is_empty() {
+        println!("auto-fix: no actions");
+        return;
+    }
+
+    for action in &report.actions {
+        let status = match action.status {
+            DoctorAutoFixStatus::Fixed => "fixed",
+            DoctorAutoFixStatus::Ok => "ok",
+            DoctorAutoFixStatus::Skipped => "skipped",
+        };
+        println!(
+            "auto-fix: {status} target={} {}",
+            action.target, action.detail
+        );
+    }
 }
 
 fn build_hook_status_report(cfg: &config::FileConfig) -> DoctorHookStatusReport {
@@ -3068,6 +3314,11 @@ fn render_sync_status_watch_frame(
     now: Instant,
 ) -> String {
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const WIDTH: usize = 120;
+    const PEER_COL: usize = 28;
+    const SEEN_COL: usize = 7;
+    const PULL_COL: usize = 25;
+    const PUSH_COL: usize = 52;
 
     let spinner = SPINNER[state.frame % SPINNER.len()];
     state.frame = state.frame.wrapping_add(1);
@@ -3078,13 +3329,36 @@ fn render_sync_status_watch_frame(
         .iter()
         .map(|peer| peer.outbound_push_pending)
         .sum();
-    out.push_str(&format!(
-        "{spinner} rustory sync-status watch  device={}  head={}  peers={}  outbound_pending={}\n",
-        report.local_device_id,
-        report.local_head,
-        report.peers.len(),
-        total_outbound_pending
-    ));
+    let mut peer_views = Vec::with_capacity(report.peers.len());
+    for peer in &report.peers {
+        let rates = sync_status_watch_peer_rates(state, peer, now);
+        let baseline = state
+            .peers
+            .get(&peer.peer_id)
+            .map(|state| state.max_outbound_push_pending)
+            .unwrap_or(peer.outbound_push_pending);
+        let progress = outbound_push_progress_percent(peer.outbound_push_pending, baseline);
+        let bar = progress_bar(progress, 12);
+        let peer_name = sync_status_peer_display_name(peer);
+        peer_views.push((peer, rates, progress, bar, peer_name));
+    }
+
+    push_watch_line(
+        &mut out,
+        WIDTH,
+        &format!(
+            "{spinner} rustory grid watch (local view)  local={}  head={}  peers={}  outbound={}",
+            truncate_display(&report.local_device_id, 24),
+            format_count_i64(report.local_head),
+            report.peers.len(),
+            format_count_usize(total_outbound_pending)
+        ),
+    );
+    push_watch_line(
+        &mut out,
+        WIDTH,
+        "truth model: peer -> local is this node's pull cursor; local -> peer is this node's push backlog",
+    );
 
     if let Some(trackers) = report.tracker_status.as_ref() {
         for tracker in trackers {
@@ -3098,52 +3372,108 @@ fn render_sync_status_watch_frame(
                 .as_deref()
                 .map(|value| format!(" error={value}"))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "tracker {status:<4} {latency:>6}  {}{error}\n",
-                tracker.base_url
-            ));
+            push_watch_line(
+                &mut out,
+                WIDTH,
+                &format!(
+                    "tracker {status:<4} {latency:>6}  {}{error}",
+                    tracker.base_url
+                ),
+            );
         }
     }
 
-    out.push_str("\nPeer                         Pull        Outbound push\n");
-    out.push_str(
-        "───────────────────────────  ──────────  ─────────────────────────────────────────\n",
-    );
+    if !peer_views.is_empty() {
+        out.push('\n');
+        push_watch_line(&mut out, WIDTH, "Flow map (known from this node)");
+        for (peer, rates, progress, bar, peer_name) in &peer_views {
+            let node = truncate_display(peer_name, 24);
+            let pull_lane = format!(
+                "{} => local  pull {:>7}/s  cursor={}",
+                fit_cell(&node, 24),
+                format_rate(rates.pull_per_sec),
+                format_count_i64(peer.pull_cursor)
+            );
+            let push_lane = format!(
+                "local => {}  [{}] {:>3}%  {} left  drain {:>7}/s",
+                fit_cell(&node, 24),
+                bar,
+                progress,
+                format_count_usize(peer.outbound_push_pending),
+                format_rate(rates.pending_drain_per_sec)
+            );
+            push_watch_line(&mut out, WIDTH, &pull_lane);
+            push_watch_line(&mut out, WIDTH, &push_lane);
+        }
+    }
 
-    for peer in &report.peers {
-        let rates = sync_status_watch_peer_rates(state, peer, now);
-        let peer_name = sync_status_peer_display_name(peer);
-        let baseline = state
-            .peers
-            .get(&peer.peer_id)
-            .map(|state| state.max_outbound_push_pending)
-            .unwrap_or(peer.outbound_push_pending);
-        let progress = outbound_push_progress_percent(peer.outbound_push_pending, baseline);
-        let bar = progress_bar(progress, 12);
+    out.push('\n');
+    push_watch_line(
+        &mut out,
+        WIDTH,
+        &format!(
+            "{}  {}  {}  {}",
+            fit_cell("Peer", PEER_COL),
+            fit_cell("Seen", SEEN_COL),
+            fit_cell("peer -> local pull", PULL_COL),
+            fit_cell("local -> peer push backlog", PUSH_COL),
+        ),
+    );
+    push_watch_line(&mut out, WIDTH, &"─".repeat(WIDTH));
+
+    for (peer, rates, progress, bar, peer_name) in peer_views {
         let last_seen = peer
             .last_seen_age_sec
             .map(|age| format!("{age}s"))
             .unwrap_or_else(|| "-".to_string());
-        out.push_str(&format!(
-            "{peer_name:<27}  {:>9}/s  [{}] {:>3}% {:>8} left  drain {:>9}/s  seen {}\n",
-            format_rate(rates.pull_per_sec),
+        let pull = format!(
+            "cur {} {:>7}/s",
+            format_count_i64(peer.pull_cursor),
+            format_rate(rates.pull_per_sec)
+        );
+        let push = format!(
+            "[{}] {:>3}% {} left drain {:>7}/s",
             bar,
             progress,
-            peer.outbound_push_pending,
-            format_rate(rates.pending_drain_per_sec),
-            last_seen
-        ));
-        out.push_str(&format!(
-            "{:27}  cursor={:<10}  push_cursor={:<10} push_rate={:>9}/s\n",
-            "",
-            peer.pull_cursor,
-            peer.push_cursor,
-            format_rate(rates.push_per_sec)
-        ));
+            format_count_usize(peer.outbound_push_pending),
+            format_rate(rates.pending_drain_per_sec)
+        );
+        push_watch_line(
+            &mut out,
+            WIDTH,
+            &format!(
+                "{}  {}  {}  {}",
+                fit_cell(&peer_name, PEER_COL),
+                right_cell(&last_seen, SEEN_COL),
+                fit_cell(&pull, PULL_COL),
+                fit_cell(&push, PUSH_COL),
+            ),
+        );
+
+        let detail = format!(
+            "push_cursor={} push_rate={}/s peer_id={}",
+            format_count_i64(peer.push_cursor),
+            format_rate(rates.push_per_sec),
+            short_peer_id(&peer.peer_id),
+        );
+        push_watch_line(
+            &mut out,
+            WIDTH,
+            &format!(
+                "{}  {}  {}  {}",
+                fit_cell("", PEER_COL),
+                fit_cell("", SEEN_COL),
+                fit_cell("", PULL_COL),
+                fit_cell(&detail, PUSH_COL),
+            ),
+        );
     }
 
-    out.push_str(
-        "\nctrl+c to exit  •  outbound_pending is this device's not-yet-pushed cursor backlog\n",
+    out.push('\n');
+    push_watch_line(
+        &mut out,
+        WIDTH,
+        "ctrl+c to exit  •  not a global mesh telemetry view; remote peer-to-peer flows require future daemon reports",
     );
     out
 }
@@ -3247,6 +3577,76 @@ fn format_rate(value: f64) -> String {
     } else {
         format!("{value:.0}")
     }
+}
+
+fn format_count_i64(value: i64) -> String {
+    if value < 0 {
+        return value.to_string();
+    }
+    format_count_usize(usize::try_from(value).unwrap_or(usize::MAX))
+}
+
+fn format_count_usize(value: usize) -> String {
+    if value >= 1_000_000_000 {
+        format!("{:.1}B", value as f64 / 1_000_000_000.0)
+    } else if value >= 1_000_000 {
+        format!("{:.1}M", value as f64 / 1_000_000.0)
+    } else if value >= 1_000 {
+        format!("{:.1}k", value as f64 / 1_000.0)
+    } else {
+        value.to_string()
+    }
+}
+
+fn push_watch_line(out: &mut String, width: usize, line: &str) {
+    out.push_str(&truncate_display(line, width));
+    out.push('\n');
+}
+
+fn fit_cell(value: &str, width: usize) -> String {
+    let truncated = truncate_display(value, width);
+    let current = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+    if current >= width {
+        truncated
+    } else {
+        format!("{truncated}{}", " ".repeat(width - current))
+    }
+}
+
+fn right_cell(value: &str, width: usize) -> String {
+    let truncated = truncate_display(value, width);
+    let current = unicode_width::UnicodeWidthStr::width(truncated.as_str());
+    if current >= width {
+        truncated
+    } else {
+        format!("{}{}", " ".repeat(width - current), truncated)
+    }
+}
+
+fn truncate_display(value: &str, max_width: usize) -> String {
+    if unicode_width::UnicodeWidthStr::width(value) <= max_width {
+        return value.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "…".to_string();
+    }
+
+    let mut out = String::new();
+    let mut width = 0;
+    let ellipsis_width = 1;
+    for ch in value.chars() {
+        let ch_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width + ellipsis_width > max_width {
+            break;
+        }
+        out.push(ch);
+        width += ch_width;
+    }
+    out.push('…');
+    out
 }
 
 fn build_tracker_status_report(
@@ -4239,8 +4639,9 @@ mod tests {
     fn doctor_parses() {
         let app = App::parse_from(["rr", "doctor"]);
         match app.cmd {
-            Command::Doctor { json } => {
+            Command::Doctor { json, auto_fix } => {
                 assert!(!json);
+                assert!(!auto_fix);
             }
             _ => panic!("expected doctor"),
         }
@@ -4250,8 +4651,21 @@ mod tests {
     fn doctor_parses_json_flag() {
         let app = App::parse_from(["rr", "doctor", "--json"]);
         match app.cmd {
-            Command::Doctor { json } => {
+            Command::Doctor { json, auto_fix } => {
                 assert!(json);
+                assert!(!auto_fix);
+            }
+            _ => panic!("expected doctor"),
+        }
+    }
+
+    #[test]
+    fn doctor_parses_auto_fix_flag() {
+        let app = App::parse_from(["rr", "doctor", "--auto-fix"]);
+        match app.cmd {
+            Command::Doctor { json, auto_fix } => {
+                assert!(!json);
+                assert!(auto_fix);
             }
             _ => panic!("expected doctor"),
         }
@@ -4662,7 +5076,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(run_doctor(&cfg, ":memory:", false, None).is_ok());
+        assert!(run_doctor(&cfg, ":memory:", false, false, None).is_ok());
     }
 
     #[test]
@@ -4671,6 +5085,7 @@ mod tests {
             run_doctor(
                 &config::FileConfig::default(),
                 ":memory:",
+                false,
                 false,
                 Some("parse config toml: invalid TOML")
             )
@@ -4686,7 +5101,47 @@ mod tests {
             ..Default::default()
         };
 
-        assert!(run_doctor(&cfg, ":memory:", false, None).is_ok());
+        assert!(run_doctor(&cfg, ":memory:", false, false, None).is_ok());
+    }
+
+    #[test]
+    fn doctor_auto_fix_sets_default_record_ignore_regex() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        std::fs::write(&cfg_path, "db_path = \"~/.rustory/history.db\"\n").unwrap();
+
+        let cfg = config::FileConfig::default();
+        let mut report = DoctorAutoFixReport::default();
+        fix_default_record_ignore_regex(&cfg, &cfg_path, None, &mut report).unwrap();
+
+        let content = std::fs::read_to_string(&cfg_path).unwrap();
+        let loaded: config::FileConfig = toml::from_str(&content).unwrap();
+        assert_eq!(
+            loaded.record_ignore_regex.as_deref(),
+            Some(DEFAULT_RECORD_IGNORE_REGEX)
+        );
+        assert!(report.actions.iter().any(|action| {
+            action.target == "record_ignore_regex" && action.status == DoctorAutoFixStatus::Fixed
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn doctor_auto_fix_sets_private_path_modes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        std::fs::write(&db_path, "").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut report = DoctorAutoFixReport::default();
+        fix_path_mode(&db_path, 0o600, "db file", &mut report).unwrap();
+
+        assert_eq!(file_mode_777(&db_path), Some(0o600));
+        assert!(report.actions.iter().any(|action| {
+            action.target == "db file" && action.status == DoctorAutoFixStatus::Fixed
+        }));
     }
 
     #[test]
@@ -5072,6 +5527,55 @@ mod tests {
 
         assert_eq!(format_rate(42.4), "42");
         assert_eq!(format_rate(1200.0), "1.2k");
+    }
+
+    #[test]
+    fn sync_status_watch_frame_stays_bounded_for_long_values() {
+        let mut state = SyncStatusWatchState::default();
+        let report = SyncStatusReport {
+            local_head: 2_129_846,
+            local_device_id: "user-arm64-with-an-extra-long-local-device-id".to_string(),
+            peers: vec![
+                SyncStatusPeerReport {
+                    peer_id: "12D3KooWE3u4VEsbCGR7w53rbBYi1mZ3kADAgAhDYTj8ACiPBC1M".to_string(),
+                    peer_device_id: Some(
+                        "sample-node-x86_64-with-a-very-long-device-name".to_string(),
+                    ),
+                    pull_cursor: 1_526_049,
+                    push_cursor: 1_968_089,
+                    outbound_push_pending: 2_311,
+                    pending_push: 2_311,
+                    last_seen_unix: Some(1),
+                    last_seen_age_sec: Some(7),
+                },
+                SyncStatusPeerReport {
+                    peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
+                    peer_device_id: Some("node3".to_string()),
+                    pull_cursor: 1_818_365,
+                    push_cursor: 2_122_722,
+                    outbound_push_pending: 0,
+                    pending_push: 0,
+                    last_seen_unix: Some(1),
+                    last_seen_age_sec: Some(123_456),
+                },
+            ],
+            tracker_status: Some(vec![SyncStatusTrackerReport {
+                base_url: "https://tracker.example.com/with/a/long/path".to_string(),
+                reachable: false,
+                latency_ms: None,
+                error: Some("timeout: connect with a long transport error message".to_string()),
+            }]),
+        };
+
+        let frame = render_sync_status_watch_frame(&mut state, &report, Instant::now());
+
+        assert!(frame.contains("rustory grid watch (local view)"));
+        assert!(frame.contains("peer -> local"));
+        assert!(frame.contains("local -> peer"));
+        for line in frame.lines() {
+            let width = unicode_width::UnicodeWidthStr::width(line);
+            assert!(width <= 120, "line width {width}: {line}");
+        }
     }
 
     #[test]
