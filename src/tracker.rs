@@ -253,11 +253,23 @@ pub fn validate_tracker_token_value(token: &str, label: &str) -> Result<()> {
         anyhow::bail!("{label} must not be empty");
     }
 
+    if has_literal_quote_wrapper(token) {
+        anyhow::bail!(
+            "{label} must not be wrapped in literal quote characters; pass the raw token value"
+        );
+    }
+
     if token.chars().any(char::is_control) {
         anyhow::bail!("{label} must not contain control characters");
     }
 
     Ok(())
+}
+
+pub fn has_literal_quote_wrapper(token: &str) -> bool {
+    token.len() >= 2
+        && ((token.starts_with('\'') && token.ends_with('\''))
+            || (token.starts_with('"') && token.ends_with('"')))
 }
 
 fn header_value(req: &tiny_http::Request, name: &'static str) -> Option<String> {
@@ -531,6 +543,14 @@ mod tests {
         let err =
             normalize_configured_token(Some("abc\nxyz".to_string()), "tracker token").unwrap_err();
         assert!(format!("{err:#}").contains("must not contain control characters"));
+    }
+
+    #[test]
+    fn tracker_rejects_literal_quote_wrapped_configured_token() {
+        let err =
+            normalize_configured_token(Some("'secret-token-value'".to_string()), "tracker token")
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("literal quote characters"));
     }
 
     #[test]

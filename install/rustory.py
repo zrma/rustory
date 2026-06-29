@@ -5,7 +5,8 @@ Designed for:
 
   curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
     python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "$RUSTORY_TRACKERS" \
-      --install-hook --import-hishtory
+      --relay "$RUSTORY_RELAY_ADDR" --user-id "$RUSTORY_USER_ID" \
+      --swarm-key-source ./swarm.key --install-hook --import-hishtory
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 from pathlib import Path
 
@@ -41,6 +43,9 @@ USER_STARTUP_FILES = (
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+
     args = parse_args()
     target = current_release_target()
     asset_name = f"rr-{target}"
@@ -61,6 +66,9 @@ def main() -> int:
 
     install_binary(data, install_path)
     verify_binary(install_path)
+
+    if args.swarm_key_source:
+        install_swarm_key(install_path, args)
 
     if args.token or args.trackers or args.relay:
         run_init(install_path, args)
@@ -95,9 +103,22 @@ def parse_args() -> argparse.Namespace:
         help="Tracker URL to write via rr init; may be repeated or comma-separated",
     )
     parser.add_argument("--relay", help="Relay multiaddr to write via rr init")
+    parser.add_argument(
+        "--swarm-key-source",
+        help="Existing shared private swarm key file to copy into the Rustory config directory",
+    )
+    parser.add_argument(
+        "--swarm-key-dest",
+        default="~/.config/rustory/swarm.key",
+        help="Destination path for --swarm-key-source",
+    )
     parser.add_argument("--user-id", help="Logical Rustory user id to write via rr init")
     parser.add_argument("--device-id", help="Device id to write via rr init")
-    parser.add_argument("--force", action="store_true", help="Pass --force to rr init")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Pass --force to rr init and replace an existing differing --swarm-key-dest",
+    )
     parser.add_argument("--install-hook", action="store_true", help="Install or update a managed Rustory block in the user's shell rc file")
     parser.add_argument(
         "--hook-shell",
@@ -121,7 +142,20 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.asset_base_url and args.asset_url:
         parser.error("pass only one of --asset-base-url or --asset-url")
+    if args.token and token_has_literal_quote_wrapper(args.token):
+        parser.error(
+            "--token appears to include literal quote characters; pass the raw token value, "
+            'for example --token "$RUSTORY_TRACKER_TOKEN"'
+        )
     return args
+
+
+def token_has_literal_quote_wrapper(value: str) -> bool:
+    token = value.strip()
+    return len(token) >= 2 and (
+        (token.startswith("'") and token.endswith("'"))
+        or (token.startswith('"') and token.endswith('"'))
+    )
 
 
 def current_release_target() -> str:
@@ -236,6 +270,83 @@ def verify_binary(install_path: Path) -> None:
     )
     first_line = output.stdout.splitlines()[0] if output.stdout.splitlines() else "version output unavailable"
     print(f"binary_check={first_line}")
+
+
+def install_swarm_key(install_path: Path, args: argparse.Namespace) -> None:
+    source_path = Path(args.swarm_key_source).expanduser()
+    dest_path = Path(args.swarm_key_dest).expanduser()
+    if not source_path.exists() or not source_path.is_file():
+        raise SystemExit(f"swarm_key=failed reason=missing_source path={source_path}")
+
+    data = source_path.read_bytes()
+    if not data.strip():
+        raise SystemExit(f"swarm_key=failed reason=empty_source path={source_path}")
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(dest_path.parent, 0o700)
+    except OSError:
+        pass
+
+    if dest_path.exists():
+        existing = dest_path.read_bytes()
+        if existing == data:
+            print(f"swarm_key=installed path={dest_path} status=unchanged")
+            print_swarm_key_fingerprint(install_path, dest_path)
+            return
+        if not args.force:
+            raise SystemExit(
+                f"swarm_key=failed reason=destination_differs path={dest_path} "
+                "hint=rerun_with_--force_to_replace"
+            )
+        backup_path = next_backup_path(dest_path)
+        os.replace(dest_path, backup_path)
+        os.chmod(backup_path, 0o600)
+        print(f"swarm_key=backup path={backup_path}")
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{dest_path.name}.", dir=str(dest_path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as file:
+            file.write(data)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, dest_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+    print(f"swarm_key=installed path={dest_path} status=updated")
+    print_swarm_key_fingerprint(install_path, dest_path)
+
+
+def next_backup_path(path: Path) -> Path:
+    suffix = int(time.time())
+    candidate = path.with_name(f"{path.name}.bak.{suffix}")
+    if not candidate.exists():
+        return candidate
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{path.name}.bak.{suffix}.{index}")
+        if not candidate.exists():
+            return candidate
+    raise SystemExit(f"swarm_key=failed reason=backup_path_exhausted path={path}")
+
+
+def print_swarm_key_fingerprint(install_path: Path, swarm_key_path: Path) -> None:
+    output = subprocess.run(
+        [str(install_path), "swarm-key", "--swarm-key", str(swarm_key_path)],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    for line in output.stdout.splitlines():
+        if "fingerprint:" in line:
+            fingerprint = line.split("fingerprint:", 1)[1].strip()
+            print(f"swarm_key_fingerprint={fingerprint}")
+            return
+    print("swarm_key_fingerprint=unknown")
 
 
 def split_tracker_values(values: list[str]) -> list[str]:

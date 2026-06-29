@@ -2381,6 +2381,11 @@ fn build_tracker_token_report(
     if token.len() < 32 {
         warnings.push("short; use at least 32 random characters for production".to_string());
     }
+    if tracker::has_literal_quote_wrapper(token) {
+        warnings.push(
+            "appears wrapped in literal quote characters; pass the raw token value".to_string(),
+        );
+    }
     if token.to_ascii_lowercase().starts_with("bearer ") {
         warnings.push("contains Bearer prefix; configure only the raw token".to_string());
     }
@@ -4273,6 +4278,41 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains("\"length\""));
         assert!(!json.contains("short-secret"));
+    }
+
+    #[test]
+    fn doctor_report_rejects_quote_wrapped_tracker_token_without_value() {
+        let cfg = config::FileConfig {
+            tracker_token: Some("'secret-token-value'".to_string()),
+            ..Default::default()
+        };
+
+        let report = build_doctor_report(&cfg, ":memory:", None).unwrap();
+        assert!(report.tracker_token.configured);
+        assert_eq!(
+            report.tracker_token.length,
+            Some("'secret-token-value'".len())
+        );
+        assert!(
+            report
+                .tracker_token
+                .warning
+                .as_deref()
+                .unwrap()
+                .contains("literal quote")
+        );
+        assert!(
+            report
+                .tracker_token
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("literal quote")
+        );
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"length\""));
+        assert!(!json.contains("secret-token-value"));
     }
 
     #[test]

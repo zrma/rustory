@@ -12,12 +12,18 @@ tracker URL/token은 private 값이므로 public 문서에는 실제 값을 두�
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+    --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
+    --swarm-key-source ./swarm.key \
     --install-hook --import-hishtory
 ```
 
 `--install-hook`은 현재 shell에 맞춰 Rustory hook을 `~/.zshrc` 또는 `~/.bashrc`에 설치한다.
 `--import-hishtory`는 `~/.hishtory/.hishtory.db`를 가져온 뒤 user startup files의 Hishtory hook 라인을 제거한다.
 Hishtory DB/디렉터리는 fallback source로 남긴다.
+`--token`에는 raw token만 전달한다. token 값 앞뒤에 literal `'` 또는 `"`가 들어가면 `rr doctor`에서
+`length`가 예상보다 길어지고 tracker ping이 401로 실패한다.
+기존 P2P grid에 합류시키려면 같은 `user_id`, 같은 relay 주소, 같은 공유 `swarm.key`가 필요하다.
+`p2p_identity_key`는 디바이스별로 새로 생성되어야 하므로 복사하지 않는다.
 
 설치 후 binary만 갱신하려면:
 
