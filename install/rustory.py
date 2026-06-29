@@ -4,7 +4,8 @@
 Designed for:
 
   curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-    python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "$RUSTORY_TRACKERS"
+    python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "$RUSTORY_TRACKERS" \
+      --install-hook --import-hishtory
 """
 
 from __future__ import annotations
@@ -24,6 +25,19 @@ from pathlib import Path
 DEFAULT_REPO = "zrma/rustory"
 MAX_ASSET_BYTES = 128 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 64 * 1024
+HOOK_START = "# >>> rustory hook >>>"
+HOOK_END = "# <<< rustory hook <<<"
+SUPPORTED_HOOK_SHELLS = ("bash", "zsh")
+USER_STARTUP_FILES = (
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".zlogin",
+    ".bashrc",
+    ".bash_profile",
+    ".bash_login",
+    ".profile",
+)
 
 
 def main() -> int:
@@ -51,6 +65,14 @@ def main() -> int:
     if args.token or args.trackers or args.relay:
         run_init(install_path, args)
 
+    if args.install_hook:
+        install_shell_hook(install_path, args)
+
+    if args.import_hishtory:
+        run_import_hishtory(install_path, args)
+        if not args.keep_hishtory_hooks:
+            remove_hishtory_hooks()
+
     print("rustory install ok")
     return 0
 
@@ -76,6 +98,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--user-id", help="Logical Rustory user id to write via rr init")
     parser.add_argument("--device-id", help="Device id to write via rr init")
     parser.add_argument("--force", action="store_true", help="Pass --force to rr init")
+    parser.add_argument("--install-hook", action="store_true", help="Install or update a managed Rustory block in the user's shell rc file")
+    parser.add_argument(
+        "--hook-shell",
+        choices=("auto", *SUPPORTED_HOOK_SHELLS),
+        default="auto",
+        help="Shell rc file to update for --install-hook",
+    )
+    parser.add_argument("--rc-file", help="Override shell rc file path for --install-hook")
+    parser.add_argument(
+        "--import-hishtory",
+        action="store_true",
+        help="Import ~/.hishtory/.hishtory.db after install when present",
+    )
+    parser.add_argument("--hishtory-path", help="Hishtory SQLite DB path for --import-hishtory")
+    parser.add_argument("--hishtory-limit", help="Maximum newest Hishtory rows to import")
+    parser.add_argument(
+        "--keep-hishtory-hooks",
+        action="store_true",
+        help="Do not remove Hishtory hook lines after --import-hishtory",
+    )
     args = parser.parse_args()
     if args.asset_base_url and args.asset_url:
         parser.error("pass only one of --asset-base-url or --asset-url")
@@ -220,6 +262,217 @@ def run_init(install_path: Path, args: argparse.Namespace) -> None:
 
     print("init=running token_configured={} trackers={}".format(bool(args.token), len(split_tracker_values(args.trackers))))
     subprocess.run(cmd, check=True)
+
+
+def run_import_hishtory(install_path: Path, args: argparse.Namespace) -> None:
+    source_path = Path(args.hishtory_path).expanduser() if args.hishtory_path else Path.home() / ".hishtory" / ".hishtory.db"
+    if not source_path.exists():
+        if args.hishtory_path:
+            raise SystemExit(f"hishtory import path not found: {source_path}")
+        print(f"hishtory_import=skipped reason=missing_default_db path={source_path}")
+        return
+
+    cmd = [str(install_path), "import", "--shell", "hishtory", "--path", str(source_path)]
+    if args.hishtory_limit:
+        cmd += ["--limit", args.hishtory_limit]
+    print(f"hishtory_import=running path={source_path}")
+    subprocess.run(cmd, check=True)
+
+
+def remove_hishtory_hooks() -> None:
+    changed: list[Path] = []
+    for rc_file in user_startup_files():
+        if cleanup_hishtory_file(rc_file):
+            changed.append(rc_file)
+
+    if changed:
+        files = ",".join(str(path) for path in changed)
+        print(f"hishtory_hooks=removed files={files}")
+    else:
+        print("hishtory_hooks=removed files=0")
+
+
+def user_startup_files() -> list[Path]:
+    home = Path.home()
+    files = [home / name for name in USER_STARTUP_FILES]
+    if platform.system().lower() == "darwin":
+        files.append(home / ".bash_profile")
+    return dedupe_paths(files)
+
+
+def dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    result: list[Path] = []
+    for path in paths:
+        normalized = path.expanduser()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def cleanup_hishtory_file(path: Path) -> bool:
+    if not path.exists() or not path.is_file():
+        return False
+
+    lines = path.read_text().splitlines()
+    cleaned = remove_hishtory_lines(lines)
+    if cleaned == lines:
+        return False
+
+    had_final_newline = path.read_text().endswith("\n")
+    text = "\n".join(cleaned)
+    if text and had_final_newline:
+        text += "\n"
+    path.write_text(text)
+    return True
+
+
+def remove_hishtory_lines(lines: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if is_hishtory_line(line):
+            index += 1
+            continue
+        if is_hishtory_config_header(line):
+            index = skip_following_hishtory_block(lines, index + 1)
+            continue
+        cleaned.append(line)
+        index += 1
+    return trim_repeated_blank_lines(cleaned)
+
+
+def is_hishtory_config_header(line: str) -> bool:
+    return "hishtory config" in line.casefold()
+
+
+def skip_following_hishtory_block(lines: list[str], index: int) -> int:
+    while index < len(lines):
+        line = lines[index]
+        stripped = line.strip()
+        if not stripped:
+            index += 1
+            break
+        if is_hishtory_line(line) or "hishtory" in line.casefold():
+            index += 1
+            continue
+        break
+    return index
+
+
+def is_hishtory_line(line: str) -> bool:
+    folded = line.casefold()
+    stripped = line.strip()
+    if "hishtory" not in folded:
+        return False
+    markers = (
+        ".hishtory",
+        "hishtory/config",
+        "hishtory config",
+        "hishtory init",
+        "hishtory enable",
+        "hishtory shell",
+        "hishtory daemon",
+        "source ",
+        "export path",
+        "eval ",
+    )
+    return stripped.startswith("#") or any(marker in folded for marker in markers)
+
+
+def trim_repeated_blank_lines(lines: list[str]) -> list[str]:
+    result: list[str] = []
+    blank = False
+    for line in lines:
+        is_blank = not line.strip()
+        if is_blank and blank:
+            continue
+        result.append(line)
+        blank = is_blank
+    while result and not result[0].strip():
+        result.pop(0)
+    while result and not result[-1].strip():
+        result.pop()
+    return result
+
+
+def install_shell_hook(install_path: Path, args: argparse.Namespace) -> None:
+    shell = resolve_hook_shell(args.hook_shell)
+    rc_file = Path(args.rc_file).expanduser() if args.rc_file else default_rc_file(shell)
+    block = render_hook_block(shell, install_path.parent)
+    update_managed_block(rc_file, block)
+    print(f"hook=installed shell={shell} rc_file={rc_file}")
+
+
+def resolve_hook_shell(value: str) -> str:
+    if value != "auto":
+        return value
+
+    shell_name = Path(os.environ.get("SHELL", "")).name
+    if shell_name in SUPPORTED_HOOK_SHELLS:
+        return shell_name
+
+    home = Path.home()
+    if (home / ".zshrc").exists():
+        return "zsh"
+    if (home / ".bashrc").exists():
+        return "bash"
+    if platform.system().lower() == "darwin":
+        return "zsh"
+    return "bash"
+
+
+def default_rc_file(shell: str) -> Path:
+    if shell == "zsh":
+        return Path.home() / ".zshrc"
+    if shell == "bash":
+        return Path.home() / ".bashrc"
+    raise SystemExit(f"unsupported hook shell: {shell}")
+
+
+def render_hook_block(shell: str, bin_dir: Path) -> str:
+    bin_expr = shell_path_expr(bin_dir)
+    return "\n".join(
+        [
+            HOOK_START,
+            "# Managed by rustory installer. Re-run with --install-hook to update.",
+            f'export PATH="{bin_expr}:$PATH"',
+            "if command -v rr >/dev/null 2>&1; then",
+            f"  source <(rr hook --shell {shell})",
+            "fi",
+            HOOK_END,
+            "",
+        ]
+    )
+
+
+def shell_path_expr(path: Path) -> str:
+    path = path.expanduser()
+    home = Path.home()
+    try:
+        rel = path.relative_to(home)
+    except ValueError:
+        return str(path).replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+    if str(rel) == ".":
+        return "$HOME"
+    return "$HOME/" + str(rel).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def update_managed_block(rc_file: Path, block: str) -> None:
+    rc_file.parent.mkdir(parents=True, exist_ok=True)
+    existing = rc_file.read_text() if rc_file.exists() else ""
+    start = existing.find(HOOK_START)
+    end = existing.find(HOOK_END)
+    if start != -1 and end != -1 and end > start:
+        end += len(HOOK_END)
+        updated = existing[:start].rstrip() + "\n\n" + block + existing[end:].lstrip("\n")
+    else:
+        prefix = existing.rstrip() + "\n\n" if existing.strip() else ""
+        updated = prefix + block
+    rc_file.write_text(updated)
 
 
 if __name__ == "__main__":

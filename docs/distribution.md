@@ -36,11 +36,17 @@ scripts/build-release-assets.sh
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>"
+  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+    --install-hook --import-hishtory
 ```
 
 `--tracker`는 반복 지정하거나 comma-separated 값으로 지정할 수 있다.
 relay 주소까지 config에 쓰려면 `--relay "<relay-multiaddr>"`를 같이 넘긴다.
+`--install-hook`은 현재 shell을 자동 감지해 `~/.zshrc` 또는 `~/.bashrc`에 Rustory managed block을 추가/교체한다.
+비표준 시작 파일을 쓰면 `--hook-shell bash|zsh --rc-file <path>`로 명시한다.
+`--import-hishtory`는 기본 Hishtory DB(`~/.hishtory/.hishtory.db`)가 있으면 import하고,
+성공 후 user startup files에서 Hishtory hook/PATH/source 라인을 삭제한다.
+Hishtory hook을 유지해야 하면 `--keep-hishtory-hooks`를 함께 넘긴다.
 
 installer는 다음 순서로 동작한다.
 
@@ -48,6 +54,8 @@ installer는 다음 순서로 동작한다.
 2. asset과 SHA-256 checksum을 다운로드한다.
 3. checksum을 검증한 뒤 `~/.local/bin/rr`에 설치한다.
 4. `--token`, `--tracker`, `--relay`, `--user-id`, `--device-id` 중 지정된 값이 있으면 `rr init`을 실행한다.
+5. `--install-hook`이 있으면 shell rc 파일에 Rustory hook block을 설치한다.
+6. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
 
 token 값은 installer 로그에 출력하지 않는다.
 

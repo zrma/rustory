@@ -11,8 +11,13 @@ tracker URL/token은 private 값이므로 public 문서에는 실제 값을 두�
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>"
+  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+    --install-hook --import-hishtory
 ```
+
+`--install-hook`은 현재 shell에 맞춰 Rustory hook을 `~/.zshrc` 또는 `~/.bashrc`에 설치한다.
+`--import-hishtory`는 `~/.hishtory/.hishtory.db`를 가져온 뒤 user startup files의 Hishtory hook 라인을 제거한다.
+Hishtory DB/디렉터리는 fallback source로 남긴다.
 
 설치 후 binary만 갱신하려면:
 

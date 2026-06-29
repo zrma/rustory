@@ -113,7 +113,7 @@ Hishtory에서 Rustory로 실제 전환할 때는 import 성공만으로 끝내�
 전환 순서:
 
 1. Hishtory DB 파일과 `~/.hishtory/` 디렉터리는 fallback source로 보존한다.
-2. `~/.zshrc`, `~/.zprofile`, `~/.zshenv`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`에서 active Hishtory `source`/PATH block을 주석 처리한다.
+2. `~/.zshrc`, `~/.zprofile`, `~/.zshenv`, `~/.zlogin`, `~/.bashrc`, `~/.bash_profile`, `~/.bash_login`, `~/.profile`에서 Hishtory `source`/PATH block을 삭제한다.
 3. `/etc/profile`, `/etc/bash.bashrc`, `/etc/profile.d/*.sh`, `/etc/zsh/*` 같은 system profile에 Hishtory hook이 없는지 확인한다.
 4. bash만 쓰는 Linux host에 Hishtory 설치 과정에서 생긴 `~/.zshrc`가 있고 내용이 Hishtory block뿐이면, 백업을 남긴 뒤 파일 자체를 삭제해도 된다.
 5. Rustory hook block은 shell별 시작 파일에 남긴다. 예: `source <(rr hook --shell zsh)` 또는 `source <(rr hook --shell bash)`.
@@ -153,6 +153,17 @@ bash -ic 'command -v rr; bind -X | grep rustory || true; rr doctor --json'
 ```sh
 grep -RIn "hishtory" ~/.zshrc ~/.zprofile ~/.zshenv ~/.zlogin ~/.bashrc ~/.bash_profile ~/.bash_login ~/.profile /etc/profile /etc/profile.d /etc/bash.bashrc /etc/zsh 2>/dev/null
 ```
+
+installer 기반 전환에서는 아래 옵션이 같은 정책을 자동화한다.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
+  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+    --install-hook --import-hishtory
+```
+
+이 경로는 Hishtory DB/디렉터리는 삭제하지 않고, import 성공 후 user startup files의 Hishtory hook 라인만 제거한다.
+Hishtory hook을 임시 유지해야 하는 디버깅 상황에서는 `--keep-hishtory-hooks`를 추가한다.
 
 ## Multi-machine soak runbook
 
