@@ -259,6 +259,8 @@ fn build_rustory_swarm_with_identity(
 
     let (relay_transport, relay_behaviour) = libp2p::relay::client::new(local_peer_id);
     let tcp_transport = libp2p::tcp::tokio::Transport::default();
+    let tcp_transport =
+        libp2p::dns::tokio::Transport::system(tcp_transport).context("dns transport")?;
     let transport = OrTransport::new(relay_transport, tcp_transport);
 
     let pnet = libp2p::pnet::PnetConfig::new(psk);

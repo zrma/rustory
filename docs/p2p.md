@@ -43,9 +43,11 @@ libp2p relay 기본값보다 큰 circuit/reservation/byte limit을 사용한다.
 운영 중 `Remote reported resource limit exceeded`가 반복되면 실제 relay 프로세스가 새 limit으로
 재시작됐는지 이 로그부터 확인한다.
 
-P2P relay 주소는 `/ip4/...` 또는 `/ip6/...` 형태로 넘긴다. DNS 이름을 써야 하는 환경에서는
-호스트명 해석을 먼저 수행한 뒤 IP 기반 multiaddr를 전달한다. tracker URL은 일반 URL이므로 DNS
-호스트명을 그대로 사용할 수 있다.
+P2P relay 주소는 `/ip4/...`, `/ip6/...`, `/dns4/...`, `/dns6/...` 형태로 넘길 수 있다.
+공개 relay는 `/dns4/rustory-relay.example.com/tcp/4001/p2p/<relay_peer_id>`처럼 DNS multiaddr을
+쓰는 편이 운영상 안전하다. `/ip4/100.64.0.0/10`, RFC1918 private IP, loopback 같은 literal relay
+주소는 같은 tailnet/LAN 밖의 peer가 dial할 수 없으므로 `rr doctor`가 경고한다.
+tracker URL은 일반 URL이므로 DNS 호스트명을 그대로 사용할 수 있다.
 
 #### 2) Tracker 서버
 ```sh
@@ -66,14 +68,14 @@ rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --allow-unauthenticated
 rr --db-path "/tmp/rustory-a.db" p2p-serve \
   --listen /ip4/0.0.0.0/tcp/8845 \
   --trackers "http://127.0.0.1:8850" \
-  --relay "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>"
+  --relay "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>"
 ```
 
 #### 4) Peer B (클라이언트 역할)
 ```sh
 rr --db-path "/tmp/rustory-b.db" p2p-sync \
   --trackers "http://127.0.0.1:8850" \
-  --relay "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>" \
+  --relay "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>" \
   --limit 1000
 ```
 
@@ -159,7 +161,7 @@ db_path = "~/.rustory/history.db"
 user_id = "zrma"
 device_id = "macbook"
 trackers = ["http://127.0.0.1:8850"]
-relay_addr = "/ip4/127.0.0.1/tcp/4001/p2p/<relay_peer_id>"
+relay_addr = "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>"
 swarm_key_path = "~/.config/rustory/swarm.key"
 p2p_identity_key_path = "~/.config/rustory/identity.key"
 relay_identity_key_path = "~/.config/rustory/relay.key"

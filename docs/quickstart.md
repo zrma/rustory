@@ -14,15 +14,18 @@ curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.p
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
     --swarm-key-source ./swarm.key \
-    --install-hook --import-hishtory
+    --install-hook --install-daemon --import-hishtory
 ```
 
 `--install-hook`은 현재 shell에 맞춰 Rustory hook을 `~/.zshrc` 또는 `~/.bashrc`에 설치한다.
+`--install-daemon`은 `rr daemon`을 user service로 등록해 이 머신을 tracker/relay grid의 상시 멤버로 유지한다.
 `--import-hishtory`는 `~/.hishtory/.hishtory.db`를 가져온 뒤 user startup files의 Hishtory hook 라인을 제거한다.
 Hishtory DB/디렉터리는 fallback source로 남긴다.
 `--token`에는 raw token만 전달한다. token 값 앞뒤에 literal `'` 또는 `"`가 들어가면 `rr doctor`에서
 `length`가 예상보다 길어지고 tracker ping이 401로 실패한다.
 기존 P2P grid에 합류시키려면 같은 `user_id`, 같은 relay 주소, 같은 공유 `swarm.key`가 필요하다.
+relay 주소는 외부 신규 머신이 dial 가능한 public multiaddr이어야 하며, DNS 이름은
+`/dns4/<host>/tcp/<port>/p2p/<relay_peer_id>` 형태로 쓸 수 있다.
 `p2p_identity_key`는 디바이스별로 새로 생성되어야 하므로 복사하지 않는다.
 
 설치 후 binary만 갱신하려면:
@@ -88,7 +91,7 @@ rr init \
   --user-id "<user>" \
   --device-id "<device>" \
   --tracker "http://<tracker-host>:8850" \
-  --relay "/ip4/<relay-ip>/tcp/4001/p2p/<relay_peer_id>" \
+  --relay "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>" \
   --token "secret"
 
 rr doctor

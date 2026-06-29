@@ -12,7 +12,9 @@ Designed for:
 from __future__ import annotations
 
 import argparse
+import html
 import hashlib
+import ipaddress
 import os
 import platform
 import stat
@@ -81,6 +83,9 @@ def main() -> int:
         if not args.keep_hishtory_hooks:
             remove_hishtory_hooks()
 
+    if args.install_daemon:
+        install_daemon_service(install_path, args)
+
     print("rustory install ok")
     return 0
 
@@ -139,6 +144,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not remove Hishtory hook lines after --import-hishtory",
     )
+    parser.add_argument(
+        "--install-daemon",
+        action="store_true",
+        help="Install and start a user-level rr daemon service after install",
+    )
+    parser.add_argument(
+        "--no-start-daemon",
+        action="store_true",
+        help="Write the daemon service file but do not load/start it",
+    )
+    parser.add_argument(
+        "--daemon-interval-sec",
+        type=positive_int,
+        default=60,
+        help="rr daemon sync interval for --install-daemon",
+    )
+    parser.add_argument(
+        "--daemon-start-jitter-sec",
+        type=non_negative_int,
+        default=10,
+        help="rr daemon startup jitter for --install-daemon",
+    )
     args = parser.parse_args()
     if args.asset_base_url and args.asset_url:
         parser.error("pass only one of --asset-base-url or --asset-url")
@@ -148,6 +175,20 @@ def parse_args() -> argparse.Namespace:
             'for example --token "$RUSTORY_TRACKER_TOKEN"'
         )
     return args
+
+
+def positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
 
 
 def token_has_literal_quote_wrapper(value: str) -> bool:
@@ -371,8 +412,151 @@ def run_init(install_path: Path, args: argparse.Namespace) -> None:
     if args.token:
         cmd += ["--token", args.token]
 
+    if args.relay:
+        warning = relay_addr_reachability_warning(args.relay)
+        if warning:
+            print(f"relay_warning={warning}")
+
     print("init=running token_configured={} trackers={}".format(bool(args.token), len(split_tracker_values(args.trackers))))
     subprocess.run(cmd, check=True)
+
+
+def relay_addr_reachability_warning(relay: str) -> str | None:
+    protocols = relay.strip().split("/")
+    for idx, proto in enumerate(protocols[:-1]):
+        if proto not in ("ip4", "ip6"):
+            continue
+        raw = protocols[idx + 1]
+        try:
+            ip = ipaddress.ip_address(raw)
+        except ValueError:
+            return f"invalid_ip_in_relay_addr value={raw}"
+        if isinstance(ip, ipaddress.IPv4Address) and ip in ipaddress.ip_network("100.64.0.0/10"):
+            return "relay_addr_uses_100.64.0.0/10_shared_space; peers_outside_that_tailnet_or_cgnat_path_cannot_dial_it"
+        if ip.is_loopback:
+            return "relay_addr_is_loopback; only_local_processes_can_dial_it"
+        if ip.is_private:
+            return "relay_addr_is_private; internet_peers_cannot_dial_it_without_vpn_or_port_forwarding"
+        if ip.is_link_local:
+            return "relay_addr_is_link_local; peers_off_link_cannot_dial_it"
+        if ip.is_multicast or ip.is_unspecified:
+            return "relay_addr_is_not_dialable_from_other_hosts"
+        return None
+    return None
+
+
+def install_daemon_service(install_path: Path, args: argparse.Namespace) -> None:
+    system = platform.system().lower()
+    daemon_args = [
+        str(install_path),
+        "daemon",
+        "--interval-sec",
+        str(args.daemon_interval_sec),
+        "--start-jitter-sec",
+        str(args.daemon_start_jitter_sec),
+    ]
+    if system == "darwin":
+        install_launchd_daemon(daemon_args, not args.no_start_daemon)
+        return
+    if system == "linux":
+        install_systemd_user_daemon(daemon_args, not args.no_start_daemon)
+        return
+    raise SystemExit(f"daemon=failed reason=unsupported_platform platform={platform.system()}")
+
+
+def install_launchd_daemon(daemon_args: list[str], start: bool) -> None:
+    label = "com.rustory.daemon"
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
+    log_dir = Path.home() / "Library" / "Logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    plist_path.parent.mkdir(parents=True, exist_ok=True)
+    plist_path.write_text(render_launchd_plist(label, daemon_args, log_dir), encoding="utf-8")
+    os.chmod(plist_path, 0o644)
+    print(f"daemon=installed manager=launchd plist={plist_path}")
+
+    if not start:
+        print("daemon=start_skipped reason=--no-start-daemon")
+        return
+
+    target = f"gui/{os.getuid()}"
+    subprocess.run(["launchctl", "bootout", target, str(plist_path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["launchctl", "bootstrap", target, str(plist_path)], check=True)
+    subprocess.run(["launchctl", "enable", f"{target}/{label}"], check=True)
+    subprocess.run(["launchctl", "kickstart", "-k", f"{target}/{label}"], check=True)
+    print(f"daemon=started manager=launchd label={label}")
+
+
+def render_launchd_plist(label: str, daemon_args: list[str], log_dir: Path) -> str:
+    arg_lines = "\n".join(f"    <string>{html.escape(arg)}</string>" for arg in daemon_args)
+    stdout_path = html.escape(str(log_dir / "rustory-daemon.out.log"))
+    stderr_path = html.escape(str(log_dir / "rustory-daemon.err.log"))
+    path_value = html.escape(os.environ.get("PATH", ""))
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{html.escape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+{arg_lines}
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{stdout_path}</string>
+  <key>StandardErrorPath</key>
+  <string>{stderr_path}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{path_value}</string>
+  </dict>
+</dict>
+</plist>
+"""
+
+
+def install_systemd_user_daemon(daemon_args: list[str], start: bool) -> None:
+    unit_path = Path.home() / ".config" / "systemd" / "user" / "rustory.service"
+    unit_path.parent.mkdir(parents=True, exist_ok=True)
+    unit_path.write_text(render_systemd_user_unit(daemon_args), encoding="utf-8")
+    os.chmod(unit_path, 0o644)
+    print(f"daemon=installed manager=systemd-user unit={unit_path}")
+
+    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+    subprocess.run(["systemctl", "--user", "enable", "rustory.service"], check=True)
+    if start:
+        subprocess.run(["systemctl", "--user", "restart", "rustory.service"], check=True)
+        print("daemon=started manager=systemd-user unit=rustory.service")
+    else:
+        print("daemon=start_skipped reason=--no-start-daemon")
+
+
+def render_systemd_user_unit(daemon_args: list[str]) -> str:
+    exec_start = " ".join(systemd_quote_arg(arg) for arg in daemon_args)
+    return f"""[Unit]
+Description=Rustory daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exec_start}
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def systemd_quote_arg(value: str) -> str:
+    if value and all(ch.isalnum() or ch in "/._:=@+-" for ch in value):
+        return value
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def run_import_hishtory(install_path: Path, args: argparse.Namespace) -> None:

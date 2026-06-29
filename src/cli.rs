@@ -1,6 +1,7 @@
 use crate::libp2p;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use multiaddr::Protocol;
 use rand::RngExt;
 
 use crate::{
@@ -2077,6 +2078,7 @@ struct DoctorKeyStatusReport {
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 struct DoctorRelayAddrReport {
     value: Option<String>,
+    warning: Option<String>,
     error: Option<String>,
 }
 
@@ -2275,15 +2277,18 @@ fn build_doctor_report(
 
     let relay_addr = match resolve_relay_addr(None, cfg) {
         Ok(Some(addr)) => DoctorRelayAddrReport {
+            warning: relay_addr_reachability_warning(&addr),
             value: Some(addr.to_string()),
             error: None,
         },
         Ok(None) => DoctorRelayAddrReport {
             value: None,
+            warning: None,
             error: None,
         },
         Err(err) => DoctorRelayAddrReport {
             value: None,
+            warning: None,
             error: Some(format!("{err:#}")),
         },
     };
@@ -2615,7 +2620,10 @@ fn run_doctor(
     )?;
 
     match resolve_relay_addr(None, cfg) {
-        Ok(Some(addr)) => println!("relay addr: {addr}"),
+        Ok(Some(addr)) => match relay_addr_reachability_warning(&addr) {
+            Some(warning) => println!("relay addr: {addr} warn: {warning}"),
+            None => println!("relay addr: {addr}"),
+        },
         Ok(None) => println!("relay addr: (none)"),
         Err(err) => println!("relay addr: invalid: {err:#}"),
     }
@@ -3775,6 +3783,78 @@ fn resolve_relay_addr(
     Ok(Some(raw.parse().context("parse relay_addr")?))
 }
 
+fn relay_addr_reachability_warning(addr: &libp2p::Multiaddr) -> Option<String> {
+    for protocol in addr.iter() {
+        match protocol {
+            Protocol::Ip4(ip) => {
+                if is_ipv4_shared_space(ip) {
+                    return Some(
+                        "uses 100.64.0.0/10 shared address space; peers outside that tailnet/CGNAT path cannot dial this relay"
+                            .to_string(),
+                    );
+                }
+                if ip.is_loopback() {
+                    return Some(
+                        "uses loopback address; only local processes can dial this relay"
+                            .to_string(),
+                    );
+                }
+                if ip.is_private() {
+                    return Some(
+                        "uses private RFC1918 address; internet peers need VPN, split-DNS, or router forwarding"
+                            .to_string(),
+                    );
+                }
+                if ip.is_link_local() {
+                    return Some(
+                        "uses link-local address; off-link peers cannot dial this relay"
+                            .to_string(),
+                    );
+                }
+                if ip.is_unspecified() || ip.is_multicast() || ip.is_broadcast() {
+                    return Some("uses a non-dialable IPv4 address".to_string());
+                }
+                return None;
+            }
+            Protocol::Ip6(ip) => {
+                if ip.is_loopback() {
+                    return Some(
+                        "uses loopback address; only local processes can dial this relay"
+                            .to_string(),
+                    );
+                }
+                if ip.is_unique_local() {
+                    return Some(
+                        "uses private IPv6 unique-local address; internet peers need VPN, split-DNS, or router forwarding"
+                            .to_string(),
+                    );
+                }
+                if ip.is_unicast_link_local() {
+                    return Some(
+                        "uses link-local address; off-link peers cannot dial this relay"
+                            .to_string(),
+                    );
+                }
+                if ip.is_unspecified() || ip.is_multicast() {
+                    return Some("uses a non-dialable IPv6 address".to_string());
+                }
+                return None;
+            }
+            Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => {
+                return None;
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn is_ipv4_shared_space(ip: std::net::Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (64..=127).contains(&octets[1])
+}
+
 fn resolve_trackers(cli: Vec<String>, cfg: &config::FileConfig) -> Result<Vec<String>> {
     let raw_list = if !cli.is_empty() {
         cli
@@ -4025,6 +4105,31 @@ mod tests {
             }
             _ => panic!("expected relay-serve"),
         }
+    }
+
+    #[test]
+    fn relay_addr_warning_flags_tailnet_and_private_addresses() {
+        let tailnet: libp2p::Multiaddr = "/ip4/100.64.0.1/tcp/4001"
+            .parse()
+            .expect("tailnet relay addr");
+        let private: libp2p::Multiaddr = "/ip4/192.168.1.10/tcp/4001"
+            .parse()
+            .expect("private relay addr");
+        let dns: libp2p::Multiaddr = "/dns4/rustory-relay.example.com/tcp/4001"
+            .parse()
+            .expect("dns relay addr");
+
+        assert!(
+            relay_addr_reachability_warning(&tailnet)
+                .expect("tailnet warning")
+                .contains("100.64.0.0/10")
+        );
+        assert!(
+            relay_addr_reachability_warning(&private)
+                .expect("private warning")
+                .contains("RFC1918")
+        );
+        assert_eq!(relay_addr_reachability_warning(&dns), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "rustory"
-version = "1.0.6"
+version = "1.0.7"
 edition = "2024"
 autobins = false
 
@@ -16,6 +16,7 @@ ctrlc = "3.5"
 futures = "0.3"
 libp2p-core = "0.43"
 libp2p-dcutr = "0.14"
+libp2p-dns = { version = "0.44", features = ["tokio"] }
 libp2p-identify = "0.47"
 libp2p-identity = { version = "0.2", features = ["ed25519", "peerid", "rand"] }
 libp2p-mplex = "0.43"

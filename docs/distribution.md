@@ -39,11 +39,15 @@ curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.p
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
     --swarm-key-source ./swarm.key \
-    --install-hook --import-hishtory
+    --install-hook --install-daemon --import-hishtory
 ```
 
 `--tracker`는 반복 지정하거나 comma-separated 값으로 지정할 수 있다.
 relay 주소까지 config에 쓰려면 `--relay "<relay-multiaddr>"`를 같이 넘긴다.
+공개 tracker/relay grid에 붙이는 설치라면 relay 주소는 외부 peer가 dial 가능한 multiaddr이어야 한다.
+예: `/dns4/rustory-relay.example.com/tcp/4001/p2p/<relay_peer_id>`.
+`/ip4/100.64.0.0/10`, RFC1918 private IP, loopback 같은 literal relay 주소를 넘기면 installer와
+`rr doctor`가 경고한다. 이런 주소는 같은 tailnet/LAN에 없는 신규 머신에서는 relay circuit을 열 수 없다.
 `--token`에는 raw token 값만 전달한다. shell quoting은 명령줄 문법일 뿐이고,
 token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증이 실패한다.
 기존 P2P grid에 합류시키는 설치라면 `--user-id`를 기존 grid 값으로 맞추고,
@@ -51,11 +55,12 @@ token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증�
 대상 머신에 다른 swarm key가 이미 있으면 installer는 기본적으로 실패하고, `--force`를 지정했을 때만 백업 후 교체한다.
 `--install-hook`은 현재 shell을 자동 감지해 `~/.zshrc` 또는 `~/.bashrc`에 Rustory managed block을 추가/교체한다.
 비표준 시작 파일을 쓰면 `--hook-shell bash|zsh --rc-file <path>`로 명시한다.
+`--install-daemon`은 macOS에서는 `~/Library/LaunchAgents/com.rustory.daemon.plist`, Linux에서는
+`~/.config/systemd/user/rustory.service`를 설치하고 기본적으로 즉시 시작한다. 설치만 하고 시작을
+미루려면 `--no-start-daemon`을 함께 넘긴다.
 `--import-hishtory`는 기본 Hishtory DB(`~/.hishtory/.hishtory.db`)가 있으면 import하고,
 성공 후 user startup files에서 Hishtory hook/PATH/source 라인을 삭제한다.
 Hishtory hook을 유지해야 하면 `--keep-hishtory-hooks`를 함께 넘긴다.
-installer는 binary/config/hook/import만 처리하며 daemon을 자동 시작하지 않는다. 설치 직후 이
-디바이스를 tracker/relay grid의 상시 멤버로 등록하려면 별도 셸에서 `rr daemon`을 실행한다.
 `rr p2p-sync --push`만 단발 실행하면 tracker에서 다른 peer는 발견할 수 있지만, 이 디바이스의
 `p2p-serve` 등록은 유지되지 않는다.
 
@@ -68,6 +73,7 @@ installer는 다음 순서로 동작한다.
 5. `--token`, `--tracker`, `--relay`, `--user-id`, `--device-id` 중 지정된 값이 있으면 `rr init`을 실행한다.
 6. `--install-hook`이 있으면 shell rc 파일에 Rustory hook block을 설치한다.
 7. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
+8. `--install-daemon`이 있으면 user service를 설치하고, `--no-start-daemon`이 없으면 즉시 시작한다.
 
 token 값은 installer 로그에 출력하지 않는다.
 private archive에 one-line install 명령을 보관할 때도 token을 literal command에 중첩 escape하지 말고,
@@ -94,7 +100,7 @@ rr init --tracker-token "$RUSTORY_TRACKER_TOKEN" --trackers "<tracker-url>"
 
 ```sh
 rr update
-rr update --version v1.0.6
+rr update --version v1.0.7
 rr update --dry-run
 ```
 
@@ -102,7 +108,7 @@ rr update --dry-run
 테스트 또는 사설 release mirror를 써야 하면 exact URL이나 base URL을 지정한다.
 
 ```sh
-rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.6"
+rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.7"
 rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256 "<sha256>"
 ```
 

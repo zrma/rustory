@@ -9,6 +9,20 @@
 현재 CLI 옵션, default, config resolver, signal 처리 세부는 `rr daemon --help`, `rr p2p-serve --help`, `rr p2p-sync --help`, `rr doctor`, config template, 관련 코드를 직접 확인한다.
 아래 launchd/systemd 단편은 운영 형태 예시이며, 템플릿의 최신 내용은 `contrib/daemon/*`가 소유한다.
 
+신규 머신 온보딩에서는 installer의 `--install-daemon`을 기본 경로로 사용한다.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
+  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+    --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
+    --swarm-key-source ./swarm.key \
+    --install-hook --install-daemon --import-hishtory
+```
+
+macOS는 `~/Library/LaunchAgents/com.rustory.daemon.plist`, Linux는
+`~/.config/systemd/user/rustory.service`가 생성된다. 설치만 하고 시작을 미루려면
+`--no-start-daemon`을 함께 넘긴다.
+
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
   - `trackers`, `relay_addr`, `swarm_key_path`, `p2p_identity_key_path`, `tracker_token` 등
@@ -81,7 +95,7 @@ rr --db-path "$HOME/.rustory/history.db" daemon \
   --max-peers-per-tick 1 \
   --swarm-key "$HOME/.config/rustory/swarm.key" \
   --trackers "http://<tracker-host>:8850" \
-  --relay "/ip4/<relay-ip>/tcp/<port>/p2p/<relay_peer_id>"
+  --relay "/dns4/<relay-host>/tcp/<port>/p2p/<relay_peer_id>"
 ```
 
 ## macOS (launchd, user agent)
