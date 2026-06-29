@@ -3262,6 +3262,15 @@ struct SyncStatusWatchPeerRates {
     pending_drain_per_sec: f64,
 }
 
+#[derive(Debug, Clone)]
+struct SyncStatusWatchPeerView<'a> {
+    peer: &'a SyncStatusPeerReport,
+    rates: SyncStatusWatchPeerRates,
+    baseline: usize,
+    progress: usize,
+    peer_name: String,
+}
+
 fn run_sync_status_watch(
     store: &storage::LocalStore,
     local_device_id: &str,
@@ -3321,12 +3330,11 @@ fn render_sync_status_watch_frame(
 ) -> String {
     const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     const WIDTH: usize = 120;
-    const PEER_COL: usize = 28;
-    const SEEN_COL: usize = 7;
-    const PULL_COL: usize = 25;
-    const PUSH_COL: usize = 52;
+    const MESH_WIDTH: usize = 74;
+    const TRAFFIC_WIDTH: usize = WIDTH - MESH_WIDTH - 1;
 
     let spinner = SPINNER[state.frame % SPINNER.len()];
+    let frame_index = state.frame;
     state.frame = state.frame.wrapping_add(1);
 
     let mut out = String::new();
@@ -3344,144 +3352,467 @@ fn render_sync_status_watch_frame(
             .map(|state| state.max_outbound_push_pending)
             .unwrap_or(peer.outbound_push_pending);
         let progress = outbound_push_progress_percent(peer.outbound_push_pending, baseline);
-        let bar = progress_bar(progress, 12);
         let peer_name = sync_status_peer_display_name(peer);
-        peer_views.push((peer, rates, progress, bar, peer_name));
+        peer_views.push(SyncStatusWatchPeerView {
+            peer,
+            rates,
+            baseline,
+            progress,
+            peer_name,
+        });
     }
 
     push_watch_line(
         &mut out,
         WIDTH,
         &format!(
-            "{spinner} rustory grid watch (local view)  local={}  head={}  peers={}  outbound={}",
+            "{spinner} rustory mesh watch  local={}  head={}  peers={}  outbound={}",
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
             format_count_usize(total_outbound_pending)
         ),
     );
-    push_watch_line(
-        &mut out,
-        WIDTH,
-        "truth model: peer -> local is this node's pull cursor; local -> peer is this node's push backlog",
-    );
 
-    if let Some(trackers) = report.tracker_status.as_ref() {
-        for tracker in trackers {
-            let status = if tracker.reachable { "ok" } else { "fail" };
-            let latency = tracker
-                .latency_ms
-                .map(|value| format!("{value}ms"))
-                .unwrap_or_else(|| "-".to_string());
-            let error = tracker
-                .error
-                .as_deref()
-                .map(|value| format!(" error={value}"))
-                .unwrap_or_default();
-            push_watch_line(
-                &mut out,
-                WIDTH,
-                &format!(
-                    "tracker {status:<4} {latency:>6}  {}{error}",
-                    tracker.base_url
-                ),
-            );
-        }
+    out.push('\n');
+    let mesh_panel = render_mesh_panel(
+        &report.local_device_id,
+        &peer_views,
+        frame_index,
+        MESH_WIDTH,
+    );
+    let traffic_panel = render_traffic_panel(
+        report,
+        &peer_views,
+        report.tracker_status.as_deref(),
+        TRAFFIC_WIDTH,
+    );
+    for line in join_watch_panels(&mesh_panel, &traffic_panel, " ") {
+        push_watch_line(&mut out, WIDTH, &line);
     }
 
-    if !peer_views.is_empty() {
-        out.push('\n');
-        push_watch_line(&mut out, WIDTH, "Flow map (known from this node)");
-        for (peer, rates, progress, bar, peer_name) in &peer_views {
-            let node = truncate_display(peer_name, 24);
-            let pull_lane = format!(
-                "{} => local  pull {:>7}/s  cursor={}",
-                fit_cell(&node, 24),
-                format_rate(rates.pull_per_sec),
-                format_count_i64(peer.pull_cursor)
-            );
-            let push_lane = format!(
-                "local => {}  [{}] {:>3}%  {} left  drain {:>7}/s",
-                fit_cell(&node, 24),
-                bar,
-                progress,
-                format_count_usize(peer.outbound_push_pending),
-                format_rate(rates.pending_drain_per_sec)
-            );
-            push_watch_line(&mut out, WIDTH, &pull_lane);
-            push_watch_line(&mut out, WIDTH, &push_lane);
-        }
+    out.push('\n');
+    for line in render_link_panel(&peer_views, WIDTH) {
+        push_watch_line(&mut out, WIDTH, &line);
     }
 
     out.push('\n');
     push_watch_line(
         &mut out,
         WIDTH,
-        &format!(
-            "{}  {}  {}  {}",
-            fit_cell("Peer", PEER_COL),
-            fit_cell("Seen", SEEN_COL),
-            fit_cell("peer -> local pull", PULL_COL),
-            fit_cell("local -> peer push backlog", PUSH_COL),
-        ),
+        "ctrl+c to exit  •  local observation: real remote peer↔peer flow needs daemon telemetry",
     );
-    push_watch_line(&mut out, WIDTH, &"─".repeat(WIDTH));
+    out
+}
 
-    for (peer, rates, progress, bar, peer_name) in peer_views {
+fn render_mesh_panel(
+    local_device_id: &str,
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    frame: usize,
+    panel_width: usize,
+) -> Vec<String> {
+    let inner_width = panel_width.saturating_sub(2);
+    let canvas_width = inner_width;
+    let canvas_height = 15;
+    let mut canvas = WatchCanvas::new(canvas_width, canvas_height);
+    let local = CanvasPoint {
+        x: canvas_width / 2,
+        y: canvas_height / 2,
+    };
+
+    let mut nodes = Vec::with_capacity(peer_views.len());
+    for (idx, view) in peer_views.iter().enumerate() {
+        let label = format!(
+            "{} {}",
+            mesh_peer_symbol(view),
+            truncate_display(&view.peer_name, 16)
+        );
+        let point = mesh_peer_point(idx, peer_views.len(), canvas_width, canvas_height, &label);
+        nodes.push((point, label, view));
+    }
+
+    for (idx, (point, _label, view)) in nodes.iter().enumerate() {
+        let edge = mesh_edge_glyph(local, *point);
+        canvas.draw_line(local, *point, edge);
+        if view.peer.outbound_push_pending > 0 || view.rates.push_per_sec > 0.0 {
+            let phase = (frame + idx.saturating_mul(2)) % 7 + 1;
+            let particle =
+                if view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
+                    '◆'
+                } else {
+                    '◇'
+                };
+            canvas.put(point_between(local, *point, phase, 8), particle);
+        }
+        if view.rates.pull_per_sec > 0.0 {
+            let phase = (frame + idx.saturating_mul(3)) % 7 + 1;
+            canvas.put(point_between(*point, local, phase, 8), '●');
+        }
+    }
+
+    for (point, label, _view) in nodes {
+        canvas.put_str(point.x, point.y, &label);
+    }
+    canvas.put_str(
+        local.x.saturating_sub(6),
+        local.y,
+        &format!("◎ {}", truncate_display(local_device_id, 12)),
+    );
+
+    box_watch_panel(
+        "Mesh Map",
+        panel_width,
+        canvas
+            .into_lines()
+            .into_iter()
+            .map(|line| truncate_display(line.trim_end(), inner_width))
+            .collect(),
+    )
+}
+
+fn render_traffic_panel(
+    report: &SyncStatusReport,
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    trackers: Option<&[SyncStatusTrackerReport]>,
+    panel_width: usize,
+) -> Vec<String> {
+    let total_pending: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending)
+        .sum();
+    let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
+    let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
+    let total_push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
+    let total_drain_rate: f64 = peer_views
+        .iter()
+        .map(|view| view.rates.pending_drain_per_sec.max(0.0))
+        .sum();
+    let progress = outbound_push_progress_percent(total_pending, total_baseline);
+    let hottest = peer_views
+        .iter()
+        .max_by_key(|view| view.peer.outbound_push_pending);
+    let seen = peer_views
+        .iter()
+        .filter_map(|view| view.peer.last_seen_age_sec)
+        .max()
+        .map(|age| format!("oldest seen {age}s"))
+        .unwrap_or_else(|| "seen unknown".to_string());
+
+    let mut body = vec![
+        tracker_summary_line(trackers),
+        format!(
+            "local   {}",
+            truncate_display(&report.local_device_id, panel_width.saturating_sub(12))
+        ),
+        format!(
+            "head    {}   peers {}",
+            format_count_i64(report.local_head),
+            report.peers.len()
+        ),
+        seen,
+        String::new(),
+        format!("pull    {:>8}/s", format_rate(total_pull_rate)),
+        format!("push    {:>8}/s", format_rate(total_push_rate)),
+        format!("drain   {:>8}/s", format_rate(total_drain_rate)),
+        format!(
+            "backlog [{}] {:>3}% {} left",
+            progress_bar(progress, 12),
+            progress,
+            format_count_usize(total_pending)
+        ),
+    ];
+
+    if let Some(view) = hottest {
+        body.push(format!(
+            "hot     {} {} left",
+            truncate_display(&view.peer_name, 22),
+            format_count_usize(view.peer.outbound_push_pending)
+        ));
+    }
+
+    body.extend([
+        String::new(),
+        "legend  ◎ local  ● synced".to_string(),
+        "        ◐ backlog  ○ stale".to_string(),
+        "flow    ◆ moving  ◇ queued  ● pull".to_string(),
+    ]);
+
+    box_watch_panel("Traffic", panel_width, body)
+}
+
+fn render_link_panel(
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    panel_width: usize,
+) -> Vec<String> {
+    const PEER_COL: usize = 27;
+    const SEEN_COL: usize = 7;
+    const PULL_COL: usize = 25;
+    const PUSH_COL: usize = 52;
+
+    let mut body = Vec::new();
+    body.push(format!(
+        "{} {} {} {}",
+        fit_cell("peer", PEER_COL),
+        fit_cell("seen", SEEN_COL),
+        fit_cell("peer → local", PULL_COL),
+        fit_cell("local → peer", PUSH_COL)
+    ));
+    body.push("─".repeat(panel_width.saturating_sub(2)));
+
+    for view in peer_views {
+        let peer = view.peer;
         let last_seen = peer
             .last_seen_age_sec
             .map(|age| format!("{age}s"))
             .unwrap_or_else(|| "-".to_string());
         let pull = format!(
-            "cur {} {:>7}/s",
-            format_count_i64(peer.pull_cursor),
-            format_rate(rates.pull_per_sec)
+            "← {:>7}/s cur {}",
+            format_rate(view.rates.pull_per_sec),
+            format_count_i64(peer.pull_cursor)
         );
         let push = format!(
-            "[{}] {:>3}% {} left drain {:>7}/s",
-            bar,
-            progress,
-            format_count_usize(peer.outbound_push_pending),
-            format_rate(rates.pending_drain_per_sec)
+            "→ [{}] {:>3}% {} left",
+            progress_bar(view.progress, 8),
+            view.progress,
+            format_count_usize(peer.outbound_push_pending)
         );
-        push_watch_line(
-            &mut out,
-            WIDTH,
-            &format!(
-                "{}  {}  {}  {}",
-                fit_cell(&peer_name, PEER_COL),
-                right_cell(&last_seen, SEEN_COL),
-                fit_cell(&pull, PULL_COL),
-                fit_cell(&push, PUSH_COL),
-            ),
-        );
-
-        let detail = format!(
-            "push_cursor={} push_rate={}/s peer_id={}",
-            format_count_i64(peer.push_cursor),
-            format_rate(rates.push_per_sec),
-            short_peer_id(&peer.peer_id),
-        );
-        push_watch_line(
-            &mut out,
-            WIDTH,
-            &format!(
-                "{}  {}  {}  {}",
-                fit_cell("", PEER_COL),
-                fit_cell("", SEEN_COL),
-                fit_cell("", PULL_COL),
-                fit_cell(&detail, PUSH_COL),
-            ),
-        );
+        body.push(format!(
+            "{} {} {} {}",
+            fit_cell(&view.peer_name, PEER_COL),
+            right_cell(&last_seen, SEEN_COL),
+            fit_cell(&pull, PULL_COL),
+            fit_cell(&push, PUSH_COL),
+        ));
     }
 
-    out.push('\n');
-    push_watch_line(
-        &mut out,
-        WIDTH,
-        "ctrl+c to exit  •  not a global mesh telemetry view; remote peer-to-peer flows require future daemon reports",
-    );
-    out
+    if peer_views.is_empty() {
+        body.push("no peers known yet; run rr daemon or p2p-serve + p2p-sync --push".to_string());
+    }
+
+    box_watch_panel("Links", panel_width, body)
+}
+
+fn tracker_summary_line(trackers: Option<&[SyncStatusTrackerReport]>) -> String {
+    let Some(trackers) = trackers else {
+        return "tracker not checked".to_string();
+    };
+    if trackers.is_empty() {
+        return "tracker none configured".to_string();
+    }
+
+    let reachable = trackers.iter().filter(|tracker| tracker.reachable).count();
+    let latency = trackers
+        .iter()
+        .filter_map(|tracker| tracker.latency_ms)
+        .min()
+        .map(|latency| format!("{latency}ms"))
+        .unwrap_or_else(|| "-".to_string());
+    let first = trackers
+        .first()
+        .map(|tracker| tracker.base_url.as_str())
+        .unwrap_or("-");
+    format!(
+        "tracker {reachable}/{} {latency} {}",
+        trackers.len(),
+        truncate_display(first, 24)
+    )
+}
+
+fn mesh_peer_symbol(view: &SyncStatusWatchPeerView<'_>) -> char {
+    if view.peer.last_seen_age_sec.is_some_and(|age| age > 300) {
+        '○'
+    } else if view.peer.outbound_push_pending > 0 {
+        '◐'
+    } else if view.rates.pull_per_sec > 0.0
+        || view.rates.push_per_sec > 0.0
+        || view.rates.pending_drain_per_sec > 0.0
+    {
+        '◉'
+    } else {
+        '●'
+    }
+}
+
+fn mesh_peer_point(
+    index: usize,
+    total: usize,
+    width: usize,
+    height: usize,
+    label: &str,
+) -> CanvasPoint {
+    if total == 0 {
+        return CanvasPoint { x: 1, y: 1 };
+    }
+    let center_x = width as f64 / 2.0;
+    let center_y = height as f64 / 2.0;
+    let radius_x = (width.saturating_sub(22) as f64 / 2.0).max(8.0);
+    let radius_y = (height.saturating_sub(4) as f64 / 2.0).max(3.0);
+    let angle =
+        -std::f64::consts::FRAC_PI_2 + (index as f64 * std::f64::consts::TAU / total as f64);
+    let label_width = unicode_width::UnicodeWidthStr::width(label);
+    let max_x = width.saturating_sub(label_width.saturating_add(1)).max(1);
+    let max_y = height.saturating_sub(2).max(1);
+    let x = (center_x + radius_x * angle.cos()).round();
+    let y = (center_y + radius_y * angle.sin()).round();
+    CanvasPoint {
+        x: (x as isize).clamp(1, max_x as isize) as usize,
+        y: (y as isize).clamp(1, max_y as isize) as usize,
+    }
+}
+
+fn mesh_edge_glyph(from: CanvasPoint, to: CanvasPoint) -> char {
+    let dx = to.x as isize - from.x as isize;
+    let dy = to.y as isize - from.y as isize;
+    if dx.abs() > dy.abs().saturating_mul(2) {
+        '─'
+    } else if dy.abs() > dx.abs().saturating_mul(2) {
+        '│'
+    } else if dx.signum() == dy.signum() {
+        '╲'
+    } else {
+        '╱'
+    }
+}
+
+fn point_between(from: CanvasPoint, to: CanvasPoint, step: usize, total: usize) -> CanvasPoint {
+    let total = total.max(1) as f64;
+    let t = step as f64 / total;
+    CanvasPoint {
+        x: (from.x as f64 + (to.x as f64 - from.x as f64) * t).round() as usize,
+        y: (from.y as f64 + (to.y as f64 - from.y as f64) * t).round() as usize,
+    }
+}
+
+fn join_watch_panels(left: &[String], right: &[String], gap: &str) -> Vec<String> {
+    let left_width = left
+        .first()
+        .map(|line| unicode_width::UnicodeWidthStr::width(line.as_str()))
+        .unwrap_or(0);
+    let right_width = right
+        .first()
+        .map(|line| unicode_width::UnicodeWidthStr::width(line.as_str()))
+        .unwrap_or(0);
+    let height = left.len().max(right.len());
+    let mut lines = Vec::with_capacity(height);
+    for idx in 0..height {
+        let left_line = left
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| " ".repeat(left_width));
+        let right_line = right
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| " ".repeat(right_width));
+        lines.push(format!(
+            "{}{}{}",
+            fit_cell(&left_line, left_width),
+            gap,
+            fit_cell(&right_line, right_width)
+        ));
+    }
+    lines
+}
+
+fn box_watch_panel(title: &str, width: usize, body: Vec<String>) -> Vec<String> {
+    let width = width.max(4);
+    let inner = width.saturating_sub(2);
+    let title = format!(" {title} ");
+    let title_width = unicode_width::UnicodeWidthStr::width(title.as_str());
+    let top_fill = inner.saturating_sub(title_width);
+    let mut lines = Vec::with_capacity(body.len() + 2);
+    lines.push(format!("┌{title}{}┐", "─".repeat(top_fill)));
+    for line in body {
+        lines.push(format!("│{}│", fit_cell(&line, inner)));
+    }
+    lines.push(format!("└{}┘", "─".repeat(inner)));
+    lines
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CanvasPoint {
+    x: usize,
+    y: usize,
+}
+
+struct WatchCanvas {
+    width: usize,
+    height: usize,
+    cells: Vec<Vec<char>>,
+}
+
+impl WatchCanvas {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            cells: vec![vec![' '; width]; height],
+        }
+    }
+
+    fn put(&mut self, point: CanvasPoint, ch: char) {
+        if point.y < self.height && point.x < self.width {
+            self.cells[point.y][point.x] = ch;
+        }
+    }
+
+    fn put_str(&mut self, x: usize, y: usize, value: &str) {
+        if y >= self.height || x >= self.width {
+            return;
+        }
+        let mut x = x;
+        for ch in value.chars() {
+            if x >= self.width {
+                break;
+            }
+            self.cells[y][x] = ch;
+            x = x.saturating_add(
+                unicode_width::UnicodeWidthChar::width(ch)
+                    .unwrap_or(1)
+                    .max(1),
+            );
+        }
+    }
+
+    fn draw_line(&mut self, from: CanvasPoint, to: CanvasPoint, ch: char) {
+        let mut x0 = from.x as isize;
+        let mut y0 = from.y as isize;
+        let x1 = to.x as isize;
+        let y1 = to.y as isize;
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+
+        loop {
+            let point = CanvasPoint {
+                x: x0.max(0) as usize,
+                y: y0.max(0) as usize,
+            };
+            if point != from && point != to {
+                self.put(point, ch);
+            }
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = err.saturating_mul(2);
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    fn into_lines(self) -> Vec<String> {
+        self.cells
+            .into_iter()
+            .map(|row| row.into_iter().collect::<String>())
+            .collect()
+    }
 }
 
 fn sync_status_watch_peer_rates(
@@ -5575,9 +5906,13 @@ mod tests {
 
         let frame = render_sync_status_watch_frame(&mut state, &report, Instant::now());
 
-        assert!(frame.contains("rustory grid watch (local view)"));
-        assert!(frame.contains("peer -> local"));
-        assert!(frame.contains("local -> peer"));
+        assert!(frame.contains("rustory mesh watch"));
+        assert!(frame.contains("Mesh Map"));
+        assert!(frame.contains("Traffic"));
+        assert!(frame.contains("Links"));
+        assert!(frame.contains("peer → local"));
+        assert!(frame.contains("local → peer"));
+        assert!(frame.contains("◇"));
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
             assert!(width <= 120, "line width {width}: {line}");
