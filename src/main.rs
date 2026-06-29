@@ -9,6 +9,7 @@ mod libp2p;
 mod p2p;
 mod p2p_codec;
 mod search;
+mod self_update;
 mod storage;
 mod sync;
 mod tracker;

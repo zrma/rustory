@@ -3,10 +3,29 @@
 이 문서는 Rustory를 "최소 구성"으로 빠르게 써보는 흐름을 정리한다.
 
 ## 0) 준비
-- Rust 툴체인: `rust-toolchain.toml` 기준
 - ctrl+r 검색 UX는 `rr search` inline TUI가 담당한다. 별도 `fzf` 설치는 필요 없다.
 
-### 빌드(로컬)
+### 공식 배포 설치
+Release asset이 준비된 버전은 아래처럼 설치하고 바로 tracker grid에 참여시킬 수 있다.
+tracker URL/token은 private 값이므로 public 문서에는 실제 값을 두지 않는다.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
+  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>"
+```
+
+설치 후 binary만 갱신하려면:
+
+```sh
+rr update
+rr update --dry-run
+```
+
+배포/업데이트 상세는 `docs/distribution.md` 참고.
+
+### 빌드(로컬 개발)
+Rust 툴체인: `rust-toolchain.toml` 기준
+
 ```sh
 cargo build --release
 ./target/release/rr --help
@@ -57,9 +76,9 @@ rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --token "secret"
 rr init \
   --user-id "<user>" \
   --device-id "<device>" \
-  --trackers "http://<tracker-host>:8850" \
+  --tracker "http://<tracker-host>:8850" \
   --relay "/ip4/<relay-ip>/tcp/4001/p2p/<relay_peer_id>" \
-  --tracker-token "secret"
+  --token "secret"
 
 rr doctor
 rr doctor --json
@@ -199,6 +218,7 @@ rr delete --entry-id '<entry_id>' --yes --vacuum
 `rr delete`는 local-only 작업이다. 이미 다른 peer로 sync된 민감 row는 각 peer에서 같은 삭제를 수행해야 한다.
 
 ## 다음 문서
+- 배포/installer/self-update: `docs/distribution.md`
 - P2P 상세/트러블슈팅: `docs/p2p.md`
 - 데몬/스케줄러: `docs/daemon.md`
 - 훅: `docs/hook.md`

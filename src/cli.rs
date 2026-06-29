@@ -373,6 +373,56 @@ enum Command {
         )]
         json: bool,
     },
+    #[command(about = "Self-update the rr binary from release assets")]
+    Update {
+        #[arg(
+            long,
+            default_value = "latest",
+            help = "Release version to install: latest or a tag such as v1.0.2"
+        )]
+        version: String,
+
+        #[arg(
+            long,
+            default_value = crate::self_update::DEFAULT_RELEASE_REPO,
+            help = "GitHub repository that publishes Rustory release assets"
+        )]
+        repo: String,
+
+        #[arg(
+            long,
+            help = "Override release asset base URL; downloads <base>/rr-<target>"
+        )]
+        asset_base_url: Option<String>,
+
+        #[arg(long, help = "Override exact release asset URL")]
+        asset_url: Option<String>,
+
+        #[arg(
+            long,
+            help = "Override SHA-256 checksum URL; defaults to <asset-url>.sha256"
+        )]
+        checksum_url: Option<String>,
+
+        #[arg(
+            long,
+            help = "Expected SHA-256 hex; when set, skip checksum URL download"
+        )]
+        sha256: Option<String>,
+
+        #[arg(
+            long,
+            help = "Install path override; defaults to the current rr executable"
+        )]
+        install_path: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Print the update plan without downloading or replacing rr"
+        )]
+        dry_run: bool,
+    },
     #[command(about = "Print a bash or zsh shell hook")]
     Hook {
         #[arg(
@@ -484,6 +534,7 @@ enum Command {
 
         #[arg(
             long,
+            alias = "tracker",
             value_delimiter = ',',
             help = "Comma-separated tracker base URLs to write into config"
         )]
@@ -492,7 +543,11 @@ enum Command {
         #[arg(long, help = "Relay multiaddr to write into config")]
         relay: Option<String>,
 
-        #[arg(long, help = "Tracker bearer token to write into config")]
+        #[arg(
+            long,
+            alias = "token",
+            help = "Tracker bearer token to write into config"
+        )]
         tracker_token: Option<String>,
     },
     #[command(about = "Diagnose local config, tools, keys, and connectivity")]
@@ -1010,6 +1065,27 @@ pub fn run() -> Result<()> {
         Command::Version { json } => {
             print_build_info(json)?;
         }
+        Command::Update {
+            version,
+            repo,
+            asset_base_url,
+            asset_url,
+            checksum_url,
+            sha256,
+            install_path,
+            dry_run,
+        } => {
+            crate::self_update::run_update(crate::self_update::UpdateRequest {
+                version,
+                repo,
+                asset_base_url,
+                asset_url,
+                checksum_url,
+                sha256,
+                install_path: install_path.map(std::path::PathBuf::from),
+                dry_run,
+            })?;
+        }
         Command::Hook { shell } => {
             let shell = hook::Shell::parse(shell.as_str())?;
             let content = hook::render_hook(shell);
@@ -1173,7 +1249,10 @@ pub fn run() -> Result<()> {
 fn can_continue_after_config_load_error(cmd: &Command) -> bool {
     matches!(
         cmd,
-        Command::Doctor { .. } | Command::Version { .. } | Command::Init { force: true, .. }
+        Command::Doctor { .. }
+            | Command::Version { .. }
+            | Command::Update { .. }
+            | Command::Init { force: true, .. }
     )
 }
 
@@ -3767,6 +3846,7 @@ mod tests {
         assert!(help.contains("Diagnose local config, tools, keys, and connectivity"));
         assert!(help.contains("Run p2p-serve plus p2p-sync watch as one supervised process"));
         assert!(help.contains("Sync with P2P peers, trackers, or cached peers"));
+        assert!(help.contains("Self-update the rr binary from release assets"));
         assert!(help.contains("Print a bash or zsh shell hook"));
         assert!(help.contains("Path to the local SQLite history database"));
     }
@@ -4023,6 +4103,45 @@ mod tests {
         match app.cmd {
             Command::Version { json } => assert!(json),
             _ => panic!("expected version"),
+        }
+        assert!(can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn update_command_parses_and_ignores_config_load_errors() {
+        let app = App::parse_from([
+            "rr",
+            "update",
+            "--version",
+            "v1.0.2",
+            "--repo",
+            "zrma/rustory",
+            "--asset-base-url",
+            "https://example.test/releases/v1.0.2",
+            "--install-path",
+            "/tmp/rr",
+            "--dry-run",
+        ]);
+
+        match &app.cmd {
+            Command::Update {
+                version,
+                repo,
+                asset_base_url,
+                install_path,
+                dry_run,
+                ..
+            } => {
+                assert_eq!(version, "v1.0.2");
+                assert_eq!(repo, "zrma/rustory");
+                assert_eq!(
+                    asset_base_url.as_deref(),
+                    Some("https://example.test/releases/v1.0.2")
+                );
+                assert_eq!(install_path.as_deref(), Some("/tmp/rr"));
+                assert!(*dry_run);
+            }
+            _ => panic!("expected update"),
         }
         assert!(can_continue_after_config_load_error(&app.cmd));
     }
@@ -5059,6 +5178,36 @@ mod tests {
                 assert_eq!(trackers.len(), 2);
                 assert_eq!(relay.as_deref(), Some("/ip4/127.0.0.1/tcp/4001"));
                 assert_eq!(tracker_token.as_deref(), Some("t1"));
+            }
+            _ => panic!("expected init"),
+        }
+    }
+
+    #[test]
+    fn init_parses_tracker_and_token_aliases() {
+        let app = App::parse_from([
+            "rr",
+            "init",
+            "--tracker",
+            "https://tracker-a.example,https://tracker-b.example",
+            "--token",
+            "secret-token",
+        ]);
+
+        match app.cmd {
+            Command::Init {
+                trackers,
+                tracker_token,
+                ..
+            } => {
+                assert_eq!(
+                    trackers,
+                    vec![
+                        "https://tracker-a.example".to_string(),
+                        "https://tracker-b.example".to_string()
+                    ]
+                );
+                assert_eq!(tracker_token.as_deref(), Some("secret-token"));
             }
             _ => panic!("expected init"),
         }
