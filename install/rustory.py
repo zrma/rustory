@@ -6,12 +6,14 @@ Designed for:
   curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
     python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "$RUSTORY_TRACKERS" \
       --relay "$RUSTORY_RELAY_ADDR" --user-id "$RUSTORY_USER_ID" \
-      --swarm-key-source ./swarm.key --install-hook --import-hishtory
+      --swarm-key-b64 "$RUSTORY_SWARM_KEY_B64" --install-hook --import-hishtory
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import html
 import hashlib
 import ipaddress
@@ -69,7 +71,7 @@ def main() -> int:
     install_binary(data, install_path)
     verify_binary(install_path)
 
-    if args.swarm_key_source:
+    if args.swarm_key_source or args.swarm_key_b64:
         install_swarm_key(install_path, args)
 
     if args.token or args.trackers or args.relay:
@@ -113,9 +115,13 @@ def parse_args() -> argparse.Namespace:
         help="Existing shared private swarm key file to copy into the Rustory config directory",
     )
     parser.add_argument(
+        "--swarm-key-b64",
+        help="Base64-encoded shared private swarm key to write into the Rustory config directory",
+    )
+    parser.add_argument(
         "--swarm-key-dest",
         default="~/.config/rustory/swarm.key",
-        help="Destination path for --swarm-key-source",
+        help="Destination path for --swarm-key-source or --swarm-key-b64",
     )
     parser.add_argument("--user-id", help="Logical Rustory user id to write via rr init")
     parser.add_argument("--device-id", help="Device id to write via rr init")
@@ -169,6 +175,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.asset_base_url and args.asset_url:
         parser.error("pass only one of --asset-base-url or --asset-url")
+    if args.swarm_key_source and args.swarm_key_b64:
+        parser.error("pass only one of --swarm-key-source or --swarm-key-b64")
     if args.token and token_has_literal_quote_wrapper(args.token):
         parser.error(
             "--token appears to include literal quote characters; pass the raw token value, "
@@ -314,14 +322,8 @@ def verify_binary(install_path: Path) -> None:
 
 
 def install_swarm_key(install_path: Path, args: argparse.Namespace) -> None:
-    source_path = Path(args.swarm_key_source).expanduser()
     dest_path = Path(args.swarm_key_dest).expanduser()
-    if not source_path.exists() or not source_path.is_file():
-        raise SystemExit(f"swarm_key=failed reason=missing_source path={source_path}")
-
-    data = source_path.read_bytes()
-    if not data.strip():
-        raise SystemExit(f"swarm_key=failed reason=empty_source path={source_path}")
+    data = read_swarm_key_data(args)
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -360,6 +362,29 @@ def install_swarm_key(install_path: Path, args: argparse.Namespace) -> None:
 
     print(f"swarm_key=installed path={dest_path} status=updated")
     print_swarm_key_fingerprint(install_path, dest_path)
+
+
+def read_swarm_key_data(args: argparse.Namespace) -> bytes:
+    if args.swarm_key_source:
+        source_path = Path(args.swarm_key_source).expanduser()
+        if not source_path.exists() or not source_path.is_file():
+            raise SystemExit(f"swarm_key=failed reason=missing_source path={source_path}")
+        data = source_path.read_bytes()
+        if not data.strip():
+            raise SystemExit(f"swarm_key=failed reason=empty_source path={source_path}")
+        return data
+
+    encoded = "".join(str(args.swarm_key_b64 or "").split())
+    if not encoded:
+        raise SystemExit("swarm_key=failed reason=empty_base64")
+    padded = encoded + ("=" * (-len(encoded) % 4))
+    try:
+        data = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
+    except (UnicodeEncodeError, binascii.Error):
+        raise SystemExit("swarm_key=failed reason=invalid_base64") from None
+    if not data.strip():
+        raise SystemExit("swarm_key=failed reason=decoded_empty")
+    return data
 
 
 def next_backup_path(path: Path) -> Path:

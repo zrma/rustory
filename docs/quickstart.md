@@ -13,7 +13,7 @@ tracker URL/token은 private 값이므로 public 문서에는 실제 값을 두�
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
-    --swarm-key-source ./swarm.key \
+    --swarm-key-b64 "<base64-swarm-key>" \
     --install-hook --install-daemon --import-hishtory
 ```
 
@@ -24,6 +24,8 @@ Hishtory DB/디렉터리는 fallback source로 남긴다.
 `--token`에는 raw token만 전달한다. token 값 앞뒤에 literal `'` 또는 `"`가 들어가면 `rr doctor`에서
 `length`가 예상보다 길어지고 tracker ping이 401로 실패한다.
 기존 P2P grid에 합류시키려면 같은 `user_id`, 같은 relay 주소, 같은 공유 `swarm.key`가 필요하다.
+신규 머신에 파일을 미리 둘 필요가 없게 하려면 `swarm.key` 내용을 base64로 인코딩해 `--swarm-key-b64`에 넣는다.
+이미 파일 배포 경로가 있는 운영 환경에서는 `--swarm-key-source <path>`도 사용할 수 있다.
 relay 주소는 외부 신규 머신이 dial 가능한 public multiaddr이어야 하며, DNS 이름은
 `/dns4/<host>/tcp/<port>/p2p/<relay_peer_id>` 형태로 쓸 수 있다.
 `p2p_identity_key`는 디바이스별로 새로 생성되어야 하므로 복사하지 않는다.

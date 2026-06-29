@@ -38,7 +38,7 @@ scripts/build-release-assets.sh
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
-    --swarm-key-source ./swarm.key \
+    --swarm-key-b64 "<base64-swarm-key>" \
     --install-hook --install-daemon --import-hishtory
 ```
 
@@ -51,7 +51,8 @@ relay 주소까지 config에 쓰려면 `--relay "<relay-multiaddr>"`를 같이 �
 `--token`에는 raw token 값만 전달한다. shell quoting은 명령줄 문법일 뿐이고,
 token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증이 실패한다.
 기존 P2P grid에 합류시키는 설치라면 `--user-id`를 기존 grid 값으로 맞추고,
-`--swarm-key-source`로 기존 공유 `swarm.key`를 복사해야 한다. `p2p_identity_key`는 디바이스별 값이므로 공유하지 않는다.
+`--swarm-key-b64`로 기존 공유 `swarm.key`의 base64 값을 전달한다. 파일을 이미 배치한 운영 경로에서는
+`--swarm-key-source <path>`도 계속 지원한다. `p2p_identity_key`는 디바이스별 값이므로 공유하지 않는다.
 대상 머신에 다른 swarm key가 이미 있으면 installer는 기본적으로 실패하고, `--force`를 지정했을 때만 백업 후 교체한다.
 `--install-hook`은 현재 shell을 자동 감지해 `~/.zshrc` 또는 `~/.bashrc`에 Rustory managed block을 추가/교체한다.
 비표준 시작 파일을 쓰면 `--hook-shell bash|zsh --rc-file <path>`로 명시한다.
@@ -69,15 +70,16 @@ installer는 다음 순서로 동작한다.
 1. 현재 OS/arch에 맞는 release asset 이름을 결정한다.
 2. asset과 SHA-256 checksum을 다운로드한다.
 3. checksum을 검증한 뒤 `~/.local/bin/rr`에 설치한다.
-4. `--swarm-key-source`가 있으면 공유 swarm key를 `~/.config/rustory/swarm.key`로 복사하고 fingerprint만 출력한다.
+4. `--swarm-key-b64` 또는 `--swarm-key-source`가 있으면 공유 swarm key를
+   `~/.config/rustory/swarm.key`로 쓰고 fingerprint만 출력한다.
 5. `--token`, `--tracker`, `--relay`, `--user-id`, `--device-id` 중 지정된 값이 있으면 `rr init`을 실행한다.
 6. `--install-hook`이 있으면 shell rc 파일에 Rustory hook block을 설치한다.
 7. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
 8. `--install-daemon`이 있으면 user service를 설치하고, `--no-start-daemon`이 없으면 즉시 시작한다.
 
 token 값은 installer 로그에 출력하지 않는다.
-private archive에 one-line install 명령을 보관할 때도 token을 literal command에 중첩 escape하지 말고,
-위 예시처럼 `RUSTORY_TRACKER_TOKEN` 변수에 둔 뒤 `--token "$RUSTORY_TRACKER_TOKEN"`로 넘긴다.
+swarm key 값도 installer 로그에 출력하지 않는다. true one-paste onboarding이 필요하면 private archive에
+token과 `base64 <swarm.key>` 결과를 literal argument로 넣은 명령을 보관한다. public repo에는 실제 값을 기록하지 않는다.
 
 ## Init Alias
 
@@ -100,7 +102,7 @@ rr init --tracker-token "$RUSTORY_TRACKER_TOKEN" --trackers "<tracker-url>"
 
 ```sh
 rr update
-rr update --version v1.0.7
+rr update --version v1.0.8
 rr update --dry-run
 ```
 
@@ -108,7 +110,7 @@ rr update --dry-run
 테스트 또는 사설 release mirror를 써야 하면 exact URL이나 base URL을 지정한다.
 
 ```sh
-rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.7"
+rr update --asset-base-url "https://example.invalid/rustory/releases/v1.0.8"
 rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256 "<sha256>"
 ```
 

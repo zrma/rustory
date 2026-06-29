@@ -15,7 +15,7 @@
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
-    --swarm-key-source ./swarm.key \
+    --swarm-key-b64 "<base64-swarm-key>" \
     --install-hook --install-daemon --import-hishtory
 ```
 

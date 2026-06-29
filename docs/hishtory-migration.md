@@ -160,7 +160,9 @@ installer 기반 전환에서는 아래 옵션이 같은 정책을 자동화한�
 ```sh
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
   python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
-    --install-hook --import-hishtory
+    --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
+    --swarm-key-b64 "<base64-swarm-key>" \
+    --install-hook --install-daemon --import-hishtory
 ```
 
 이 경로는 Hishtory DB/디렉터리는 삭제하지 않고, import 성공 후 user startup files의 Hishtory hook 라인만 제거한다.
