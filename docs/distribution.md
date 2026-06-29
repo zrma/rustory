@@ -30,6 +30,41 @@ scripts/build-release-assets.sh
 출력은 `dist/rr-<target>`, `dist/rr-<target>.sha256`, `dist/checksums.txt`다.
 `dist/`는 release upload staging이며 Git에 커밋하지 않는다.
 
+## Release Fast Path
+
+`scripts/release-version.sh`는 version/tag 확인, release gate, asset build, GitHub Release upload,
+`rr update --dry-run` 검증을 한 명령으로 묶는다. 기본 version은 `Cargo.toml`의 package
+version이고 tag는 `v<version>` 형식이다.
+
+```sh
+scripts/release-version.sh --profile current --dry-run
+scripts/release-version.sh --profile daily-driver --skip-upload
+scripts/release-version.sh --profile daily-driver --gate none
+```
+
+프로파일 의미:
+
+| Profile | Targets | 용도 |
+| --- | --- | --- |
+| `current` | 현재 머신의 target | 로컬 canary 또는 단일 asset 확인 |
+| `daily-driver` | `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu` | MacBook + Linux k8s node 실사용 배포 |
+| `full` | macOS arm64/x86_64 + Linux x86_64/arm64 | 지원 target 전체 게시 |
+
+권장 순서는 코드 변경과 release asset 게시를 분리하는 것이다.
+
+```sh
+scripts/finalize-and-push.sh --message "<type>: <summary>" --work-id "<work-id>"
+scripts/release-version.sh --profile daily-driver --gate none
+```
+
+같은 턴에서 source 검증까지 release script가 책임져야 하면 `--gate full --work-id <work-id>`를 쓴다.
+기본 gate는 이미 main 출고 검증이 끝난 직후의 asset publish를 빠르게 하기 위해 `quick`이다.
+cross target build는 host toolchain/linker 준비 상태에 의존한다. macOS에서 Linux asset build가 실패하면
+Linux builder에서 해당 target을 먼저 staging하고, upload 단계에서는 `--skip-build --dist-dir <dir>`를 사용한다.
+
+`--skip-upload`은 asset/checksum만 만들고 GitHub Release는 건드리지 않는다.
+`--dry-run`은 release plan과 실행할 명령만 출력한다.
+
 ## One-Line Install
 
 공식 배포 URL이 GitHub raw installer를 가리키면 신규 머신은 아래처럼 시작한다.

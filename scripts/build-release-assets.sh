@@ -49,6 +49,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/rust-toolchain.sh
+source "$repo_root/scripts/lib/rust-toolchain.sh"
 if [[ "$dist_dir" = /* ]]; then
   dist_path="$dist_dir"
 else
@@ -85,6 +87,7 @@ mkdir -p "$dist_path"
 
 (
   cd "$repo_root"
+  rustory_require_cargo
   cargo "${cargo_args[@]}"
 )
 
