@@ -4,6 +4,7 @@
 
 ## Todo Closure Tokens
 
+- 2026-06-29: `todo-search-delete-selected`
 - 2026-06-29: `todo-release-109-update-assets`
 - 2026-02-19: `todo-main-sync-status`
 - 2026-02-19: `todo-main-sync-status-json`

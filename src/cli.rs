@@ -922,8 +922,14 @@ pub fn run() -> Result<()> {
 
             let store = storage::LocalStore::open(&db_path)?;
             let entries = store.list_recent(limit)?;
-            if let Some(cmd) = search::select_command(&entries)? {
-                println!("{cmd}");
+            match search::select_action(&entries)? {
+                Some(search::SearchAction::Select(cmd)) => {
+                    println!("{cmd}");
+                }
+                Some(search::SearchAction::Delete { entry_id }) => {
+                    store.delete_entries_by_ids(&[entry_id], false)?;
+                }
+                None => {}
             }
         }
         Command::Prune {

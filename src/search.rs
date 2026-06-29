@@ -62,8 +62,41 @@ struct ColumnSpec {
 #[derive(Debug, Clone)]
 struct SearchRow {
     entry_index: usize,
-    search_text_lower: String,
+    search_fields: SearchFields,
     cells: [String; 6],
+}
+
+#[derive(Debug, Clone)]
+struct SearchFields {
+    command: String,
+    cwd: String,
+    compact_cwd: String,
+    hostname: String,
+    device_id: String,
+    user_id: String,
+    exit_code: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SearchTerm {
+    negate: bool,
+    matcher: SearchMatcher,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchMatcher {
+    Any(String),
+    Field { field: SearchField, value: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchField {
+    Command,
+    Cwd,
+    Hostname,
+    User,
+    Device,
+    ExitCode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +104,7 @@ enum Key {
     Char(char),
     Backspace,
     Delete,
+    DeleteSelected,
     Enter,
     Quit,
     Help,
@@ -91,7 +125,13 @@ enum Key {
     Unknown,
 }
 
-pub fn select_command(entries: &[Entry]) -> Result<Option<String>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchAction {
+    Select(String),
+    Delete { entry_id: String },
+}
+
+pub fn select_action(entries: &[Entry]) -> Result<Option<SearchAction>> {
     if entries.is_empty() {
         return Ok(None);
     }
@@ -106,13 +146,21 @@ fn build_search_rows(entries: &[Entry]) -> Vec<SearchRow> {
         .iter()
         .enumerate()
         .map(|(entry_index, entry)| {
-            let search_text = format_search_text(entry);
+            let compact = compact_cwd(&entry.cwd);
             SearchRow {
                 entry_index,
-                search_text_lower: search_text.to_lowercase(),
+                search_fields: SearchFields {
+                    command: sanitize_one_line(&entry.cmd).to_lowercase(),
+                    cwd: sanitize_one_line(&entry.cwd).to_lowercase(),
+                    compact_cwd: compact.to_lowercase(),
+                    hostname: sanitize_one_line(&entry.hostname).to_lowercase(),
+                    device_id: sanitize_one_line(&entry.device_id).to_lowercase(),
+                    user_id: sanitize_one_line(&entry.user_id).to_lowercase(),
+                    exit_code: entry.exit_code.to_string(),
+                },
                 cells: [
                     sanitize_one_line(&entry.hostname),
-                    compact_cwd(&entry.cwd),
+                    compact,
                     format_timestamp(entry.ts),
                     format_duration(entry.duration_ms),
                     entry.exit_code.to_string(),
@@ -159,13 +207,20 @@ impl<'a> SearchTui<'a> {
         Ok(tui)
     }
 
-    fn run(&mut self) -> Result<Option<String>> {
+    fn run(&mut self) -> Result<Option<SearchAction>> {
         self.render()?;
         loop {
             match self.tty.read_key().context("read search TUI key")? {
                 Key::Enter => {
+                    let action = self.selected_command().map(SearchAction::Select);
                     self.finish()?;
-                    return Ok(self.selected_command());
+                    return Ok(action);
+                }
+                Key::DeleteSelected => {
+                    if let Some(action) = self.selected_delete_action() {
+                        self.finish()?;
+                        return Ok(Some(action));
+                    }
                 }
                 Key::Quit => {
                     self.finish()?;
@@ -188,9 +243,17 @@ impl<'a> SearchTui<'a> {
     }
 
     fn selected_command(&self) -> Option<String> {
-        let row_index = *self.filtered.get(self.cursor)?;
-        let entry_index = self.rows.get(row_index)?.entry_index;
-        Some(self.entries.get(entry_index)?.cmd.clone())
+        Some(self.selected_entry()?.cmd.clone())
+    }
+
+    fn selected_delete_action(&self) -> Option<SearchAction> {
+        Some(SearchAction::Delete {
+            entry_id: self.selected_entry()?.entry_id.clone(),
+        })
+    }
+
+    fn selected_entry(&self) -> Option<&Entry> {
+        selected_entry(self.entries, &self.rows, &self.filtered, self.cursor)
     }
 
     fn handle_key(&mut self, key: Key) {
@@ -248,7 +311,7 @@ impl<'a> SearchTui<'a> {
             Key::ShiftRight => {
                 self.hscroll = self.hscroll.saturating_add(TABLE_SCROLL_STEP);
             }
-            Key::Enter | Key::Quit | Key::Unknown => {}
+            Key::Enter | Key::DeleteSelected | Key::Quit | Key::Unknown => {}
         }
     }
 
@@ -367,7 +430,8 @@ impl<'a> SearchTui<'a> {
         lines.push(FOOTER.to_string());
         if self.show_help {
             lines.push(
-                "↑/↓ or mouse wheel scroll  pgup/pgdn page  enter select  esc exit".to_string(),
+                "↑/↓ or mouse wheel scroll  pgup/pgdn page  enter select  ctrl+k delete  esc exit"
+                    .to_string(),
             );
             lines.push("←/→ edit query  ctrl+←/→ jump word  shift+←/→ scroll table".to_string());
         }
@@ -450,19 +514,11 @@ impl Tty {
 
     fn read_key(&mut self) -> std::io::Result<Key> {
         let byte = self.read_byte_blocking()?;
-        Ok(match byte {
-            b'\r' | b'\n' => Key::Enter,
-            0x01 => Key::Home,
-            0x03 | 0x04 => Key::Quit,
-            0x05 => Key::End,
-            0x08 => Key::Help,
-            0x0e => Key::Down,
-            0x10 => Key::Up,
-            0x1b => self.read_escape_sequence()?,
-            0x7f => Key::Backspace,
-            byte if byte.is_ascii_graphic() || byte == b' ' => Key::Char(byte as char),
-            _ => Key::Unknown,
-        })
+        if byte == 0x1b {
+            self.read_escape_sequence()
+        } else {
+            Ok(parse_plain_key(byte))
+        }
     }
 
     fn read_escape_sequence(&mut self) -> std::io::Result<Key> {
@@ -562,6 +618,22 @@ fn parse_escape_sequence(bytes: &[u8]) -> Key {
     }
 }
 
+fn parse_plain_key(byte: u8) -> Key {
+    match byte {
+        b'\r' | b'\n' => Key::Enter,
+        0x01 => Key::Home,
+        0x03 | 0x04 => Key::Quit,
+        0x05 => Key::End,
+        0x08 => Key::Help,
+        0x0b => Key::DeleteSelected,
+        0x0e => Key::Down,
+        0x10 => Key::Up,
+        0x7f => Key::Backspace,
+        byte if byte.is_ascii_graphic() || byte == b' ' => Key::Char(byte as char),
+        _ => Key::Unknown,
+    }
+}
+
 fn parse_sgr_mouse_sequence(bytes: &[u8]) -> Option<Key> {
     let body = bytes.strip_prefix(b"[<")?;
     let (final_byte, payload) = body.split_last()?;
@@ -606,21 +678,264 @@ fn terminal_size(fd: RawFd) -> Option<(usize, usize)> {
 }
 
 fn filter_rows(rows: &[SearchRow], query: &str) -> Vec<usize> {
-    let tokens = query
-        .split_whitespace()
-        .map(str::to_lowercase)
-        .filter(|token| !token.is_empty())
+    let terms = parse_search_terms(query);
+    if terms.is_empty() {
+        return (0..rows.len()).collect();
+    }
+
+    let mut scored = rows
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, row)| match_row_score(row, &terms).map(|score| (idx, score)))
         .collect::<Vec<_>>();
 
-    rows.iter()
-        .enumerate()
-        .filter_map(|(idx, row)| {
-            tokens
-                .iter()
-                .all(|token| fuzzy_token_matches(&row.search_text_lower, token))
-                .then_some(idx)
-        })
+    scored.sort_by(|(left_idx, left_score), (right_idx, right_score)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left_idx.cmp(right_idx))
+    });
+    scored.into_iter().map(|(idx, _)| idx).collect()
+}
+
+fn parse_search_terms(query: &str) -> Vec<SearchTerm> {
+    tokenize_query(query)
+        .into_iter()
+        .filter_map(|token| parse_search_term(&token))
         .collect()
+}
+
+fn parse_search_term(token: &str) -> Option<SearchTerm> {
+    let mut token = token.trim();
+    if token.is_empty() {
+        return None;
+    }
+
+    let negate = token.starts_with('-') && token != "-";
+    if negate {
+        token = &token[1..];
+    }
+
+    let atom_parts = split_unescaped(token, ':', Some(2));
+    let matcher = if atom_parts.len() == 2 {
+        parse_search_field(&unescape_query(&atom_parts[0]))
+            .map(|field| SearchMatcher::Field {
+                field,
+                value: normalize_query_token(&atom_parts[1]),
+            })
+            .unwrap_or_else(|| SearchMatcher::Any(normalize_query_token(token)))
+    } else {
+        SearchMatcher::Any(normalize_query_token(token))
+    };
+
+    match &matcher {
+        SearchMatcher::Any(value) if value.is_empty() => None,
+        SearchMatcher::Field { value, .. } if value.is_empty() => None,
+        _ => Some(SearchTerm { negate, matcher }),
+    }
+}
+
+fn parse_search_field(field: &str) -> Option<SearchField> {
+    match field.to_lowercase().as_str() {
+        "command" | "cmd" => Some(SearchField::Command),
+        "cwd" | "path" => Some(SearchField::Cwd),
+        "host" | "hostname" => Some(SearchField::Hostname),
+        "user" | "user_id" => Some(SearchField::User),
+        "device" | "device_id" => Some(SearchField::Device),
+        "exit_code" | "code" => Some(SearchField::ExitCode),
+        _ => None,
+    }
+}
+
+fn normalize_query_token(token: &str) -> String {
+    unescape_query(token).to_lowercase()
+}
+
+fn match_row_score(row: &SearchRow, terms: &[SearchTerm]) -> Option<usize> {
+    let mut total = 0usize;
+    for term in terms {
+        let score = matcher_score(row, &term.matcher);
+        if term.negate {
+            if score > 0 {
+                return None;
+            }
+        } else if score == 0 {
+            return None;
+        } else {
+            total = total.saturating_add(score);
+        }
+    }
+    Some(total)
+}
+
+fn matcher_score(row: &SearchRow, matcher: &SearchMatcher) -> usize {
+    match matcher {
+        SearchMatcher::Any(token) => any_field_score(&row.search_fields, token),
+        SearchMatcher::Field { field, value } => field_score(&row.search_fields, *field, value),
+    }
+}
+
+fn any_field_score(fields: &SearchFields, token: &str) -> usize {
+    [
+        text_match_score(&fields.command, token, 1000),
+        text_match_score(&fields.compact_cwd, token, 780),
+        text_match_score(&fields.cwd, token, 760),
+        text_match_score(&fields.hostname, token, 680),
+        text_match_score(&fields.device_id, token, 620),
+        text_match_score(&fields.user_id, token, 420),
+    ]
+    .into_iter()
+    .max()
+    .unwrap_or(0)
+}
+
+fn field_score(fields: &SearchFields, field: SearchField, value: &str) -> usize {
+    match field {
+        SearchField::Command => text_match_score(&fields.command, value, 1000),
+        SearchField::Cwd => text_match_score(&fields.cwd, value.trim_end_matches('/'), 1000).max(
+            text_match_score(&fields.compact_cwd, value.trim_end_matches('/'), 1000),
+        ),
+        SearchField::Hostname => text_match_score(&fields.hostname, value, 1000),
+        SearchField::User => text_match_score(&fields.user_id, value, 1000),
+        SearchField::Device => text_match_score(&fields.device_id, value, 1000),
+        SearchField::ExitCode => {
+            if fields.exit_code == value.trim() {
+                1000
+            } else {
+                0
+            }
+        }
+    }
+}
+
+fn text_match_score(haystack: &str, token: &str, base: usize) -> usize {
+    if token.is_empty() {
+        return 0;
+    }
+    if let Some(pos) = haystack.find(token) {
+        return base
+            .saturating_add(boundary_bonus(haystack, pos))
+            .saturating_add(token.chars().count().min(32) * 4)
+            .saturating_add(60usize.saturating_sub(pos.min(60)));
+    }
+    if token.chars().count() >= 3 && fuzzy_token_matches(haystack, token) {
+        return base / 3 + token.chars().count().min(32);
+    }
+    0
+}
+
+fn boundary_bonus(haystack: &str, byte_pos: usize) -> usize {
+    if byte_pos == 0 {
+        return 80;
+    }
+    haystack[..byte_pos]
+        .chars()
+        .next_back()
+        .filter(|ch| !ch.is_alphanumeric())
+        .map(|_| 35)
+        .unwrap_or(0)
+}
+
+fn tokenize_query(query: &str) -> Vec<String> {
+    split_unescaped(query, ' ', None)
+        .into_iter()
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn split_unescaped(query: &str, separator: char, max_split: Option<usize>) -> Vec<String> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let chars = query.chars().collect::<Vec<_>>();
+    let mut tokens = Vec::new();
+    let mut token = String::new();
+    let mut splits = 1usize;
+    let mut in_double_quote = false;
+    let mut in_single_quote = false;
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if max_split.is_none_or(|max| splits < max)
+            && ch == separator
+            && !in_single_quote
+            && !in_double_quote
+        {
+            if !token.is_empty() {
+                tokens.push(std::mem::take(&mut token));
+            }
+            splits += 1;
+        } else if ch == '\\' && idx + 1 < chars.len() {
+            let next = chars[idx + 1];
+            if matches!(next, '-' | ':' | '\\') {
+                token.push(ch);
+            }
+            idx += 1;
+            token.push(chars[idx]);
+        } else if ch == '"'
+            && !in_single_quote
+            && !heuristic_ignore_unclosed_quote(in_double_quote, '"', &chars, idx)
+        {
+            in_double_quote = !in_double_quote;
+        } else if ch == '\''
+            && !in_double_quote
+            && !heuristic_ignore_unclosed_quote(in_single_quote, '\'', &chars, idx)
+        {
+            in_single_quote = !in_single_quote;
+        } else {
+            if (in_single_quote || in_double_quote) && separator == ' ' {
+                if ch == ':' {
+                    token.push('\\');
+                }
+                if ch == '-' && token.is_empty() {
+                    token.push('\\');
+                }
+            }
+            token.push(ch);
+        }
+        idx += 1;
+    }
+    tokens.push(token);
+    tokens
+}
+
+fn heuristic_ignore_unclosed_quote(
+    is_currently_in_quoted_string: bool,
+    quote_type: char,
+    query: &[char],
+    idx: usize,
+) -> bool {
+    if is_currently_in_quoted_string {
+        return false;
+    }
+    !query.iter().skip(idx + 1).any(|ch| *ch == quote_type)
+}
+
+fn unescape_query(query: &str) -> String {
+    let chars = query.chars().collect::<Vec<_>>();
+    let mut out = String::new();
+    let mut idx = 0usize;
+    while idx < chars.len() {
+        if chars[idx] == '\\' {
+            idx += 1;
+        }
+        if let Some(ch) = chars.get(idx) {
+            out.push(*ch);
+        }
+        idx += 1;
+    }
+    out
+}
+
+fn selected_entry<'a>(
+    entries: &'a [Entry],
+    rows: &[SearchRow],
+    filtered: &[usize],
+    cursor: usize,
+) -> Option<&'a Entry> {
+    let row_index = *filtered.get(cursor)?;
+    let entry_index = rows.get(row_index)?.entry_index;
+    entries.get(entry_index)
 }
 
 fn fuzzy_token_matches(haystack: &str, token: &str) -> bool {
@@ -935,20 +1250,6 @@ fn sanitize_one_line(value: &str) -> String {
     out
 }
 
-fn format_search_text(entry: &Entry) -> String {
-    sanitize_one_line(&format!(
-        "{} {} {} {} {} {} {} {}",
-        entry.hostname,
-        entry.device_id,
-        entry.cwd,
-        compact_cwd(&entry.cwd),
-        format_timestamp(entry.ts),
-        format_duration(entry.duration_ms),
-        entry.exit_code,
-        entry.cmd
-    ))
-}
-
 fn compact_cwd(cwd: &str) -> String {
     let cwd = sanitize_one_line(cwd);
     if cwd.is_empty() {
@@ -1064,16 +1365,19 @@ mod tests {
 
         let rows = build_search_rows(&entries);
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].search_text_lower.contains("sample-node"));
-        assert!(rows[0].search_text_lower.contains("macbook"));
+        assert!(rows[0].search_fields.hostname.contains("sample-node"));
+        assert!(rows[0].search_fields.device_id.contains("macbook"));
         assert!(
             rows[0]
-                .search_text_lower
+                .search_fields
+                .cwd
                 .contains("/users/user/code/src/sample-project")
         );
+        assert!(rows[0].search_fields.compact_cwd.contains("sample-project"));
         assert!(
             rows[0]
-                .search_text_lower
+                .search_fields
+                .command
                 .contains("cat ./sample-project/docs/readme.md")
         );
         assert_eq!(rows[0].cells[0], "sample-node");
@@ -1098,6 +1402,84 @@ mod tests {
 
         let matches = filter_rows(&rows, "pro doc");
         assert_eq!(matches, vec![0]);
+    }
+
+    #[test]
+    fn filter_rows_supports_hishtory_style_field_atoms_and_negation() {
+        let mut typo = entry("node0", "/home/user", "ifcofnig");
+        typo.exit_code = 127;
+        let entries = vec![
+            entry(
+                "macbook",
+                "/Users/user/code/src/rustory",
+                "cargo test search",
+            ),
+            entry("node0", "/tmp", "ls -lah"),
+            typo,
+        ];
+        let rows = build_search_rows(&entries);
+
+        assert_eq!(filter_rows(&rows, "cwd:/tmp ls"), vec![1]);
+        assert_eq!(filter_rows(&rows, "hostname:node exit_code:127"), vec![2]);
+        assert_eq!(filter_rows(&rows, "-exit_code:0"), vec![2]);
+        assert_eq!(filter_rows(&rows, "cmd:\"cargo test\""), vec![0]);
+    }
+
+    #[test]
+    fn filter_rows_ranks_command_matches_above_metadata_matches() {
+        let entries = vec![
+            entry("docker-host", "/Users/user/code/src/rustory", "echo ok"),
+            entry(
+                "macbook",
+                "/Users/user/code/src/rustory",
+                "docker compose up",
+            ),
+            entry("node0", "/Users/user/docker/context", "ls -lah"),
+        ];
+        let rows = build_search_rows(&entries);
+
+        let matches = filter_rows(&rows, "docker");
+
+        assert_eq!(matches, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn tokenize_query_matches_hishtory_quotes_and_escaping() {
+        assert_eq!(
+            tokenize_query(r#"cwd:"foo bar :baz\"" docker"#),
+            vec![r#"cwd:foo bar \:baz""#.to_string(), "docker".to_string()]
+        );
+        assert_eq!(
+            tokenize_query(r#"ls \-Slah foo\:bar"#),
+            vec![
+                r#"ls"#.to_string(),
+                r#"\-Slah"#.to_string(),
+                r#"foo\:bar"#.to_string()
+            ]
+        );
+        assert_eq!(
+            parse_search_terms(r#""docker run" hostname:node -exit_code:127"#),
+            vec![
+                SearchTerm {
+                    negate: false,
+                    matcher: SearchMatcher::Any("docker run".to_string())
+                },
+                SearchTerm {
+                    negate: false,
+                    matcher: SearchMatcher::Field {
+                        field: SearchField::Hostname,
+                        value: "node".to_string()
+                    }
+                },
+                SearchTerm {
+                    negate: true,
+                    matcher: SearchMatcher::Field {
+                        field: SearchField::ExitCode,
+                        value: "127".to_string()
+                    }
+                }
+            ]
+        );
     }
 
     #[test]
@@ -1222,6 +1604,30 @@ mod tests {
         assert_eq!(parse_escape_sequence(b"[<68;12;5M"), Key::MouseWheelUp);
         assert_eq!(parse_escape_sequence(b"[<69;12;5M"), Key::MouseWheelDown);
         assert_eq!(parse_escape_sequence(b"[<64;12;5m"), Key::Unknown);
+    }
+
+    #[test]
+    fn parse_plain_key_maps_ctrl_k_to_delete_selected() {
+        assert_eq!(parse_plain_key(0x0b), Key::DeleteSelected);
+    }
+
+    #[test]
+    fn selected_entry_uses_filtered_cursor() {
+        let entries = vec![
+            entry("node0", "/home/user", "which rr"),
+            entry(
+                "macbook",
+                "/Users/user/code/src/rustory",
+                "cargo test search",
+            ),
+        ];
+        let rows = build_search_rows(&entries);
+        let filtered = filter_rows(&rows, "cargo");
+
+        let got = selected_entry(&entries, &rows, &filtered, 0).unwrap();
+
+        assert_eq!(got.entry_id, entries[1].entry_id);
+        assert_eq!(got.cmd, "cargo test search");
     }
 
     #[test]
