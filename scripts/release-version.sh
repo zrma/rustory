@@ -214,7 +214,11 @@ build_or_collect_assets() {
     fi
 
     if [[ "$SKIP_BUILD" -eq 0 ]]; then
-      run_argv scripts/build-release-assets.sh --target "$target" --dist-dir "$DIST_DIR"
+      run_argv \
+        env "RUSTORY_BUILD_REVISION=${COMMIT_SHA:0:12}" \
+        RUSTORY_BUILD_REVISION_SOURCE=git \
+        RUSTORY_BUILD_DIRTY=false \
+        scripts/build-release-assets.sh --target "$target" --dist-dir "$DIST_DIR"
     else
       warn "skip build for $resolved_target (--skip-build)"
     fi

@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build-release-assets.sh [--target current|TRIPLE] [--dist-dir DIR]
+  scripts/build-release-assets.sh [--target current|TRIPLE] [--dist-dir DIR] [--linux-builder auto|host|docker|ssh]
 
 Build the rr release binary for the requested target and write:
   DIR/rr-<target>
@@ -12,11 +12,19 @@ Build the rr release binary for the requested target and write:
   DIR/checksums.txt
 
 The updater and installer expect raw executable assets named rr-<target>.
+
+Linux targets default to the native host when target == host target. On
+non-Linux or cross-arch hosts, auto mode uses RUSTORY_RELEASE_LINUX_REMOTE as
+an SSH builder when set, otherwise Docker buildx. Set --linux-builder host, or
+RUSTORY_RELEASE_LINUX_BUILDER=host, when a native cross C toolchain such as
+x86_64-linux-gnu-gcc is available.
 USAGE
 }
 
 target="current"
 dist_dir="dist"
+linux_builder="${RUSTORY_RELEASE_LINUX_BUILDER:-auto}"
+linux_remote="${RUSTORY_RELEASE_LINUX_REMOTE:-}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -32,6 +40,14 @@ while [[ $# -gt 0 ]]; do
       dist_dir="${2:-}"
       if [[ -z "$dist_dir" ]]; then
         echo "--dist-dir requires a value" >&2
+        exit 2
+      fi
+      shift 2
+      ;;
+    --linux-builder)
+      linux_builder="${2:-}"
+      if [[ -z "$linux_builder" ]]; then
+        echo "--linux-builder requires a value" >&2
         exit 2
       fi
       shift 2
@@ -73,8 +89,10 @@ current_target() {
   esac
 }
 
+host_target="$(current_target)"
+
 if [[ "$target" == "current" ]]; then
-  target="$(current_target)"
+  target="$host_target"
   cargo_args=(build --release --locked)
   binary_path="$repo_root/target/release/rr"
 else
@@ -85,11 +103,192 @@ fi
 asset_name="rr-${target}"
 mkdir -p "$dist_path"
 
-(
-  cd "$repo_root"
-  rustory_require_cargo
-  cargo "${cargo_args[@]}"
-)
+linux_platform_for_target() {
+  case "$1" in
+    x86_64-unknown-linux-gnu) echo "linux/amd64" ;;
+    aarch64-unknown-linux-gnu) echo "linux/arm64" ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_build_revision() {
+  if [[ -n "${RUSTORY_BUILD_REVISION:-}" ]]; then
+    printf '%s' "$RUSTORY_BUILD_REVISION"
+    return 0
+  fi
+  if command -v git >/dev/null 2>&1; then
+    git -C "$repo_root" rev-parse --short=12 HEAD 2>/dev/null && return 0
+  fi
+  if command -v jj >/dev/null 2>&1; then
+    jj --ignore-working-copy -R "$repo_root" log -r @- --no-graph -T 'commit_id.short(12)' 2>/dev/null \
+      | tr -d '\r\n ' && return 0
+  fi
+  printf '%s' "unknown"
+}
+
+build_with_cargo() {
+  (
+    cd "$repo_root"
+    rustory_require_cargo
+    cargo "${cargo_args[@]}"
+  )
+}
+
+build_linux_with_docker() {
+  local platform="$1"
+  local docker_out=""
+  local docker_binary=""
+  local docker_config=""
+  local build_revision=""
+  local build_source=""
+  local build_dirty=""
+
+  if ! command -v docker >/dev/null 2>&1; then
+    echo "docker is required for Linux release assets on this host; pass --linux-builder host if a cross C toolchain is installed" >&2
+    return 1
+  fi
+  if ! docker buildx version >/dev/null 2>&1; then
+    echo "docker buildx is required for Linux release assets on this host" >&2
+    return 1
+  fi
+
+  docker_out="$(mktemp -d "${TMPDIR:-/tmp}/rustory-release-linux.XXXXXX")"
+  docker_config="$(mktemp -d "${TMPDIR:-/tmp}/rustory-release-docker-config.XXXXXX")"
+  printf '{}\n' > "$docker_config/config.json"
+  build_revision="$(detect_build_revision)"
+  build_source="${RUSTORY_BUILD_REVISION_SOURCE:-git}"
+  build_dirty="${RUSTORY_BUILD_DIRTY:-false}"
+
+  if ! DOCKER_CONFIG="${RUSTORY_RELEASE_DOCKER_CONFIG:-$docker_config}" docker buildx build \
+    --platform "$platform" \
+    --target builder \
+    --build-arg "RUSTORY_BUILD_REVISION=$build_revision" \
+    --build-arg "RUSTORY_BUILD_REVISION_SOURCE=$build_source" \
+    --build-arg "RUSTORY_BUILD_DIRTY=$build_dirty" \
+    --output "type=local,dest=$docker_out" \
+    "$repo_root" >/dev/null; then
+    rm -rf "$docker_out" "$docker_config"
+    return 1
+  fi
+
+  docker_binary="$docker_out/app/target/release/rr"
+  if [[ ! -x "$docker_binary" ]]; then
+    echo "docker build did not produce expected binary: $docker_binary" >&2
+    rm -rf "$docker_out" "$docker_config"
+    return 1
+  fi
+  mkdir -p "$(dirname "$binary_path")"
+  install -m 755 "$docker_binary" "$binary_path"
+  rm -rf "$docker_out" "$docker_config"
+}
+
+sh_quote() {
+  local value="$1"
+  printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
+}
+
+remote_matches_target() {
+  local remote_host="$1"
+  case "$target:$remote_host" in
+    x86_64-unknown-linux-gnu:Linux:x86_64) return 0 ;;
+    aarch64-unknown-linux-gnu:Linux:aarch64) return 0 ;;
+    aarch64-unknown-linux-gnu:Linux:arm64) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+build_linux_with_ssh() {
+  if [[ -z "$linux_remote" ]]; then
+    echo "RUSTORY_RELEASE_LINUX_REMOTE is required when --linux-builder ssh is used" >&2
+    return 1
+  fi
+  command -v ssh >/dev/null 2>&1 || {
+    echo "ssh is required for --linux-builder ssh" >&2
+    return 1
+  }
+  command -v scp >/dev/null 2>&1 || {
+    echo "scp is required for --linux-builder ssh" >&2
+    return 1
+  }
+  command -v git >/dev/null 2>&1 || {
+    echo "git is required to package the source for --linux-builder ssh" >&2
+    return 1
+  }
+
+  local remote_host=""
+  local remote_dir=""
+  local remote_dir_q=""
+  local source_list=""
+  local build_revision=""
+  local build_source=""
+  local build_dirty=""
+
+  remote_host="$(ssh "$linux_remote" 'printf "%s:%s" "$(uname -s)" "$(uname -m)"')"
+  if ! remote_matches_target "$remote_host"; then
+    echo "remote builder target mismatch: target=$target remote=$linux_remote host=$remote_host" >&2
+    return 1
+  fi
+
+  remote_dir="${RUSTORY_RELEASE_LINUX_REMOTE_DIR:-/tmp/rustory-release-${target}-$$}"
+  remote_dir_q="$(sh_quote "$remote_dir")"
+  source_list="$(mktemp "${TMPDIR:-/tmp}/rustory-release-sources.XXXXXX")"
+  build_revision="$(detect_build_revision)"
+  build_source="${RUSTORY_BUILD_REVISION_SOURCE:-git}"
+  build_dirty="${RUSTORY_BUILD_DIRTY:-false}"
+
+  (
+    cd "$repo_root"
+    git ls-files -co --exclude-standard -z > "$source_list"
+    ssh "$linux_remote" "rm -rf $remote_dir_q && mkdir -p $remote_dir_q"
+    COPYFILE_DISABLE=1 tar --no-xattrs --null -T "$source_list" -czf - \
+      | ssh "$linux_remote" "tar -xzf - -C $remote_dir_q"
+  )
+  rm -f "$source_list"
+
+  ssh "$linux_remote" \
+    "cd $remote_dir_q && RUSTORY_BUILD_REVISION=$(sh_quote "$build_revision") RUSTORY_BUILD_REVISION_SOURCE=$(sh_quote "$build_source") RUSTORY_BUILD_DIRTY=$(sh_quote "$build_dirty") cargo build --release --locked --bin rr"
+
+  mkdir -p "$(dirname "$binary_path")"
+  scp "$linux_remote:$remote_dir/target/release/rr" "$binary_path" >/dev/null
+
+  if [[ "${RUSTORY_RELEASE_LINUX_REMOTE_KEEP:-0}" != "1" ]]; then
+    ssh "$linux_remote" "rm -rf $remote_dir_q" >/dev/null 2>&1 || true
+  fi
+}
+
+linux_platform=""
+if linux_platform="$(linux_platform_for_target "$target")"; then
+  case "$linux_builder" in
+    auto)
+      if [[ "$host_target" == "$target" ]]; then
+        build_with_cargo
+      elif [[ -n "$linux_remote" ]]; then
+        echo "linux_builder=ssh remote=$linux_remote"
+        build_linux_with_ssh
+      else
+        echo "linux_builder=docker platform=$linux_platform"
+        build_linux_with_docker "$linux_platform"
+      fi
+      ;;
+    host)
+      build_with_cargo
+      ;;
+    docker)
+      echo "linux_builder=docker platform=$linux_platform"
+      build_linux_with_docker "$linux_platform"
+      ;;
+    ssh)
+      echo "linux_builder=ssh remote=$linux_remote"
+      build_linux_with_ssh
+      ;;
+    *)
+      echo "unknown --linux-builder: $linux_builder" >&2
+      exit 2
+      ;;
+  esac
+else
+  build_with_cargo
+fi
 
 install -m 755 "$binary_path" "$dist_path/$asset_name"
 

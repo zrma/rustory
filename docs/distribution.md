@@ -59,8 +59,10 @@ scripts/release-version.sh --profile daily-driver --gate none
 
 같은 턴에서 source 검증까지 release script가 책임져야 하면 `--gate full --work-id <work-id>`를 쓴다.
 기본 gate는 이미 main 출고 검증이 끝난 직후의 asset publish를 빠르게 하기 위해 `quick`이다.
-cross target build는 host toolchain/linker 준비 상태에 의존한다. macOS에서 Linux asset build가 실패하면
-Linux builder에서 해당 target을 먼저 staging하고, upload 단계에서는 `--skip-build --dist-dir <dir>`를 사용한다.
+Linux target은 현재 host와 target이 같으면 로컬에서 빌드한다. macOS 같은 non-Linux host에서는
+`RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`가 설정되어 있으면 native Linux SSH builder를 먼저 쓰고,
+없으면 Docker buildx로 빌드한다. Docker/qemu가 불안정하거나 별도 cross C toolchain을 쓰려면 각각
+`RUSTORY_RELEASE_LINUX_BUILDER=ssh` 또는 `RUSTORY_RELEASE_LINUX_BUILDER=host`를 명시한다.
 
 `--skip-upload`은 asset/checksum만 만들고 GitHub Release는 건드리지 않는다.
 `--dry-run`은 release plan과 실행할 명령만 출력한다.
