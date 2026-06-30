@@ -149,6 +149,7 @@ rr init --tracker-token "$RUSTORY_TRACKER_TOKEN" --trackers "<tracker-url>"
 rr update
 rr update --version v1.0.10
 rr update --dry-run
+rr update --no-restart-daemon
 ```
 
 기본값은 `zrma/rustory` GitHub Releases의 `latest` asset이다.
@@ -160,7 +161,19 @@ rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256
 ```
 
 `rr update`는 binary를 임시 파일로 다운로드하고 checksum을 검증한 뒤,
-다운로드한 binary의 `rr version` 실행이 성공할 때만 설치 경로를 교체한다.
+다운로드한 binary의 `rr version` 실행이 성공할 때만 설치 경로를 교체한다. 다운로드한
+asset이 현재 설치된 파일과 byte-identical이면 교체하지 않고 daemon 재시작도 생략한다.
+파일이 바뀐 경우에는 기본적으로 관리 중인 daemon을 재시작한다.
+
+- macOS: `com.rustory.daemon` launchd user agent가 있으면 `launchctl kickstart -k`로 재시작한다.
+- Linux systemd-user: `~/.config/systemd/user/rustory.service`가 있으면 `systemctl --user restart`를 시도한다.
+- Linux container/background fallback: systemd user bus가 없거나 fallback pid가 있으면
+  `~/.local/state/rustory/daemon.pid`의 기존 process를 종료하고 새 binary로 `rr daemon`을 다시 띄운다.
+
+자동 재시작을 원하지 않으면 `--no-restart-daemon`을 사용한다. one-shot installer를
+`--install-daemon`과 함께 다시 실행하는 경우에도 service 파일을 갱신하고 시작 경로를 다시 밟으므로,
+systemd-user/launchd에서는 재시작되고 Linux systemd user bus가 없는 환경에서는 background fallback이
+새 binary로 재시작된다.
 
 ## Linux user service caveat
 

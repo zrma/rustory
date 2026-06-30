@@ -19,6 +19,7 @@ import hashlib
 import ipaddress
 import os
 import platform
+import signal
 import stat
 import subprocess
 import sys
@@ -302,6 +303,13 @@ def normalize_sha256(value: str) -> str:
 
 def install_binary(data: bytes, install_path: Path) -> None:
     install_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if install_path.exists() and install_path.read_bytes() == data:
+            print(f"binary=unchanged path={install_path}")
+            return
+    except OSError:
+        pass
+
     fd, tmp_name = tempfile.mkstemp(prefix=f".{install_path.name}.", dir=str(install_path.parent))
     tmp_path = Path(tmp_name)
     try:
@@ -311,6 +319,7 @@ def install_binary(data: bytes, install_path: Path) -> None:
             os.fsync(file.fileno())
         tmp_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
         os.replace(tmp_path, install_path)
+        print(f"binary=updated path={install_path}")
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
@@ -576,7 +585,7 @@ def install_systemd_user_daemon(daemon_args: list[str], start: bool, args: argpa
             except subprocess.CalledProcessError as exc:
                 if systemd_user_bus_unavailable(exc):
                     print_systemd_user_start_deferred(step[0], exc)
-                    start_background_daemon(daemon_args)
+                    start_background_daemon(daemon_args, restart=True)
                     install_background_daemon_autostart(daemon_args, args)
                     return
                 print_systemd_user_failure(step[0], exc)
@@ -638,7 +647,7 @@ def one_line_process_output(exc: subprocess.CalledProcessError) -> str:
     return " ".join((exc.stderr or exc.stdout or str(exc)).split())
 
 
-def start_background_daemon(daemon_args: list[str]) -> None:
+def start_background_daemon(daemon_args: list[str], restart: bool = False) -> None:
     state_dir = rustory_state_dir()
     state_dir.mkdir(parents=True, exist_ok=True)
     pid_path = state_dir / "daemon.pid"
@@ -646,8 +655,11 @@ def start_background_daemon(daemon_args: list[str]) -> None:
 
     existing_pid = read_pid_file(pid_path)
     if existing_pid and pid_is_running(existing_pid):
-        print(f"daemon=started manager=background status=already_running pid={existing_pid} log={log_path}")
-        return
+        if not restart:
+            print(f"daemon=started manager=background status=already_running pid={existing_pid} log={log_path}")
+            return
+        print(f"daemon=stopping manager=background pid={existing_pid}")
+        stop_background_daemon(existing_pid)
 
     with log_path.open("ab") as log_file:
         proc = subprocess.Popen(
@@ -674,8 +686,26 @@ def start_background_daemon(daemon_args: list[str]) -> None:
             print(f"daemon=failed_detail {detail}", file=sys.stderr)
         raise SystemExit(exit_code)
 
-    print(f"daemon=started manager=background pid={proc.pid} log={log_path}")
+    action = "restarted" if restart else "started"
+    print(f"daemon={action} manager=background pid={proc.pid} log={log_path}")
     print("daemon=start_note manager=background persistence=until_process_exit_or_reboot")
+
+
+def stop_background_daemon(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise SystemExit(f"daemon=failed manager=background step=stop pid={pid} detail={exc}") from exc
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if not pid_is_running(pid):
+            return
+        time.sleep(0.1)
+
+    raise SystemExit(f"daemon=failed manager=background step=stop pid={pid} detail=timeout_after_sigterm")
 
 
 def install_background_daemon_autostart(daemon_args: list[str], args: argparse.Namespace) -> None:

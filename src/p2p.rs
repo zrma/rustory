@@ -277,7 +277,11 @@ fn build_rustory_swarm_with_identity(
         format!("rustory/{}", crate::build_info::VERSION),
         local_public_key,
     )
-    .with_agent_version(format!("rustory/{}", crate::build_info::VERSION_DISPLAY));
+    .with_agent_version(format!("rustory/{}", crate::build_info::VERSION_DISPLAY))
+    // Rustory 실사용 동기화는 tracker + relay를 우선한다. 임시 local listen 주소를
+    // peer에게 광고하면 DCUtR가 NAT/router 밖에서 의미 없는 loopback/private 후보
+    // 다이얼을 반복할 수 있다.
+    .with_hide_listen_addrs(true);
 
     let behaviour = RustoryBehaviour {
         relay: relay_behaviour,

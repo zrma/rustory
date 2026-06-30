@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 
 pub const DEFAULT_RELEASE_REPO: &str = "zrma/rustory";
 
@@ -20,6 +24,7 @@ pub struct UpdateRequest {
     pub sha256: Option<String>,
     pub install_path: Option<PathBuf>,
     pub dry_run: bool,
+    pub restart_daemon: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +65,23 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
         .with_context(|| format!("download release asset: {}", plan.asset_url))?;
     let expected = resolve_expected_sha256(&request, &plan)?;
     verify_sha256(&bytes, &expected)?;
+
+    if installed_binary_matches(&plan.install_path, &bytes)? {
+        println!(
+            "update: installed binary already matches downloaded asset; no replacement performed"
+        );
+        println!("daemon=restart_skipped reason=binary_unchanged");
+        return Ok(());
+    }
+
     install_binary(&bytes, &plan.install_path)?;
 
     println!("updated rr: {}", plan.install_path.display());
+    if request.restart_daemon {
+        restart_managed_daemon(&plan.install_path);
+    } else {
+        println!("daemon=restart_skipped reason=--no-restart-daemon");
+    }
     Ok(())
 }
 
@@ -274,6 +293,16 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
     Ok(())
 }
 
+fn installed_binary_matches(install_path: &Path, bytes: &[u8]) -> Result<bool> {
+    match std::fs::read(install_path) {
+        Ok(existing) => Ok(existing == bytes),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => {
+            Err(err).with_context(|| format!("read installed binary: {}", install_path.display()))
+        }
+    }
+}
+
 fn install_binary(bytes: &[u8], install_path: &Path) -> Result<()> {
     let parent = install_path
         .parent()
@@ -310,6 +339,294 @@ fn install_binary(bytes: &[u8], install_path: &Path) -> Result<()> {
     }
     result.with_context(|| format!("install downloaded binary to {}", install_path.display()))?;
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DaemonRestartStatus {
+    Restarted,
+    Skipped,
+    Failed(String),
+}
+
+fn restart_managed_daemon(install_path: &Path) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = install_path;
+
+    #[cfg(target_os = "macos")]
+    {
+        match restart_launchd_daemon() {
+            DaemonRestartStatus::Restarted => return,
+            DaemonRestartStatus::Failed(error) => {
+                println!("warn: daemon restart failed manager=launchd detail={error}");
+                return;
+            }
+            DaemonRestartStatus::Skipped => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let systemd_bus_unavailable = match restart_systemd_user_daemon() {
+            DaemonRestartStatus::Restarted => return,
+            DaemonRestartStatus::Failed(error) if systemd_user_bus_unavailable_text(&error) => {
+                println!(
+                    "daemon=restart_deferred manager=systemd-user reason=user_bus_unavailable"
+                );
+                true
+            }
+            DaemonRestartStatus::Failed(error) => {
+                println!("warn: daemon restart failed manager=systemd-user detail={error}");
+                false
+            }
+            DaemonRestartStatus::Skipped => false,
+        };
+
+        match restart_background_daemon(install_path, systemd_bus_unavailable) {
+            DaemonRestartStatus::Restarted => return,
+            DaemonRestartStatus::Failed(error) => {
+                println!("warn: daemon restart failed manager=background detail={error}");
+                return;
+            }
+            DaemonRestartStatus::Skipped => {}
+        }
+    }
+
+    println!("daemon=restart_skipped reason=no_managed_daemon_detected");
+}
+
+#[cfg(target_os = "macos")]
+fn restart_launchd_daemon() -> DaemonRestartStatus {
+    let label = "com.rustory.daemon";
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{label}");
+    let plist_path = home_dir()
+        .join("Library/LaunchAgents")
+        .join(format!("{label}.plist"));
+    if !plist_path.exists()
+        && !process_status(ProcessCommand::new("launchctl").arg("print").arg(&target))
+    {
+        return DaemonRestartStatus::Skipped;
+    }
+
+    let output = ProcessCommand::new("launchctl")
+        .arg("kickstart")
+        .arg("-k")
+        .arg(&target)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            println!("daemon=restarted manager=launchd label={label}");
+            DaemonRestartStatus::Restarted
+        }
+        Ok(output) => DaemonRestartStatus::Failed(one_line_output(&output)),
+        Err(err) => DaemonRestartStatus::Failed(err.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restart_systemd_user_daemon() -> DaemonRestartStatus {
+    let unit_path = home_dir().join(".config/systemd/user/rustory.service");
+    if !unit_path.exists() {
+        return DaemonRestartStatus::Skipped;
+    }
+
+    for args in [
+        ["--user", "daemon-reload"],
+        ["--user", "restart", "rustory.service"],
+    ] {
+        let output = ProcessCommand::new("systemctl").args(args).output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => return DaemonRestartStatus::Failed(one_line_output(&output)),
+            Err(err) => return DaemonRestartStatus::Failed(err.to_string()),
+        }
+    }
+    println!("daemon=restarted manager=systemd-user unit=rustory.service");
+    DaemonRestartStatus::Restarted
+}
+
+#[cfg(target_os = "linux")]
+fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRestartStatus {
+    let state_dir = rustory_state_dir();
+    let pid_path = state_dir.join("daemon.pid");
+    let log_path = state_dir.join("daemon.log");
+    let pid = read_pid_file(&pid_path);
+
+    if !force_start && pid.is_none() {
+        return DaemonRestartStatus::Skipped;
+    }
+
+    if let Some(pid) = pid {
+        if pid_is_running(pid) {
+            println!("daemon=stopping manager=background pid={pid}");
+            if let Err(err) = terminate_pid(pid) {
+                return DaemonRestartStatus::Failed(format!("terminate pid {pid}: {err}"));
+            }
+            if !wait_pid_stopped(pid, Duration::from_secs(5)) {
+                return DaemonRestartStatus::Failed(format!(
+                    "pid {pid} did not stop after SIGTERM"
+                ));
+            }
+        }
+    }
+
+    if let Err(err) = std::fs::create_dir_all(&state_dir) {
+        return DaemonRestartStatus::Failed(format!(
+            "create state dir {}: {err}",
+            state_dir.display()
+        ));
+    }
+
+    let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+        Ok(file) => file,
+        Err(err) => {
+            return DaemonRestartStatus::Failed(format!("open log {}: {err}", log_path.display()));
+        }
+    };
+    let stderr = match log_file.try_clone() {
+        Ok(file) => file,
+        Err(err) => return DaemonRestartStatus::Failed(format!("clone daemon log: {err}")),
+    };
+
+    let mut command = ProcessCommand::new(install_path);
+    command
+        .arg("daemon")
+        .arg("--interval-sec")
+        .arg("60")
+        .arg("--start-jitter-sec")
+        .arg("10")
+        .current_dir(home_dir())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr));
+
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    let child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return DaemonRestartStatus::Failed(format!(
+                "spawn {} daemon: {err}",
+                install_path.display()
+            ));
+        }
+    };
+    let pid = child.id();
+    if let Err(err) = std::fs::write(&pid_path, format!("{pid}\n")) {
+        return DaemonRestartStatus::Failed(format!("write pid {}: {err}", pid_path.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
+    }
+
+    println!(
+        "daemon=restarted manager=background pid={pid} log={}",
+        log_path.display()
+    );
+    DaemonRestartStatus::Restarted
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(target_os = "linux")]
+fn rustory_state_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".local/state"))
+        .join("rustory")
+}
+
+#[cfg(target_os = "linux")]
+fn read_pid_file(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+}
+
+#[cfg(target_os = "linux")]
+fn pid_is_running(pid: u32) -> bool {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if rc == 0 {
+        return true;
+    }
+    let err = std::io::Error::last_os_error();
+    err.raw_os_error() != Some(libc::ESRCH)
+}
+
+#[cfg(target_os = "linux")]
+fn terminate_pid(pid: u32) -> std::io::Result<()> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(err)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_pid_stopped(pid: u32, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !pid_is_running(pid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !pid_is_running(pid)
+}
+
+#[cfg(target_os = "macos")]
+fn process_status(command: &mut ProcessCommand) -> bool {
+    command
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn one_line_output(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stderr.trim().is_empty() {
+        stdout.as_ref()
+    } else {
+        stderr.as_ref()
+    };
+    format!(
+        "exit={} {}",
+        output.status,
+        text.split_whitespace().collect::<Vec<_>>().join(" ")
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_bus_unavailable_text(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    text.contains("failed to connect to bus")
+        || text.contains("dbus_session_bus_address")
+        || text.contains("xdg_runtime_dir")
+        || text.contains("no medium found")
 }
 
 fn make_executable(path: &Path) -> Result<()> {
@@ -356,6 +673,7 @@ mod tests {
             sha256: None,
             install_path: Some(PathBuf::from("/tmp/rr")),
             dry_run: true,
+            restart_daemon: true,
         };
 
         let plan = build_update_plan(&request).unwrap();
@@ -381,6 +699,7 @@ mod tests {
             sha256: Some("0".repeat(64)),
             install_path: Some(PathBuf::from("/tmp/rr")),
             dry_run: true,
+            restart_daemon: true,
         };
 
         let plan = build_update_plan(&request).unwrap();
@@ -403,6 +722,7 @@ mod tests {
             sha256: None,
             install_path: Some(PathBuf::from("/tmp/rr")),
             dry_run: true,
+            restart_daemon: true,
         };
 
         assert!(build_update_plan(&request).is_err());
@@ -431,5 +751,36 @@ mod tests {
         let expected = sha256_hex(b"hello");
         assert!(verify_sha256(b"hello", &expected).is_ok());
         assert!(verify_sha256(b"hello", &"0".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn installed_binary_match_detects_identical_bytes() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"rr-binary").unwrap();
+
+        assert!(installed_binary_matches(temp.path(), b"rr-binary").unwrap());
+        assert!(!installed_binary_matches(temp.path(), b"other").unwrap());
+    }
+
+    #[test]
+    fn installed_binary_match_treats_missing_as_changed() {
+        let path = std::env::temp_dir().join(format!(
+            "rustory-missing-update-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        assert!(!installed_binary_matches(&path, b"rr-binary").unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_user_bus_detection_accepts_container_messages() {
+        assert!(systemd_user_bus_unavailable_text(
+            "Failed to connect to bus: $DBUS_SESSION_BUS_ADDRESS and $XDG_RUNTIME_DIR not defined"
+        ));
+        assert!(!systemd_user_bus_unavailable_text(
+            "Unit rustory.service not found"
+        ));
     }
 }

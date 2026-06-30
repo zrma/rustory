@@ -715,10 +715,19 @@ FROM (
 INSERT INTO peer_book(peer_id, addrs_json, user_id, device_id, last_seen)
 VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(peer_id) DO UPDATE SET
-  addrs_json = excluded.addrs_json,
-  user_id = excluded.user_id,
-  device_id = excluded.device_id,
-  last_seen = excluded.last_seen
+  addrs_json = CASE
+    WHEN excluded.last_seen >= peer_book.last_seen THEN excluded.addrs_json
+    ELSE peer_book.addrs_json
+  END,
+  user_id = CASE
+    WHEN excluded.last_seen >= peer_book.last_seen AND excluded.user_id IS NOT NULL THEN excluded.user_id
+    ELSE peer_book.user_id
+  END,
+  device_id = CASE
+    WHEN excluded.last_seen >= peer_book.last_seen AND excluded.device_id IS NOT NULL THEN excluded.device_id
+    ELSE peer_book.device_id
+  END,
+  last_seen = MAX(peer_book.last_seen, excluded.last_seen)
 "#,
                 params![
                     peer.peer_id,
@@ -1763,5 +1772,52 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].peer_id, "peer-c");
         assert_eq!(got[1].peer_id, "peer-b");
+    }
+
+    #[test]
+    fn peer_book_upsert_keeps_latest_device_metadata() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/198.51.100.1/tcp/1/p2p/peer-a".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("node1".to_string()),
+                last_seen_unix: 200,
+            })
+            .unwrap();
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/198.51.100.2/tcp/2/p2p/peer-a".to_string()],
+                user_id: None,
+                device_id: Some("stale-name".to_string()),
+                last_seen_unix: 100,
+            })
+            .unwrap();
+
+        let got = store.get_peer_book_peer("peer-a").unwrap().unwrap();
+        assert_eq!(got.addrs, vec!["/ip4/198.51.100.1/tcp/1/p2p/peer-a"]);
+        assert_eq!(got.user_id.as_deref(), Some("u1"));
+        assert_eq!(got.device_id.as_deref(), Some("node1"));
+        assert_eq!(got.last_seen_unix, 200);
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/198.51.100.3/tcp/3/p2p/peer-a".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("node1-x86_64".to_string()),
+                last_seen_unix: 300,
+            })
+            .unwrap();
+
+        let got = store.get_peer_book_peer("peer-a").unwrap().unwrap();
+        assert_eq!(got.addrs, vec!["/ip4/198.51.100.3/tcp/3/p2p/peer-a"]);
+        assert_eq!(got.user_id.as_deref(), Some("u1"));
+        assert_eq!(got.device_id.as_deref(), Some("node1-x86_64"));
+        assert_eq!(got.last_seen_unix, 300);
     }
 }

@@ -188,7 +188,8 @@ p2p_watch_start_jitter_sec = 10
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
   - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push 커서가 전진하지 않은 로컬 엔트리 수다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
   - `--watch`는 alternate screen TUI로 local-observed mesh map, traffic 요약, peer별 pull/push link 상태, outbound backlog progress, tracker 상태를 계속 갱신한다.
-  - watch 화면의 `peer → local`은 이 노드가 해당 peer에서 pull한 cursor/rate이고, `local → peer`는 이 노드의 로컬 엔트리를 해당 peer로 push해야 하는 backlog다. 다른 peer끼리 실제로 주고받는 global active flow는 아직 원격 daemon telemetry가 없으므로 표시하지 않는다.
+  - watch 화면의 `peer → local`은 이 노드가 해당 peer에서 pull한 cursor/rate이고, `local → peer`는 이 노드의 로컬 엔트리를 해당 peer로 push하는 상태다. 넓은 화면에서는 `push_cur`, `pending`, `drain/s`, `progress`가 별도 컬럼으로 표시된다.
+  - 다른 peer끼리 실제로 주고받는 global active flow는 아직 원격 daemon telemetry가 없으므로 표시하지 않는다.
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
   - 예시:
     - `rr sync-status`

@@ -428,6 +428,13 @@ enum Command {
             help = "Print the update plan without downloading or replacing rr"
         )]
         dry_run: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Do not restart a managed Rustory daemon after replacing rr"
+        )]
+        no_restart_daemon: bool,
     },
     #[command(about = "Print a bash or zsh shell hook")]
     Hook {
@@ -1127,6 +1134,7 @@ pub fn run() -> Result<()> {
             sha256,
             install_path,
             dry_run,
+            no_restart_daemon,
         } => {
             crate::self_update::run_update(crate::self_update::UpdateRequest {
                 version,
@@ -1137,6 +1145,7 @@ pub fn run() -> Result<()> {
                 sha256,
                 install_path: install_path.map(std::path::PathBuf::from),
                 dry_run,
+                restart_daemon: !no_restart_daemon,
             })?;
         }
         Command::Hook { shell } => {
@@ -3581,6 +3590,7 @@ fn render_traffic_panel(
     if let Some(view) = hottest {
         body.push(traffic_hot_line(
             &view.peer_name,
+            view.peer.push_cursor,
             view.peer.outbound_push_pending,
             inner_width,
         ));
@@ -3626,8 +3636,17 @@ fn traffic_backlog_line(progress: usize, pending: usize, inner_width: usize) -> 
     align_left_right(&left, &right, inner_width)
 }
 
-fn traffic_hot_line(peer_name: &str, pending: usize, inner_width: usize) -> String {
-    let right = format!("{} left", right_cell(&format_count_usize(pending), 7));
+fn traffic_hot_line(
+    peer_name: &str,
+    push_cursor: i64,
+    pending: usize,
+    inner_width: usize,
+) -> String {
+    let right = format!(
+        "cur {}  {} left",
+        right_cell(&format_count_i64(push_cursor), 7),
+        right_cell(&format_count_usize(pending), 7)
+    );
     let label_width = 9;
     let peer_width = inner_width
         .saturating_sub(label_width)
@@ -3656,17 +3675,96 @@ fn render_link_panel(
     panel_width: usize,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
-    let seen_col = 8;
+    let mut body = if inner_width >= 118 {
+        render_link_panel_wide(peer_views, inner_width)
+    } else {
+        render_link_panel_compact(peer_views, inner_width)
+    };
+
+    if peer_views.is_empty() {
+        body.push("no peers known yet; run rr daemon or p2p-serve + p2p-sync --push".to_string());
+    }
+
+    box_watch_panel("Links", panel_width, body)
+}
+
+fn render_link_panel_wide(
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    inner_width: usize,
+) -> Vec<String> {
+    const SEEN_COL: usize = 8;
+    const PULL_CURSOR_COL: usize = 10;
+    const PULL_RATE_COL: usize = 8;
+    const PUSH_CURSOR_COL: usize = 10;
+    const PENDING_COL: usize = 10;
+    const DRAIN_COL: usize = 8;
+    const PROGRESS_COL: usize = 24;
+    const COLUMN_GAPS: usize = 7;
+
+    let fixed_width = SEEN_COL
+        + PULL_CURSOR_COL
+        + PULL_RATE_COL
+        + PUSH_CURSOR_COL
+        + PENDING_COL
+        + DRAIN_COL
+        + PROGRESS_COL
+        + COLUMN_GAPS;
+    let peer_col = inner_width.saturating_sub(fixed_width).max(18);
+
+    let mut body = Vec::new();
+    body.push(format!(
+        "{} {} {} {} {} {} {} {}",
+        fit_cell("peer", peer_col),
+        right_cell("seen", SEEN_COL),
+        right_cell("pull_cur", PULL_CURSOR_COL),
+        right_cell("pull/s", PULL_RATE_COL),
+        right_cell("push_cur", PUSH_CURSOR_COL),
+        right_cell("pending", PENDING_COL),
+        right_cell("drain/s", DRAIN_COL),
+        fit_cell("progress", PROGRESS_COL),
+    ));
+    body.push("─".repeat(inner_width));
+
+    for view in peer_views {
+        let peer = view.peer;
+        let last_seen = peer
+            .last_seen_age_sec
+            .map(|age| format!("{age}s"))
+            .unwrap_or_else(|| "-".to_string());
+        body.push(format!(
+            "{} {} {} {} {} {} {} {}",
+            fit_cell(&view.peer_name, peer_col),
+            right_cell(&last_seen, SEEN_COL),
+            right_cell(&format_count_i64(peer.pull_cursor), PULL_CURSOR_COL),
+            right_cell(&format_rate(view.rates.pull_per_sec), PULL_RATE_COL),
+            right_cell(&format_count_i64(peer.push_cursor), PUSH_CURSOR_COL),
+            right_cell(&format_count_usize(peer.outbound_push_pending), PENDING_COL),
+            right_cell(
+                &format_rate(view.rates.pending_drain_per_sec.max(0.0)),
+                DRAIN_COL
+            ),
+            link_push_progress_line(view.progress, PROGRESS_COL),
+        ));
+    }
+
+    body
+}
+
+fn render_link_panel_compact(
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    inner_width: usize,
+) -> Vec<String> {
+    let seen_col = 7;
     let variable_width = inner_width.saturating_sub(seen_col + 3);
-    let peer_col = (variable_width / 3).clamp(20, 34);
-    let pull_col = (variable_width / 4).clamp(20, 30);
-    let push_col = variable_width.saturating_sub(peer_col + pull_col).max(20);
+    let peer_col = (variable_width / 4).clamp(18, 28);
+    let pull_col = (variable_width / 4).clamp(18, 26);
+    let push_col = variable_width.saturating_sub(peer_col + pull_col).max(32);
 
     let mut body = Vec::new();
     body.push(format!(
         "{} {} {} {}",
         fit_cell("peer", peer_col),
-        fit_cell("seen", seen_col),
+        right_cell("seen", seen_col),
         fit_cell("peer → local", pull_col),
         fit_cell("local → peer", push_col)
     ));
@@ -3679,11 +3777,16 @@ fn render_link_panel(
             .map(|age| format!("{age}s"))
             .unwrap_or_else(|| "-".to_string());
         let pull = format!(
-            "← {:>7}/s cur {}",
-            format_rate(view.rates.pull_per_sec),
-            format_count_i64(peer.pull_cursor)
+            "cur {} {}/s",
+            format_count_i64(peer.pull_cursor),
+            format_rate(view.rates.pull_per_sec)
         );
-        let push = link_push_line(view.progress, peer.outbound_push_pending, push_col);
+        let push = format!(
+            "cur {} pend {} {}",
+            format_count_i64(peer.push_cursor),
+            format_count_usize(peer.outbound_push_pending),
+            link_push_progress_line(view.progress, 12),
+        );
         body.push(format!(
             "{} {} {} {}",
             fit_cell(&view.peer_name, peer_col),
@@ -3693,20 +3796,16 @@ fn render_link_panel(
         ));
     }
 
-    if peer_views.is_empty() {
-        body.push("no peers known yet; run rr daemon or p2p-serve + p2p-sync --push".to_string());
-    }
-
-    box_watch_panel("Links", panel_width, body)
+    body
 }
 
-fn link_push_line(progress: usize, pending: usize, width: usize) -> String {
-    let left = format!("→ [{}]", progress_bar(progress, 12));
-    let right = format!(
-        "{} {} left",
-        right_cell(&format!("{progress}%"), 5),
-        right_cell(&format_count_usize(pending), 7)
-    );
+fn link_push_progress_line(progress: usize, width: usize) -> String {
+    if width < 8 {
+        return truncate_display(&format!("{progress}%"), width);
+    }
+    let bar_width = width.saturating_sub(8).clamp(4, 18);
+    let left = format!("[{}]", progress_bar(progress, bar_width));
+    let right = right_cell(&format!("{progress}%"), 5);
     align_left_right(&left, &right, width)
 }
 
@@ -5161,6 +5260,7 @@ mod tests {
             "https://example.test/releases/v1.0.2",
             "--install-path",
             "/tmp/rr",
+            "--no-restart-daemon",
             "--dry-run",
         ]);
 
@@ -5171,6 +5271,7 @@ mod tests {
                 asset_base_url,
                 install_path,
                 dry_run,
+                no_restart_daemon,
                 ..
             } => {
                 assert_eq!(version, "v1.0.2");
@@ -5181,6 +5282,7 @@ mod tests {
                 );
                 assert_eq!(install_path.as_deref(), Some("/tmp/rr"));
                 assert!(*dry_run);
+                assert!(*no_restart_daemon);
             }
             _ => panic!("expected update"),
         }
@@ -6075,8 +6177,13 @@ mod tests {
         assert!(frame.contains("Mesh Map"));
         assert!(frame.contains("Traffic"));
         assert!(frame.contains("Links"));
-        assert!(frame.contains("peer → local"));
-        assert!(frame.contains("local → peer"));
+        assert!(frame.contains("pull_cur"));
+        assert!(frame.contains("pull/s"));
+        assert!(frame.contains("push_cur"));
+        assert!(frame.contains("pending"));
+        assert!(frame.contains("drain/s"));
+        assert!(frame.contains("2.3k"));
+        assert!(frame.contains("2.0M"));
         assert!(frame.contains("◇"));
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
@@ -6087,15 +6194,15 @@ mod tests {
     #[test]
     fn sync_status_watch_status_lines_align_right_columns() {
         let backlog = traffic_backlog_line(5, 16, 52);
-        let hot = traffic_hot_line("node0 12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR", 13, 52);
-        let push = link_push_line(100, 0, 44);
+        let hot = traffic_hot_line("node0 12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR", 1_968_089, 13, 52);
+        let progress = link_push_progress_line(66, 24);
 
         assert_eq!(unicode_width::UnicodeWidthStr::width(backlog.as_str()), 52);
         assert_eq!(unicode_width::UnicodeWidthStr::width(hot.as_str()), 52);
-        assert_eq!(unicode_width::UnicodeWidthStr::width(push.as_str()), 44);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(progress.as_str()), 24);
         assert!(backlog.ends_with("   5%      16 left"));
-        assert!(hot.ends_with("     13 left"));
-        assert!(push.ends_with(" 100%       0 left"));
+        assert!(hot.ends_with("cur    2.0M       13 left"));
+        assert!(progress.ends_with("  66%"));
     }
 
     #[test]

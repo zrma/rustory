@@ -42,6 +42,12 @@ systemctl --user status rustory.service
 lifetime 동안 grid presence를 유지하고, 재시작 뒤에는 다음 interactive shell startup에서
 자동 복구된다. shell이 한 번도 열리지 않으면 daemon도 자동으로 떠 있지 않다.
 
+`rr update`는 새 release asset이 현재 설치 파일과 다를 때 기본적으로 관리 중인 daemon을
+재시작한다. macOS launchd, Linux systemd-user, Linux background fallback pid 파일을 순서대로
+처리하므로 일반 업데이트 뒤에 수동 재시작을 별도로 기억할 필요는 없다. 단,
+`rr update --no-restart-daemon`을 사용했거나 service/fallback이 아직 설치되지 않은 머신에서는
+아래 플랫폼별 수동 명령으로 직접 재시작한다.
+
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
   - `trackers`, `relay_addr`, `swarm_key_path`, `p2p_identity_key_path`, `tracker_token` 등
