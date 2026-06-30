@@ -2,7 +2,7 @@
 
 - Audience: Rustory 운영자, release 관리자
 - Owner: Rustory
-- Last Verified: 2026-06-29
+- Last Verified: 2026-06-30
 
 이 문서는 Rustory binary 배포, 신규 디바이스 온보딩, self-update 경로를 정리한다.
 private tracker 주소, token, registry, k8s/NAS 경로는 public repo에 기록하지 않는다.
@@ -60,9 +60,12 @@ scripts/release-version.sh --profile daily-driver --gate none
 같은 턴에서 source 검증까지 release script가 책임져야 하면 `--gate full --work-id <work-id>`를 쓴다.
 기본 gate는 이미 main 출고 검증이 끝난 직후의 asset publish를 빠르게 하기 위해 `quick`이다.
 Linux target은 현재 host와 target이 같으면 로컬에서 빌드한다. macOS 같은 non-Linux host에서는
-`RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`가 설정되어 있으면 native Linux SSH builder를 먼저 쓰고,
-없으면 Docker buildx로 빌드한다. Docker/qemu가 불안정하거나 별도 cross C toolchain을 쓰려면 각각
-`RUSTORY_RELEASE_LINUX_BUILDER=ssh` 또는 `RUSTORY_RELEASE_LINUX_BUILDER=host`를 명시한다.
+`zig`가 있으면 Zig cross C toolchain을 먼저 써서 remote builder의 glibc version을 release asset에
+묶지 않는다. baseline override가 필요하면 `RUSTORY_RELEASE_ZIG_GLIBC=<glibc-version>`을 지정한다.
+Zig가 없고 `RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`가 설정되어 있으면 native Linux SSH builder를 쓰며,
+마지막 fallback은 Docker buildx다. 빌더를 고정해야 하면 `RUSTORY_RELEASE_LINUX_BUILDER=zig|ssh|docker|host`
+또는 `--linux-builder zig|ssh|docker|host`를 명시한다. 실제 옵션/default는
+`scripts/build-release-assets.sh --help`와 스크립트 본문을 기준으로 한다.
 
 `--skip-upload`은 asset/checksum만 만들고 GitHub Release는 건드리지 않는다.
 `--dry-run`은 release plan과 실행할 명령만 출력한다.

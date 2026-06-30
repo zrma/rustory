@@ -309,8 +309,17 @@ verify_update_plan() {
   if [[ "$VERIFY_UPDATE" -eq 0 || "$SKIP_UPLOAD" -eq 1 ]]; then
     return 0
   fi
-  if command -v rr >/dev/null 2>&1; then
-    run_argv rr update --repo "$REPO" --version "$TAG" --dry-run
+  local verifier=""
+  local staged_current_asset="$DIST_PATH/rr-$(current_target)"
+
+  if [[ -x "$staged_current_asset" ]]; then
+    verifier="$staged_current_asset"
+  elif command -v rr >/dev/null 2>&1; then
+    verifier="$(command -v rr)"
+  fi
+
+  if [[ -n "$verifier" ]]; then
+    run_argv "$verifier" update --repo "$REPO" --version "$TAG" --dry-run
   else
     warn "skip rr update verification: rr not found in PATH"
   fi

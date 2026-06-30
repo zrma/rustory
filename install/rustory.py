@@ -310,13 +310,24 @@ def install_binary(data: bytes, install_path: Path) -> None:
 
 
 def verify_binary(install_path: Path) -> None:
-    output = subprocess.run(
-        [str(install_path), "version"],
-        check=True,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    )
+    try:
+        output = subprocess.run(
+            [str(install_path), "version"],
+            check=True,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        print(f"binary_check=failed exit_code={exc.returncode}", file=sys.stderr)
+        if exc.stdout:
+            print("binary_check_stdout:", file=sys.stderr)
+            print(exc.stdout.rstrip(), file=sys.stderr)
+        if exc.stderr:
+            print("binary_check_stderr:", file=sys.stderr)
+            print(exc.stderr.rstrip(), file=sys.stderr)
+        raise SystemExit(exc.returncode) from exc
+
     first_line = output.stdout.splitlines()[0] if output.stdout.splitlines() else "version output unavailable"
     print(f"binary_check={first_line}")
 

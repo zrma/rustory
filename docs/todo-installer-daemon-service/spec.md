@@ -9,7 +9,7 @@
 
 - 목표: installer가 macOS/Linux user service를 설치하고, public relay 주소를 기준으로 운영 문서와 진단 경고를 맞춘다.
 - 범위: installer, CLI doctor 경고, DNS relay multiaddr transport, public 문서, private install archive 갱신.
-- 검증 명령: `python3 -m py_compile install/rustory.py`, `cargo test relay_addr_warning_flags_tailnet_and_private_addresses`, `scripts/check.sh --fast`, `scripts/run-manifest-checks.sh --mode quick --work-id installer-daemon-service`.
+- 검증 명령: `python3 -m py_compile install/rustory.py`, `RUSTORY_RELEASE_LINUX_BUILDER=zig scripts/build-release-assets.sh --target x86_64-unknown-linux-gnu --dist-dir /tmp/rustory-release-portable-linux`, `cargo test relay_addr_warning_flags_tailnet_and_private_addresses`, `scripts/check.sh --fast`, `scripts/run-manifest-checks.sh --mode quick --work-id installer-daemon-service`.
 - 완료 기준: C-체크리스트 항목이 `done` 상태가 되고 검증 명령이 재현 가능하게 남는다. 단, 외부 라우터/NAT L4 포워딩처럼 이 repo에서 직접 소유하지 않는 운영 작업은 후속 체크포인트로 남긴다.
 
 ## C-체크리스트
@@ -23,10 +23,12 @@
 | C5 | done | codex | `scripts/run-manifest-checks.sh --mode quick --work-id installer-daemon-service` | one-shot install 문서가 hook + daemon + Hishtory import + public relay 주소를 기준으로 갱신된다. |
 | C6 | done | codex | `scripts/check.sh --fast` | fast checks와 관련 단위 테스트가 통과한다. |
 | C7 | todo | owner | `nc -vz -w 5 <public-relay-ip> 4001` | 클러스터 외부 인터넷에서 relay TCP/4001이 public IP를 통해 도달 가능한지 라우터/NAT/LB 경로를 확인한다. |
+| C8 | done | codex | `RUSTORY_RELEASE_LINUX_BUILDER=zig scripts/build-release-assets.sh --target x86_64-unknown-linux-gnu --dist-dir /tmp/rustory-release-portable-linux` | Linux x86_64 release asset이 remote builder glibc에 묶이지 않는 경로로 빌드된다. |
+| C9 | done | codex | `python3 -m py_compile install/rustory.py` | installer가 다운로드한 binary 검증 실패 시 `rr version`의 stdout/stderr를 숨기지 않고 출력한다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: C1-C6.
+- 완료: C1-C6, C8-C9.
 - 미완료: C7.
 - 다음 액션: release/push 후 private install archive를 public relay DNS 주소 기준으로 갱신한다. 외부 WAN L4 포워딩은 cluster/repo 내부 배포와 별도 운영 체크포인트로 확인한다.
-- 검증 증거: `python3 -m py_compile install/rustory.py`, `cargo fmt --all --check`, `cargo test relay_addr_warning_flags_tailnet_and_private_addresses`, `cargo test --workspace` (201 passed), `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check.sh --fast`, k8s `rustory-relay` Pod/Service Running, internal DNS `rustory-relay` TCP/4001 success, public WAN IP TCP/4001 refused.
+- 검증 증거: `python3 -m py_compile install/rustory.py`, `RUSTORY_RELEASE_LINUX_BUILDER=zig scripts/build-release-assets.sh --target x86_64-unknown-linux-gnu --dist-dir /tmp/rustory-release-portable-linux`, `strings /tmp/rustory-release-portable-linux/rr-x86_64-unknown-linux-gnu | rg GLIBC_ | sort -u` (max `GLIBC_2.17`), `cargo fmt --all --check`, `cargo test relay_addr_warning_flags_tailnet_and_private_addresses`, `cargo test --workspace` (212 passed), `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check.sh --fast`, k8s `rustory-relay` Pod/Service Running, internal DNS `rustory-relay` TCP/4001 success, public WAN IP TCP/4001 refused.

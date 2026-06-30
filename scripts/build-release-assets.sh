@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'USAGE'
 Usage:
-  scripts/build-release-assets.sh [--target current|TRIPLE] [--dist-dir DIR] [--linux-builder auto|host|docker|ssh]
+  scripts/build-release-assets.sh [--target current|TRIPLE] [--dist-dir DIR] [--linux-builder auto|host|zig|docker|ssh]
 
 Build the rr release binary for the requested target and write:
   DIR/rr-<target>
@@ -14,8 +14,11 @@ Build the rr release binary for the requested target and write:
 The updater and installer expect raw executable assets named rr-<target>.
 
 Linux targets default to the native host when target == host target. On
-non-Linux or cross-arch hosts, auto mode uses RUSTORY_RELEASE_LINUX_REMOTE as
-an SSH builder when set, otherwise Docker buildx. Set --linux-builder host, or
+non-Linux or cross-arch hosts, auto mode prefers Zig when available so release
+assets do not inherit the glibc version of an arbitrary remote builder. Set
+RUSTORY_RELEASE_ZIG_GLIBC=2.17 to override the default glibc baseline. When Zig
+is not available, auto uses RUSTORY_RELEASE_LINUX_REMOTE as an SSH builder when
+set, otherwise Docker buildx. Set --linux-builder host, or
 RUSTORY_RELEASE_LINUX_BUILDER=host, when a native cross C toolchain such as
 x86_64-linux-gnu-gcc is available.
 USAGE
@@ -182,6 +185,107 @@ build_linux_with_docker() {
   rm -rf "$docker_out" "$docker_config"
 }
 
+zig_target_for_linux_target() {
+  local glibc_baseline="${RUSTORY_RELEASE_ZIG_GLIBC:-2.17}"
+  case "$1" in
+    x86_64-unknown-linux-gnu) echo "x86_64-linux-gnu.$glibc_baseline" ;;
+    aarch64-unknown-linux-gnu) echo "aarch64-linux-gnu.$glibc_baseline" ;;
+    *) return 1 ;;
+  esac
+}
+
+build_linux_with_zig() {
+  local zig_bin=""
+  local zig_target=""
+  local tmp_dir=""
+  local zig_cc=""
+  local zig_cxx=""
+  local zig_ar=""
+  local zig_local_cache=""
+  local zig_global_cache=""
+  local target_env_upper=""
+  local target_env_lower=""
+
+  zig_bin="$(command -v zig || true)"
+  if [[ -z "$zig_bin" ]]; then
+    echo "zig is required for --linux-builder zig" >&2
+    return 1
+  fi
+
+  if ! zig_target="$(zig_target_for_linux_target "$target")"; then
+    echo "zig release builder does not support target: $target" >&2
+    return 1
+  fi
+
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/rustory-release-zig.XXXXXX")"
+  zig_cc="$tmp_dir/zig-cc"
+  zig_cxx="$tmp_dir/zig-cxx"
+  zig_ar="$tmp_dir/zig-ar"
+  zig_local_cache="${RUSTORY_RELEASE_ZIG_LOCAL_CACHE_DIR:-$tmp_dir/zig-local-cache}"
+  zig_global_cache="${RUSTORY_RELEASE_ZIG_GLOBAL_CACHE_DIR:-$tmp_dir/zig-global-cache}"
+  mkdir -p "$zig_local_cache" "$zig_global_cache"
+  cat > "$zig_cc" <<EOF
+#!/usr/bin/env bash
+args=()
+skip_next=0
+for arg in "\$@"; do
+  if (( skip_next == 1 )); then
+    skip_next=0
+    continue
+  fi
+  case "\$arg" in
+    --target=*) continue ;;
+    --target) skip_next=1; continue ;;
+  esac
+  args+=("\$arg")
+done
+exec $(sh_quote "$zig_bin") cc -target $(sh_quote "$zig_target") "\${args[@]}"
+EOF
+  cat > "$zig_cxx" <<EOF
+#!/usr/bin/env bash
+args=()
+skip_next=0
+for arg in "\$@"; do
+  if (( skip_next == 1 )); then
+    skip_next=0
+    continue
+  fi
+  case "\$arg" in
+    --target=*) continue ;;
+    --target) skip_next=1; continue ;;
+  esac
+  args+=("\$arg")
+done
+exec $(sh_quote "$zig_bin") c++ -target $(sh_quote "$zig_target") "\${args[@]}"
+EOF
+  cat > "$zig_ar" <<EOF
+#!/usr/bin/env bash
+exec $(sh_quote "$zig_bin") ar "\$@"
+EOF
+  chmod +x "$zig_cc" "$zig_cxx" "$zig_ar"
+
+  target_env_upper="$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')"
+  target_env_lower="$(printf '%s' "$target" | tr '-' '_')"
+
+  if ! (
+    cd "$repo_root"
+    rustory_require_cargo
+    env \
+      "CARGO_TARGET_${target_env_upper}_LINKER=$zig_cc" \
+      "CC_${target_env_lower}=$zig_cc" \
+      "CXX_${target_env_lower}=$zig_cxx" \
+      "AR_${target_env_lower}=$zig_ar" \
+      "ZIG_LOCAL_CACHE_DIR=$zig_local_cache" \
+      "ZIG_GLOBAL_CACHE_DIR=$zig_global_cache" \
+      PKG_CONFIG_ALLOW_CROSS=1 \
+      cargo "${cargo_args[@]}"
+  ); then
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  rm -rf "$tmp_dir"
+}
+
 sh_quote() {
   local value="$1"
   printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
@@ -262,6 +366,9 @@ if linux_platform="$(linux_platform_for_target "$target")"; then
     auto)
       if [[ "$host_target" == "$target" ]]; then
         build_with_cargo
+      elif command -v zig >/dev/null 2>&1; then
+        echo "linux_builder=zig target=$(zig_target_for_linux_target "$target")"
+        build_linux_with_zig
       elif [[ -n "$linux_remote" ]]; then
         echo "linux_builder=ssh remote=$linux_remote"
         build_linux_with_ssh
@@ -272,6 +379,10 @@ if linux_platform="$(linux_platform_for_target "$target")"; then
       ;;
     host)
       build_with_cargo
+      ;;
+    zig)
+      echo "linux_builder=zig target=$(zig_target_for_linux_target "$target")"
+      build_linux_with_zig
       ;;
     docker)
       echo "linux_builder=docker platform=$linux_platform"
