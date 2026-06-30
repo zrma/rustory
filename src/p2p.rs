@@ -447,9 +447,13 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
             event = swarm.select_next_some() => {
                 match event {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        let full = ensure_p2p_suffix(address, local_peer_id);
+                        let Some(full) =
+                            tracker_announce_addr_from_listen_addr(address, local_peer_id)
+                        else {
+                            continue;
+                        };
                         println!("p2p listen: {}", full);
-                        known_addrs.insert(full.to_string());
+                        known_addrs.insert(full);
 
                         // 주소를 1개 이상 확보한 시점에 tracker에 즉시 등록한다.
                         if !trackers.is_empty() {
@@ -780,7 +784,7 @@ fn validate_push_provenance(entries: &[crate::core::Entry], peer: &AuthorizedPee
                 entry.user_id
             );
         }
-        if entry.device_id != device_id {
+        if !device_ids_match(&entry.device_id, device_id) {
             anyhow::bail!(
                 "entry device_id mismatch for peer {}: got={} want={device_id}",
                 peer.peer_id,
@@ -828,12 +832,11 @@ fn dialable_tracker_addr_from_external_candidate(
     addr: Multiaddr,
     peer_id: PeerId,
 ) -> Option<String> {
-    // `0.0.0.0/::` 및 relay circuit 주소는 direct dial 후보로 의미가 없다.
-    if addr.iter().any(|p| {
-        matches!(p, Protocol::Ip4(ip) if ip.is_unspecified())
-            || matches!(p, Protocol::Ip6(ip) if ip.is_unspecified())
-            || matches!(p, Protocol::P2pCircuit)
-    }) {
+    // tracker에 광고하는 direct 주소는 다른 NAT/WiFi 뒤 peer가 blind dial하는 표면이다.
+    // loopback/private/link-local/unspecified 및 relay circuit 주소는 direct 후보로 의미가 없다.
+    if is_disallowed_tracker_direct_addr(&addr)
+        || addr.iter().any(|p| matches!(p, Protocol::P2pCircuit))
+    {
         return None;
     }
 
@@ -1171,6 +1174,12 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
         };
         let (dial_addrs, target_relay_addr) =
             tracker_target_addrs(&peer.addrs, peer_id, &relay_addr);
+        if dial_addrs.is_empty() && target_relay_addr.is_none() {
+            eprintln!(
+                "warn: skip peer without dialable direct addr or relay reservation: {peer_id_str}"
+            );
+            continue;
+        }
         out.push(SyncTarget {
             peer_id,
             peer_key: peer_id_str,
@@ -1197,10 +1206,29 @@ fn sync_target_is_self(
     }
     match (peer_device_id, local_device_id) {
         (Some(peer_device_id), Some(local_device_id)) => {
-            peer_device_id.trim() == local_device_id.trim()
+            device_ids_match(peer_device_id, local_device_id)
         }
         _ => false,
     }
+}
+
+fn device_ids_match(a: &str, b: &str) -> bool {
+    let a = canonical_device_id(a);
+    let b = canonical_device_id(b);
+    !a.is_empty() && a == b
+}
+
+fn canonical_device_id(value: &str) -> String {
+    let mut out = value.trim().to_string();
+    for suffix in [
+        "-x86_64", "-aarch64", "-arm64", "_x86_64", "_aarch64", "_arm64",
+    ] {
+        if let Some(stripped) = out.strip_suffix(suffix) {
+            out = stripped.to_string();
+            break;
+        }
+    }
+    out
 }
 
 fn tracker_target_addrs(
@@ -1213,10 +1241,12 @@ fn tracker_target_addrs(
         return (relay_addrs, None);
     }
 
-    (
-        direct_candidate_addrs_from_tracker(addrs),
-        Some(relay_addr.clone()),
-    )
+    let direct_addrs = direct_candidate_addrs_from_tracker(addrs);
+    if direct_addrs.is_empty() {
+        return (Vec::new(), None);
+    }
+
+    (direct_addrs, None)
 }
 
 fn relay_candidate_addrs_from_tracker(
@@ -1284,6 +1314,14 @@ fn direct_candidate_addrs_from_tracker(addrs: &[String]) -> Vec<Multiaddr> {
     }
 
     out
+}
+
+fn tracker_announce_addr_from_listen_addr(addr: Multiaddr, peer_id: PeerId) -> Option<String> {
+    if is_relay_circuit_addr(&addr) {
+        return Some(ensure_p2p_suffix(addr, peer_id).to_string());
+    }
+
+    dialable_tracker_addr_from_external_candidate(addr, peer_id)
 }
 
 fn is_disallowed_tracker_direct_addr(addr: &Multiaddr) -> bool {
@@ -1975,7 +2013,7 @@ mod tests {
     }
 
     #[test]
-    fn tracker_target_addrs_keeps_relay_first_fallback_for_direct_only_tracker_records() {
+    fn tracker_target_addrs_skips_private_direct_records_without_relay_reservation() {
         let peer_id = PeerId::random();
         let relay_id = PeerId::random();
         let configured_relay: Multiaddr = format!("/ip4/198.51.100.10/tcp/4001/p2p/{relay_id}")
@@ -1987,7 +2025,7 @@ mod tests {
             tracker_target_addrs(&[advertised_direct], peer_id, &configured_relay);
 
         assert!(dial_addrs.is_empty());
-        assert_eq!(relay_addr, Some(configured_relay));
+        assert!(relay_addr.is_none());
     }
 
     #[test]
@@ -2040,6 +2078,23 @@ mod tests {
     }
 
     #[test]
+    fn tracker_announce_addr_from_listen_addr_filters_local_direct_but_keeps_relay() {
+        let peer_id = PeerId::random();
+        let relay_id = PeerId::random();
+
+        let local: Multiaddr = "/ip4/127.0.0.1/tcp/1234".parse().unwrap();
+        assert!(tracker_announce_addr_from_listen_addr(local, peer_id).is_none());
+
+        let relay: Multiaddr =
+            format!("/dns4/rustory-relay.example/tcp/4001/p2p/{relay_id}/p2p-circuit")
+                .parse()
+                .unwrap();
+        let out = tracker_announce_addr_from_listen_addr(relay, peer_id).unwrap();
+        assert!(out.ends_with(&format!("/p2p/{peer_id}")));
+        assert!(out.contains("/p2p-circuit/"));
+    }
+
+    #[test]
     fn dialable_tracker_addr_from_external_candidate_overwrites_wrong_p2p_suffix() {
         let peer_id = PeerId::random();
         let other = PeerId::random();
@@ -2056,25 +2111,22 @@ mod tests {
         let store = LocalStore::open(":memory:").unwrap();
 
         let peer_id = PeerId::random().to_string();
+        let relay_id = PeerId::random();
+        let relay_addr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}");
         store
             .upsert_peer_book(&PeerBookPeer {
                 peer_id: peer_id.clone(),
-                addrs: vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+                addrs: vec![format!("{relay_addr}/p2p-circuit/p2p/{peer_id}")],
                 user_id: Some("u1".to_string()),
                 device_id: Some("dev-remote".to_string()),
                 last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
             })
             .unwrap();
 
-        let relay_id = PeerId::random();
         let cfg = SyncConfig {
             identity: libp2p::identity::Keypair::generate_ed25519(),
             psk: libp2p::pnet::PreSharedKey::new([0; 32]),
-            relay_addr: Some(
-                format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
-                    .parse()
-                    .unwrap(),
-            ),
+            relay_addr: Some(relay_addr.parse().unwrap()),
             // connection refused should fail fast on loopback.
             trackers: vec!["http://127.0.0.1:1".to_string()],
             tracker_token: None,
@@ -2087,8 +2139,33 @@ mod tests {
         let got = discover_targets(&store, &cfg).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].peer_key, peer_id);
-        assert!(got[0].dial_addrs.is_empty());
-        assert!(got[0].relay_addr.is_some());
+        assert_eq!(got[0].dial_addrs.len(), 1);
+        assert!(got[0].relay_addr.is_none());
+    }
+
+    #[test]
+    fn tracker_target_addrs_requires_dialable_direct_or_advertised_relay_reservation() {
+        let peer_id = PeerId::random();
+        let relay_id = PeerId::random();
+        let relay_addr: Multiaddr = format!("/ip4/203.0.113.10/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+
+        let (dial_addrs, relay_fallback) = tracker_target_addrs(
+            &[format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+            peer_id,
+            &relay_addr,
+        );
+        assert!(dial_addrs.is_empty());
+        assert!(relay_fallback.is_none());
+
+        let (dial_addrs, relay_fallback) = tracker_target_addrs(
+            &[format!("{relay_addr}/p2p-circuit/p2p/{peer_id}")],
+            peer_id,
+            &relay_addr,
+        );
+        assert_eq!(dial_addrs.len(), 1);
+        assert!(relay_fallback.is_none());
     }
 
     #[test]
@@ -2098,16 +2175,23 @@ mod tests {
         let local_peer_id = identity.public().to_peer_id().to_string();
         let stale_self_peer_id = PeerId::random().to_string();
         let remote_peer_id = PeerId::random().to_string();
+        let relay_id = PeerId::random();
+        let relay_addr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}");
 
         for (peer_id, device_id) in [
             (local_peer_id.clone(), "remote-looking-device"),
             (stale_self_peer_id, " dev-local "),
             (remote_peer_id.clone(), "dev-remote"),
         ] {
+            let addrs = if peer_id == remote_peer_id {
+                vec![format!("{relay_addr}/p2p-circuit/p2p/{peer_id}")]
+            } else {
+                vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")]
+            };
             store
                 .upsert_peer_book(&PeerBookPeer {
                     peer_id: peer_id.clone(),
-                    addrs: vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+                    addrs,
                     user_id: Some("u1".to_string()),
                     device_id: Some(device_id.to_string()),
                     last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
@@ -2115,15 +2199,10 @@ mod tests {
                 .unwrap();
         }
 
-        let relay_id = PeerId::random();
         let cfg = SyncConfig {
             identity,
             psk: libp2p::pnet::PreSharedKey::new([0; 32]),
-            relay_addr: Some(
-                format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
-                    .parse()
-                    .unwrap(),
-            ),
+            relay_addr: Some(relay_addr.parse().unwrap()),
             trackers: vec!["http://127.0.0.1:1".to_string()],
             tracker_token: None,
             user_id: Some("u1".to_string()),
@@ -2235,6 +2314,27 @@ mod tests {
     }
 
     #[test]
+    fn inbound_push_provenance_accepts_arch_suffix_device_renames() {
+        let authorized = AuthorizedPeer {
+            peer_id: "peer-1".to_string(),
+            user_id: Some("u1".to_string()),
+            device_id: Some("node1".to_string()),
+        };
+        let mut renamed = entry("id-1", 1, "echo ok");
+        renamed.user_id = "u1".to_string();
+        renamed.device_id = "node1-x86_64".to_string();
+
+        validate_push_provenance(&[renamed], &authorized).unwrap();
+
+        assert!(sync_target_is_self(
+            "peer-remote",
+            Some("node1-x86_64"),
+            "peer-local",
+            Some("node1")
+        ));
+    }
+
+    #[test]
     fn remote_pull_limit_is_clamped_before_storage_read() {
         assert_eq!(clamp_remote_pull_limit(0), 1);
         assert_eq!(clamp_remote_pull_limit(10), 10);
@@ -2249,14 +2349,21 @@ mod tests {
         let store = LocalStore::open(":memory:").unwrap();
 
         let valid_peer_id = PeerId::random().to_string();
+        let relay_id = PeerId::random();
+        let relay_addr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}");
         for (peer_id, user_id) in [
             ("not-a-peer-id".to_string(), "u1".to_string()),
             (valid_peer_id.clone(), "u1".to_string()),
         ] {
+            let addrs = if peer_id == valid_peer_id {
+                vec![format!("{relay_addr}/p2p-circuit/p2p/{peer_id}")]
+            } else {
+                vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")]
+            };
             store
                 .upsert_peer_book(&PeerBookPeer {
                     peer_id: peer_id.clone(),
-                    addrs: vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+                    addrs,
                     user_id: Some(user_id),
                     device_id: Some("dev-remote".to_string()),
                     last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
@@ -2264,15 +2371,10 @@ mod tests {
                 .unwrap();
         }
 
-        let relay_id = PeerId::random();
         let cfg = SyncConfig {
             identity: libp2p::identity::Keypair::generate_ed25519(),
             psk: libp2p::pnet::PreSharedKey::new([0; 32]),
-            relay_addr: Some(
-                format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
-                    .parse()
-                    .unwrap(),
-            ),
+            relay_addr: Some(relay_addr.parse().unwrap()),
             trackers: vec!["http://127.0.0.1:1".to_string()],
             tracker_token: None,
             user_id: Some("u1".to_string()),

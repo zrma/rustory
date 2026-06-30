@@ -52,7 +52,7 @@ lifetime 동안 grid presence를 유지하고, 재시작 뒤에는 다음 intera
 - `--push`는 **로컬 디바이스 엔트리만** 전송한다(`entry.device_id == local_device_id`).
 - `rr daemon` 중지(SIGTERM/Ctrl-C)는 하위 serve/sync 프로세스까지 종료한다.
 - 여러 디바이스가 같은 주기로 동시에 시작하면 요청이 몰릴 수 있으니, 필요하면 `--start-jitter-sec`을 켠다.
-- tracker-discovered peer가 여러 개일 때는 작은 self-hosted relay에 fan-out이 몰리지 않도록 `rr daemon` 기본값처럼 tick당 1 peer sync를 유지한다.
+- `rr daemon`은 큰 Hishtory import/backfill 수렴을 우선해 기본값으로 모든 tracker-discovered peer를 매 tick 시도한다. 작은 self-hosted relay에 fan-out이 몰리면 `--max-peers-per-tick <n>`으로 낮춘다.
 
 ## Enable 전 preflight
 
@@ -111,7 +111,7 @@ CLI로 다 넣는 형태(예시):
 rr --db-path "$HOME/.rustory/history.db" daemon \
   --interval-sec 60 \
   --start-jitter-sec 10 \
-  --max-peers-per-tick 1 \
+  --max-peers-per-tick 0 \
   --swarm-key "$HOME/.config/rustory/swarm.key" \
   --trackers "http://<tracker-host>:8850" \
   --relay "/dns4/<relay-host>/tcp/<port>/p2p/<relay_peer_id>"

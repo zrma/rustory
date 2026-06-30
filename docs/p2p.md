@@ -6,8 +6,9 @@
 ## 범위
 - 단계 1: 수동 multiaddr로 피어를 지정해 pull 기반 동기화를 수행한다.
 - 단계 2: tracker/relay(디스커버리 + 중계) 기반으로 peer 목록을 얻고,
-  - relay 주소가 설정되어 있으면 relay circuit을 우선 시도하고,
-  - relay 실패 시 tracker/peerbook의 direct 후보로 fallback 한다.
+  - peer가 tracker/peerbook에 relay circuit 주소를 광고했으면 configured relay 주소로 circuit을 우선 시도하고,
+  - relay reservation이 없는 peer는 configured relay를 억지로 붙여 dial하지 않으며,
+  - public direct 후보가 있는 경우에만 direct dial 후보로 사용한다.
 
 ## 운영 가이드(PoC vs 안정화)
 - PoC 단계에서는 tracker/relay를 로컬/임시로 띄워도 된다. 내려가면 동기화가 지연될 뿐이고, 로컬 DB가 source of truth라 데이터 유실은 없다.
@@ -80,10 +81,11 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync \
 ```
 
 `--peers`를 생략하면 tracker에서 peer 목록을 받아 동기화한다.
-이때 `--relay`가 설정되어 있으면 NAT/공유기 뒤 peer를 기본값으로 보고 relay circuit을 먼저 시도한다.
 tracker가 relay circuit 주소를 광고한 peer는 현재 sync 실행 환경에서 지정한 relay 주소로 다시 구성해 dial한다.
 이렇게 해야 tracker에 저장된 Docker/LAN/private IP가 현재 머신에서 직접 dial 불가능해도 같은 relay PeerId를 통해 연결할 수 있다.
-relay 연결이 실패하면 tracker/peerbook의 direct 후보로 fallback 하되, loopback/private/link-local 같은 주소는 blind dial 후보에서 제외한다.
+peer가 relay circuit 주소를 광고하지 않았고 public direct 후보도 없으면 그 peer는 이번 tick에서 건너뛴다.
+이는 relay에 reservation이 없는 destination을 계속 dial해 `Relay has no reservation for destination`으로 tick을 소모하는 것을 막기 위함이다.
+loopback/private/link-local 같은 주소는 tracker 광고와 blind direct dial 후보에서 제외한다.
 pull/push request-response도 timeout/connection closed 같은 일시 오류에 대해 재시도할 수 있다.
 현재 재시도 횟수, 타임아웃, 백오프 default는 `rr p2p-sync --help`, config resolver, 관련 코드를 확인한다.
 - CLI: `--req-attempts`, `--req-timeout-base-sec`, `--req-timeout-cap-sec`, `--req-backoff-base-ms`
@@ -96,7 +98,8 @@ pull/push request-response도 timeout/connection closed 같은 일시 오류에 
 tracker에서 발견한 모든 peer를 매 tick마다 동시에 dial하면 작은 relay에서 resource limit에 걸릴 수 있다.
 `--max-peers-per-tick <n>`으로 한 tick에 시도할 tracker-discovered peer 수를 제한할 수 있으며,
 `0`은 제한 없음이다. 수동 `--peers` 대상은 명시적 운영 의도이므로 이 제한을 적용하지 않는다.
-`rr daemon`은 daily-driver 기본값으로 sync tick당 tracker peer 1개만 시도한다.
+`rr daemon`은 daily-driver backfill 수렴을 우선해 기본값으로 모든 tracker-discovered peer를 시도한다.
+작은 relay에서 fan-out을 줄여야 하면 `--max-peers-per-tick <n>`을 명시한다.
 
 pull뿐 아니라 로컬 신규 엔트리를 peer로 업로드(push)하려면 `--push`를 켠다.
 이때 push는 **현재 디바이스의 엔트리만** 전송한다(`entry.device_id == local_device_id`).
@@ -107,8 +110,9 @@ push 응답(ack)에는 (가능하면) `inserted`/`ignored` 카운트가 포함�
 - pull: `p2p pull summary: <peer>: received=<n> inserted=<n> ignored=<n>`
 - push: `p2p push summary: <peer>: sent=<n> inserted=<n> ignored=<n>`
 
-`rr p2p-serve`는 listen 주소뿐 아니라 libp2p가 발견한 **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)도 tracker에 같이 등록한다.
-따라서 relay 실패 후 direct fallback 또는 DCUtR 업그레이드가 가능한 환경에서는 direct 경로도 활용할 수 있다.
+`rr p2p-serve`는 relay circuit listen 주소와 libp2p가 발견한 public **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)를 tracker에 등록한다.
+loopback/private/listen-only 주소는 tracker에 광고하지 않는다.
+따라서 relay reservation이 잡힌 peer는 relay 경로로, public direct fallback 또는 DCUtR 업그레이드가 가능한 환경에서는 direct 경로도 활용할 수 있다.
 
 ## Hole Punching(DCUtR)
 - relay 경유로 연결이 수립되면(libp2p `/p2p-circuit`), **가능하면 direct 연결로 업그레이드**(hole punching)한다.

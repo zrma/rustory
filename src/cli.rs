@@ -230,7 +230,7 @@ enum Command {
 
         #[arg(
             long,
-            default_value_t = 1,
+            default_value_t = 0,
             help = "Maximum tracker-discovered peers to sync per daemon tick; 0 means all peers"
         )]
         max_peers_per_tick: usize,
