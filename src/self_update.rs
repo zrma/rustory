@@ -431,8 +431,8 @@ fn restart_systemd_user_daemon() -> DaemonRestartStatus {
     }
 
     for args in [
-        ["--user", "daemon-reload"],
-        ["--user", "restart", "rustory.service"],
+        &["--user", "daemon-reload"][..],
+        &["--user", "restart", "rustory.service"][..],
     ] {
         let output = ProcessCommand::new("systemctl").args(args).output();
         match output {
