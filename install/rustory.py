@@ -33,6 +33,8 @@ MAX_ASSET_BYTES = 128 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 64 * 1024
 HOOK_START = "# >>> rustory hook >>>"
 HOOK_END = "# <<< rustory hook <<<"
+DAEMON_AUTOSTART_START = "# >>> rustory daemon autostart >>>"
+DAEMON_AUTOSTART_END = "# <<< rustory daemon autostart <<<"
 SUPPORTED_HOOK_SHELLS = ("bash", "zsh")
 USER_STARTUP_FILES = (
     ".zshrc",
@@ -137,7 +139,7 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Shell rc file to update for --install-hook",
     )
-    parser.add_argument("--rc-file", help="Override shell rc file path for --install-hook")
+    parser.add_argument("--rc-file", help="Override shell rc file path for --install-hook and daemon shell autostart")
     parser.add_argument(
         "--import-hishtory",
         action="store_true",
@@ -159,6 +161,11 @@ def parse_args() -> argparse.Namespace:
         "--no-start-daemon",
         action="store_true",
         help="Write the daemon service file but do not load/start it",
+    )
+    parser.add_argument(
+        "--no-daemon-shell-autostart",
+        action="store_true",
+        help="Do not install a shell-start fallback block when Linux systemd user bus is unavailable",
     )
     parser.add_argument(
         "--daemon-interval-sec",
@@ -495,7 +502,7 @@ def install_daemon_service(install_path: Path, args: argparse.Namespace) -> None
         install_launchd_daemon(daemon_args, not args.no_start_daemon)
         return
     if system == "linux":
-        install_systemd_user_daemon(daemon_args, not args.no_start_daemon)
+        install_systemd_user_daemon(daemon_args, not args.no_start_daemon, args)
         return
     raise SystemExit(f"daemon=failed reason=unsupported_platform platform={platform.system()}")
 
@@ -555,7 +562,7 @@ def render_launchd_plist(label: str, daemon_args: list[str], log_dir: Path) -> s
 """
 
 
-def install_systemd_user_daemon(daemon_args: list[str], start: bool) -> None:
+def install_systemd_user_daemon(daemon_args: list[str], start: bool, args: argparse.Namespace) -> None:
     unit_path = Path.home() / ".config" / "systemd" / "user" / "rustory.service"
     unit_path.parent.mkdir(parents=True, exist_ok=True)
     unit_path.write_text(render_systemd_user_unit(daemon_args), encoding="utf-8")
@@ -570,6 +577,7 @@ def install_systemd_user_daemon(daemon_args: list[str], start: bool) -> None:
                 if systemd_user_bus_unavailable(exc):
                     print_systemd_user_start_deferred(step[0], exc)
                     start_background_daemon(daemon_args)
+                    install_background_daemon_autostart(daemon_args, args)
                     return
                 print_systemd_user_failure(step[0], exc)
                 raise SystemExit(exc.returncode) from exc
@@ -612,6 +620,7 @@ def print_systemd_user_start_deferred(step: str, exc: subprocess.CalledProcessEr
     print("daemon=start_hint command=systemctl --user status rustory.service")
     print("daemon=start_hint linger=loginctl enable-linger <user>")
     print("daemon=start_hint fallback=background process started because systemd user bus is unavailable")
+    print("daemon=start_hint fallback_autostart=shell rc block will restart it on the next interactive shell")
 
 
 def print_systemd_user_failure(step: str, exc: subprocess.CalledProcessError) -> None:
@@ -667,6 +676,59 @@ def start_background_daemon(daemon_args: list[str]) -> None:
 
     print(f"daemon=started manager=background pid={proc.pid} log={log_path}")
     print("daemon=start_note manager=background persistence=until_process_exit_or_reboot")
+
+
+def install_background_daemon_autostart(daemon_args: list[str], args: argparse.Namespace) -> None:
+    if args.no_daemon_shell_autostart:
+        print("daemon=autostart_skipped manager=background reason=--no-daemon-shell-autostart")
+        return
+
+    shell = resolve_hook_shell(args.hook_shell)
+    rc_file = Path(args.rc_file).expanduser() if args.rc_file else default_rc_file(shell)
+    block = render_daemon_autostart_block(daemon_args)
+    update_managed_block(rc_file, block, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END)
+    print(f"daemon=autostart_installed manager=background shell={shell} rc_file={rc_file}")
+
+
+def render_daemon_autostart_block(daemon_args: list[str]) -> str:
+    daemon_command = " ".join(shell_quote_arg(arg) for arg in daemon_args)
+    return "\n".join(
+        [
+            DAEMON_AUTOSTART_START,
+            "# Managed by rustory installer. Re-run with --install-daemon to update.",
+            "case $- in",
+            "  *i*)",
+            '    __rustory_daemon_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/rustory"',
+            '    __rustory_daemon_pid_file="$__rustory_daemon_state_dir/daemon.pid"',
+            '    __rustory_daemon_log_file="$__rustory_daemon_state_dir/daemon.log"',
+            "    __rustory_daemon_running=0",
+            '    if [ -r "$__rustory_daemon_pid_file" ]; then',
+            '      __rustory_daemon_pid="$(cat "$__rustory_daemon_pid_file" 2>/dev/null)"',
+            '      case "$__rustory_daemon_pid" in',
+            "        ''|*[!0-9]*) __rustory_daemon_running=0 ;;",
+            '        *) kill -0 "$__rustory_daemon_pid" >/dev/null 2>&1 && __rustory_daemon_running=1 ;;',
+            "      esac",
+            "    fi",
+            '    if [ "$__rustory_daemon_running" != "1" ]; then',
+            '      mkdir -p "$__rustory_daemon_state_dir"',
+            f'      nohup {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
+            '      echo $! > "$__rustory_daemon_pid_file"',
+            '      chmod 600 "$__rustory_daemon_pid_file" "$__rustory_daemon_log_file" 2>/dev/null || true',
+            "    fi",
+            "    unset __rustory_daemon_state_dir __rustory_daemon_pid_file __rustory_daemon_log_file",
+            "    unset __rustory_daemon_running __rustory_daemon_pid",
+            "    ;;",
+            "esac",
+            DAEMON_AUTOSTART_END,
+            "",
+        ]
+    )
+
+
+def shell_quote_arg(value: str) -> str:
+    if value and all(ch.isalnum() or ch in "/._:=@+-" for ch in value):
+        return value
+    return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
 def rustory_state_dir() -> Path:
@@ -937,13 +999,18 @@ def shell_path_expr(path: Path) -> str:
     return "$HOME/" + str(rel).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def update_managed_block(rc_file: Path, block: str) -> None:
+def update_managed_block(
+    rc_file: Path,
+    block: str,
+    start_marker: str = HOOK_START,
+    end_marker: str = HOOK_END,
+) -> None:
     rc_file.parent.mkdir(parents=True, exist_ok=True)
     existing = rc_file.read_text() if rc_file.exists() else ""
-    start = existing.find(HOOK_START)
-    end = existing.find(HOOK_END)
+    start = existing.find(start_marker)
+    end = existing.find(end_marker)
     if start != -1 and end != -1 and end > start:
-        end += len(HOOK_END)
+        end += len(end_marker)
         updated = existing[:start].rstrip() + "\n\n" + block + existing[end:].lstrip("\n")
     else:
         prefix = existing.rstrip() + "\n\n" if existing.strip() else ""

@@ -99,7 +99,9 @@ token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증�
 `--install-daemon`은 macOS에서는 `~/Library/LaunchAgents/com.rustory.daemon.plist`, Linux에서는
 `~/.config/systemd/user/rustory.service`를 설치하고 기본적으로 즉시 시작한다. Linux에서
 user systemd bus가 없으면 unit 파일은 보존하고 `manager=background` fallback으로 `rr daemon`을
-즉시 시작한다. 설치만 하고 시작을 미루려면 `--no-start-daemon`을 함께 넘긴다.
+즉시 시작하며, 같은 shell rc 파일에 background daemon autostart block을 설치해 컨테이너 재시작 뒤
+첫 interactive shell에서 다시 띄운다. 설치만 하고 시작을 미루려면 `--no-start-daemon`을 함께
+넘긴다. rc autostart가 싫으면 `--no-daemon-shell-autostart`를 함께 넘긴다.
 `--import-hishtory`는 기본 Hishtory DB(`~/.hishtory/.hishtory.db`)가 있으면 import하고,
 성공 후 user startup files에서 Hishtory hook/PATH/source 라인을 삭제한다.
 Hishtory hook을 유지해야 하면 `--keep-hishtory-hooks`를 함께 넘긴다.
@@ -118,7 +120,7 @@ installer는 다음 순서로 동작한다.
 7. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
 8. `--install-daemon`이 있으면 user service를 설치하고, `--no-start-daemon`이 없으면 즉시 시작한다.
    Linux user systemd bus가 없으면 `~/.local/state/rustory/daemon.{pid,log}`를 쓰는 background
-   fallback으로 시작한다.
+   fallback으로 시작하고, shell rc 파일에 idempotent autostart block을 설치한다.
 
 token 값은 installer 로그에 출력하지 않는다.
 swarm key 값도 installer 로그에 출력하지 않는다. true one-paste onboarding이 필요하면 private archive에
@@ -167,8 +169,9 @@ one-shot installer의 `--install-daemon`은 Linux에서
 시도한다. SSH 비로그인 세션이나 container-like shell처럼 user systemd bus가 없으면
 installer는 `daemon=start_deferred`를 출력하고 `manager=background` fallback으로
 `rr daemon`을 시작한다. fallback 로그와 pid는 `~/.local/state/rustory/daemon.log`,
-`~/.local/state/rustory/daemon.pid`에 둔다. 장기 운영 서버에서는 같은 사용자 로그인
-세션에서 다음을 실행해 systemd-user 관리로 전환한다.
+`~/.local/state/rustory/daemon.pid`에 둔다. 또한 같은 shell rc 파일에 managed autostart
+block을 설치해 컨테이너 재시작 뒤 첫 interactive shell에서 죽은 daemon을 다시 띄운다.
+장기 운영 서버에서는 같은 사용자 로그인 세션에서 다음을 실행해 systemd-user 관리로 전환한다.
 
 ```sh
 systemctl --user daemon-reload
@@ -177,4 +180,6 @@ systemctl --user status rustory.service
 ```
 
 로그아웃 뒤에도 계속 실행해야 하는 서버라면 운영 정책에 맞게
-`loginctl enable-linger <user>`를 별도로 적용한다.
+`loginctl enable-linger <user>`를 별도로 적용한다. shell autostart fallback은 interactive
+shell이 열릴 때만 복구되므로, 컨테이너 entrypoint나 supervisor를 소유할 수 있는 환경에서는
+그 경로에 `rr daemon`을 직접 붙이는 쪽이 더 강하다.

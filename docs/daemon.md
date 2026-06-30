@@ -27,9 +27,10 @@ Linux에서 SSH 비로그인 세션, container-like shell, `sudo -u` 환경처�
 bus가 없는 상태에서는 installer가 unit 파일을 설치한 뒤 `daemon=start_deferred`를
 출력하고 `manager=background` fallback으로 `rr daemon`을 즉시 시작한다. fallback은
 `~/.local/state/rustory/daemon.pid`와 `~/.local/state/rustory/daemon.log`를 사용하며,
-systemd user service와 달리 reboot 뒤 자동 복구를 보장하지 않는다. 장기 운영 서버에서는
-가능하면 같은 사용자 로그인 세션에서 아래 `systemctl --user` 명령을 직접 실행해
-systemd-user 관리로 전환한다.
+같은 rc 파일에 managed shell autostart block을 추가해 컨테이너 재시작 뒤 첫 interactive
+shell에서 죽은 daemon을 다시 띄운다. 이 autostart block을 원하지 않으면
+`--no-daemon-shell-autostart`를 함께 넘긴다. 장기 운영 서버에서는 가능하면 같은 사용자
+로그인 세션에서 아래 `systemctl --user` 명령을 직접 실행해 systemd-user 관리로 전환한다.
 
 ```sh
 systemctl --user daemon-reload
@@ -38,7 +39,8 @@ systemctl --user status rustory.service
 ```
 
 컨테이너처럼 user systemd manager가 없는 환경에서는 fallback daemon이 해당 process/container
-lifetime 동안 grid presence를 유지한다.
+lifetime 동안 grid presence를 유지하고, 재시작 뒤에는 다음 interactive shell startup에서
+자동 복구된다. shell이 한 번도 열리지 않으면 daemon도 자동으로 떠 있지 않다.
 
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
