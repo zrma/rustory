@@ -27,10 +27,11 @@
 | C9 | done | codex | `python3 -m py_compile install/rustory.py` | installer가 다운로드한 binary 검증 실패 시 `rr version`의 stdout/stderr를 숨기지 않고 출력한다. |
 | C10 | done | codex | `python3 -m py_compile install/rustory.py` | Linux user systemd bus가 없는 환경에서 `--install-daemon`이 traceback으로 실패하지 않고 unit 설치 후 start deferred 안내로 정상 종료한다. |
 | C11 | done | codex | `cargo test sync_status_report_includes_pending_push_and_filter discover_targets_skips_self_peer_book_entries_by_peer_id_and_device_id` | `sync-status --watch`/P2P discovery가 local PeerId와 정규화된 같은 `device_id`를 가진 stale self peer를 제외한다. |
+| C12 | done | codex | `python3 -m py_compile install/rustory.py` | Linux user systemd bus가 없는 container-like 환경에서 `--install-daemon`이 `manager=background` fallback으로 `rr daemon`을 즉시 시작한다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: C1-C6, C8-C11.
+- 완료: C1-C6, C8-C12.
 - 미완료: C7.
 - 다음 액션: release/push 후 private install archive를 public relay DNS 주소 기준으로 갱신한다. 외부 WAN L4 포워딩은 cluster/repo 내부 배포와 별도 운영 체크포인트로 확인한다.
 - 검증 증거: `python3 -m py_compile install/rustory.py`, `cargo test sync_status_report_includes_pending_push_and_filter discover_targets_skips_self_peer_book_entries_by_peer_id_and_device_id`, `RUSTORY_RELEASE_LINUX_BUILDER=zig scripts/build-release-assets.sh --target x86_64-unknown-linux-gnu --dist-dir /tmp/rustory-release-portable-linux`, `strings /tmp/rustory-release-portable-linux/rr-x86_64-unknown-linux-gnu | rg GLIBC_ | sort -u` (max `GLIBC_2.17`), `cargo fmt --all --check`, `cargo test relay_addr_warning_flags_tailnet_and_private_addresses`, `cargo test --workspace` (212 passed), `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check.sh --fast`, k8s `rustory-relay` Pod/Service Running, internal DNS `rustory-relay` TCP/4001 success, public WAN IP TCP/4001 refused.

@@ -97,8 +97,9 @@ token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증�
 `--install-hook`은 현재 shell을 자동 감지해 `~/.zshrc` 또는 `~/.bashrc`에 Rustory managed block을 추가/교체한다.
 비표준 시작 파일을 쓰면 `--hook-shell bash|zsh --rc-file <path>`로 명시한다.
 `--install-daemon`은 macOS에서는 `~/Library/LaunchAgents/com.rustory.daemon.plist`, Linux에서는
-`~/.config/systemd/user/rustory.service`를 설치하고 기본적으로 즉시 시작한다. 설치만 하고 시작을
-미루려면 `--no-start-daemon`을 함께 넘긴다.
+`~/.config/systemd/user/rustory.service`를 설치하고 기본적으로 즉시 시작한다. Linux에서
+user systemd bus가 없으면 unit 파일은 보존하고 `manager=background` fallback으로 `rr daemon`을
+즉시 시작한다. 설치만 하고 시작을 미루려면 `--no-start-daemon`을 함께 넘긴다.
 `--import-hishtory`는 기본 Hishtory DB(`~/.hishtory/.hishtory.db`)가 있으면 import하고,
 성공 후 user startup files에서 Hishtory hook/PATH/source 라인을 삭제한다.
 Hishtory hook을 유지해야 하면 `--keep-hishtory-hooks`를 함께 넘긴다.
@@ -116,6 +117,8 @@ installer는 다음 순서로 동작한다.
 6. `--install-hook`이 있으면 shell rc 파일에 Rustory hook block을 설치한다.
 7. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
 8. `--install-daemon`이 있으면 user service를 설치하고, `--no-start-daemon`이 없으면 즉시 시작한다.
+   Linux user systemd bus가 없으면 `~/.local/state/rustory/daemon.{pid,log}`를 쓰는 background
+   fallback으로 시작한다.
 
 token 값은 installer 로그에 출력하지 않는다.
 swarm key 값도 installer 로그에 출력하지 않는다. true one-paste onboarding이 필요하면 private archive에
@@ -161,9 +164,11 @@ rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256
 
 one-shot installer의 `--install-daemon`은 Linux에서
 `~/.config/systemd/user/rustory.service`를 만든 뒤 `systemctl --user`로 enable/start를
-시도한다. SSH 비로그인 세션처럼 user systemd bus가 없으면 installer는
-`daemon=start_deferred`를 출력하고 성공 종료한다. 이때는 같은 사용자 로그인 세션에서
-다음을 실행한다.
+시도한다. SSH 비로그인 세션이나 container-like shell처럼 user systemd bus가 없으면
+installer는 `daemon=start_deferred`를 출력하고 `manager=background` fallback으로
+`rr daemon`을 시작한다. fallback 로그와 pid는 `~/.local/state/rustory/daemon.log`,
+`~/.local/state/rustory/daemon.pid`에 둔다. 장기 운영 서버에서는 같은 사용자 로그인
+세션에서 다음을 실행해 systemd-user 관리로 전환한다.
 
 ```sh
 systemctl --user daemon-reload

@@ -569,6 +569,7 @@ def install_systemd_user_daemon(daemon_args: list[str], start: bool) -> None:
             except subprocess.CalledProcessError as exc:
                 if systemd_user_bus_unavailable(exc):
                     print_systemd_user_start_deferred(step[0], exc)
+                    start_background_daemon(daemon_args)
                     return
                 print_systemd_user_failure(step[0], exc)
                 raise SystemExit(exc.returncode) from exc
@@ -610,6 +611,7 @@ def print_systemd_user_start_deferred(step: str, exc: subprocess.CalledProcessEr
     print("daemon=start_hint command=systemctl --user enable --now rustory.service")
     print("daemon=start_hint command=systemctl --user status rustory.service")
     print("daemon=start_hint linger=loginctl enable-linger <user>")
+    print("daemon=start_hint fallback=background process started because systemd user bus is unavailable")
 
 
 def print_systemd_user_failure(step: str, exc: subprocess.CalledProcessError) -> None:
@@ -625,6 +627,90 @@ def print_systemd_user_failure(step: str, exc: subprocess.CalledProcessError) ->
 
 def one_line_process_output(exc: subprocess.CalledProcessError) -> str:
     return " ".join((exc.stderr or exc.stdout or str(exc)).split())
+
+
+def start_background_daemon(daemon_args: list[str]) -> None:
+    state_dir = rustory_state_dir()
+    state_dir.mkdir(parents=True, exist_ok=True)
+    pid_path = state_dir / "daemon.pid"
+    log_path = state_dir / "daemon.log"
+
+    existing_pid = read_pid_file(pid_path)
+    if existing_pid and pid_is_running(existing_pid):
+        print(f"daemon=started manager=background status=already_running pid={existing_pid} log={log_path}")
+        return
+
+    with log_path.open("ab") as log_file:
+        proc = subprocess.Popen(
+            daemon_args,
+            cwd=str(Path.home()),
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+    pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
+    os.chmod(pid_path, 0o600)
+    time.sleep(0.2)
+    exit_code = proc.poll()
+    if exit_code is not None:
+        detail = tail_file_one_line(log_path)
+        print(
+            f"daemon=failed manager=background exit_code={exit_code} log={log_path}",
+            file=sys.stderr,
+        )
+        if detail:
+            print(f"daemon=failed_detail {detail}", file=sys.stderr)
+        raise SystemExit(exit_code)
+
+    print(f"daemon=started manager=background pid={proc.pid} log={log_path}")
+    print("daemon=start_note manager=background persistence=until_process_exit_or_reboot")
+
+
+def rustory_state_dir() -> Path:
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        return Path(base).expanduser() / "rustory"
+    return Path.home() / ".local" / "state" / "rustory"
+
+
+def read_pid_file(path: Path) -> int | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def tail_file_one_line(path: Path, max_bytes: int = 4096) -> str:
+    try:
+        with path.open("rb") as file:
+            file.seek(0, os.SEEK_END)
+            size = file.tell()
+            file.seek(max(0, size - max_bytes), os.SEEK_SET)
+            data = file.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return " ".join(data.split())
 
 
 def render_systemd_user_unit(daemon_args: list[str]) -> str:
