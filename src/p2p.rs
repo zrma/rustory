@@ -1075,6 +1075,7 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
         .relay_addr
         .clone()
         .context("relay_addr required for tracker-based sync")?;
+    let local_peer_id = cfg.identity.public().to_peer_id().to_string();
 
     let mut by_peer: HashMap<String, crate::tracker::PeerInfo> = HashMap::new();
     for base_url in &cfg.trackers {
@@ -1084,9 +1085,12 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
             Ok(list) => {
                 for p in list.peers {
                     // self는 제외한다.
-                    if let Some(my_device) = cfg.device_id.as_deref()
-                        && p.meta.as_ref().and_then(|m| m.device_id.as_deref()) == Some(my_device)
-                    {
+                    if sync_target_is_self(
+                        &p.peer_id,
+                        p.meta.as_ref().and_then(|m| m.device_id.as_deref()),
+                        &local_peer_id,
+                        cfg.device_id.as_deref(),
+                    ) {
                         continue;
                     }
 
@@ -1115,9 +1119,12 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
             store.list_peer_book(cfg.user_id.as_deref(), min_last_seen, PEER_BOOK_LIMIT)?;
         for peer in cached {
             // self는 제외한다.
-            if let Some(my_device) = cfg.device_id.as_deref()
-                && peer.device_id.as_deref() == Some(my_device)
-            {
+            if sync_target_is_self(
+                &peer.peer_id,
+                peer.device_id.as_deref(),
+                &local_peer_id,
+                cfg.device_id.as_deref(),
+            ) {
                 continue;
             }
 
@@ -1146,9 +1153,12 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
 
     let mut out = Vec::new();
     for (peer_id_str, peer) in by_peer {
-        if let Some(my_device) = cfg.device_id.as_deref()
-            && peer.meta.as_ref().and_then(|m| m.device_id.as_deref()) == Some(my_device)
-        {
+        if sync_target_is_self(
+            &peer_id_str,
+            peer.meta.as_ref().and_then(|m| m.device_id.as_deref()),
+            &local_peer_id,
+            cfg.device_id.as_deref(),
+        ) {
             continue;
         }
 
@@ -1174,6 +1184,23 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
     }
 
     Ok(out)
+}
+
+fn sync_target_is_self(
+    peer_id: &str,
+    peer_device_id: Option<&str>,
+    local_peer_id: &str,
+    local_device_id: Option<&str>,
+) -> bool {
+    if peer_id == local_peer_id {
+        return true;
+    }
+    match (peer_device_id, local_device_id) {
+        (Some(peer_device_id), Some(local_device_id)) => {
+            peer_device_id.trim() == local_device_id.trim()
+        }
+        _ => false,
+    }
 }
 
 fn tracker_target_addrs(
@@ -2062,6 +2089,52 @@ mod tests {
         assert_eq!(got[0].peer_key, peer_id);
         assert!(got[0].dial_addrs.is_empty());
         assert!(got[0].relay_addr.is_some());
+    }
+
+    #[test]
+    fn discover_targets_skips_self_peer_book_entries_by_peer_id_and_device_id() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let identity = libp2p::identity::Keypair::generate_ed25519();
+        let local_peer_id = identity.public().to_peer_id().to_string();
+        let stale_self_peer_id = PeerId::random().to_string();
+        let remote_peer_id = PeerId::random().to_string();
+
+        for (peer_id, device_id) in [
+            (local_peer_id.clone(), "remote-looking-device"),
+            (stale_self_peer_id, " dev-local "),
+            (remote_peer_id.clone(), "dev-remote"),
+        ] {
+            store
+                .upsert_peer_book(&PeerBookPeer {
+                    peer_id: peer_id.clone(),
+                    addrs: vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")],
+                    user_id: Some("u1".to_string()),
+                    device_id: Some(device_id.to_string()),
+                    last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                })
+                .unwrap();
+        }
+
+        let relay_id = PeerId::random();
+        let cfg = SyncConfig {
+            identity,
+            psk: libp2p::pnet::PreSharedKey::new([0; 32]),
+            relay_addr: Some(
+                format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
+                    .parse()
+                    .unwrap(),
+            ),
+            trackers: vec!["http://127.0.0.1:1".to_string()],
+            tracker_token: None,
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            request_retry_policy: RequestRetryPolicy::default(),
+            max_peers_per_tick: 0,
+        };
+
+        let got = discover_targets(&store, &cfg).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].peer_key, remote_peer_id);
     }
 
     #[test]

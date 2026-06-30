@@ -562,13 +562,69 @@ def install_systemd_user_daemon(daemon_args: list[str], start: bool) -> None:
     os.chmod(unit_path, 0o644)
     print(f"daemon=installed manager=systemd-user unit={unit_path}")
 
-    subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
-    subprocess.run(["systemctl", "--user", "enable", "rustory.service"], check=True)
     if start:
-        subprocess.run(["systemctl", "--user", "restart", "rustory.service"], check=True)
+        for step in (["daemon-reload"], ["enable", "rustory.service"], ["restart", "rustory.service"]):
+            try:
+                run_systemd_user(step)
+            except subprocess.CalledProcessError as exc:
+                if systemd_user_bus_unavailable(exc):
+                    print_systemd_user_start_deferred(step[0], exc)
+                    return
+                print_systemd_user_failure(step[0], exc)
+                raise SystemExit(exc.returncode) from exc
         print("daemon=started manager=systemd-user unit=rustory.service")
-    else:
-        print("daemon=start_skipped reason=--no-start-daemon")
+        return
+
+    print("daemon=start_skipped reason=--no-start-daemon")
+
+
+def run_systemd_user(args: list[str]) -> None:
+    subprocess.run(
+        ["systemctl", "--user", *args],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def systemd_user_bus_unavailable(exc: subprocess.CalledProcessError) -> bool:
+    text = f"{exc.stdout or ''}\n{exc.stderr or ''}\n{exc}".lower()
+    return (
+        "failed to connect to bus" in text
+        or "dbus_session_bus_address" in text
+        or "xdg_runtime_dir" in text
+        or "no medium found" in text
+    )
+
+
+def print_systemd_user_start_deferred(step: str, exc: subprocess.CalledProcessError) -> None:
+    detail = one_line_process_output(exc)
+    print(
+        "daemon=start_deferred manager=systemd-user unit=rustory.service "
+        f"reason=user_bus_unavailable step={step}"
+    )
+    if detail:
+        print(f"daemon=start_deferred_detail {detail}")
+    print("daemon=start_hint command=systemctl --user daemon-reload")
+    print("daemon=start_hint command=systemctl --user enable --now rustory.service")
+    print("daemon=start_hint command=systemctl --user status rustory.service")
+    print("daemon=start_hint linger=loginctl enable-linger <user>")
+
+
+def print_systemd_user_failure(step: str, exc: subprocess.CalledProcessError) -> None:
+    detail = one_line_process_output(exc)
+    print(
+        "daemon=failed manager=systemd-user unit=rustory.service "
+        f"step={step} exit_code={exc.returncode}",
+        file=sys.stderr,
+    )
+    if detail:
+        print(f"daemon=failed_detail {detail}", file=sys.stderr)
+
+
+def one_line_process_output(exc: subprocess.CalledProcessError) -> str:
+    return " ".join((exc.stderr or exc.stdout or str(exc)).split())
 
 
 def render_systemd_user_unit(daemon_args: list[str]) -> str:

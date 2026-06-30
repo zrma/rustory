@@ -1017,6 +1017,7 @@ pub fn run() -> Result<()> {
             let peer = normalize_opt_string(peer);
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
+            let local_peer_id = resolve_local_p2p_peer_id(&cfg);
             let trackers = if with_tracker {
                 Some(resolve_trackers(Vec::new(), &cfg)?)
             } else {
@@ -1031,6 +1032,7 @@ pub fn run() -> Result<()> {
                 run_sync_status_watch(
                     &store,
                     &local_device_id,
+                    local_peer_id.as_deref(),
                     peer.as_deref(),
                     trackers.as_deref(),
                     tracker_token.as_deref(),
@@ -1042,6 +1044,7 @@ pub fn run() -> Result<()> {
             let report = build_sync_status_report_for_cli(
                 &store,
                 &local_device_id,
+                local_peer_id.as_deref(),
                 peer.as_deref(),
                 trackers.as_deref(),
                 tracker_token.as_deref(),
@@ -3187,6 +3190,7 @@ fn compute_last_seen_age_sec(now_unix: i64, last_seen_unix: Option<i64>) -> Opti
 fn build_sync_status_report(
     store: &storage::LocalStore,
     local_device_id: &str,
+    local_peer_id: Option<&str>,
     peer_filter: Option<&str>,
     tracker_status: Option<Vec<SyncStatusTrackerReport>>,
 ) -> Result<SyncStatusReport> {
@@ -3206,8 +3210,11 @@ fn build_sync_status_report(
     let mut peers = Vec::with_capacity(statuses.len());
     for status in statuses {
         let peer_id = status.peer_id;
+        if local_peer_id == Some(peer_id.as_str()) {
+            continue;
+        }
         let peer_device_id = peer_device_ids.get(&peer_id).cloned();
-        if peer_device_id.as_deref() == Some(local_device_id) {
+        if sync_device_id_matches(peer_device_id.as_deref(), local_device_id) {
             continue;
         }
         let pending_push = store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
@@ -3236,13 +3243,34 @@ fn build_sync_status_report(
 fn build_sync_status_report_for_cli(
     store: &storage::LocalStore,
     local_device_id: &str,
+    local_peer_id: Option<&str>,
     peer_filter: Option<&str>,
     trackers: Option<&[String]>,
     tracker_token: Option<&str>,
 ) -> Result<SyncStatusReport> {
     let tracker_status =
         trackers.map(|trackers| build_tracker_status_report(trackers, tracker_token));
-    build_sync_status_report(store, local_device_id, peer_filter, tracker_status)
+    build_sync_status_report(
+        store,
+        local_device_id,
+        local_peer_id,
+        peer_filter,
+        tracker_status,
+    )
+}
+
+fn resolve_local_p2p_peer_id(cfg: &config::FileConfig) -> Option<String> {
+    let path = resolve_p2p_identity_key_path(None, cfg);
+    config::load_identity_keypair(&path)
+        .ok()
+        .flatten()
+        .map(|key| key.public().to_peer_id().to_string())
+}
+
+fn sync_device_id_matches(peer_device_id: Option<&str>, local_device_id: &str) -> bool {
+    peer_device_id
+        .map(|device_id| device_id.trim() == local_device_id.trim())
+        .unwrap_or(false)
 }
 
 #[derive(Default)]
@@ -3279,6 +3307,7 @@ struct SyncStatusWatchPeerView<'a> {
 fn run_sync_status_watch(
     store: &storage::LocalStore,
     local_device_id: &str,
+    local_peer_id: Option<&str>,
     peer_filter: Option<&str>,
     trackers: Option<&[String]>,
     tracker_token: Option<&str>,
@@ -3302,6 +3331,7 @@ fn run_sync_status_watch(
         let report = match build_sync_status_report_for_cli(
             store,
             local_device_id,
+            local_peer_id,
             peer_filter,
             trackers,
             tracker_token,
@@ -5892,6 +5922,8 @@ mod tests {
         store.set_last_cursor("peer-b", 3).unwrap();
         store.set_last_pushed_seq("peer-b", 3).unwrap();
         store.set_last_cursor("peer-self", 1).unwrap();
+        store.set_last_cursor("peer-local-id", 1).unwrap();
+        store.set_last_cursor("peer-self-spaced", 1).unwrap();
         store
             .upsert_peer_book(&storage::PeerBookPeer {
                 peer_id: "peer-a".to_string(),
@@ -5910,13 +5942,36 @@ mod tests {
                 last_seen_unix: 100,
             })
             .unwrap();
+        store
+            .upsert_peer_book(&storage::PeerBookPeer {
+                peer_id: "peer-self-spaced".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/3333/p2p/peer-self-spaced".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some(" dev-local ".to_string()),
+                last_seen_unix: 101,
+            })
+            .unwrap();
 
-        let report = build_sync_status_report(&store, "dev-local", None, None).unwrap();
+        let report =
+            build_sync_status_report(&store, "dev-local", Some("peer-local-id"), None, None)
+                .unwrap();
         assert_eq!(report.local_head, 3);
         assert_eq!(report.local_device_id, "dev-local");
         assert_eq!(report.peers.len(), 2);
         assert!(report.tracker_status.is_none());
         assert!(!report.peers.iter().any(|peer| peer.peer_id == "peer-self"));
+        assert!(
+            !report
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == "peer-local-id")
+        );
+        assert!(
+            !report
+                .peers
+                .iter()
+                .any(|peer| peer.peer_id == "peer-self-spaced")
+        );
 
         let peer_a = report
             .peers
@@ -5941,7 +5996,14 @@ mod tests {
         assert_eq!(peer_b.last_seen_unix, None);
         assert_eq!(peer_b.last_seen_age_sec, None);
 
-        let filtered = build_sync_status_report(&store, "dev-local", Some("peer-a"), None).unwrap();
+        let filtered = build_sync_status_report(
+            &store,
+            "dev-local",
+            Some("peer-local-id"),
+            Some("peer-a"),
+            None,
+        )
+        .unwrap();
         assert_eq!(filtered.peers.len(), 1);
         assert_eq!(filtered.peers[0].peer_id, "peer-a");
 

@@ -23,6 +23,11 @@ macOS는 `~/Library/LaunchAgents/com.rustory.daemon.plist`, Linux는
 `~/.config/systemd/user/rustory.service`가 생성된다. 설치만 하고 시작을 미루려면
 `--no-start-daemon`을 함께 넘긴다.
 
+Linux에서 SSH 비로그인 세션, container-like shell, `sudo -u` 환경처럼 user systemd
+bus가 없는 상태에서는 installer가 unit 파일만 설치하고 `daemon=start_deferred`로
+정상 종료할 수 있다. 이 경우 같은 사용자 로그인 세션에서 아래 `systemctl --user`
+명령을 직접 실행한다.
+
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
   - `trackers`, `relay_addr`, `swarm_key_path`, `p2p_identity_key_path`, `tracker_token` 등
@@ -207,6 +212,12 @@ journalctl --user -u rustory.service -f
 systemctl --user restart rustory.service
 systemctl --user stop rustory.service
 ```
+
+`systemctl --user`가 `Failed to connect to bus`,
+`DBUS_SESSION_BUS_ADDRESS`, `XDG_RUNTIME_DIR` 관련 메시지로 실패하면 현재 shell이
+user systemd bus에 붙어 있지 않은 것이다. unit 파일은 이미 설치되어 있으므로
+로그인 세션에서 다시 실행하거나, 정책상 허용된다면 `loginctl enable-linger <user>`를
+설정한 뒤 재시도한다.
 
 #### (옵션) 로그인 없이도 계속 돌리고 싶다면
 배포/운영 정책에 따라 다르지만, “사용자가 로그아웃해도 user service가 계속 실행”되길 원하면

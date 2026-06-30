@@ -156,3 +156,20 @@ rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256
 
 `rr update`는 binary를 임시 파일로 다운로드하고 checksum을 검증한 뒤,
 다운로드한 binary의 `rr version` 실행이 성공할 때만 설치 경로를 교체한다.
+
+## Linux user service caveat
+
+one-shot installer의 `--install-daemon`은 Linux에서
+`~/.config/systemd/user/rustory.service`를 만든 뒤 `systemctl --user`로 enable/start를
+시도한다. SSH 비로그인 세션처럼 user systemd bus가 없으면 installer는
+`daemon=start_deferred`를 출력하고 성공 종료한다. 이때는 같은 사용자 로그인 세션에서
+다음을 실행한다.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now rustory.service
+systemctl --user status rustory.service
+```
+
+로그아웃 뒤에도 계속 실행해야 하는 서버라면 운영 정책에 맞게
+`loginctl enable-linger <user>`를 별도로 적용한다.
