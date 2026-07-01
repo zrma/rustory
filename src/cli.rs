@@ -3313,6 +3313,63 @@ struct SyncStatusWatchPeerView<'a> {
     peer_name: String,
 }
 
+fn sync_status_watch_peer_cmp(
+    left: &SyncStatusWatchPeerView<'_>,
+    right: &SyncStatusWatchPeerView<'_>,
+) -> std::cmp::Ordering {
+    sync_status_watch_peer_severity(right)
+        .cmp(&sync_status_watch_peer_severity(left))
+        .then_with(|| {
+            right
+                .peer
+                .outbound_push_pending
+                .cmp(&left.peer.outbound_push_pending)
+        })
+        .then_with(|| {
+            right
+                .peer
+                .last_seen_age_sec
+                .unwrap_or(-1)
+                .cmp(&left.peer.last_seen_age_sec.unwrap_or(-1))
+        })
+        .then_with(|| left.peer_name.cmp(&right.peer_name))
+}
+
+fn sync_status_watch_peer_severity(view: &SyncStatusWatchPeerView<'_>) -> u8 {
+    let stale = view.peer.last_seen_age_sec.is_some_and(|age| age > 300);
+    let queued = view.peer.outbound_push_pending > 0;
+    let moving = view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0;
+    if stale && queued {
+        5
+    } else if queued && moving {
+        4
+    } else if queued {
+        3
+    } else if stale {
+        2
+    } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
+        1
+    } else {
+        0
+    }
+}
+
+fn sync_status_watch_peer_status(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
+    if view.peer.last_seen_age_sec.is_some_and(|age| age > 300) {
+        "stale"
+    } else if view.peer.outbound_push_pending > 0
+        && (view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0)
+    {
+        "sending"
+    } else if view.peer.outbound_push_pending > 0 {
+        "queued"
+    } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
+        "active"
+    } else {
+        "ok"
+    }
+}
+
 fn run_sync_status_watch(
     store: &storage::LocalStore,
     local_device_id: &str,
@@ -3402,7 +3459,6 @@ fn render_sync_status_watch_frame(
     let mesh_width = width.saturating_sub(traffic_width + display_width(PANEL_GAP));
 
     let spinner = SPINNER[state.frame % SPINNER.len()];
-    let frame_index = state.frame;
     state.frame = state.frame.wrapping_add(1);
 
     let mut out = String::new();
@@ -3429,12 +3485,13 @@ fn render_sync_status_watch_frame(
             peer_name,
         });
     }
+    peer_views.sort_by(sync_status_watch_peer_cmp);
 
     push_watch_line(
         &mut out,
         width,
         &format!(
-            "{spinner} rustory mesh watch  local={}  head={}  peers={}  outbound={}",
+            "{spinner} rustory sync watch  local={}  head={}  peers={}  to_send={}",
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
@@ -3443,18 +3500,13 @@ fn render_sync_status_watch_frame(
     );
 
     out.push('\n');
-    let mesh_panel = render_mesh_panel(
-        &report.local_device_id,
-        &peer_views,
-        frame_index,
-        mesh_width,
-    );
-    let traffic_panel = render_traffic_panel(
+    let mesh_panel = render_overview_panel(
         report,
         &peer_views,
         report.tracker_status.as_deref(),
-        traffic_width,
+        mesh_width,
     );
+    let traffic_panel = render_traffic_panel(report, &peer_views, traffic_width);
     for line in join_watch_panels(&mesh_panel, &traffic_panel, PANEL_GAP) {
         push_watch_line(&mut out, width, &line);
     }
@@ -3468,80 +3520,97 @@ fn render_sync_status_watch_frame(
     push_watch_line(
         &mut out,
         width,
-        "ctrl+c to exit  •  local observation: real remote peer↔peer flow needs daemon telemetry",
+        "ctrl+c to exit  •  direct_pull is only this node's direct pull cursor; inbound pushes can still keep data current",
     );
     out
 }
 
-fn render_mesh_panel(
-    local_device_id: &str,
+fn render_overview_panel(
+    report: &SyncStatusReport,
     peer_views: &[SyncStatusWatchPeerView<'_>],
-    frame: usize,
+    trackers: Option<&[SyncStatusTrackerReport]>,
     panel_width: usize,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
-    let canvas_width = inner_width;
-    let canvas_height = 17;
-    let mut canvas = WatchCanvas::new(canvas_width, canvas_height);
-    let local = CanvasPoint {
-        x: canvas_width / 2,
-        y: canvas_height / 2,
-    };
+    let total_pending: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending)
+        .sum();
+    let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
+    let progress = outbound_push_progress_percent(total_pending, total_baseline);
+    let queued = peer_views
+        .iter()
+        .filter(|view| view.peer.outbound_push_pending > 0)
+        .count();
+    let stale = peer_views
+        .iter()
+        .filter(|view| view.peer.last_seen_age_sec.is_some_and(|age| age > 300))
+        .count();
+    let direct_zero = peer_views
+        .iter()
+        .filter(|view| view.peer.pull_cursor == 0)
+        .count();
+    let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
+    let total_push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
+    let total_drain_rate: f64 = peer_views
+        .iter()
+        .map(|view| view.rates.pending_drain_per_sec.max(0.0))
+        .sum();
 
-    let mut nodes = Vec::with_capacity(peer_views.len());
-    for (idx, view) in peer_views.iter().enumerate() {
-        let label = format!(
-            "{} {}",
-            mesh_peer_symbol(view),
-            truncate_display(&view.peer_name, 20)
-        );
-        let point = mesh_peer_point(idx, peer_views.len(), canvas_width, canvas_height, &label);
-        nodes.push((point, label, view));
-    }
+    let body = vec![
+        tracker_summary_line(trackers),
+        traffic_kv_line("local", &report.local_device_id, inner_width),
+        traffic_kv_line(
+            "head",
+            &format!(
+                "{} rows   {} peers",
+                format_count_i64(report.local_head),
+                report.peers.len()
+            ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "outbox",
+            &format!(
+                "{} rows queued across {} peers",
+                format_count_usize(total_pending),
+                queued
+            ),
+            inner_width,
+        ),
+        traffic_progress_line("progress", progress, total_pending, inner_width),
+        traffic_kv_line(
+            "rates",
+            &format!(
+                "pull {}/s   push {}/s   drain {}/s",
+                format_rate(total_pull_rate),
+                format_rate(total_push_rate),
+                format_rate(total_drain_rate)
+            ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "health",
+            &format!("{stale} stale   {direct_zero} direct_pull=0"),
+            inner_width,
+        ),
+        String::new(),
+        truncate_display(
+            "read: to_send is local rows not yet accepted by that peer",
+            inner_width,
+        ),
+        truncate_display(
+            "read: direct_pull is only this node's completed pull cursor",
+            inner_width,
+        ),
+    ];
 
-    for (idx, (point, _label, view)) in nodes.iter().enumerate() {
-        let edge = mesh_edge_glyph(local, *point);
-        canvas.draw_line(local, *point, edge);
-        if view.peer.outbound_push_pending > 0 || view.rates.push_per_sec > 0.0 {
-            let phase = (frame + idx.saturating_mul(2)) % 7 + 1;
-            let particle =
-                if view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
-                    '◆'
-                } else {
-                    '◇'
-                };
-            canvas.put(point_between(local, *point, phase, 8), particle);
-        }
-        if view.rates.pull_per_sec > 0.0 {
-            let phase = (frame + idx.saturating_mul(3)) % 7 + 1;
-            canvas.put(point_between(*point, local, phase, 8), '●');
-        }
-    }
-
-    for (point, label, _view) in nodes {
-        canvas.put_str(point.x, point.y, &label);
-    }
-    canvas.put_str(
-        local.x.saturating_sub(8),
-        local.y,
-        &format!("◎ {}", truncate_display(local_device_id, 16)),
-    );
-
-    box_watch_panel(
-        "Mesh Map",
-        panel_width,
-        canvas
-            .into_lines()
-            .into_iter()
-            .map(|line| truncate_display(line.trim_end(), inner_width))
-            .collect(),
-    )
+    box_watch_panel("Overview", panel_width, body)
 }
 
 fn render_traffic_panel(
     report: &SyncStatusReport,
     peer_views: &[SyncStatusWatchPeerView<'_>],
-    trackers: Option<&[SyncStatusTrackerReport]>,
     panel_width: usize,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
@@ -3568,12 +3637,10 @@ fn render_traffic_panel(
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut body = vec![
-        tracker_summary_line(trackers),
-        traffic_kv_line("local", &report.local_device_id, inner_width),
         traffic_kv_line(
             "head",
             &format!(
-                "{}   peers {}",
+                "{} rows   {} peers",
                 format_count_i64(report.local_head),
                 report.peers.len()
             ),
@@ -3584,26 +3651,46 @@ fn render_traffic_panel(
         traffic_rate_line("pull", total_pull_rate, inner_width),
         traffic_rate_line("push", total_push_rate, inner_width),
         traffic_rate_line("drain", total_drain_rate, inner_width),
-        traffic_backlog_line(progress, total_pending, inner_width),
+        traffic_progress_line("to_send", progress, total_pending, inner_width),
     ];
 
     if let Some(view) = hottest {
         body.push(traffic_hot_line(
             &view.peer_name,
+            view.peer.pull_cursor,
             view.peer.push_cursor,
             view.peer.outbound_push_pending,
             inner_width,
         ));
     }
 
+    body.push(String::new());
+    for view in peer_views
+        .iter()
+        .filter(|view| view.peer.outbound_push_pending > 0)
+        .take(4)
+    {
+        body.push(traffic_peer_queue_line(view, inner_width));
+    }
+    if peer_views
+        .iter()
+        .all(|view| view.peer.outbound_push_pending == 0)
+    {
+        body.push(truncate_display("no queued local rows", inner_width));
+    }
+
     body.extend([
         String::new(),
-        traffic_kv_line("legend", "◎ local  ● synced", inner_width),
-        traffic_kv_line("", "◐ backlog  ○ stale", inner_width),
-        traffic_kv_line("flow", "◆ moving  ◇ queued  ● pull", inner_width),
+        traffic_kv_line("state", "sending drains queued rows", inner_width),
+        traffic_kv_line("", "queued waits for an accepted push", inner_width),
+        traffic_kv_line(
+            "",
+            "stale means tracker has not seen peer recently",
+            inner_width,
+        ),
     ]);
 
-    box_watch_panel("Traffic", panel_width, body)
+    box_watch_panel("Attention", panel_width, body)
 }
 
 fn traffic_kv_line(label: &str, value: &str, inner_width: usize) -> String {
@@ -3622,12 +3709,13 @@ fn traffic_rate_line(label: &str, rate: f64, inner_width: usize) -> String {
     )
 }
 
-fn traffic_backlog_line(progress: usize, pending: usize, inner_width: usize) -> String {
-    let left = format!(
-        "{} [{}]",
-        fit_cell("backlog", 8),
-        progress_bar(progress, 14)
-    );
+fn traffic_progress_line(
+    label: &str,
+    progress: usize,
+    pending: usize,
+    inner_width: usize,
+) -> String {
+    let left = format!("{} [{}]", fit_cell(label, 8), progress_bar(progress, 14));
     let right = format!(
         "{} {} left",
         right_cell(&format!("{progress}%"), 5),
@@ -3638,12 +3726,14 @@ fn traffic_backlog_line(progress: usize, pending: usize, inner_width: usize) -> 
 
 fn traffic_hot_line(
     peer_name: &str,
+    pull_cursor: i64,
     push_cursor: i64,
     pending: usize,
     inner_width: usize,
 ) -> String {
     let right = format!(
-        "cur {}  {} left",
+        "direct {}  sent {}  {} left",
+        right_cell(&format_count_i64(pull_cursor), 7),
         right_cell(&format_count_i64(push_cursor), 7),
         right_cell(&format_count_usize(pending), 7)
     );
@@ -3656,6 +3746,26 @@ fn traffic_hot_line(
         "{} {}",
         fit_cell("hot", 8),
         truncate_display(peer_name, peer_width)
+    );
+    align_left_right(&left, &right, inner_width)
+}
+
+fn traffic_peer_queue_line(view: &SyncStatusWatchPeerView<'_>, inner_width: usize) -> String {
+    let peer = view.peer;
+    let right = format!(
+        "sent {}  {} left",
+        right_cell(&format_count_i64(peer.push_cursor), 7),
+        right_cell(&format_count_usize(peer.outbound_push_pending), 7)
+    );
+    let label_width = 9;
+    let peer_width = inner_width
+        .saturating_sub(label_width)
+        .saturating_sub(display_width(&right))
+        .saturating_sub(1);
+    let left = format!(
+        "{} {}",
+        fit_cell(sync_status_watch_peer_status(view), 8),
+        truncate_display(&view.peer_name, peer_width)
     );
     align_left_right(&left, &right, inner_width)
 }
@@ -3692,16 +3802,18 @@ fn render_link_panel_wide(
     peer_views: &[SyncStatusWatchPeerView<'_>],
     inner_width: usize,
 ) -> Vec<String> {
+    const STATE_COL: usize = 8;
     const SEEN_COL: usize = 8;
-    const PULL_CURSOR_COL: usize = 10;
+    const PULL_CURSOR_COL: usize = 11;
     const PULL_RATE_COL: usize = 8;
     const PUSH_CURSOR_COL: usize = 10;
-    const PENDING_COL: usize = 10;
+    const PENDING_COL: usize = 8;
     const DRAIN_COL: usize = 8;
     const PROGRESS_COL: usize = 24;
-    const COLUMN_GAPS: usize = 7;
+    const COLUMN_GAPS: usize = 8;
 
-    let fixed_width = SEEN_COL
+    let fixed_width = STATE_COL
+        + SEEN_COL
         + PULL_CURSOR_COL
         + PULL_RATE_COL
         + PUSH_CURSOR_COL
@@ -3713,13 +3825,14 @@ fn render_link_panel_wide(
 
     let mut body = Vec::new();
     body.push(format!(
-        "{} {} {} {} {} {} {} {}",
+        "{} {} {} {} {} {} {} {} {}",
         fit_cell("peer", peer_col),
+        fit_cell("state", STATE_COL),
         right_cell("seen", SEEN_COL),
-        right_cell("pull_cur", PULL_CURSOR_COL),
+        right_cell("direct", PULL_CURSOR_COL),
         right_cell("pull/s", PULL_RATE_COL),
-        right_cell("push_cur", PUSH_CURSOR_COL),
-        right_cell("pending", PENDING_COL),
+        right_cell("sent", PUSH_CURSOR_COL),
+        right_cell("to_send", PENDING_COL),
         right_cell("drain/s", DRAIN_COL),
         fit_cell("progress", PROGRESS_COL),
     ));
@@ -3732,8 +3845,9 @@ fn render_link_panel_wide(
             .map(|age| format!("{age}s"))
             .unwrap_or_else(|| "-".to_string());
         body.push(format!(
-            "{} {} {} {} {} {} {} {}",
+            "{} {} {} {} {} {} {} {} {}",
             fit_cell(&view.peer_name, peer_col),
+            fit_cell(sync_status_watch_peer_status(view), STATE_COL),
             right_cell(&last_seen, SEEN_COL),
             right_cell(&format_count_i64(peer.pull_cursor), PULL_CURSOR_COL),
             right_cell(&format_rate(view.rates.pull_per_sec), PULL_RATE_COL),
@@ -3754,19 +3868,21 @@ fn render_link_panel_compact(
     peer_views: &[SyncStatusWatchPeerView<'_>],
     inner_width: usize,
 ) -> Vec<String> {
+    let state_col = 8;
     let seen_col = 7;
-    let variable_width = inner_width.saturating_sub(seen_col + 3);
-    let peer_col = (variable_width / 4).clamp(18, 28);
+    let variable_width = inner_width.saturating_sub(state_col + seen_col + 4);
+    let peer_col = (variable_width / 4).clamp(16, 26);
     let pull_col = (variable_width / 4).clamp(18, 26);
     let push_col = variable_width.saturating_sub(peer_col + pull_col).max(32);
 
     let mut body = Vec::new();
     body.push(format!(
-        "{} {} {} {}",
+        "{} {} {} {} {}",
         fit_cell("peer", peer_col),
+        fit_cell("state", state_col),
         right_cell("seen", seen_col),
-        fit_cell("peer → local", pull_col),
-        fit_cell("local → peer", push_col)
+        fit_cell("direct_pull", pull_col),
+        fit_cell("local_to_peer", push_col)
     ));
     body.push("─".repeat(inner_width));
 
@@ -3782,14 +3898,15 @@ fn render_link_panel_compact(
             format_rate(view.rates.pull_per_sec)
         );
         let push = format!(
-            "cur {} pend {} {}",
+            "sent {} to_send {} {}",
             format_count_i64(peer.push_cursor),
             format_count_usize(peer.outbound_push_pending),
             link_push_progress_line(view.progress, 12),
         );
         body.push(format!(
-            "{} {} {} {}",
+            "{} {} {} {} {}",
             fit_cell(&view.peer_name, peer_col),
+            fit_cell(sync_status_watch_peer_status(view), state_col),
             right_cell(&last_seen, seen_col),
             fit_cell(&pull, pull_col),
             fit_cell(&push, push_col),
@@ -3818,86 +3935,36 @@ fn tracker_summary_line(trackers: Option<&[SyncStatusTrackerReport]>) -> String 
     }
 
     let reachable = trackers.iter().filter(|tracker| tracker.reachable).count();
-    let latency = trackers
-        .iter()
-        .filter_map(|tracker| tracker.latency_ms)
-        .min()
-        .map(|latency| format!("{latency}ms"))
-        .unwrap_or_else(|| "-".to_string());
+    let detail = if reachable > 0 {
+        trackers
+            .iter()
+            .filter_map(|tracker| tracker.latency_ms)
+            .min()
+            .map(|latency| format!("{latency}ms"))
+            .unwrap_or_else(|| "latency unknown".to_string())
+    } else {
+        trackers
+            .iter()
+            .find_map(|tracker| tracker.error.as_deref())
+            .map(|error| format!("fail {error}"))
+            .unwrap_or_else(|| "fail".to_string())
+    };
+    let state = if reachable == trackers.len() {
+        "ok"
+    } else if reachable == 0 {
+        "fail"
+    } else {
+        "degraded"
+    };
     let first = trackers
         .first()
         .map(|tracker| tracker.base_url.as_str())
         .unwrap_or("-");
     format!(
-        "tracker {reachable}/{} {latency} {}",
+        "tracker {state} {reachable}/{} {detail} {}",
         trackers.len(),
         truncate_display(first, 24)
     )
-}
-
-fn mesh_peer_symbol(view: &SyncStatusWatchPeerView<'_>) -> char {
-    if view.peer.last_seen_age_sec.is_some_and(|age| age > 300) {
-        '○'
-    } else if view.peer.outbound_push_pending > 0 {
-        '◐'
-    } else if view.rates.pull_per_sec > 0.0
-        || view.rates.push_per_sec > 0.0
-        || view.rates.pending_drain_per_sec > 0.0
-    {
-        '◉'
-    } else {
-        '●'
-    }
-}
-
-fn mesh_peer_point(
-    index: usize,
-    total: usize,
-    width: usize,
-    height: usize,
-    label: &str,
-) -> CanvasPoint {
-    if total == 0 {
-        return CanvasPoint { x: 1, y: 1 };
-    }
-    let center_x = width as f64 / 2.0;
-    let center_y = height as f64 / 2.0;
-    let radius_x = (width.saturating_sub(22) as f64 / 2.0).max(8.0);
-    let radius_y = (height.saturating_sub(4) as f64 / 2.0).max(3.0);
-    let angle =
-        -std::f64::consts::FRAC_PI_2 + (index as f64 * std::f64::consts::TAU / total as f64);
-    let label_width = unicode_width::UnicodeWidthStr::width(label);
-    let max_x = width.saturating_sub(label_width.saturating_add(1)).max(1);
-    let max_y = height.saturating_sub(2).max(1);
-    let x = (center_x + radius_x * angle.cos()).round();
-    let y = (center_y + radius_y * angle.sin()).round();
-    CanvasPoint {
-        x: (x as isize).clamp(1, max_x as isize) as usize,
-        y: (y as isize).clamp(1, max_y as isize) as usize,
-    }
-}
-
-fn mesh_edge_glyph(from: CanvasPoint, to: CanvasPoint) -> char {
-    let dx = to.x as isize - from.x as isize;
-    let dy = to.y as isize - from.y as isize;
-    if dx.abs() > dy.abs().saturating_mul(2) {
-        '─'
-    } else if dy.abs() > dx.abs().saturating_mul(2) {
-        '│'
-    } else if dx.signum() == dy.signum() {
-        '╲'
-    } else {
-        '╱'
-    }
-}
-
-fn point_between(from: CanvasPoint, to: CanvasPoint, step: usize, total: usize) -> CanvasPoint {
-    let total = total.max(1) as f64;
-    let t = step as f64 / total;
-    CanvasPoint {
-        x: (from.x as f64 + (to.x as f64 - from.x as f64) * t).round() as usize,
-        y: (from.y as f64 + (to.y as f64 - from.y as f64) * t).round() as usize,
-    }
 }
 
 fn join_watch_panels(left: &[String], right: &[String], gap: &str) -> Vec<String> {
@@ -3943,93 +4010,6 @@ fn box_watch_panel(title: &str, width: usize, body: Vec<String>) -> Vec<String> 
     }
     lines.push(format!("└{}┘", "─".repeat(inner)));
     lines
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CanvasPoint {
-    x: usize,
-    y: usize,
-}
-
-struct WatchCanvas {
-    width: usize,
-    height: usize,
-    cells: Vec<Vec<char>>,
-}
-
-impl WatchCanvas {
-    fn new(width: usize, height: usize) -> Self {
-        Self {
-            width,
-            height,
-            cells: vec![vec![' '; width]; height],
-        }
-    }
-
-    fn put(&mut self, point: CanvasPoint, ch: char) {
-        if point.y < self.height && point.x < self.width {
-            self.cells[point.y][point.x] = ch;
-        }
-    }
-
-    fn put_str(&mut self, x: usize, y: usize, value: &str) {
-        if y >= self.height || x >= self.width {
-            return;
-        }
-        let mut x = x;
-        for ch in value.chars() {
-            if x >= self.width {
-                break;
-            }
-            self.cells[y][x] = ch;
-            x = x.saturating_add(
-                unicode_width::UnicodeWidthChar::width(ch)
-                    .unwrap_or(1)
-                    .max(1),
-            );
-        }
-    }
-
-    fn draw_line(&mut self, from: CanvasPoint, to: CanvasPoint, ch: char) {
-        let mut x0 = from.x as isize;
-        let mut y0 = from.y as isize;
-        let x1 = to.x as isize;
-        let y1 = to.y as isize;
-        let dx = (x1 - x0).abs();
-        let sx = if x0 < x1 { 1 } else { -1 };
-        let dy = -(y1 - y0).abs();
-        let sy = if y0 < y1 { 1 } else { -1 };
-        let mut err = dx + dy;
-
-        loop {
-            let point = CanvasPoint {
-                x: x0.max(0) as usize,
-                y: y0.max(0) as usize,
-            };
-            if point != from && point != to {
-                self.put(point, ch);
-            }
-            if x0 == x1 && y0 == y1 {
-                break;
-            }
-            let e2 = err.saturating_mul(2);
-            if e2 >= dy {
-                err += dy;
-                x0 += sx;
-            }
-            if e2 <= dx {
-                err += dx;
-                y0 += sy;
-            }
-        }
-    }
-
-    fn into_lines(self) -> Vec<String> {
-        self.cells
-            .into_iter()
-            .map(|row| row.into_iter().collect::<String>())
-            .collect()
-    }
 }
 
 fn sync_status_watch_peer_rates(
@@ -6173,18 +6153,19 @@ mod tests {
 
         let frame = render_sync_status_watch_frame(&mut state, &report, Instant::now(), 160);
 
-        assert!(frame.contains("rustory mesh watch"));
-        assert!(frame.contains("Mesh Map"));
-        assert!(frame.contains("Traffic"));
+        assert!(frame.contains("rustory sync watch"));
+        assert!(frame.contains("Overview"));
+        assert!(frame.contains("Attention"));
         assert!(frame.contains("Links"));
-        assert!(frame.contains("pull_cur"));
+        assert!(frame.contains("direct"));
         assert!(frame.contains("pull/s"));
-        assert!(frame.contains("push_cur"));
-        assert!(frame.contains("pending"));
+        assert!(frame.contains("sent"));
+        assert!(frame.contains("to_send"));
         assert!(frame.contains("drain/s"));
         assert!(frame.contains("2.3k"));
         assert!(frame.contains("2.0M"));
-        assert!(frame.contains("◇"));
+        assert!(frame.contains("direct_pull is only"));
+        assert!(!frame.contains("Mesh Map"));
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
             assert!(width <= 160, "line width {width}: {line}");
@@ -6193,15 +6174,23 @@ mod tests {
 
     #[test]
     fn sync_status_watch_status_lines_align_right_columns() {
-        let backlog = traffic_backlog_line(5, 16, 52);
-        let hot = traffic_hot_line("node0 12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR", 1_968_089, 13, 52);
+        let backlog = traffic_progress_line("to_send", 5, 16, 52);
+        let hot = traffic_hot_line(
+            "node0 12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR",
+            1_526_049,
+            1_968_089,
+            13,
+            52,
+        );
         let progress = link_push_progress_line(66, 24);
 
         assert_eq!(unicode_width::UnicodeWidthStr::width(backlog.as_str()), 52);
         assert_eq!(unicode_width::UnicodeWidthStr::width(hot.as_str()), 52);
         assert_eq!(unicode_width::UnicodeWidthStr::width(progress.as_str()), 24);
         assert!(backlog.ends_with("   5%      16 left"));
-        assert!(hot.ends_with("cur    2.0M       13 left"));
+        assert!(hot.contains("direct"));
+        assert!(hot.contains("sent"));
+        assert!(hot.ends_with("13 left"));
         assert!(progress.ends_with("  66%"));
     }
 
