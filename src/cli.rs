@@ -370,6 +370,29 @@ enum Command {
         )]
         interval_sec: u64,
     },
+    #[command(about = "Show a visual local mesh dashboard")]
+    Mesh {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Continuously redraw the mesh dashboard"
+        )]
+        watch: bool,
+
+        #[arg(
+            long,
+            default_value_t = 2,
+            help = "Seconds between mesh dashboard refreshes"
+        )]
+        interval_sec: u64,
+
+        #[arg(
+            long = "no-tracker",
+            default_value_t = false,
+            help = "Skip tracker reachability checks"
+        )]
+        no_tracker: bool,
+    },
     #[command(about = "Print Rustory version and build revision")]
     Version {
         #[arg(
@@ -1121,6 +1144,59 @@ pub fn run() -> Result<()> {
                     }
                 }
             }
+        }
+        Command::Mesh {
+            watch,
+            interval_sec,
+            no_tracker,
+        } => {
+            let store = storage::LocalStore::open(&db_path)?;
+            let local_device_id = resolve_device_id(&cfg);
+            let local_peer_id = resolve_local_p2p_peer_id(&cfg);
+            let trackers = if no_tracker {
+                None
+            } else {
+                Some(resolve_trackers(Vec::new(), &cfg)?)
+            };
+            let tracker_token = if no_tracker {
+                None
+            } else {
+                resolve_tracker_token(None, &cfg)?
+            };
+
+            if watch {
+                run_mesh_watch(
+                    &store,
+                    &local_device_id,
+                    local_peer_id.as_deref(),
+                    trackers.as_deref(),
+                    tracker_token.as_deref(),
+                    interval_sec.max(1),
+                )?;
+                return Ok(());
+            }
+
+            let report = build_sync_status_report_for_cli(
+                &store,
+                &local_device_id,
+                local_peer_id.as_deref(),
+                None,
+                trackers.as_deref(),
+                tracker_token.as_deref(),
+            )?;
+            let mut state = SyncStatusWatchState::default();
+            let (width, height) =
+                sync_status_watch_terminal_size(io::stdout().as_raw_fd()).unwrap_or((150, 40));
+            print!(
+                "{}",
+                render_mesh_watch_frame(
+                    &mut state,
+                    &report,
+                    Instant::now(),
+                    width.saturating_sub(1),
+                    height,
+                )
+            );
         }
         Command::Version { json } => {
             print_build_info(json)?;
@@ -3319,6 +3395,8 @@ fn sync_device_id_matches(peer_device_id: Option<&str>, local_device_id: &str) -
 #[derive(Default)]
 struct SyncStatusWatchState {
     peers: HashMap<String, SyncStatusWatchPeerState>,
+    total_pending_history: Vec<usize>,
+    total_rate_history: Vec<f64>,
     frame: usize,
 }
 
@@ -3336,6 +3414,15 @@ struct SyncStatusWatchPeerRates {
     pull_per_sec: f64,
     push_per_sec: f64,
     pending_drain_per_sec: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MeshWatchTotals {
+    progress: usize,
+    pending: usize,
+    pull_rate: f64,
+    push_rate: f64,
+    drain_rate: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -3457,6 +3544,62 @@ fn run_sync_status_watch(
     Ok(())
 }
 
+fn run_mesh_watch(
+    store: &storage::LocalStore,
+    local_device_id: &str,
+    local_peer_id: Option<&str>,
+    trackers: Option<&[String]>,
+    tracker_token: Option<&str>,
+    interval_sec: u64,
+) -> Result<()> {
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = stop.clone();
+        ctrlc::set_handler(move || {
+            stop.store(true, Ordering::SeqCst);
+        })
+        .context("set Ctrl-C/SIGTERM handler")?;
+    }
+
+    let mut state = SyncStatusWatchState::default();
+    let mut stdout = io::stdout();
+    write!(stdout, "\x1b[?1049h\x1b[?25l")?;
+    stdout.flush()?;
+
+    while !stop.load(Ordering::SeqCst) {
+        let report = match build_sync_status_report_for_cli(
+            store,
+            local_device_id,
+            local_peer_id,
+            None,
+            trackers,
+            tracker_token,
+        ) {
+            Ok(report) => report,
+            Err(err) => {
+                restore_sync_status_watch_terminal(&mut stdout)?;
+                return Err(err);
+            }
+        };
+        let (frame_width, frame_height) = sync_status_watch_terminal_size(stdout.as_raw_fd())
+            .map(|(width, height)| (width.saturating_sub(1), height))
+            .unwrap_or((150, 40));
+        let frame = render_mesh_watch_frame(
+            &mut state,
+            &report,
+            Instant::now(),
+            frame_width,
+            frame_height,
+        );
+        write!(stdout, "\x1b[H\x1b[2J{frame}")?;
+        stdout.flush()?;
+        sleep_with_stop(Duration::from_secs(interval_sec.max(1)), stop.as_ref());
+    }
+
+    restore_sync_status_watch_terminal(&mut stdout)?;
+    Ok(())
+}
+
 fn restore_sync_status_watch_terminal(stdout: &mut impl Write) -> Result<()> {
     write!(stdout, "\x1b[?25h\x1b[?1049l")?;
     stdout.flush()?;
@@ -3501,25 +3644,7 @@ fn render_sync_status_watch_frame(
         .iter()
         .map(|peer| peer.outbound_push_pending)
         .sum();
-    let mut peer_views = Vec::with_capacity(report.peers.len());
-    for peer in &report.peers {
-        let rates = sync_status_watch_peer_rates(state, peer, now);
-        let baseline = state
-            .peers
-            .get(&peer.peer_id)
-            .map(|state| state.max_outbound_push_pending)
-            .unwrap_or(peer.outbound_push_pending);
-        let progress = outbound_push_progress_percent(peer.outbound_push_pending, baseline);
-        let peer_name = sync_status_peer_display_name(peer);
-        peer_views.push(SyncStatusWatchPeerView {
-            peer,
-            rates,
-            baseline,
-            progress,
-            peer_name,
-        });
-    }
-    peer_views.sort_by(sync_status_watch_peer_cmp);
+    let peer_views = build_sync_status_watch_peer_views(state, report, now);
 
     push_watch_line(
         &mut out,
@@ -3556,6 +3681,588 @@ fn render_sync_status_watch_frame(
         width,
         "ctrl+c to exit  •  direct_pull is only this node's direct pull cursor; inbound pushes can still keep data current",
     );
+    out
+}
+
+fn build_sync_status_watch_peer_views<'a>(
+    state: &mut SyncStatusWatchState,
+    report: &'a SyncStatusReport,
+    now: Instant,
+) -> Vec<SyncStatusWatchPeerView<'a>> {
+    let mut peer_views = Vec::with_capacity(report.peers.len());
+    for peer in &report.peers {
+        let rates = sync_status_watch_peer_rates(state, peer, now);
+        let baseline = state
+            .peers
+            .get(&peer.peer_id)
+            .map(|state| state.max_outbound_push_pending)
+            .unwrap_or(peer.outbound_push_pending);
+        let progress = outbound_push_progress_percent(peer.outbound_push_pending, baseline);
+        let peer_name = sync_status_peer_display_name(peer);
+        peer_views.push(SyncStatusWatchPeerView {
+            peer,
+            rates,
+            baseline,
+            progress,
+            peer_name,
+        });
+    }
+    peer_views.sort_by(sync_status_watch_peer_cmp);
+    peer_views
+}
+
+fn render_mesh_watch_frame(
+    state: &mut SyncStatusWatchState,
+    report: &SyncStatusReport,
+    now: Instant,
+    frame_width: usize,
+    frame_height: usize,
+) -> String {
+    const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+    const PANEL_GAP: &str = "  ";
+
+    let width = frame_width.max(92);
+    let height = frame_height.max(24);
+    let phase = state.frame;
+    let spinner = SPINNER[phase % SPINNER.len()];
+    state.frame = state.frame.wrapping_add(1);
+
+    let peer_views = build_sync_status_watch_peer_views(state, report, now);
+    let total_pending: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending)
+        .sum();
+    let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
+    let total_progress = outbound_push_progress_percent(total_pending, total_baseline);
+    let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
+    let total_push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
+    let total_drain_rate: f64 = peer_views
+        .iter()
+        .map(|view| view.rates.pending_drain_per_sec.max(0.0))
+        .sum();
+    let totals = MeshWatchTotals {
+        progress: total_progress,
+        pending: total_pending,
+        pull_rate: total_pull_rate,
+        push_rate: total_push_rate,
+        drain_rate: total_drain_rate,
+    };
+    record_mesh_watch_sample(
+        state,
+        total_pending,
+        total_pull_rate + total_push_rate + total_drain_rate,
+    );
+
+    let side_width = (width / 3).clamp(44, 64);
+    let map_width = width.saturating_sub(side_width + display_width(PANEL_GAP));
+    let peer_ring_rows = (height / 3).clamp(6, 12);
+
+    let mut out = String::new();
+    push_watch_line(
+        &mut out,
+        width,
+        &format!(
+            "{spinner} rustory mesh watch  local={}  head={}  peers={}  to_send={}",
+            truncate_display(&report.local_device_id, 24),
+            format_count_i64(report.local_head),
+            report.peers.len(),
+            format_count_usize(total_pending),
+        ),
+    );
+    push_watch_line(
+        &mut out,
+        width,
+        "local view: peer→local is direct pull; local→peer is accepted push coverage",
+    );
+
+    out.push('\n');
+    let ring_panel =
+        render_mesh_peer_ring_panel(report, &peer_views, map_width, peer_ring_rows, phase);
+    let outbox_panel = render_mesh_outbox_panel(
+        report,
+        &peer_views,
+        report.tracker_status.as_deref(),
+        state,
+        side_width,
+        totals,
+    );
+    for line in join_watch_panels(&ring_panel, &outbox_panel, PANEL_GAP) {
+        push_watch_line(&mut out, width, &line);
+    }
+
+    out.push('\n');
+    let used_lines = out.lines().count();
+    let lane_rows = height
+        .saturating_sub(used_lines + 5)
+        .clamp(4, peer_views.len().max(4));
+    for line in render_mesh_lanes_panel(&peer_views, width, lane_rows) {
+        push_watch_line(&mut out, width, &line);
+    }
+
+    out.push('\n');
+    push_watch_line(
+        &mut out,
+        width,
+        "ctrl+c to exit  •  global peer↔peer flow needs future daemon telemetry; this view is this node's measured mesh edge state",
+    );
+    out
+}
+
+fn record_mesh_watch_sample(
+    state: &mut SyncStatusWatchState,
+    total_pending: usize,
+    total_rate: f64,
+) {
+    const HISTORY_LIMIT: usize = 48;
+
+    state.total_pending_history.push(total_pending);
+    if state.total_pending_history.len() > HISTORY_LIMIT {
+        state.total_pending_history.remove(0);
+    }
+    state.total_rate_history.push(total_rate.max(0.0));
+    if state.total_rate_history.len() > HISTORY_LIMIT {
+        state.total_rate_history.remove(0);
+    }
+}
+
+fn render_mesh_peer_ring_panel(
+    report: &SyncStatusReport,
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    panel_width: usize,
+    max_peer_rows: usize,
+    phase: usize,
+) -> Vec<String> {
+    let inner_width = panel_width.saturating_sub(2);
+    let visible_rows = peer_views.len().div_ceil(2).clamp(1, max_peer_rows.max(1));
+    let hub_width = (inner_width / 5).clamp(16, 28);
+    let connector_width = 8;
+    let side_width = inner_width
+        .saturating_sub(hub_width)
+        .saturating_sub(connector_width * 2)
+        .saturating_sub(4)
+        / 2;
+    let hub = truncate_display(&format!("◎ {}", report.local_device_id), hub_width);
+    let mut body = Vec::new();
+
+    body.push(center_cell(
+        &format!("{} local hub with {} observed edges", hub, peer_views.len()),
+        inner_width,
+    ));
+    body.push(center_cell(
+        "peer ring: ● synced  ◐ queued  ◌ stale  ◆ moving",
+        inner_width,
+    ));
+    body.push(String::new());
+
+    for row in 0..visible_rows {
+        let left = peer_views.get(row * 2);
+        let right = peer_views.get(row * 2 + 1);
+        let center = if row == visible_rows / 2 {
+            fit_cell(&hub, hub_width)
+        } else {
+            center_cell("│", hub_width)
+        };
+        let left_label = left.map(mesh_node_label).unwrap_or_default();
+        let right_label = right.map(mesh_node_label).unwrap_or_default();
+        let left_flow = left
+            .map(|view| mesh_flow_segment(view, phase + row, true))
+            .unwrap_or_else(|| " ".repeat(connector_width));
+        let right_flow = right
+            .map(|view| mesh_flow_segment(view, phase + row + 2, false))
+            .unwrap_or_else(|| " ".repeat(connector_width));
+        body.push(format!(
+            "{} {} {} {} {}",
+            right_cell(&left_label, side_width),
+            left_flow,
+            center,
+            right_flow,
+            fit_cell(&right_label, side_width),
+        ));
+    }
+
+    let hidden = peer_views.len().saturating_sub(visible_rows * 2);
+    if hidden > 0 {
+        body.push(center_cell(
+            &format!("+ {hidden} more peers in Flow Lanes"),
+            inner_width,
+        ));
+    }
+    if peer_views.is_empty() {
+        body.push(center_cell(
+            "no peers known yet; start rr daemon on another device",
+            inner_width,
+        ));
+    }
+
+    box_watch_panel("Peer Ring", panel_width, body)
+}
+
+fn render_mesh_outbox_panel(
+    report: &SyncStatusReport,
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    trackers: Option<&[SyncStatusTrackerReport]>,
+    state: &SyncStatusWatchState,
+    panel_width: usize,
+    totals: MeshWatchTotals,
+) -> Vec<String> {
+    let inner_width = panel_width.saturating_sub(2);
+    let queued = peer_views
+        .iter()
+        .filter(|view| view.peer.outbound_push_pending > 0)
+        .count();
+    let stale = peer_views
+        .iter()
+        .filter(|view| view.peer.last_seen_age_sec.is_some_and(|age| age > 300))
+        .count();
+    let active = peer_views
+        .iter()
+        .filter(|view| view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0)
+        .count();
+    let hottest = peer_views
+        .iter()
+        .max_by_key(|view| view.peer.outbound_push_pending);
+    let oldest_seen = peer_views
+        .iter()
+        .filter_map(|view| view.peer.last_seen_age_sec)
+        .max()
+        .map(|age| format!("oldest {}", format_age_sec(age)))
+        .unwrap_or_else(|| "oldest unknown".to_string());
+
+    let mut body = vec![
+        tracker_summary_line(trackers),
+        traffic_kv_line("local", &report.local_device_id, inner_width),
+        traffic_kv_line(
+            "head",
+            &format!(
+                "{} rows   {} peers",
+                format_count_i64(report.local_head),
+                report.peers.len()
+            ),
+            inner_width,
+        ),
+        traffic_kv_line("seen", &oldest_seen, inner_width),
+        String::new(),
+        traffic_progress_line("to_send", totals.progress, totals.pending, inner_width),
+        traffic_kv_line(
+            "trend",
+            &format!(
+                "queue {}",
+                sparkline_usize(&state.total_pending_history, inner_width.saturating_sub(14))
+            ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "rate",
+            &format!(
+                "pull {}/s  push {}/s  drain {}/s",
+                format_rate(totals.pull_rate),
+                format_rate(totals.push_rate),
+                format_rate(totals.drain_rate),
+            ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "spark",
+            &format!(
+                "flow {}",
+                sparkline_f64(&state.total_rate_history, inner_width.saturating_sub(13))
+            ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "health",
+            &format!("{queued} queued   {active} active   {stale} stale"),
+            inner_width,
+        ),
+    ];
+
+    if let Some(view) = hottest.filter(|view| view.peer.outbound_push_pending > 0) {
+        body.push(traffic_kv_line(
+            "hot",
+            &format!(
+                "{}  {} left  {}",
+                truncate_display(&view.peer_name, 22),
+                format_count_usize(view.peer.outbound_push_pending),
+                link_push_progress_line(view.progress, 14),
+            ),
+            inner_width,
+        ));
+    }
+    if peer_views
+        .iter()
+        .all(|view| view.peer.outbound_push_pending == 0)
+    {
+        body.push(truncate_display(
+            "steady: no queued local rows",
+            inner_width,
+        ));
+    }
+
+    box_watch_panel("Outbox", panel_width, body)
+}
+
+fn render_mesh_lanes_panel(
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    panel_width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    let inner_width = panel_width.saturating_sub(2);
+    let mut body = if inner_width >= 132 {
+        render_mesh_lanes_wide(peer_views, inner_width, max_rows)
+    } else {
+        render_mesh_lanes_compact(peer_views, inner_width, max_rows)
+    };
+
+    if peer_views.is_empty() {
+        body.push("no local mesh edges yet".to_string());
+    }
+
+    box_watch_panel("Flow Lanes", panel_width, body)
+}
+
+fn render_mesh_lanes_wide(
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    inner_width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    const STATE_COL: usize = 8;
+    const SEEN_COL: usize = 8;
+    const DIRECT_COL: usize = 11;
+    const PULL_RATE_COL: usize = 8;
+    const SENT_COL: usize = 11;
+    const PENDING_COL: usize = 9;
+    const DRAIN_COL: usize = 8;
+    const PROGRESS_COL: usize = 24;
+    const GAPS: usize = 8;
+
+    let fixed_width = STATE_COL
+        + SEEN_COL
+        + DIRECT_COL
+        + PULL_RATE_COL
+        + SENT_COL
+        + PENDING_COL
+        + DRAIN_COL
+        + PROGRESS_COL
+        + GAPS;
+    let peer_col = inner_width.saturating_sub(fixed_width).max(20);
+    let mut body = Vec::new();
+    body.push(format!(
+        "{} {} {} {} {} {} {} {} {}",
+        fit_cell("peer", peer_col),
+        fit_cell("state", STATE_COL),
+        right_cell("seen", SEEN_COL),
+        right_cell("direct", DIRECT_COL),
+        right_cell("pull/s", PULL_RATE_COL),
+        right_cell("sent", SENT_COL),
+        right_cell("to_send", PENDING_COL),
+        right_cell("drain/s", DRAIN_COL),
+        fit_cell("coverage", PROGRESS_COL),
+    ));
+    body.push("─".repeat(inner_width));
+
+    for view in peer_views.iter().take(max_rows) {
+        body.push(format!(
+            "{} {} {} {} {} {} {} {} {}",
+            fit_cell(&view.peer_name, peer_col),
+            fit_cell(sync_status_watch_peer_status(view), STATE_COL),
+            right_cell(&format_age_opt(view.peer.last_seen_age_sec), SEEN_COL),
+            right_cell(&format_count_i64(view.peer.pull_cursor), DIRECT_COL),
+            right_cell(&format_rate(view.rates.pull_per_sec), PULL_RATE_COL),
+            right_cell(&format_count_i64(view.peer.push_cursor), SENT_COL),
+            right_cell(
+                &format_count_usize(view.peer.outbound_push_pending),
+                PENDING_COL,
+            ),
+            right_cell(
+                &format_rate(view.rates.pending_drain_per_sec.max(0.0)),
+                DRAIN_COL,
+            ),
+            link_push_progress_line(view.progress, PROGRESS_COL),
+        ));
+    }
+    append_hidden_peer_count(&mut body, peer_views.len(), max_rows, inner_width);
+    body
+}
+
+fn render_mesh_lanes_compact(
+    peer_views: &[SyncStatusWatchPeerView<'_>],
+    inner_width: usize,
+    max_rows: usize,
+) -> Vec<String> {
+    let state_col = 8;
+    let seen_col = 7;
+    let pending_col = 9;
+    let progress_col = 16;
+    let variable =
+        inner_width.saturating_sub(state_col + seen_col + pending_col + progress_col + 5);
+    let peer_col = (variable / 2).clamp(18, 34);
+    let cursor_col = variable.saturating_sub(peer_col).max(28);
+
+    let mut body = Vec::new();
+    body.push(format!(
+        "{} {} {} {} {} {}",
+        fit_cell("peer", peer_col),
+        fit_cell("state", state_col),
+        right_cell("seen", seen_col),
+        fit_cell("direct/sent", cursor_col),
+        right_cell("to_send", pending_col),
+        fit_cell("coverage", progress_col),
+    ));
+    body.push("─".repeat(inner_width));
+
+    for view in peer_views.iter().take(max_rows) {
+        let cursor = format!(
+            "direct {}  sent {}",
+            format_count_i64(view.peer.pull_cursor),
+            format_count_i64(view.peer.push_cursor),
+        );
+        body.push(format!(
+            "{} {} {} {} {} {}",
+            fit_cell(&view.peer_name, peer_col),
+            fit_cell(sync_status_watch_peer_status(view), state_col),
+            right_cell(&format_age_opt(view.peer.last_seen_age_sec), seen_col),
+            fit_cell(&cursor, cursor_col),
+            right_cell(
+                &format_count_usize(view.peer.outbound_push_pending),
+                pending_col,
+            ),
+            link_push_progress_line(view.progress, progress_col),
+        ));
+    }
+    append_hidden_peer_count(&mut body, peer_views.len(), max_rows, inner_width);
+    body
+}
+
+fn append_hidden_peer_count(body: &mut Vec<String>, total: usize, visible: usize, width: usize) {
+    let hidden = total.saturating_sub(visible);
+    if hidden > 0 {
+        body.push(truncate_display(
+            &format!("+ {hidden} more peers hidden by terminal height"),
+            width,
+        ));
+    }
+}
+
+fn mesh_node_label(view: &SyncStatusWatchPeerView<'_>) -> String {
+    let peer = view.peer;
+    let queued = if peer.outbound_push_pending > 0 {
+        format!(" {} left", format_count_usize(peer.outbound_push_pending))
+    } else {
+        String::new()
+    };
+    format!(
+        "{} {}{} {}",
+        mesh_peer_symbol(view),
+        truncate_display(&mesh_peer_ring_name(view), 22),
+        queued,
+        format_age_opt(peer.last_seen_age_sec),
+    )
+}
+
+fn mesh_peer_ring_name(view: &SyncStatusWatchPeerView<'_>) -> String {
+    view.peer
+        .peer_device_id
+        .clone()
+        .unwrap_or_else(|| short_peer_id(&view.peer.peer_id))
+}
+
+fn mesh_peer_symbol(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
+    if view.peer.last_seen_age_sec.is_some_and(|age| age > 300) {
+        "◌"
+    } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
+        "◆"
+    } else if view.peer.outbound_push_pending > 0 {
+        "◐"
+    } else {
+        "●"
+    }
+}
+
+fn mesh_flow_segment(
+    view: &SyncStatusWatchPeerView<'_>,
+    phase: usize,
+    points_left: bool,
+) -> String {
+    const WIDTH: usize = 8;
+    let active = view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0;
+    let queued = view.peer.outbound_push_pending > 0;
+    let marker = if active {
+        "◆"
+    } else if queued {
+        "◇"
+    } else {
+        "─"
+    };
+    if marker == "─" {
+        return "─".repeat(WIDTH);
+    }
+
+    let lane_width = WIDTH.saturating_sub(1).max(1);
+    let slot = phase % lane_width;
+    let mut chars = vec!['─'; lane_width];
+    chars[slot] = marker.chars().next().unwrap_or('◆');
+    let value = chars.into_iter().collect::<String>();
+    if points_left {
+        format!("◀{value}")
+    } else {
+        format!("{value}▶")
+    }
+}
+
+fn center_cell(value: &str, width: usize) -> String {
+    let value = truncate_display(value, width);
+    let value_width = display_width(&value);
+    if value_width >= width {
+        return value;
+    }
+    let left = (width - value_width) / 2;
+    let right = width - value_width - left;
+    format!("{}{}{}", " ".repeat(left), value, " ".repeat(right))
+}
+
+fn format_age_opt(age: Option<i64>) -> String {
+    age.map(format_age_sec).unwrap_or_else(|| "-".to_string())
+}
+
+fn format_age_sec(age: i64) -> String {
+    let age = age.max(0);
+    if age >= 86_400 {
+        format!("{}d", age / 86_400)
+    } else if age >= 3_600 {
+        format!("{}h", age / 3_600)
+    } else if age >= 60 {
+        format!("{}m", age / 60)
+    } else {
+        format!("{age}s")
+    }
+}
+
+fn sparkline_usize(values: &[usize], width: usize) -> String {
+    let values = values.iter().map(|value| *value as f64).collect::<Vec<_>>();
+    sparkline_f64(values.as_slice(), width)
+}
+
+fn sparkline_f64(values: &[f64], width: usize) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if width == 0 {
+        return String::new();
+    }
+    if values.is_empty() {
+        return "·".repeat(width.min(3));
+    }
+
+    let sample_count = values.len().min(width);
+    let start = values.len().saturating_sub(sample_count);
+    let samples = &values[start..];
+    let min = samples.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let span = (max - min).max(0.000_001);
+    let mut out = String::new();
+    for value in samples {
+        let normalized = ((*value - min) / span).clamp(0.0, 1.0);
+        let idx = (normalized * (BARS.len() - 1) as f64).round() as usize;
+        out.push(BARS[idx.min(BARS.len() - 1)]);
+    }
     out
 }
 
@@ -5804,6 +6511,37 @@ mod tests {
     }
 
     #[test]
+    fn mesh_parses_watch_flags() {
+        let app = App::parse_from(["rr", "mesh", "--watch", "--interval-sec", "5"]);
+        match app.cmd {
+            Command::Mesh {
+                watch,
+                interval_sec,
+                no_tracker,
+            } => {
+                assert!(watch);
+                assert_eq!(interval_sec, 5);
+                assert!(!no_tracker);
+            }
+            _ => panic!("expected mesh"),
+        }
+
+        let app = App::parse_from(["rr", "mesh", "--no-tracker"]);
+        match app.cmd {
+            Command::Mesh {
+                watch,
+                interval_sec,
+                no_tracker,
+            } => {
+                assert!(!watch);
+                assert_eq!(interval_sec, 2);
+                assert!(no_tracker);
+            }
+            _ => panic!("expected mesh"),
+        }
+    }
+
+    #[test]
     fn daemon_parses_daily_driver_flags() {
         let app = App::parse_from([
             "rr",
@@ -6199,6 +6937,71 @@ mod tests {
         assert!(frame.contains("2.3k"));
         assert!(frame.contains("2.0M"));
         assert!(frame.contains("direct_pull is only"));
+        assert!(!frame.contains("Mesh Map"));
+        for line in frame.lines() {
+            let width = unicode_width::UnicodeWidthStr::width(line);
+            assert!(width <= 160, "line width {width}: {line}");
+        }
+    }
+
+    #[test]
+    fn mesh_watch_frame_uses_visual_local_mesh_dashboard() {
+        let mut state = SyncStatusWatchState::default();
+        let report = SyncStatusReport {
+            local_head: 4_494_530,
+            local_device_id: "user-arm64-with-an-extra-long-local-device-id".to_string(),
+            peers: vec![
+                SyncStatusPeerReport {
+                    peer_id: "12D3KooWE3u4VEsbCGR7w53rbBYi1mZ3kADAgAhDYTj8ACiPBC1M".to_string(),
+                    peer_device_id: Some("sample-node-x86_64".to_string()),
+                    pull_cursor: 4_400_747,
+                    push_cursor: 4_494_530,
+                    outbound_push_pending: 0,
+                    pending_push: 0,
+                    last_seen_unix: Some(1),
+                    last_seen_age_sec: Some(27),
+                },
+                SyncStatusPeerReport {
+                    peer_id: "12D3KooWJSi7WKtoW8wp2MnxhheB3Y62fAN9FRHGMspc5fQZfZnH".to_string(),
+                    peer_device_id: Some("samplex-x86_64-with-long-name".to_string()),
+                    pull_cursor: 0,
+                    push_cursor: 3_678_638,
+                    outbound_push_pending: 158_485,
+                    pending_push: 158_485,
+                    last_seen_unix: Some(1),
+                    last_seen_age_sec: Some(602),
+                },
+                SyncStatusPeerReport {
+                    peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
+                    peer_device_id: Some("node3-x86_64".to_string()),
+                    pull_cursor: 4_345_857,
+                    push_cursor: 4_494_530,
+                    outbound_push_pending: 2,
+                    pending_push: 2,
+                    last_seen_unix: Some(1),
+                    last_seen_age_sec: Some(3),
+                },
+            ],
+            tracker_status: Some(vec![SyncStatusTrackerReport {
+                base_url: "https://tracker.example.com".to_string(),
+                reachable: true,
+                latency_ms: Some(26),
+                error: None,
+            }]),
+        };
+
+        let frame = render_mesh_watch_frame(&mut state, &report, Instant::now(), 160, 36);
+
+        assert!(frame.contains("rustory mesh watch"));
+        assert!(frame.contains("Peer Ring"));
+        assert!(frame.contains("Outbox"));
+        assert!(frame.contains("Flow Lanes"));
+        assert!(frame.contains("local view: peer"));
+        assert!(frame.contains("global peer"));
+        assert!(frame.contains("to_send"));
+        assert!(frame.contains("coverage"));
+        assert!(frame.contains("queue"));
+        assert!(frame.contains("158.5k"));
         assert!(!frame.contains("Mesh Map"));
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
