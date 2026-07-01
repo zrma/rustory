@@ -2762,6 +2762,8 @@ fn run_doctor_auto_fix(
         fix_path_mode(&key_path, 0o600, label, &mut report)?;
     }
 
+    fix_managed_hook_blocks(&mut report)?;
+
     Ok(report)
 }
 
@@ -2903,6 +2905,38 @@ fn fix_default_record_ignore_regex(
         status: DoctorAutoFixStatus::Fixed,
         detail: "set default secret-filter pattern".to_string(),
     });
+    Ok(())
+}
+
+fn fix_managed_hook_blocks(report: &mut DoctorAutoFixReport) -> Result<()> {
+    let install_path = std::env::current_exe().context("resolve current rr executable")?;
+    let fixes = hook::auto_fix_existing_managed_hook_blocks(&install_path)?;
+    if fixes.is_empty() {
+        report.actions.push(DoctorAutoFixAction {
+            target: "shell hook".to_string(),
+            status: DoctorAutoFixStatus::Skipped,
+            detail: "no managed rustory hook blocks found".to_string(),
+        });
+        return Ok(());
+    }
+
+    for fix in fixes {
+        let status = match fix.status {
+            hook::ManagedHookFixStatus::Fixed => DoctorAutoFixStatus::Fixed,
+            hook::ManagedHookFixStatus::Ok => DoctorAutoFixStatus::Ok,
+            hook::ManagedHookFixStatus::Skipped => DoctorAutoFixStatus::Skipped,
+        };
+        report.actions.push(DoctorAutoFixAction {
+            target: "shell hook".to_string(),
+            status,
+            detail: format!(
+                "path={} shell={} removed_blocks={}",
+                fix.rc_file.display(),
+                fix.shell.name(),
+                fix.removed_blocks
+            ),
+        });
+    }
     Ok(())
 }
 

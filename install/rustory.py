@@ -34,6 +34,8 @@ MAX_ASSET_BYTES = 128 * 1024 * 1024
 MAX_CHECKSUM_BYTES = 64 * 1024
 HOOK_START = "# >>> rustory hook >>>"
 HOOK_END = "# <<< rustory hook <<<"
+LEGACY_HOOK_START = "# >>> rustory >>>"
+LEGACY_HOOK_END = "# <<< rustory <<<"
 DAEMON_AUTOSTART_START = "# >>> rustory daemon autostart >>>"
 DAEMON_AUTOSTART_END = "# <<< rustory daemon autostart <<<"
 SUPPORTED_HOOK_SHELLS = ("bash", "zsh")
@@ -971,8 +973,12 @@ def install_shell_hook(install_path: Path, args: argparse.Namespace) -> None:
     shell = resolve_hook_shell(args.hook_shell)
     rc_file = Path(args.rc_file).expanduser() if args.rc_file else default_rc_file(shell)
     block = render_hook_block(shell, install_path.parent)
-    update_managed_block(rc_file, block)
-    print(f"hook=installed shell={shell} rc_file={rc_file}")
+    removed_blocks = update_managed_block(
+        rc_file,
+        block,
+        legacy_marker_pairs=((LEGACY_HOOK_START, LEGACY_HOOK_END),),
+    )
+    print(f"hook=installed shell={shell} rc_file={rc_file} deduped_blocks={removed_blocks}")
 
 
 def resolve_hook_shell(value: str) -> str:
@@ -1034,18 +1040,72 @@ def update_managed_block(
     block: str,
     start_marker: str = HOOK_START,
     end_marker: str = HOOK_END,
-) -> None:
+    legacy_marker_pairs: tuple[tuple[str, str], ...] = (),
+) -> int:
     rc_file.parent.mkdir(parents=True, exist_ok=True)
     existing = rc_file.read_text() if rc_file.exists() else ""
-    start = existing.find(start_marker)
-    end = existing.find(end_marker)
-    if start != -1 and end != -1 and end > start:
-        end += len(end_marker)
-        updated = existing[:start].rstrip() + "\n\n" + block + existing[end:].lstrip("\n")
-    else:
-        prefix = existing.rstrip() + "\n\n" if existing.strip() else ""
-        updated = prefix + block
+    cleaned, removed_blocks = strip_managed_blocks(
+        existing,
+        ((start_marker, end_marker), *legacy_marker_pairs),
+    )
+    prefix = cleaned.rstrip() + "\n\n" if cleaned.strip() else ""
+    updated = prefix + block
     rc_file.write_text(updated)
+    return removed_blocks
+
+
+def strip_managed_blocks(content: str, marker_pairs: tuple[tuple[str, str], ...]) -> tuple[str, int]:
+    output: list[str] = []
+    rest = content
+    removed_blocks = 0
+    while True:
+        found = find_next_managed_block_start(rest, marker_pairs)
+        if found is None:
+            output.append(rest)
+            break
+        start, start_marker, end_marker = found
+        output.append(rest[:start])
+        after_start = rest[start + len(start_marker) :]
+        end = after_start.find(end_marker)
+        if end == -1:
+            output.append(rest[start:])
+            break
+        skip = start + len(start_marker) + end + len(end_marker)
+        if rest[skip:].startswith("\n"):
+            skip += 1
+        rest = rest[skip:]
+        removed_blocks += 1
+    return trim_repeated_blank_lines_text("".join(output)), removed_blocks
+
+
+def find_next_managed_block_start(
+    content: str,
+    marker_pairs: tuple[tuple[str, str], ...],
+):
+    found = None
+    for start_marker, end_marker in marker_pairs:
+        start = content.find(start_marker)
+        if start == -1:
+            continue
+        if found is None or start < found[0]:
+            found = (start, start_marker, end_marker)
+    return found
+
+
+def trim_repeated_blank_lines_text(content: str) -> str:
+    result: list[str] = []
+    blank = False
+    for line in content.splitlines():
+        is_blank = not line.strip()
+        if is_blank and blank:
+            continue
+        result.append(line)
+        blank = is_blank
+    while result and not result[0].strip():
+        result.pop(0)
+    while result and not result[-1].strip():
+        result.pop()
+    return "\n".join(result)
 
 
 if __name__ == "__main__":

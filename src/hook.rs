@@ -1,6 +1,7 @@
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
+use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Shell {
     Bash,
     Zsh,
@@ -14,6 +15,33 @@ impl Shell {
             _ => bail!("unsupported shell: {value}"),
         }
     }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+        }
+    }
+}
+
+pub const HOOK_START: &str = "# >>> rustory hook >>>";
+pub const HOOK_END: &str = "# <<< rustory hook <<<";
+const LEGACY_HOOK_START: &str = "# >>> rustory >>>";
+const LEGACY_HOOK_END: &str = "# <<< rustory <<<";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedHookFixReport {
+    pub rc_file: PathBuf,
+    pub shell: Shell,
+    pub status: ManagedHookFixStatus,
+    pub removed_blocks: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedHookFixStatus {
+    Fixed,
+    Ok,
+    Skipped,
 }
 
 pub fn render_hook(shell: Shell) -> String {
@@ -21,6 +49,230 @@ pub fn render_hook(shell: Shell) -> String {
         Shell::Bash => render_bash_hook(),
         Shell::Zsh => render_zsh_hook(),
     }
+}
+
+pub fn auto_fix_existing_managed_hook_blocks(
+    install_path: &Path,
+) -> Result<Vec<ManagedHookFixReport>> {
+    let bin_dir = install_path
+        .parent()
+        .with_context(|| format!("install path has no parent: {}", install_path.display()))?;
+    let mut reports = Vec::new();
+    for (rc_file, shell) in managed_hook_candidate_files()? {
+        let existing = match std::fs::read_to_string(&rc_file) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read rc file: {}", rc_file.display()));
+            }
+        };
+        if !contains_managed_hook_block(&existing) {
+            continue;
+        }
+        let block = render_managed_source_block(shell, bin_dir);
+        reports.push(update_managed_hook_block(
+            &rc_file,
+            shell,
+            &block,
+            false,
+            Some(existing),
+        )?);
+    }
+    Ok(reports)
+}
+
+fn managed_hook_candidate_files() -> Result<Vec<(PathBuf, Shell)>> {
+    let home = home_dir()?;
+    let mut candidates = Vec::new();
+    if let Some(shell) = default_shell() {
+        candidates.push((default_rc_file_for_home(&home, shell), shell));
+    }
+    for (name, shell) in [(".zshrc", Shell::Zsh), (".bashrc", Shell::Bash)] {
+        let path = home.join(name);
+        if !candidates.iter().any(|(candidate, _)| candidate == &path) {
+            candidates.push((path, shell));
+        }
+    }
+    Ok(candidates)
+}
+
+fn update_managed_hook_block(
+    rc_file: &Path,
+    shell: Shell,
+    block: &str,
+    install_if_missing: bool,
+    existing: Option<String>,
+) -> Result<ManagedHookFixReport> {
+    let existing = match existing {
+        Some(content) => content,
+        None => match std::fs::read_to_string(rc_file) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("read rc file: {}", rc_file.display()));
+            }
+        },
+    };
+    let has_block = contains_managed_hook_block(&existing);
+    if !has_block && !install_if_missing {
+        return Ok(ManagedHookFixReport {
+            rc_file: rc_file.to_path_buf(),
+            shell,
+            status: ManagedHookFixStatus::Skipped,
+            removed_blocks: 0,
+        });
+    }
+
+    let (cleaned, removed_blocks) = strip_managed_hook_blocks(&existing);
+    let updated = append_managed_block(&cleaned, block);
+    if updated == existing {
+        return Ok(ManagedHookFixReport {
+            rc_file: rc_file.to_path_buf(),
+            shell,
+            status: ManagedHookFixStatus::Ok,
+            removed_blocks,
+        });
+    }
+
+    if let Some(parent) = rc_file.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create rc parent: {}", parent.display()))?;
+    }
+    std::fs::write(rc_file, updated)
+        .with_context(|| format!("write rc file: {}", rc_file.display()))?;
+    Ok(ManagedHookFixReport {
+        rc_file: rc_file.to_path_buf(),
+        shell,
+        status: ManagedHookFixStatus::Fixed,
+        removed_blocks,
+    })
+}
+
+fn contains_managed_hook_block(content: &str) -> bool {
+    content.contains(HOOK_START) || content.contains(LEGACY_HOOK_START)
+}
+
+fn strip_managed_hook_blocks(content: &str) -> (String, usize) {
+    let mut rest = content;
+    let mut output = String::with_capacity(content.len());
+    let mut removed = 0;
+    while let Some((start, start_marker, end_marker)) = find_next_managed_block_start(rest) {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + start_marker.len()..];
+        let Some(end) = after_start.find(end_marker) else {
+            output.push_str(&rest[start..]);
+            return (output, removed);
+        };
+        let mut skip = start + start_marker.len() + end + end_marker.len();
+        if rest[skip..].starts_with('\n') {
+            skip += 1;
+        }
+        rest = &rest[skip..];
+        removed += 1;
+    }
+    output.push_str(rest);
+    (trim_repeated_blank_lines(&output), removed)
+}
+
+fn find_next_managed_block_start(content: &str) -> Option<(usize, &'static str, &'static str)> {
+    [(HOOK_START, HOOK_END), (LEGACY_HOOK_START, LEGACY_HOOK_END)]
+        .into_iter()
+        .filter_map(|(start_marker, end_marker)| {
+            content
+                .find(start_marker)
+                .map(|offset| (offset, start_marker, end_marker))
+        })
+        .min_by_key(|(offset, _, _)| *offset)
+}
+
+fn append_managed_block(existing: &str, block: &str) -> String {
+    if existing.trim().is_empty() {
+        return block.to_string();
+    }
+    format!("{}\n\n{}", existing.trim_end(), block)
+}
+
+fn trim_repeated_blank_lines(content: &str) -> String {
+    let mut result = String::with_capacity(content.len());
+    let mut blank = false;
+    for line in content.lines() {
+        let is_blank = line.trim().is_empty();
+        if is_blank && blank {
+            continue;
+        }
+        result.push_str(line);
+        result.push('\n');
+        blank = is_blank;
+    }
+    result.trim_matches('\n').to_string()
+}
+
+fn render_managed_source_block(shell: Shell, bin_dir: &Path) -> String {
+    let bin_expr = shell_path_expr(bin_dir);
+    format!(
+        "{HOOK_START}\n\
+         # Managed by rustory installer. Re-run with --install-hook to update.\n\
+         export PATH=\"{bin_expr}:$PATH\"\n\
+         if command -v rr >/dev/null 2>&1; then\n\
+           source <(rr hook --shell {})\n\
+         fi\n\
+         {HOOK_END}\n",
+        shell.name()
+    )
+}
+
+fn shell_path_expr(path: &Path) -> String {
+    let home = match std::env::var_os("HOME") {
+        Some(home) => PathBuf::from(home),
+        None => return shell_escape_path(path),
+    };
+    match path.strip_prefix(&home) {
+        Ok(rel) if rel.as_os_str().is_empty() => "$HOME".to_string(),
+        Ok(rel) => format!("$HOME/{}", shell_escape_path(rel)),
+        Err(_) => shell_escape_path(path),
+    }
+}
+
+fn shell_escape_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('$', "\\$")
+}
+
+fn default_shell() -> Option<Shell> {
+    let shell_name = std::env::var_os("SHELL")
+        .and_then(|value| PathBuf::from(value).file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(str::to_string));
+    match shell_name.as_deref() {
+        Some("bash") => Some(Shell::Bash),
+        Some("zsh") => Some(Shell::Zsh),
+        _ => {
+            #[cfg(target_os = "macos")]
+            {
+                Some(Shell::Zsh)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                Some(Shell::Bash)
+            }
+        }
+    }
+}
+
+fn default_rc_file_for_home(home: &Path, shell: Shell) -> PathBuf {
+    match shell {
+        Shell::Bash => home.join(".bashrc"),
+        Shell::Zsh => home.join(".zshrc"),
+    }
+}
+
+fn home_dir() -> Result<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .context("HOME env var not set")
 }
 
 fn render_bash_hook() -> String {
@@ -293,5 +545,58 @@ mod tests {
         assert!(got.contains("frac=\"${frac[1,3]}\""));
 
         assert!(!got.contains("rr|rr\\ *)"));
+    }
+
+    #[test]
+    fn install_managed_hook_block_dedupes_legacy_and_current_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".zshrc");
+        let rr = dir.path().join(".local/bin/rr");
+        std::fs::write(
+            &rc,
+            [
+                "export KEEP=1\n",
+                LEGACY_HOOK_START,
+                "\nsource <(rr hook --shell zsh)\n",
+                LEGACY_HOOK_END,
+                "\n\n",
+                HOOK_START,
+                "\nsource <(rr hook --shell zsh)\n",
+                HOOK_END,
+                "\n",
+            ]
+            .join(""),
+        )
+        .unwrap();
+
+        let block = render_managed_source_block(Shell::Zsh, rr.parent().unwrap());
+        let report = update_managed_hook_block(&rc, Shell::Zsh, &block, true, None).unwrap();
+        let content = std::fs::read_to_string(&rc).unwrap();
+
+        assert_eq!(report.status, ManagedHookFixStatus::Fixed);
+        assert_eq!(report.removed_blocks, 2);
+        assert_eq!(content.matches(HOOK_START).count(), 1);
+        assert_eq!(content.matches(HOOK_END).count(), 1);
+        assert!(!content.contains(LEGACY_HOOK_START));
+        assert!(content.contains("export KEEP=1"));
+        assert!(content.contains("source <(rr hook --shell zsh)"));
+    }
+
+    #[test]
+    fn auto_fix_skips_rc_without_managed_hook_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let rc = dir.path().join(".bashrc");
+        let block = render_managed_source_block(Shell::Bash, dir.path());
+        let report = update_managed_hook_block(
+            &rc,
+            Shell::Bash,
+            &block,
+            false,
+            Some("alias ll='ls -alh'\n".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(report.status, ManagedHookFixStatus::Skipped);
+        assert!(!rc.exists());
     }
 }

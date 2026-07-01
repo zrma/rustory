@@ -3,6 +3,7 @@
 ## 설치(현재 세션)
 ctrl+r 검색은 `rr search`의 inline TUI를 사용한다. 별도 `fzf` 설치는 필요 없다.
 현재 셸에 hook이 적용됐는지는 `rr doctor`의 `hook:` 라인에서 `installed=true`로 확인한다.
+one-shot installer의 `--install-hook`은 `# >>> rustory hook >>>` 관리 블록을 1개만 유지한다. 이전 릴리즈의 `# >>> rustory >>>` 블록이나 중복 관리 블록이 남아 있으면 installer, `rr doctor --auto-fix`, `rr update`가 현재 셸 rc 파일의 Rustory 관리 블록을 정규화한다. Rustory marker 밖의 사용자 설정은 수정하지 않는다.
 
 ### zsh
 ```sh

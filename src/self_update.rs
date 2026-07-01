@@ -70,6 +70,7 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
         println!(
             "update: installed binary already matches downloaded asset; no replacement performed"
         );
+        auto_fix_managed_hook_blocks(&plan.install_path);
         println!("daemon=restart_skipped reason=binary_unchanged");
         return Ok(());
     }
@@ -77,12 +78,39 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
     install_binary(&bytes, &plan.install_path)?;
 
     println!("updated rr: {}", plan.install_path.display());
+    auto_fix_managed_hook_blocks(&plan.install_path);
     if request.restart_daemon {
         restart_managed_daemon(&plan.install_path);
     } else {
         println!("daemon=restart_skipped reason=--no-restart-daemon");
     }
     Ok(())
+}
+
+fn auto_fix_managed_hook_blocks(install_path: &Path) {
+    match crate::hook::auto_fix_existing_managed_hook_blocks(install_path) {
+        Ok(reports) if reports.is_empty() => {
+            println!("hook_auto_fix=skipped reason=no_managed_hook_blocks");
+        }
+        Ok(reports) => {
+            for report in reports {
+                let status = match report.status {
+                    crate::hook::ManagedHookFixStatus::Fixed => "fixed",
+                    crate::hook::ManagedHookFixStatus::Ok => "ok",
+                    crate::hook::ManagedHookFixStatus::Skipped => "skipped",
+                };
+                println!(
+                    "hook_auto_fix={status} shell={} rc_file={} removed_blocks={}",
+                    report.shell.name(),
+                    report.rc_file.display(),
+                    report.removed_blocks
+                );
+            }
+        }
+        Err(err) => {
+            eprintln!("warn: hook auto-fix failed: {err:#}");
+        }
+    }
 }
 
 fn build_update_plan(request: &UpdateRequest) -> Result<UpdatePlan> {
