@@ -605,20 +605,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         libp2p_request_response::Event::ResponseSent { .. } => {}
                     },
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
-                        match &event.result {
-                            Ok(connection_id) => {
-                                eprintln!(
-                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                                    event.remote_peer_id
-                                );
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
-                                    event.remote_peer_id
-                                );
-                            }
-                        }
+                        log_dcutr_event(&event);
                     }
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Relay(event)) => match event {
                         libp2p::relay::client::Event::ReservationReqAccepted {
@@ -658,11 +645,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         let error = error.to_string();
-                        if is_loopback_direct_dial_noise(&error) {
-                            eprintln!(
-                                "p2p direct candidate failed; relay path may still be active: peer={peer_id:?} error={error}"
-                            );
-                        } else {
+                        if !is_loopback_direct_dial_noise(&error) {
                             eprintln!(
                                 "warn: p2p outgoing connection error: peer={peer_id:?} error={error}"
                             );
@@ -1568,20 +1551,7 @@ impl P2pClient {
                         return Ok(());
                     }
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
-                        match &event.result {
-                            Ok(connection_id) => {
-                                eprintln!(
-                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                                    event.remote_peer_id
-                                );
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
-                                    event.remote_peer_id
-                                );
-                            }
-                        }
+                        log_dcutr_event(&event);
                     }
                     SwarmEvent::OutgoingConnectionError {
                         connection_id: got,
@@ -1692,20 +1662,9 @@ impl P2pClient {
                             libp2p_request_response::Event::InboundFailure { .. } => {}
                             libp2p_request_response::Event::ResponseSent { .. } => {}
                         },
-                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
-                            Ok(connection_id) => {
-                                eprintln!(
-                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                                    event.remote_peer_id
-                                );
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
-                                    event.remote_peer_id
-                                );
-                            }
-                        },
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
+                            log_dcutr_event(&event);
+                        }
                         _ => {}
                     }
                 }
@@ -1819,20 +1778,9 @@ impl P2pClient {
                             libp2p_request_response::Event::InboundFailure { .. } => {}
                             libp2p_request_response::Event::ResponseSent { .. } => {}
                         },
-                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => match &event.result {
-                            Ok(connection_id) => {
-                                eprintln!(
-                                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                                    event.remote_peer_id
-                                );
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
-                                    event.remote_peer_id
-                                );
-                            }
-                        },
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Dcutr(event)) => {
+                            log_dcutr_event(&event);
+                        }
                         _ => {}
                     }
                 }
@@ -1866,6 +1814,35 @@ fn is_loopback_direct_dial_noise(message: &str) -> bool {
         || msg.contains("/ip6/::1")
         || msg.contains("/ip6/0:0:0:0:0:0:0:1");
     has_loopback && msg.contains("connection refused")
+}
+
+fn log_dcutr_event(event: &libp2p::dcutr::Event) {
+    match &event.result {
+        Ok(connection_id) => {
+            eprintln!(
+                "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                event.remote_peer_id
+            );
+        }
+        Err(err) => {
+            let error = err.to_string();
+            if !is_dcutr_direct_upgrade_noise(&error) {
+                eprintln!(
+                    "warn: dcutr direct upgrade failed: peer={} error={error}",
+                    event.remote_peer_id
+                );
+            }
+        }
+    }
+}
+
+fn is_dcutr_direct_upgrade_noise(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    msg.contains("failed to hole-punch connection")
+        && (msg.contains("outbound stream error")
+            || msg.contains("giving up after")
+            || msg.contains("io error")
+            || msg.contains("protocol error"))
 }
 
 fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
@@ -2708,11 +2685,24 @@ mod tests {
     #[test]
     fn loopback_direct_dial_failure_is_log_noise() {
         let err = "Failed to negotiate transport protocol(s): [(/ip4/127.0.0.6/tcp/36485/p2p/12D3KooW: : Multiple dial errors occurred:
- - Connection refused (os error 111): Connection refused (os error 111))]";
+	 - Connection refused (os error 111): Connection refused (os error 111))]";
 
         assert!(is_loopback_direct_dial_noise(err));
         assert!(!is_loopback_direct_dial_noise(
             "Failed to negotiate transport protocol(s): [(/dns4/rustory-relay.example/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooW: relay rejected)]"
+        ));
+    }
+
+    #[test]
+    fn dcutr_direct_upgrade_failure_is_log_noise() {
+        assert!(is_dcutr_direct_upgrade_noise(
+            "Failed to hole-punch connection: Outbound stream error: IO error"
+        ));
+        assert!(is_dcutr_direct_upgrade_noise(
+            "Failed to hole-punch connection: Giving up after 3 dial attempts"
+        ));
+        assert!(!is_dcutr_direct_upgrade_noise(
+            "Failed to connect to destination.: Relay has no reservation for destination."
         ));
     }
 
