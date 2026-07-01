@@ -242,7 +242,7 @@ where
             anyhow::bail!("invalid local push batch: next_cursor did not advance");
         }
         cursor = next_cursor;
-        local.set_last_pushed_seq(peer_id, cursor)?;
+        local.advance_last_pushed_seq(peer_id, cursor)?;
     }
 
     Ok(pushed_total)
@@ -301,7 +301,7 @@ where
             anyhow::bail!("invalid local push batch: next_cursor did not advance");
         }
         cursor = next_cursor;
-        local.set_last_pushed_seq(peer_id, cursor)?;
+        local.advance_last_pushed_seq(peer_id, cursor)?;
     }
 
     Ok(pushed_total)

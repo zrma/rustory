@@ -439,6 +439,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
         .collect::<Vec<_>>();
 
     let mut known_addrs: HashSet<String> = HashSet::new();
+    let mut pending_pull_responses = HashMap::new();
     let mut next_register = tokio::time::interval(Duration::from_secs(30));
 
     loop {
@@ -506,7 +507,11 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                     }
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) => match event {
                         libp2p_request_response::Event::Message { peer, message, .. } => match message {
-                            libp2p_request_response::Message::Request { request, channel, .. } => {
+                            libp2p_request_response::Message::Request {
+                                request,
+                                channel,
+                                request_id,
+                            } => {
                                 if let Err(err) =
                                     authorize_inbound_peer(&store, peer, &meta, &trackers)
                                 {
@@ -522,13 +527,46 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                     entries: batch.entries,
                                     next_cursor: batch.next_cursor,
                                 };
-                                let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
+                                if let Some(next_cursor) = resp.next_cursor {
+                                    pending_pull_responses.insert((peer, request_id), next_cursor);
+                                }
+                                if swarm
+                                    .behaviour_mut()
+                                    .sync
+                                    .send_response(channel, resp)
+                                    .is_err()
+                                {
+                                    pending_pull_responses.remove(&(peer, request_id));
+                                }
                             }
                             libp2p_request_response::Message::Response { .. } => {}
                         },
                         libp2p_request_response::Event::OutboundFailure { .. } => {}
-                        libp2p_request_response::Event::InboundFailure { .. } => {}
-                        libp2p_request_response::Event::ResponseSent { .. } => {}
+                        libp2p_request_response::Event::InboundFailure {
+                            peer,
+                            request_id,
+                            ..
+                        } => {
+                            pending_pull_responses.remove(&(peer, request_id));
+                        }
+                        libp2p_request_response::Event::ResponseSent {
+                            peer,
+                            request_id,
+                            ..
+                        } => {
+                            if let Some(next_cursor) =
+                                pending_pull_responses.remove(&(peer, request_id))
+                            {
+                                let peer_key = peer.to_string();
+                                if let Err(err) =
+                                    store.advance_last_pushed_seq(&peer_key, next_cursor)
+                                {
+                                    eprintln!(
+                                        "warn: p2p pull response cursor update failed: peer={peer} cursor={next_cursor} error={err:#}"
+                                    );
+                                }
+                            }
+                        }
                     },
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
                         libp2p_request_response::Event::Message { peer, message, .. } => match message {
@@ -576,7 +614,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             }
                             Err(err) => {
                                 eprintln!(
-                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
                                     event.remote_peer_id
                                 );
                             }
@@ -619,7 +657,16 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         );
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
-                        eprintln!("warn: p2p outgoing connection error: peer={peer_id:?} error={error}");
+                        let error = error.to_string();
+                        if is_loopback_direct_dial_noise(&error) {
+                            eprintln!(
+                                "p2p direct candidate failed; relay path may still be active: peer={peer_id:?} error={error}"
+                            );
+                        } else {
+                            eprintln!(
+                                "warn: p2p outgoing connection error: peer={peer_id:?} error={error}"
+                            );
+                        }
                     }
                     SwarmEvent::ListenerClosed { addresses, reason, .. } => {
                         eprintln!(
@@ -1530,7 +1577,7 @@ impl P2pClient {
                             }
                             Err(err) => {
                                 eprintln!(
-                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
                                     event.remote_peer_id
                                 );
                             }
@@ -1654,7 +1701,7 @@ impl P2pClient {
                             }
                             Err(err) => {
                                 eprintln!(
-                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
                                     event.remote_peer_id
                                 );
                             }
@@ -1781,7 +1828,7 @@ impl P2pClient {
                             }
                             Err(err) => {
                                 eprintln!(
-                                    "dcutr: upgrade failed: peer={} error={err}",
+                                    "dcutr: direct upgrade failed; relay path may still be active: peer={} error={err}",
                                     event.remote_peer_id
                                 );
                             }
@@ -1811,6 +1858,14 @@ impl crate::sync::Pusher for P2pClient {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
         Box::pin(self.push_batch_with_retries(entries))
     }
+}
+
+fn is_loopback_direct_dial_noise(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    let has_loopback = msg.contains("/ip4/127.")
+        || msg.contains("/ip6/::1")
+        || msg.contains("/ip6/0:0:0:0:0:0:0:1");
+    has_loopback && msg.contains("connection refused")
 }
 
 fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
@@ -2648,6 +2703,17 @@ mod tests {
 
         let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
         assert!(!is_retryable_p2p_request_error(&err));
+    }
+
+    #[test]
+    fn loopback_direct_dial_failure_is_log_noise() {
+        let err = "Failed to negotiate transport protocol(s): [(/ip4/127.0.0.6/tcp/36485/p2p/12D3KooW: : Multiple dial errors occurred:
+ - Connection refused (os error 111): Connection refused (os error 111))]";
+
+        assert!(is_loopback_direct_dial_noise(err));
+        assert!(!is_loopback_direct_dial_noise(
+            "Failed to negotiate transport protocol(s): [(/dns4/rustory-relay.example/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooW: relay rejected)]"
+        ));
     }
 
     #[test]

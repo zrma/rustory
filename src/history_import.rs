@@ -596,6 +596,7 @@ mod tests {
     use super::*;
     use crate::storage::LocalStore;
     use rusqlite::params;
+    use std::collections::BTreeSet;
 
     #[test]
     fn parse_zsh_extended_history() {
@@ -801,6 +802,10 @@ mod tests {
 
         let entries = store.list_recent(10).unwrap();
         assert_eq!(entries.len(), 2);
+        let entry_ids_before_second_import = entries
+            .iter()
+            .map(|entry| entry.entry_id.clone())
+            .collect::<BTreeSet<_>>();
         let echo_entry = entries.iter().find(|entry| entry.cmd == "echo ok").unwrap();
         assert_eq!(echo_entry.device_id, "rustory-device-a");
         assert_eq!(echo_entry.user_id, "u1");
@@ -828,7 +833,16 @@ mod tests {
         assert_eq!(s2.inserted, 0);
         assert_eq!(s2.ignored, 2);
         assert_eq!(s2.skipped, 1);
-        assert_eq!(store.list_recent(10).unwrap().len(), 2);
+        let entries_after_second_import = store.list_recent(10).unwrap();
+        assert_eq!(entries_after_second_import.len(), 2);
+        let entry_ids_after_second_import = entries_after_second_import
+            .iter()
+            .map(|entry| entry.entry_id.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            entry_ids_after_second_import,
+            entry_ids_before_second_import
+        );
     }
 
     #[test]

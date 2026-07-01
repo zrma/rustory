@@ -342,6 +342,21 @@ ON CONFLICT(peer_id) DO UPDATE SET last_pushed_seq = excluded.last_pushed_seq
         Ok(())
     }
 
+    pub fn advance_last_pushed_seq(&self, peer_id: &str, seq: i64) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO peer_push_state(peer_id, last_pushed_seq)
+VALUES (?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET
+  last_pushed_seq = MAX(peer_push_state.last_pushed_seq, excluded.last_pushed_seq)
+"#,
+                params![peer_id, seq],
+            )
+            .context("advance peer_push_state")?;
+        Ok(())
+    }
+
     pub fn latest_ingest_seq(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -1350,6 +1365,20 @@ mod tests {
             .unwrap();
         assert!(b3.entries.is_empty());
         assert_eq!(b3.next_cursor, None);
+    }
+
+    #[test]
+    fn advance_last_pushed_seq_never_moves_cursor_backward() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store.advance_last_pushed_seq("peer-a", 10).unwrap();
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 10);
+
+        store.advance_last_pushed_seq("peer-a", 7).unwrap();
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 10);
+
+        store.advance_last_pushed_seq("peer-a", 12).unwrap();
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 12);
     }
 
     #[test]
