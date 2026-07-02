@@ -484,17 +484,15 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
         return DaemonRestartStatus::Skipped;
     }
 
-    if let Some(pid) = pid {
-        if pid_is_running(pid) {
-            println!("daemon=stopping manager=background pid={pid}");
-            if let Err(err) = terminate_pid(pid) {
-                return DaemonRestartStatus::Failed(format!("terminate pid {pid}: {err}"));
-            }
-            if !wait_pid_stopped(pid, Duration::from_secs(5)) {
-                return DaemonRestartStatus::Failed(format!(
-                    "pid {pid} did not stop after SIGTERM"
-                ));
-            }
+    if let Some(pid) = pid
+        && pid_is_running(pid)
+    {
+        println!("daemon=stopping manager=background pid={pid}");
+        if let Err(err) = terminate_pid(pid) {
+            return DaemonRestartStatus::Failed(format!("terminate pid {pid}: {err}"));
+        }
+        if !wait_pid_stopped(pid, Duration::from_secs(5)) {
+            return DaemonRestartStatus::Failed(format!("pid {pid} did not stop after SIGTERM"));
         }
     }
 
