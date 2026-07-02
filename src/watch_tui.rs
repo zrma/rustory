@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::cli::{SyncStatusPeerReport, SyncStatusReport, SyncStatusTrackerReport};
+use crate::sync_status::{SyncStatusPeerReport, SyncStatusReport, SyncStatusTrackerReport};
 
 #[derive(Default)]
 pub(crate) struct SyncStatusWatchState {

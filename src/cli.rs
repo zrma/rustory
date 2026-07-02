@@ -4,28 +4,43 @@ use clap::{Parser, Subcommand};
 use multiaddr::Protocol;
 use rand::RngExt;
 
+#[cfg(test)]
+use crate::daemon::validate_daemon_preflight_statuses;
+use crate::daemon::{
+    DaemonArgs, build_daemon_child_specs, run_daemon_preflight, sleep_with_stop,
+    spawn_daemon_child, supervise_daemon_children, terminate_daemon_child,
+};
+#[cfg(test)]
+use crate::runtime_tasks::{
+    AsyncUploadRuntimeSettings, AutoPruneRuntimeSettings, DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC,
+    DEFAULT_ASYNC_UPLOAD_LIMIT, DEFAULT_ASYNC_UPLOAD_MARKER_PATH, DEFAULT_AUTO_PRUNE_DAYS,
+    compute_next_due_in_sec, read_rate_limit_marker, resolve_bool_setting, resolve_string_setting,
+    resolve_u64_setting, resolve_usize_setting, should_trigger_interval, write_rate_limit_marker,
+};
+use crate::runtime_tasks::{
+    compute_prune_cutoff_unix, load_async_upload_runtime_settings,
+    load_auto_prune_runtime_settings, maybe_run_auto_prune, maybe_spawn_async_upload,
+    parse_env_bool, summarize_async_upload_runtime, summarize_auto_prune_runtime,
+};
+use crate::sync_status::{
+    SyncStatusTrackerReport, build_sync_status_report_for_cli, build_tracker_status_report,
+    tracker_ping,
+};
+#[cfg(test)]
+use crate::sync_status::{build_sync_status_report, compute_last_seen_age_sec};
 use crate::watch_tui::{
     SyncStatusWatchState, render_mesh_watch_frame, render_sync_status_watch_frame,
 };
 use crate::{
     config, hishtory_cleanup, history_import, hook, p2p, search, storage, tracker, transport,
 };
-use std::collections::HashMap;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command as ProcessCommand, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-const DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC: u64 = 15;
-const DEFAULT_ASYNC_UPLOAD_LIMIT: usize = 200;
-const DEFAULT_ASYNC_UPLOAD_MARKER_PATH: &str = "~/.config/rustory/async-upload.last";
-const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
-const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
-const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
-const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
 const DEFAULT_HOOK_SEARCH_LIMIT: usize = 100_000;
 const DEFAULT_RECORD_IGNORE_REGEX: &str = r"(?i)(password|passwd|token|secret|authorization:|bearer |api[_-]?key|access[_-]?key|private[_-]?key)";
 
@@ -1423,34 +1438,6 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct DaemonArgs {
-    listen: String,
-    identity_key: Option<String>,
-    swarm_key: Option<String>,
-    relay: Option<String>,
-    trackers: Vec<String>,
-    tracker_token: Option<String>,
-    limit: usize,
-    pull_only: bool,
-    interval_sec: u64,
-    start_jitter_sec: Option<u64>,
-    sync_start_delay_sec: u64,
-    max_peers_per_tick: usize,
-    preflight: bool,
-    req_attempts: Option<u64>,
-    req_timeout_base_sec: Option<u64>,
-    req_timeout_cap_sec: Option<u64>,
-    req_backoff_base_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct DaemonChildSpecs {
-    serve_args: Vec<String>,
-    sync_args: Vec<String>,
-    tracker_token_env: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 struct InitArgs {
     force: bool,
     user_id: Option<String>,
@@ -1535,253 +1522,6 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
     )?;
 
     supervise_daemon_children(&mut serve, &mut sync, stop.as_ref())
-}
-
-fn run_daemon_preflight(trackers: &[String], tracker_token: Option<&str>) -> Result<()> {
-    eprintln!("daemon preflight: ping {} tracker(s)", trackers.len());
-    let statuses = build_tracker_status_report(trackers, tracker_token);
-    for status in &statuses {
-        if status.reachable {
-            let latency_ms = status
-                .latency_ms
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "-".to_string());
-            eprintln!(
-                "daemon preflight: tracker {} ok latency_ms={latency_ms}",
-                status.base_url
-            );
-        } else {
-            let error = status.error.as_deref().unwrap_or("unknown error");
-            eprintln!(
-                "daemon preflight: tracker {} failed: {error}",
-                status.base_url
-            );
-        }
-    }
-    validate_daemon_preflight_statuses(&statuses)
-}
-
-fn validate_daemon_preflight_statuses(statuses: &[SyncStatusTrackerReport]) -> Result<()> {
-    let failures = statuses
-        .iter()
-        .filter(|status| !status.reachable)
-        .collect::<Vec<_>>();
-    if failures.is_empty() {
-        return Ok(());
-    }
-
-    let details = failures
-        .iter()
-        .map(|status| {
-            let error = status.error.as_deref().unwrap_or("unknown error");
-            format!("{} ({error})", status.base_url)
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    anyhow::bail!(
-        "daemon preflight failed: {}/{} tracker ping(s) failed: {details}",
-        failures.len(),
-        statuses.len()
-    );
-}
-
-fn build_daemon_child_specs(db_path: &str, args: &DaemonArgs) -> DaemonChildSpecs {
-    let mut serve_args = vec![
-        "--db-path".to_string(),
-        db_path.to_string(),
-        "p2p-serve".to_string(),
-        "--listen".to_string(),
-        args.listen.clone(),
-    ];
-    push_optional_arg(
-        &mut serve_args,
-        "--identity-key",
-        args.identity_key.as_deref(),
-    );
-    push_optional_arg(&mut serve_args, "--swarm-key", args.swarm_key.as_deref());
-    push_optional_arg(&mut serve_args, "--relay", args.relay.as_deref());
-    push_trackers_arg(&mut serve_args, &args.trackers);
-
-    let mut sync_args = vec![
-        "--db-path".to_string(),
-        db_path.to_string(),
-        "p2p-sync".to_string(),
-        "--watch".to_string(),
-        "--limit".to_string(),
-        args.limit.to_string(),
-        "--interval-sec".to_string(),
-        args.interval_sec.max(1).to_string(),
-        "--max-peers-per-tick".to_string(),
-        args.max_peers_per_tick.to_string(),
-    ];
-    if !args.pull_only {
-        sync_args.push("--push".to_string());
-    }
-    if let Some(v) = args.start_jitter_sec {
-        sync_args.push("--start-jitter-sec".to_string());
-        sync_args.push(v.to_string());
-    }
-    push_optional_arg(&mut sync_args, "--swarm-key", args.swarm_key.as_deref());
-    push_optional_arg(
-        &mut sync_args,
-        "--identity-key",
-        args.identity_key.as_deref(),
-    );
-    push_optional_arg(&mut sync_args, "--relay", args.relay.as_deref());
-    push_trackers_arg(&mut sync_args, &args.trackers);
-    push_optional_u64_arg(&mut sync_args, "--req-attempts", args.req_attempts);
-    push_optional_u64_arg(
-        &mut sync_args,
-        "--req-timeout-base-sec",
-        args.req_timeout_base_sec,
-    );
-    push_optional_u64_arg(
-        &mut sync_args,
-        "--req-timeout-cap-sec",
-        args.req_timeout_cap_sec,
-    );
-    push_optional_u64_arg(
-        &mut sync_args,
-        "--req-backoff-base-ms",
-        args.req_backoff_base_ms,
-    );
-
-    DaemonChildSpecs {
-        serve_args,
-        sync_args,
-        tracker_token_env: args.tracker_token.clone(),
-    }
-}
-
-fn push_optional_arg(args: &mut Vec<String>, flag: &str, value: Option<&str>) {
-    if let Some(value) = value {
-        args.push(flag.to_string());
-        args.push(value.to_string());
-    }
-}
-
-fn push_optional_u64_arg(args: &mut Vec<String>, flag: &str, value: Option<u64>) {
-    if let Some(value) = value {
-        args.push(flag.to_string());
-        args.push(value.to_string());
-    }
-}
-
-fn push_trackers_arg(args: &mut Vec<String>, trackers: &[String]) {
-    if trackers.is_empty() {
-        return;
-    }
-    args.push("--trackers".to_string());
-    args.push(trackers.join(","));
-}
-
-fn spawn_daemon_child(
-    label: &str,
-    exe: &std::path::Path,
-    args: &[String],
-    tracker_token_env: Option<&str>,
-) -> Result<Child> {
-    eprintln!("daemon: spawn {label}: {}", redacted_command(exe, args));
-    let mut cmd = ProcessCommand::new(exe);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    if let Some(token) = tracker_token_env {
-        cmd.env("RUSTORY_TRACKER_TOKEN", token);
-    }
-    cmd.spawn()
-        .with_context(|| format!("spawn daemon child: {label}"))
-}
-
-fn redacted_command(exe: &std::path::Path, args: &[String]) -> String {
-    let mut parts = Vec::with_capacity(args.len() + 1);
-    parts.push(exe.display().to_string());
-    parts.extend(args.iter().cloned());
-    parts.join(" ")
-}
-
-fn supervise_daemon_children(serve: &mut Child, sync: &mut Child, stop: &AtomicBool) -> Result<()> {
-    loop {
-        if stop.load(Ordering::SeqCst) {
-            eprintln!("daemon: shutdown requested");
-            terminate_daemon_child("p2p-sync", sync)?;
-            terminate_daemon_child("p2p-serve", serve)?;
-            return Ok(());
-        }
-
-        if let Some(status) = serve.try_wait().context("poll p2p-serve child")? {
-            terminate_daemon_child("p2p-sync", sync)?;
-            anyhow::bail!("daemon child p2p-serve exited: {status}");
-        }
-
-        if let Some(status) = sync.try_wait().context("poll p2p-sync child")? {
-            terminate_daemon_child("p2p-serve", serve)?;
-            anyhow::bail!("daemon child p2p-sync exited: {status}");
-        }
-
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn sleep_with_stop(duration: Duration, stop: &AtomicBool) {
-    let deadline = Instant::now() + duration;
-    while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn terminate_daemon_child(label: &str, child: &mut Child) -> Result<()> {
-    if child.try_wait()?.is_some() {
-        return Ok(());
-    }
-
-    send_child_terminate(child).with_context(|| format!("terminate daemon child: {label}"))?;
-    if let Some(status) = wait_child_timeout(child, Duration::from_secs(5))? {
-        eprintln!("daemon: {label} stopped: {status}");
-        return Ok(());
-    }
-
-    eprintln!("warn: daemon child {label} did not stop after SIGTERM; killing");
-    child
-        .kill()
-        .with_context(|| format!("kill daemon child: {label}"))?;
-    let status = child
-        .wait()
-        .with_context(|| format!("wait killed daemon child: {label}"))?;
-    eprintln!("daemon: {label} killed: {status}");
-    Ok(())
-}
-
-fn wait_child_timeout(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(None)
-}
-
-fn send_child_terminate(child: &mut Child) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let rc = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-        if rc == 0 {
-            return Ok(());
-        }
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            return Ok(());
-        }
-        Err(err)
-    }
-
-    #[cfg(not(unix))]
-    {
-        child.kill()
-    }
 }
 
 fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<()> {
@@ -1960,129 +1700,6 @@ fn restrict_permissions_0600(path: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AsyncUploadRuntimeSettings {
-    enabled: bool,
-    interval_sec: u64,
-    limit: usize,
-    marker_path: std::path::PathBuf,
-    last_trigger_unix: Option<i64>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct AutoPruneRuntimeSettings {
-    enabled: bool,
-    older_than_days: u64,
-    interval_sec: u64,
-    keep_recent: usize,
-    marker_path: std::path::PathBuf,
-    last_trigger_unix: Option<i64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-struct AsyncUploadDoctorReport {
-    enabled: bool,
-    interval_sec: u64,
-    limit: usize,
-    marker_path: std::path::PathBuf,
-    last_trigger_unix: Option<i64>,
-    next_due_in_sec: u64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-struct AutoPruneDoctorReport {
-    enabled: bool,
-    older_than_days: u64,
-    interval_sec: u64,
-    keep_recent: usize,
-    marker_path: std::path::PathBuf,
-    last_trigger_unix: Option<i64>,
-    next_due_in_sec: u64,
-}
-
-fn load_async_upload_runtime_settings(
-    cfg: &config::FileConfig,
-) -> Result<AsyncUploadRuntimeSettings> {
-    let marker_path_raw = resolve_async_upload_marker_path(cfg);
-    let marker_path = config::expand_home_path(&marker_path_raw)
-        .with_context(|| format!("expand async upload marker path: {marker_path_raw}"))?;
-
-    Ok(AsyncUploadRuntimeSettings {
-        enabled: resolve_async_upload_enabled(cfg)?,
-        interval_sec: resolve_async_upload_interval_sec(cfg)?,
-        limit: resolve_async_upload_limit(cfg)?,
-        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
-        marker_path,
-    })
-}
-
-fn summarize_async_upload_runtime(
-    settings: AsyncUploadRuntimeSettings,
-    now_unix: i64,
-) -> AsyncUploadDoctorReport {
-    AsyncUploadDoctorReport {
-        enabled: settings.enabled,
-        interval_sec: settings.interval_sec,
-        limit: settings.limit,
-        marker_path: settings.marker_path,
-        last_trigger_unix: settings.last_trigger_unix,
-        next_due_in_sec: compute_next_due_in_sec(
-            now_unix,
-            settings.last_trigger_unix,
-            settings.interval_sec,
-        ),
-    }
-}
-
-fn load_auto_prune_runtime_settings(cfg: &config::FileConfig) -> Result<AutoPruneRuntimeSettings> {
-    let marker_path_raw = resolve_auto_prune_marker_path(cfg);
-    let marker_path = config::expand_home_path(&marker_path_raw)
-        .with_context(|| format!("expand auto prune marker path: {marker_path_raw}"))?;
-
-    Ok(AutoPruneRuntimeSettings {
-        enabled: resolve_auto_prune_enabled(cfg)?,
-        older_than_days: resolve_auto_prune_days(cfg)?,
-        interval_sec: resolve_auto_prune_interval_sec(cfg)?,
-        keep_recent: resolve_auto_prune_keep_recent(cfg)?,
-        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
-        marker_path,
-    })
-}
-
-fn summarize_auto_prune_runtime(
-    settings: AutoPruneRuntimeSettings,
-    now_unix: i64,
-) -> AutoPruneDoctorReport {
-    AutoPruneDoctorReport {
-        enabled: settings.enabled,
-        older_than_days: settings.older_than_days,
-        interval_sec: settings.interval_sec,
-        keep_recent: settings.keep_recent,
-        marker_path: settings.marker_path,
-        last_trigger_unix: settings.last_trigger_unix,
-        next_due_in_sec: compute_next_due_in_sec(
-            now_unix,
-            settings.last_trigger_unix,
-            settings.interval_sec,
-        ),
-    }
-}
-
-fn compute_next_due_in_sec(
-    now_unix: i64,
-    last_trigger_unix: Option<i64>,
-    interval_sec: u64,
-) -> u64 {
-    let Some(last) = last_trigger_unix else {
-        return 0;
-    };
-
-    let interval_i64 = i64::try_from(interval_sec).unwrap_or(i64::MAX);
-    let elapsed_i64 = now_unix.saturating_sub(last).max(0);
-    let remaining_i64 = interval_i64.saturating_sub(elapsed_i64).max(0);
-    u64::try_from(remaining_i64).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -3244,155 +2861,12 @@ fn file_mode_777(path: &std::path::Path) -> Option<u32> {
     }
 }
 
-fn tracker_ping(base_url: &str, token: Option<&str>) -> std::result::Result<u64, String> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
-        .timeout_connect(Some(Duration::from_secs(1)))
-        .timeout_send_request(Some(Duration::from_secs(1)))
-        .timeout_send_body(Some(Duration::from_secs(1)))
-        .timeout_recv_response(Some(Duration::from_secs(1)))
-        .timeout_recv_body(Some(Duration::from_secs(1)))
-        .build()
-        .into();
-
-    let url = format!("{}/api/v1/ping", base_url.trim_end_matches('/'));
-    let mut req = agent.get(&url);
-    if let Some(token) = token {
-        req = req.header("Authorization", format!("Bearer {}", token.trim()));
-    }
-
-    let started = Instant::now();
-    match req.call() {
-        Ok(resp) => {
-            if resp.status().as_u16() == 200 {
-                let elapsed_ms = started.elapsed().as_millis();
-                let latency_ms = u64::try_from(elapsed_ms).unwrap_or(u64::MAX);
-                Ok(latency_ms)
-            } else {
-                Err(format!("status {}", resp.status()))
-            }
-        }
-        Err(err) => Err(err.to_string()),
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub(crate) struct SyncStatusPeerReport {
-    pub(crate) peer_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) peer_device_id: Option<String>,
-    pub(crate) pull_cursor: i64,
-    pub(crate) push_cursor: i64,
-    pub(crate) outbound_push_pending: usize,
-    pub(crate) pending_push: usize,
-    pub(crate) last_seen_unix: Option<i64>,
-    pub(crate) last_seen_age_sec: Option<i64>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub(crate) struct SyncStatusTrackerReport {
-    pub(crate) base_url: String,
-    pub(crate) reachable: bool,
-    pub(crate) latency_ms: Option<u64>,
-    pub(crate) error: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
-pub(crate) struct SyncStatusReport {
-    pub(crate) local_head: i64,
-    pub(crate) local_device_id: String,
-    pub(crate) peers: Vec<SyncStatusPeerReport>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) tracker_status: Option<Vec<SyncStatusTrackerReport>>,
-}
-
-fn compute_last_seen_age_sec(now_unix: i64, last_seen_unix: Option<i64>) -> Option<i64> {
-    last_seen_unix.map(|ts| now_unix.saturating_sub(ts).max(0))
-}
-
-fn build_sync_status_report(
-    store: &storage::LocalStore,
-    local_device_id: &str,
-    local_peer_id: Option<&str>,
-    peer_filter: Option<&str>,
-    tracker_status: Option<Vec<SyncStatusTrackerReport>>,
-) -> Result<SyncStatusReport> {
-    let local_head = store.latest_ingest_seq()?;
-    let peer_last_seen = store.list_peer_book_last_seen_map()?;
-    let peer_device_ids = store
-        .list_peer_book(None, 0, 1000)?
-        .into_iter()
-        .filter_map(|peer| peer.device_id.map(|device_id| (peer.peer_id, device_id)))
-        .collect::<HashMap<_, _>>();
-    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-    let mut statuses = store.list_peer_sync_status()?;
-    if let Some(peer_id) = peer_filter {
-        statuses.retain(|status| status.peer_id == peer_id);
-    }
-
-    let mut peers = Vec::with_capacity(statuses.len());
-    for status in statuses {
-        let peer_id = status.peer_id;
-        if local_peer_id == Some(peer_id.as_str()) {
-            continue;
-        }
-        let peer_device_id = peer_device_ids.get(&peer_id).cloned();
-        if sync_device_id_matches(peer_device_id.as_deref(), local_device_id) {
-            continue;
-        }
-        let pending_push = store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
-        let last_seen_unix = peer_last_seen.get(&peer_id).copied();
-        let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
-        peers.push(SyncStatusPeerReport {
-            peer_device_id,
-            peer_id,
-            pull_cursor: status.last_cursor,
-            push_cursor: status.last_pushed_seq,
-            outbound_push_pending: pending_push,
-            pending_push,
-            last_seen_unix,
-            last_seen_age_sec,
-        });
-    }
-
-    Ok(SyncStatusReport {
-        local_head,
-        local_device_id: local_device_id.to_string(),
-        peers,
-        tracker_status,
-    })
-}
-
-fn build_sync_status_report_for_cli(
-    store: &storage::LocalStore,
-    local_device_id: &str,
-    local_peer_id: Option<&str>,
-    peer_filter: Option<&str>,
-    trackers: Option<&[String]>,
-    tracker_token: Option<&str>,
-) -> Result<SyncStatusReport> {
-    let tracker_status =
-        trackers.map(|trackers| build_tracker_status_report(trackers, tracker_token));
-    build_sync_status_report(
-        store,
-        local_device_id,
-        local_peer_id,
-        peer_filter,
-        tracker_status,
-    )
-}
-
 fn resolve_local_p2p_peer_id(cfg: &config::FileConfig) -> Option<String> {
     let path = resolve_p2p_identity_key_path(None, cfg);
     config::load_identity_keypair(&path)
         .ok()
         .flatten()
         .map(|key| key.public().to_peer_id().to_string())
-}
-
-fn sync_device_id_matches(peer_device_id: Option<&str>, local_device_id: &str) -> bool {
-    peer_device_id
-        .map(|device_id| device_id.trim() == local_device_id.trim())
-        .unwrap_or(false)
 }
 
 fn run_sync_status_watch(
@@ -3524,29 +2998,6 @@ fn sync_status_watch_terminal_size(fd: RawFd) -> Option<(usize, usize)> {
     }
 }
 
-fn build_tracker_status_report(
-    trackers: &[String],
-    tracker_token: Option<&str>,
-) -> Vec<SyncStatusTrackerReport> {
-    trackers
-        .iter()
-        .map(|base_url| match tracker_ping(base_url, tracker_token) {
-            Ok(latency_ms) => SyncStatusTrackerReport {
-                base_url: base_url.clone(),
-                reachable: true,
-                latency_ms: Some(latency_ms),
-                error: None,
-            },
-            Err(err) => SyncStatusTrackerReport {
-                base_url: base_url.clone(),
-                reachable: false,
-                latency_ms: None,
-                error: Some(err),
-            },
-        })
-        .collect()
-}
-
 fn default_cwd() -> String {
     std::env::current_dir()
         .ok()
@@ -3574,284 +3025,6 @@ fn normalize_opt_string(value: Option<String>) -> Option<String> {
 
 fn env_nonempty(key: &str) -> Option<String> {
     normalize_opt_string(std::env::var(key).ok())
-}
-
-fn maybe_spawn_async_upload(db_path: &str, cfg: &config::FileConfig) -> Result<()> {
-    if !resolve_async_upload_enabled(cfg)? {
-        return Ok(());
-    }
-
-    let min_interval_sec = resolve_async_upload_interval_sec(cfg)?;
-    let limit = resolve_async_upload_limit(cfg)?;
-    let marker_path = config::expand_home_path(&resolve_async_upload_marker_path(cfg))?;
-
-    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
-    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
-        return Ok(());
-    }
-    write_rate_limit_marker(&marker_path, now_unix)?;
-
-    let exe = std::env::current_exe().context("resolve current executable for async upload")?;
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("--db-path")
-        .arg(db_path)
-        .arg("p2p-sync")
-        .arg("--push")
-        .arg("--limit")
-        .arg(limit.to_string())
-        .env("RUSTORY_ASYNC_UPLOAD", "0")
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
-    cmd.spawn().context("spawn async upload p2p-sync")?;
-
-    Ok(())
-}
-
-fn maybe_run_auto_prune(store: &storage::LocalStore, cfg: &config::FileConfig) -> Result<()> {
-    if !resolve_auto_prune_enabled(cfg)? {
-        return Ok(());
-    }
-
-    let older_than_days = resolve_auto_prune_days(cfg)?;
-    let keep_recent = resolve_auto_prune_keep_recent(cfg)?;
-    let min_interval_sec = resolve_auto_prune_interval_sec(cfg)?;
-    let marker_path = config::expand_home_path(&resolve_auto_prune_marker_path(cfg))?;
-
-    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
-    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
-    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
-        return Ok(());
-    }
-
-    let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
-    let stats = store.prune_entries_older_than(cutoff_unix, keep_recent, false)?;
-    write_rate_limit_marker(&marker_path, now_unix)?;
-
-    if stats.deleted > 0 {
-        eprintln!(
-            "info: auto prune deleted={} older_than_days={} keep_recent={} cutoff_unix={}",
-            stats.deleted, older_than_days, keep_recent, cutoff_unix
-        );
-    }
-
-    Ok(())
-}
-
-fn resolve_async_upload_enabled(cfg: &config::FileConfig) -> Result<bool> {
-    resolve_bool_setting(
-        "RUSTORY_ASYNC_UPLOAD",
-        env_nonempty("RUSTORY_ASYNC_UPLOAD"),
-        cfg.async_upload,
-        false,
-    )
-}
-
-fn resolve_async_upload_interval_sec(cfg: &config::FileConfig) -> Result<u64> {
-    resolve_u64_setting(
-        "RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC",
-        "async_upload_interval_sec",
-        env_nonempty("RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC"),
-        cfg.async_upload_interval_sec,
-        DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC,
-        1,
-    )
-}
-
-fn resolve_async_upload_limit(cfg: &config::FileConfig) -> Result<usize> {
-    resolve_usize_setting(
-        "RUSTORY_ASYNC_UPLOAD_LIMIT",
-        "async_upload_limit",
-        env_nonempty("RUSTORY_ASYNC_UPLOAD_LIMIT"),
-        cfg.async_upload_limit,
-        DEFAULT_ASYNC_UPLOAD_LIMIT,
-        1,
-    )
-}
-
-fn resolve_async_upload_marker_path(cfg: &config::FileConfig) -> String {
-    resolve_string_setting(
-        env_nonempty("RUSTORY_ASYNC_UPLOAD_MARKER_PATH"),
-        cfg.async_upload_marker_path.clone(),
-        DEFAULT_ASYNC_UPLOAD_MARKER_PATH,
-    )
-}
-
-fn resolve_auto_prune_enabled(cfg: &config::FileConfig) -> Result<bool> {
-    resolve_bool_setting(
-        "RUSTORY_AUTO_PRUNE",
-        env_nonempty("RUSTORY_AUTO_PRUNE"),
-        cfg.auto_prune,
-        false,
-    )
-}
-
-fn resolve_auto_prune_days(cfg: &config::FileConfig) -> Result<u64> {
-    resolve_u64_setting(
-        "RUSTORY_AUTO_PRUNE_DAYS",
-        "auto_prune_days",
-        env_nonempty("RUSTORY_AUTO_PRUNE_DAYS"),
-        cfg.auto_prune_days,
-        DEFAULT_AUTO_PRUNE_DAYS,
-        1,
-    )
-}
-
-fn resolve_auto_prune_interval_sec(cfg: &config::FileConfig) -> Result<u64> {
-    resolve_u64_setting(
-        "RUSTORY_AUTO_PRUNE_INTERVAL_SEC",
-        "auto_prune_interval_sec",
-        env_nonempty("RUSTORY_AUTO_PRUNE_INTERVAL_SEC"),
-        cfg.auto_prune_interval_sec,
-        DEFAULT_AUTO_PRUNE_INTERVAL_SEC,
-        1,
-    )
-}
-
-fn resolve_auto_prune_keep_recent(cfg: &config::FileConfig) -> Result<usize> {
-    resolve_usize_setting(
-        "RUSTORY_AUTO_PRUNE_KEEP_RECENT",
-        "auto_prune_keep_recent",
-        env_nonempty("RUSTORY_AUTO_PRUNE_KEEP_RECENT"),
-        cfg.auto_prune_keep_recent,
-        DEFAULT_AUTO_PRUNE_KEEP_RECENT,
-        0,
-    )
-}
-
-fn resolve_auto_prune_marker_path(cfg: &config::FileConfig) -> String {
-    resolve_string_setting(
-        env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH"),
-        cfg.auto_prune_marker_path.clone(),
-        DEFAULT_AUTO_PRUNE_MARKER_PATH,
-    )
-}
-
-fn resolve_bool_setting(
-    env_key: &str,
-    env_value: Option<String>,
-    cfg_value: Option<bool>,
-    default: bool,
-) -> Result<bool> {
-    match env_value {
-        Some(raw) => parse_env_bool(&raw, env_key),
-        None => Ok(cfg_value.unwrap_or(default)),
-    }
-}
-
-fn resolve_u64_setting(
-    env_key: &str,
-    cfg_key: &str,
-    env_value: Option<String>,
-    cfg_value: Option<u64>,
-    default: u64,
-    min: u64,
-) -> Result<u64> {
-    if let Some(raw) = env_value {
-        let parsed: u64 = raw
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid {env_key}={:?}: {e}", raw.trim()))?;
-        if parsed < min {
-            anyhow::bail!("{env_key} must be >= {min}");
-        }
-        return Ok(parsed);
-    }
-
-    let value = cfg_value.unwrap_or(default);
-    if value < min {
-        anyhow::bail!("{cfg_key} must be >= {min}");
-    }
-    Ok(value)
-}
-
-fn resolve_usize_setting(
-    env_key: &str,
-    cfg_key: &str,
-    env_value: Option<String>,
-    cfg_value: Option<usize>,
-    default: usize,
-    min: usize,
-) -> Result<usize> {
-    if let Some(raw) = env_value {
-        let parsed: usize = raw
-            .parse()
-            .map_err(|e| anyhow::anyhow!("invalid {env_key}={:?}: {e}", raw.trim()))?;
-        if parsed < min {
-            anyhow::bail!("{env_key} must be >= {min}");
-        }
-        return Ok(parsed);
-    }
-
-    let value = cfg_value.unwrap_or(default);
-    if value < min {
-        anyhow::bail!("{cfg_key} must be >= {min}");
-    }
-    Ok(value)
-}
-
-fn resolve_string_setting(
-    env_value: Option<String>,
-    cfg_value: Option<String>,
-    default: &str,
-) -> String {
-    env_value
-        .or_else(|| normalize_opt_string(cfg_value))
-        .unwrap_or_else(|| default.to_string())
-}
-
-fn parse_env_bool(value: &str, label: &str) -> Result<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => {
-            anyhow::bail!("invalid {label}={value:?}; expected one of 1/0/true/false/yes/no/on/off")
-        }
-    }
-}
-
-fn read_rate_limit_marker(path: &std::path::Path) -> Result<Option<i64>> {
-    let content = match std::fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(err).with_context(|| format!("read rate limit marker: {}", path.display()));
-        }
-    };
-
-    let trimmed = content.trim();
-    if trimmed.is_empty() {
-        return Ok(None);
-    }
-
-    let parsed = trimmed
-        .parse::<i64>()
-        .map_err(|e| anyhow::anyhow!("invalid rate limit marker {}: {e}", path.display()))?;
-    Ok(Some(parsed))
-}
-
-fn write_rate_limit_marker(path: &std::path::Path, now_unix: i64) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("create rate limit marker dir: {}", parent.display()))?;
-    }
-    std::fs::write(path, format!("{now_unix}\n"))
-        .with_context(|| format!("write rate limit marker: {}", path.display()))?;
-    Ok(())
-}
-
-fn should_trigger_interval(
-    now_unix: i64,
-    last_trigger_unix: Option<i64>,
-    min_interval_sec: u64,
-) -> bool {
-    let min_interval_sec = i64::try_from(min_interval_sec).unwrap_or(i64::MAX);
-    let Some(last) = last_trigger_unix else {
-        return true;
-    };
-    now_unix.saturating_sub(last) >= min_interval_sec
 }
 
 fn resolve_search_limit(cli: Option<usize>, cfg: &config::FileConfig) -> Result<usize> {
@@ -3883,21 +3056,6 @@ fn resolve_search_limit_from_values(
     }
 
     Ok(DEFAULT_HOOK_SEARCH_LIMIT)
-}
-
-fn compute_prune_cutoff_unix(now_unix: i64, older_than_days: u64) -> Result<i64> {
-    if older_than_days == 0 {
-        anyhow::bail!("--older-than-days must be >= 1");
-    }
-
-    let retention_sec = i64::try_from(older_than_days)
-        .context("older-than-days is too large")?
-        .checked_mul(86_400)
-        .context("older-than-days is too large")?;
-
-    now_unix
-        .checked_sub(retention_sec)
-        .context("failed to compute prune cutoff")
 }
 
 fn resolve_p2p_watch_start_jitter_sec(cli: Option<u64>, cfg: &config::FileConfig) -> Result<u64> {
