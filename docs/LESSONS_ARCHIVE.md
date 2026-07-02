@@ -4,6 +4,7 @@
 
 ## Todo Closure Tokens
 
+- 2026-07-02: `todo-mesh-watch-stable-order`
 - 2026-07-02: `todo-cli-watch-tui-refactor`
 - 2026-06-29: `todo-sync-watch-mesh-dashboard`
 - 2026-06-29: `todo-search-delete-selected`
