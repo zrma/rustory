@@ -19,11 +19,12 @@
 | C1 | done | codex | `cargo test relay_circuit_listen_addr --workspace` | DNS relay listen 주소 변환 helper와 단위 테스트 추가 |
 | C2 | done | codex | `cargo test p2p --workspace` | `p2p-serve` 초기 listen 및 listener close 후 re-listen 경로에 helper 적용 |
 | C3 | done | codex | `scripts/check.sh --fast` | 회귀 검증 후 릴리즈 가능한 상태로 정리 |
-| C4 | todo | codex | `scripts/release-version.sh --version v1.0.29 --profile daily-driver --gate quick --work-id relay-dns-listen` | v1.0.29 릴리즈/배포 후 외부 컨테이너에서 relay reservation 복구 확인 |
+| C4 | done | codex | `scripts/release-version.sh --version v1.0.29 --profile daily-driver --gate quick --work-id relay-dns-listen` | v1.0.29 릴리즈 및 로컬 맥북 + k8s 5개 노드 배포 |
+| C5 | todo | user | `rr update --version v1.0.29 && rr sync-status --json --with-tracker && tail -n 80 ~/.local/state/rustory/daemon.log` | 외부망 Linux 컨테이너에서 relay reservation 복구 확인 |
 
 ## 완료/미완료/다음 액션
 
-- 완료: C1, C2, C3.
-- 미완료: C4.
-- 다음 액션: v1.0.29 릴리즈/배포로 외부 컨테이너 재검증 경로를 제공한다.
-- 검증 증거: `scripts/start-work.sh --work-id relay-dns-listen`, `cargo test relay_circuit_listen_addr --workspace` (2 passed), `cargo test resolve_dns_multiaddr --workspace` (3 passed), `cargo test p2p --workspace` (44 passed), `scripts/smoke_p2p_local.sh` (ok), `scripts/check.sh --fast` (248 passed + clippy).
+- 완료: C1, C2, C3, C4.
+- 미완료: C5.
+- 다음 액션: 외부망 Linux 컨테이너에서 v1.0.29로 업데이트한 뒤 daemon log에 `p2p relay reservation accepted`가 나타나고 `pending_push`가 drain되는지 확인한다.
+- 검증 증거: `scripts/start-work.sh --work-id relay-dns-listen`, `cargo test relay_circuit_listen_addr --workspace` (2 passed), `cargo test resolve_dns_multiaddr --workspace` (3 passed), `cargo test p2p --workspace` (44 passed), `scripts/smoke_p2p_local.sh` (ok), `scripts/check.sh --fast` (248 passed + clippy), `scripts/finalize-and-push.sh --message "fix: resolve dns relay listen addresses" --work-id relay-dns-listen` (pushed `aba3a4b1`), `scripts/finalize-and-push.sh --message "build: release 1.0.29" --work-id relay-dns-listen` (pushed `ccf7d440`), `scripts/release-version.sh --version v1.0.29 --profile daily-driver --gate quick --work-id relay-dns-listen` (GitHub release published), `rr update --version v1.0.29` on local macOS + `ts-sample-node`, `builder0`, `builder1`, `builder2`, `builder3` (all version `1.0.29`, daemon restarted, tracker reachable, internal peers pending 0).
