@@ -188,7 +188,13 @@ struct SyncStatusWatchPeerView<'a> {
     peer_name: String,
 }
 
-fn sync_status_watch_peer_cmp(
+#[derive(Debug, Clone, Copy)]
+enum SyncStatusWatchPeerOrder {
+    Attention,
+    StableName,
+}
+
+fn sync_status_watch_peer_attention_cmp(
     left: &SyncStatusWatchPeerView<'_>,
     right: &SyncStatusWatchPeerView<'_>,
 ) -> std::cmp::Ordering {
@@ -208,6 +214,16 @@ fn sync_status_watch_peer_cmp(
                 .cmp(&left.peer.last_seen_age_sec.unwrap_or(-1))
         })
         .then_with(|| left.peer_name.cmp(&right.peer_name))
+}
+
+fn sync_status_watch_peer_stable_name_cmp(
+    left: &SyncStatusWatchPeerView<'_>,
+    right: &SyncStatusWatchPeerView<'_>,
+) -> std::cmp::Ordering {
+    left.peer_name
+        .to_lowercase()
+        .cmp(&right.peer_name.to_lowercase())
+        .then_with(|| left.peer.peer_id.cmp(&right.peer.peer_id))
 }
 
 fn sync_status_watch_peer_severity(view: &SyncStatusWatchPeerView<'_>) -> u8 {
@@ -269,7 +285,8 @@ pub(crate) fn render_sync_status_watch_frame(
         .iter()
         .map(|peer| peer.outbound_push_pending)
         .sum();
-    let peer_views = build_sync_status_watch_peer_views(state, report, now);
+    let peer_views =
+        build_sync_status_watch_peer_views(state, report, now, SyncStatusWatchPeerOrder::Attention);
 
     push_watch_line(
         &mut out,
@@ -313,6 +330,7 @@ fn build_sync_status_watch_peer_views<'a>(
     state: &mut SyncStatusWatchState,
     report: &'a SyncStatusReport,
     now: Instant,
+    order: SyncStatusWatchPeerOrder,
 ) -> Vec<SyncStatusWatchPeerView<'a>> {
     let mut peer_views = Vec::with_capacity(report.peers.len());
     for peer in &report.peers {
@@ -332,7 +350,14 @@ fn build_sync_status_watch_peer_views<'a>(
             peer_name,
         });
     }
-    peer_views.sort_by(sync_status_watch_peer_cmp);
+    match order {
+        SyncStatusWatchPeerOrder::Attention => {
+            peer_views.sort_by(sync_status_watch_peer_attention_cmp);
+        }
+        SyncStatusWatchPeerOrder::StableName => {
+            peer_views.sort_by(sync_status_watch_peer_stable_name_cmp);
+        }
+    }
     peer_views
 }
 
@@ -352,7 +377,12 @@ pub(crate) fn render_mesh_watch_frame(
     let spinner = SPINNER[phase % SPINNER.len()];
     state.frame = state.frame.wrapping_add(1);
 
-    let peer_views = build_sync_status_watch_peer_views(state, report, now);
+    let peer_views = build_sync_status_watch_peer_views(
+        state,
+        report,
+        now,
+        SyncStatusWatchPeerOrder::StableName,
+    );
     let total_pending: usize = peer_views
         .iter()
         .map(|view| view.peer.outbound_push_pending)
@@ -1588,6 +1618,52 @@ fn truncate_display(value: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
 
+    fn sample_watch_peer(
+        device: &str,
+        peer_id: &str,
+        outbound_push_pending: usize,
+        last_seen_age_sec: i64,
+    ) -> SyncStatusPeerReport {
+        SyncStatusPeerReport {
+            peer_id: peer_id.to_string(),
+            peer_device_id: Some(device.to_string()),
+            pull_cursor: 100,
+            push_cursor: 200,
+            outbound_push_pending,
+            pending_push: outbound_push_pending,
+            last_seen_unix: Some(1),
+            last_seen_age_sec: Some(last_seen_age_sec),
+        }
+    }
+
+    fn unsorted_watch_report() -> SyncStatusReport {
+        SyncStatusReport {
+            local_head: 300,
+            local_device_id: "local".to_string(),
+            peers: vec![
+                sample_watch_peer(
+                    "zulu",
+                    "12D3KooWZ111111111111111111111111111111111111111111111",
+                    0,
+                    600,
+                ),
+                sample_watch_peer(
+                    "alpha",
+                    "12D3KooWA11111111111111111111111111111111111111111111",
+                    0,
+                    30,
+                ),
+                sample_watch_peer(
+                    "bravo",
+                    "12D3KooWB11111111111111111111111111111111111111111111",
+                    7,
+                    30,
+                ),
+            ],
+            tracker_status: None,
+        }
+    }
+
     #[test]
     fn sync_status_watch_progress_helpers_are_stable() {
         assert_eq!(outbound_push_progress_percent(0, 0), 100);
@@ -1600,6 +1676,44 @@ mod tests {
 
         assert_eq!(format_rate(42.4), "42");
         assert_eq!(format_rate(1200.0), "1.2k");
+    }
+
+    #[test]
+    fn sync_status_watch_peer_order_prefers_attention() {
+        let mut state = SyncStatusWatchState::default();
+        let report = unsorted_watch_report();
+        let peer_views = build_sync_status_watch_peer_views(
+            &mut state,
+            &report,
+            Instant::now(),
+            SyncStatusWatchPeerOrder::Attention,
+        );
+
+        let devices = peer_views
+            .iter()
+            .map(mesh_peer_display_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(devices, vec!["bravo", "zulu", "alpha"]);
+    }
+
+    #[test]
+    fn mesh_watch_peer_order_is_stable_by_name() {
+        let mut state = SyncStatusWatchState::default();
+        let report = unsorted_watch_report();
+        let peer_views = build_sync_status_watch_peer_views(
+            &mut state,
+            &report,
+            Instant::now(),
+            SyncStatusWatchPeerOrder::StableName,
+        );
+
+        let devices = peer_views
+            .iter()
+            .map(mesh_peer_display_name)
+            .collect::<Vec<_>>();
+
+        assert_eq!(devices, vec!["alpha", "bravo", "zulu"]);
     }
 
     #[test]

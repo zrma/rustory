@@ -194,9 +194,9 @@ p2p_watch_start_jitter_sec = 10
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
 - `rr mesh [--watch] [--no-tracker]`: `sync-status`와 같은 로컬 cursor 데이터를 사람이 보기 쉬운 mesh dashboard로 렌더링한다.
   - 기본값은 configured tracker를 ping해서 `Outbox` 패널에 tracker health를 포함한다. 네트워크 조회를 피하려면 `--no-tracker`를 사용한다.
-  - `Mesh Topology`는 braille canvas로 이 노드(local hub)와 각 peer 사이의 관측 가능한 edge, peer 상태, queue/active packet marker를 표시한다. peer끼리 직접 주고받는 global graph는 아직 daemon telemetry가 없으므로 그리지 않는다.
+  - `Mesh Topology`는 braille canvas로 이 노드(local hub)와 각 peer 사이의 관측 가능한 edge, peer 상태, queue/active packet marker를 표시한다. peer 위치는 device/peer display name 오름차순으로 고정해 watch tick마다 노드가 뒤섞이지 않게 한다. peer끼리 직접 주고받는 global graph는 아직 daemon telemetry가 없으므로 그리지 않는다.
   - `Outbox`는 전체 `to_send`, queue trend sparkline, pull/push/drain rate, hot peer를 보여준다.
-  - `Flow Lanes`는 peer별 `direct`, `sent`, `to_send`, coverage를 정렬된 표로 보여준다. 정밀 자동화나 JSON이 필요하면 `rr sync-status --json --with-tracker`를 사용한다.
+  - `Flow Lanes`는 topology와 같은 stable name order로 peer별 `direct`, `sent`, `to_send`, coverage를 보여준다. 상태 기반 attention sorting이 필요하면 `rr sync-status --watch --with-tracker`를 사용하고, 정밀 자동화나 JSON이 필요하면 `rr sync-status --json --with-tracker`를 사용한다.
   - 예시:
     - `rr sync-status`
     - `rr sync-status --peer 12D3KooW...`
