@@ -133,6 +133,12 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if ! todo_workspace_load_config "$ROOT"; then
+  fail "failed to load todo workspace config from docs/REPO_MANIFEST.yaml"
+  echo "[FAIL] script smoke check failed with $fail_count issue(s)" >&2
+  exit 1
+fi
+
 if [[ -n "$WORK_ID" ]]; then
   if [[ ! "$WORK_ID" =~ $WORK_ID_PATTERN ]]; then
     fail "invalid --work-id: $WORK_ID (expected lowercase kebab-case)"
@@ -140,6 +146,13 @@ if [[ -n "$WORK_ID" ]]; then
     exit 1
   fi
   RESOLVED_WORK_ID="$WORK_ID"
+  smoke_work_rel="$(todo_workspace_rel_for_work_id "$RESOLVED_WORK_ID")"
+  if [[ ! -d "$ROOT/$smoke_work_rel" ]]; then
+    closed_work_id_output=""
+    if closed_work_id_output="$(todo_workspace_discover_closed_work_id "$ROOT" auto)" && [[ "$closed_work_id_output" == "$RESOLVED_WORK_ID" ]]; then
+      RESOLVED_WORK_ID="$DEFAULT_WORK_ID"
+    fi
+  fi
 else
   if discovered_work_id="$(discover_single_work_id 2>/dev/null || true)"; then
     if [[ -n "$discovered_work_id" ]]; then
@@ -150,12 +163,6 @@ fi
 
 if [[ -z "$RESOLVED_WORK_ID" ]]; then
   RESOLVED_WORK_ID="$DEFAULT_WORK_ID"
-fi
-
-if ! todo_workspace_load_config "$ROOT"; then
-  fail "failed to load todo workspace config from docs/REPO_MANIFEST.yaml"
-  echo "[FAIL] script smoke check failed with $fail_count issue(s)" >&2
-  exit 1
 fi
 
 ensure_work_todo_workspace() {

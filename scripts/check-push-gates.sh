@@ -253,6 +253,8 @@ if [[ -n "$WORK_ID" ]]; then
   else
     fail "$todo_rel not found while todo readiness is required"
   fi
+elif [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
+  warn "skip todo readiness due --allow-missing-work-id override"
 else
   TODO_DIRS=()
   while IFS= read -r todo_dir; do
@@ -274,6 +276,8 @@ if [[ -n "$WORK_ID" && -d "$todo_abs" ]]; then
   OPEN_QUESTION_TARGETS+=("$todo_rel/open-questions.md")
 elif [[ -n "$WORK_ID" && "$CLOSED_WORK_ID" -eq 1 ]]; then
   warn "skip scoped open-questions check for closed work-id: $WORK_ID (workspace deleted in current diff)"
+elif [[ -z "$WORK_ID" && "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
+  warn "skip open-questions checks due --allow-missing-work-id override"
 else
   TODO_DIRS_FOR_OPEN_Q=()
   while IFS= read -r todo_dir; do
@@ -309,7 +313,7 @@ safe_run "scripts/check-readme-policy.sh"
 safe_run "scripts/check-manifest-entrypoints.sh"
 safe_run "scripts/check-submodules.sh --strict"
 script_smoke_cmd="scripts/check-script-smoke.sh"
-if [[ -n "$WORK_ID" ]]; then
+if [[ -n "$WORK_ID" && "$CLOSED_WORK_ID" -ne 1 ]]; then
   printf -v script_smoke_cmd '%s --work-id %q' "$script_smoke_cmd" "$WORK_ID"
 fi
 safe_run "$script_smoke_cmd"
