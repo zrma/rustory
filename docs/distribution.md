@@ -162,8 +162,9 @@ rr update --asset-url "https://example.invalid/rr-aarch64-apple-darwin" --sha256
 
 `rr update`는 binary를 임시 파일로 다운로드하고 checksum을 검증한 뒤,
 다운로드한 binary의 `rr version` 실행이 성공할 때만 설치 경로를 교체한다. 다운로드한
-asset이 현재 설치된 파일과 byte-identical이면 교체하지 않고 daemon 재시작도 생략한다.
-파일이 바뀐 경우에는 기본적으로 관리 중인 daemon을 재시작한다.
+asset이 현재 설치된 파일과 byte-identical이면 파일 교체는 생략하지만, 기본적으로 관리 중인
+daemon restart는 계속 시도한다. 이 때문에 이미 최신 버전이어도 `rr update`를 다시 실행하면
+오래 떠 있던 daemon process/child를 현재 binary와 default로 재시작할 수 있다.
 
 - macOS: `com.rustory.daemon` launchd user agent가 있으면 `launchctl kickstart -k`로 재시작한다.
 - Linux systemd-user: `~/.config/systemd/user/rustory.service`가 있으면 `systemctl --user restart`를 시도한다.

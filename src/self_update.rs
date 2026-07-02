@@ -73,7 +73,7 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
             "update: installed binary already matches downloaded asset; no replacement performed"
         );
         auto_fix_managed_hook_blocks(&plan.install_path);
-        println!("daemon=restart_skipped reason=binary_unchanged");
+        handle_post_update_daemon(&plan.install_path, false, request.restart_daemon);
         return Ok(());
     }
 
@@ -81,11 +81,7 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
 
     println!("updated rr: {}", plan.install_path.display());
     auto_fix_managed_hook_blocks(&plan.install_path);
-    if request.restart_daemon {
-        restart_managed_daemon(&plan.install_path);
-    } else {
-        println!("daemon=restart_skipped reason=--no-restart-daemon");
-    }
+    handle_post_update_daemon(&plan.install_path, true, request.restart_daemon);
     Ok(())
 }
 
@@ -434,6 +430,32 @@ enum DaemonRestartStatus {
     Restarted,
     Skipped,
     Failed(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PostUpdateDaemonAction {
+    Restart,
+    SkipNoRestartDaemon,
+}
+
+fn post_update_daemon_action(
+    _binary_changed: bool,
+    restart_daemon: bool,
+) -> PostUpdateDaemonAction {
+    if restart_daemon {
+        PostUpdateDaemonAction::Restart
+    } else {
+        PostUpdateDaemonAction::SkipNoRestartDaemon
+    }
+}
+
+fn handle_post_update_daemon(install_path: &Path, binary_changed: bool, restart_daemon: bool) {
+    match post_update_daemon_action(binary_changed, restart_daemon) {
+        PostUpdateDaemonAction::Restart => restart_managed_daemon(install_path),
+        PostUpdateDaemonAction::SkipNoRestartDaemon => {
+            println!("daemon=restart_skipped reason=--no-restart-daemon");
+        }
+    }
 }
 
 fn restart_managed_daemon(install_path: &Path) {
@@ -952,6 +974,22 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(!installed_binary_matches(&path, b"rr-binary").unwrap());
+    }
+
+    #[test]
+    fn post_update_restart_runs_even_when_binary_is_unchanged() {
+        assert_eq!(
+            post_update_daemon_action(false, true),
+            PostUpdateDaemonAction::Restart
+        );
+        assert_eq!(
+            post_update_daemon_action(true, true),
+            PostUpdateDaemonAction::Restart
+        );
+        assert_eq!(
+            post_update_daemon_action(false, false),
+            PostUpdateDaemonAction::SkipNoRestartDaemon
+        );
     }
 
     #[cfg(target_os = "linux")]
