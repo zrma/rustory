@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -60,6 +61,12 @@ def main() -> int:
     asset_name = f"rr-{target}"
     asset_url = resolve_asset_url(args, asset_name)
     checksum_url = args.checksum_url or f"{asset_url}.sha256"
+    validate_download_urls(
+        asset_url=asset_url,
+        checksum_url=None if args.sha256 else checksum_url,
+        has_pinned_sha256=bool(args.sha256),
+        allow_insecure_download=args.allow_insecure_download,
+    )
     bin_dir = Path(args.bin_dir).expanduser()
     install_path = bin_dir / "rr"
 
@@ -105,6 +112,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--asset-url", help="Override exact release asset URL")
     parser.add_argument("--checksum-url", help="Override SHA-256 checksum URL; defaults to <asset-url>.sha256")
     parser.add_argument("--sha256", help="Expected SHA-256 hex; skips checksum URL download")
+    parser.add_argument(
+        "--allow-insecure-download",
+        action="store_true",
+        help="Allow non-HTTPS asset/checksum URLs for a trusted private mirror",
+    )
     parser.add_argument("--bin-dir", default="~/.local/bin", help="Directory to install rr into")
     parser.add_argument("--token", help="Tracker bearer token to write via rr init")
     parser.add_argument(
@@ -252,6 +264,45 @@ def normalize_repo(repo: str) -> str:
     if "/" not in repo or ".." in repo or any(ch.isspace() for ch in repo):
         raise SystemExit("--repo must be a GitHub owner/name value")
     return repo
+
+
+def validate_download_urls(
+    *,
+    asset_url: str,
+    checksum_url: str | None,
+    has_pinned_sha256: bool,
+    allow_insecure_download: bool,
+) -> None:
+    if allow_insecure_download:
+        return
+
+    checksum_is_trusted = bool(checksum_url and is_trusted_download_url(checksum_url))
+    if not is_trusted_download_url(asset_url) and not has_pinned_sha256 and not checksum_is_trusted:
+        raise SystemExit(
+            "refusing insecure release asset URL; use HTTPS, localhost HTTP, --sha256, "
+            "or --allow-insecure-download for a trusted private mirror"
+        )
+
+    if checksum_url and not is_trusted_download_url(checksum_url):
+        raise SystemExit(
+            "refusing insecure checksum URL; use HTTPS, localhost HTTP, --sha256, "
+            "or --allow-insecure-download for a trusted private mirror"
+        )
+
+
+def is_trusted_download_url(raw: str) -> bool:
+    parsed = urllib.parse.urlparse(raw.strip())
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme != "http":
+        return False
+    hostname = parsed.hostname or ""
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
 
 
 def download_bytes(url: str, limit: int) -> bytes:

@@ -1,7 +1,6 @@
 pub use libp2p_core as core;
 pub use libp2p_core::Transport;
 pub use libp2p_dcutr as dcutr;
-pub use libp2p_dns as dns;
 pub use libp2p_identify as identify;
 pub use libp2p_identity as identity;
 pub use libp2p_identity::PeerId;

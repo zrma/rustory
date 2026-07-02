@@ -55,6 +55,10 @@ struct TrackerState {
     peers: HashMap<String, PeerRecord>,
 }
 
+const MAX_TRACKER_ADDRS: usize = 32;
+const MAX_TRACKER_ADDR_BYTES: usize = 512;
+const MAX_TRACKER_META_FIELD_BYTES: usize = 256;
+
 pub fn serve(bind: &str, ttl_sec: u64, token: Option<String>) -> Result<()> {
     let token = normalize_configured_token(token, "tracker token")?;
     let state = Arc::new(Mutex::new(TrackerState::default()));
@@ -122,20 +126,28 @@ fn route_http_request(
                 Ok(peer_id) => peer_id,
                 Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
             };
+            let peer_id = peer_id.to_string();
+
+            let addrs = match normalize_register_addrs(reg.addrs) {
+                Ok(addrs) => addrs,
+                Err(message) => return Ok(respond_text(400, message)),
+            };
+            if let Err(message) = validate_register_meta(&reg.meta) {
+                return Ok(respond_text(400, message));
+            }
 
             let now = OffsetDateTime::now_utc();
             {
                 let mut locked = state.lock().unwrap();
                 prune_expired(&mut locked, now, ttl_sec);
+                if !locked.peers.contains_key(&peer_id) && locked.peers.len() >= max_tracker_peers()
+                {
+                    return Ok(respond_text(429, "too many registered peers\n"));
+                }
                 locked.peers.insert(
-                    peer_id.to_string(),
+                    peer_id,
                     PeerRecord {
-                        addrs: reg
-                            .addrs
-                            .into_iter()
-                            .map(|a| a.trim().to_string())
-                            .filter(|a| !a.is_empty())
-                            .collect(),
+                        addrs,
                         meta: reg.meta,
                         last_seen_unix: now.unix_timestamp(),
                     },
@@ -191,6 +203,56 @@ fn max_request_body_bytes() -> usize {
     16 * 1024 * 1024
 }
 
+#[cfg(test)]
+fn max_tracker_peers() -> usize {
+    4
+}
+
+#[cfg(not(test))]
+fn max_tracker_peers() -> usize {
+    4096
+}
+
+fn normalize_register_addrs(addrs: Vec<String>) -> std::result::Result<Vec<String>, &'static str> {
+    if addrs.len() > MAX_TRACKER_ADDRS {
+        return Err("too many addrs\n");
+    }
+
+    let mut normalized = Vec::with_capacity(addrs.len());
+    for addr in addrs {
+        let addr = addr.trim();
+        if addr.is_empty() {
+            continue;
+        }
+        if addr.len() > MAX_TRACKER_ADDR_BYTES {
+            return Err("addr too large\n");
+        }
+        normalized.push(addr.to_string());
+    }
+    Ok(normalized)
+}
+
+fn validate_register_meta(meta: &Option<PeerMeta>) -> std::result::Result<(), &'static str> {
+    let Some(meta) = meta else {
+        return Ok(());
+    };
+    for field in [
+        meta.device_id.as_deref(),
+        meta.hostname.as_deref(),
+        meta.user_id.as_deref(),
+        meta.version.as_deref(),
+        meta.build_revision.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if field.len() > MAX_TRACKER_META_FIELD_BYTES {
+            return Err("meta field too large\n");
+        }
+    }
+    Ok(())
+}
+
 fn prune_expired(state: &mut TrackerState, now: OffsetDateTime, ttl_sec: u64) {
     if ttl_sec == 0 {
         state.peers.clear();
@@ -226,15 +288,30 @@ fn is_authorized(req: &tiny_http::Request, token: &str) -> bool {
     if let Some(value) = header_value(req, "Authorization")
         && let Some(rest) = value.strip_prefix("Bearer ")
     {
-        return rest.trim() == token;
+        return token_matches(rest, token);
     }
 
     // 2) X-Rustory-Token: <token>
     if let Some(value) = header_value(req, "X-Rustory-Token") {
-        return value.trim() == token;
+        return token_matches(&value, token);
     }
 
     false
+}
+
+pub(crate) fn token_matches(candidate: &str, configured: &str) -> bool {
+    constant_time_eq(candidate.trim().as_bytes(), configured.trim().as_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut diff = left.len() ^ right.len();
+    let max_len = left.len().max(right.len());
+    for index in 0..max_len {
+        let left_byte = *left.get(index).unwrap_or(&0);
+        let right_byte = *right.get(index).unwrap_or(&0);
+        diff |= (left_byte ^ right_byte) as usize;
+    }
+    diff == 0
 }
 
 fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Option<String>> {
@@ -509,6 +586,89 @@ mod tests {
         };
         let resp = client.register(&req).unwrap();
         assert!(resp.ok);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn token_matches_uses_trimmed_exact_value() {
+        assert!(token_matches(" secret ", "secret"));
+        assert!(!token_matches("secret1", "secret"));
+        assert!(!token_matches("secret", "secret1"));
+    }
+
+    #[test]
+    fn tracker_rejects_too_many_register_addrs() {
+        let server = start_test_server(60, None);
+        let client = TrackerClient::new(server.base_url.clone(), None);
+
+        let req = RegisterRequest {
+            peer_id: PeerId::random().to_string(),
+            addrs: vec!["/ip4/127.0.0.1/tcp/1234".to_string(); MAX_TRACKER_ADDRS + 1],
+            meta: None,
+        };
+
+        let err = client.register(&req).unwrap_err();
+        assert_ureq_status(&err, 400);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn tracker_rejects_oversized_register_addr_and_meta() {
+        let server = start_test_server(60, None);
+        let client = TrackerClient::new(server.base_url.clone(), None);
+
+        let oversized_addr = RegisterRequest {
+            peer_id: PeerId::random().to_string(),
+            addrs: vec!["x".repeat(MAX_TRACKER_ADDR_BYTES + 1)],
+            meta: None,
+        };
+        let err = client.register(&oversized_addr).unwrap_err();
+        assert_ureq_status(&err, 400);
+
+        let oversized_meta = RegisterRequest {
+            peer_id: PeerId::random().to_string(),
+            addrs: vec![],
+            meta: Some(PeerMeta {
+                device_id: Some("d1".to_string()),
+                hostname: Some("h".repeat(MAX_TRACKER_META_FIELD_BYTES + 1)),
+                user_id: Some("u1".to_string()),
+                version: None,
+                build_revision: None,
+                build_dirty: Some(false),
+            }),
+        };
+        let err = client.register(&oversized_meta).unwrap_err();
+        assert_ureq_status(&err, 400);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn tracker_caps_registered_peer_count() {
+        let server = start_test_server(60, None);
+        let client = TrackerClient::new(server.base_url.clone(), None);
+
+        for _ in 0..max_tracker_peers() {
+            let resp = client
+                .register(&RegisterRequest {
+                    peer_id: PeerId::random().to_string(),
+                    addrs: vec![],
+                    meta: None,
+                })
+                .unwrap();
+            assert!(resp.ok);
+        }
+
+        let err = client
+            .register(&RegisterRequest {
+                peer_id: PeerId::random().to_string(),
+                addrs: vec![],
+                meta: None,
+            })
+            .unwrap_err();
+        assert_ureq_status(&err, 429);
 
         server.shutdown();
     }

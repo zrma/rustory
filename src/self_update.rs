@@ -3,6 +3,7 @@ use sha2::{Digest, Sha256};
 #[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::Duration;
@@ -25,6 +26,7 @@ pub struct UpdateRequest {
     pub install_path: Option<PathBuf>,
     pub dry_run: bool,
     pub restart_daemon: bool,
+    pub allow_insecure_download: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -144,6 +146,12 @@ fn build_update_plan(request: &UpdateRequest) -> Result<UpdatePlan> {
                 .is_none()
                 .then(|| format!("{asset_url}.sha256"))
         });
+    validate_release_download_urls(
+        &asset_url,
+        checksum_url.as_deref(),
+        request.sha256.is_some(),
+        request.allow_insecure_download,
+    )?;
     let install_path = match request.install_path.clone() {
         Some(path) => path,
         None => std::env::current_exe().context("resolve current rr executable path")?,
@@ -194,6 +202,58 @@ fn asset_name_from_url(url: &str) -> Option<String> {
         .rsplit('/')
         .next()
         .and_then(normalize_nonempty)
+}
+
+fn validate_release_download_urls(
+    asset_url: &str,
+    checksum_url: Option<&str>,
+    has_pinned_sha256: bool,
+    allow_insecure_download: bool,
+) -> Result<()> {
+    if allow_insecure_download {
+        return Ok(());
+    }
+
+    let checksum_is_trusted = checksum_url
+        .map(is_trusted_release_download_url)
+        .unwrap_or(false);
+    if !is_trusted_release_download_url(asset_url) && !has_pinned_sha256 && !checksum_is_trusted {
+        anyhow::bail!(
+            "refusing insecure release asset URL {asset_url}; use HTTPS, localhost HTTP, --sha256, or --allow-insecure-download for a trusted private mirror"
+        );
+    }
+
+    if let Some(checksum_url) = checksum_url
+        && !is_trusted_release_download_url(checksum_url)
+    {
+        anyhow::bail!(
+            "refusing insecure checksum URL {checksum_url}; use HTTPS, localhost HTTP, --sha256, or --allow-insecure-download for a trusted private mirror"
+        );
+    }
+
+    Ok(())
+}
+
+fn is_trusted_release_download_url(raw: &str) -> bool {
+    let url = raw.trim();
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let host_port = rest.split('/').next().unwrap_or_default();
+    let host_port = host_port.rsplit('@').next().unwrap_or(host_port);
+    let host = if let Some(bracketed) = host_port.strip_prefix('[') {
+        bracketed.split(']').next().unwrap_or_default()
+    } else {
+        host_port.split(':').next().unwrap_or_default()
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<IpAddr>()
+            .map(|addr| addr.is_loopback())
+            .unwrap_or(false)
 }
 
 fn current_release_target() -> Result<&'static str> {
@@ -700,6 +760,7 @@ mod tests {
             install_path: Some(PathBuf::from("/tmp/rr")),
             dry_run: true,
             restart_daemon: true,
+            allow_insecure_download: false,
         };
 
         let plan = build_update_plan(&request).unwrap();
@@ -726,6 +787,7 @@ mod tests {
             install_path: Some(PathBuf::from("/tmp/rr")),
             dry_run: true,
             restart_daemon: true,
+            allow_insecure_download: false,
         };
 
         let plan = build_update_plan(&request).unwrap();
@@ -749,9 +811,102 @@ mod tests {
             install_path: Some(PathBuf::from("/tmp/rr")),
             dry_run: true,
             restart_daemon: true,
+            allow_insecure_download: false,
         };
 
         assert!(build_update_plan(&request).is_err());
+    }
+
+    #[test]
+    fn update_plan_rejects_unpinned_insecure_release_urls() {
+        let request = UpdateRequest {
+            version: "latest".to_string(),
+            repo: "zrma/rustory".to_string(),
+            asset_base_url: None,
+            asset_url: Some("http://example.test/rr".to_string()),
+            checksum_url: None,
+            sha256: None,
+            install_path: Some(PathBuf::from("/tmp/rr")),
+            dry_run: true,
+            restart_daemon: true,
+            allow_insecure_download: false,
+        };
+
+        let err = build_update_plan(&request).unwrap_err();
+        assert!(format!("{err:#}").contains("refusing insecure release asset URL"));
+    }
+
+    #[test]
+    fn update_plan_allows_http_loopback_release_urls() {
+        let request = UpdateRequest {
+            version: "latest".to_string(),
+            repo: "zrma/rustory".to_string(),
+            asset_base_url: Some("http://127.0.0.1:8080/releases".to_string()),
+            asset_url: None,
+            checksum_url: None,
+            sha256: None,
+            install_path: Some(PathBuf::from("/tmp/rr")),
+            dry_run: true,
+            restart_daemon: true,
+            allow_insecure_download: false,
+        };
+
+        let plan = build_update_plan(&request).unwrap();
+        assert!(plan.asset_url.starts_with("http://127.0.0.1:8080/"));
+        assert!(
+            plan.checksum_url
+                .as_deref()
+                .unwrap()
+                .starts_with("http://127.0.0.1:8080/")
+        );
+    }
+
+    #[test]
+    fn update_plan_allows_pinned_insecure_asset_without_checksum_url() {
+        let request = UpdateRequest {
+            version: "latest".to_string(),
+            repo: "zrma/rustory".to_string(),
+            asset_base_url: None,
+            asset_url: Some("http://example.test/rr".to_string()),
+            checksum_url: None,
+            sha256: Some("0".repeat(64)),
+            install_path: Some(PathBuf::from("/tmp/rr")),
+            dry_run: true,
+            restart_daemon: true,
+            allow_insecure_download: false,
+        };
+
+        let plan = build_update_plan(&request).unwrap();
+        assert_eq!(plan.asset_url, "http://example.test/rr");
+        assert!(plan.checksum_url.is_none());
+    }
+
+    #[test]
+    fn update_plan_allows_explicit_insecure_download_override() {
+        let request = UpdateRequest {
+            version: "latest".to_string(),
+            repo: "zrma/rustory".to_string(),
+            asset_base_url: Some("http://example.test/releases".to_string()),
+            asset_url: None,
+            checksum_url: None,
+            sha256: None,
+            install_path: Some(PathBuf::from("/tmp/rr")),
+            dry_run: true,
+            restart_daemon: true,
+            allow_insecure_download: true,
+        };
+
+        let plan = build_update_plan(&request).unwrap();
+        assert!(
+            plan.asset_url
+                .starts_with("http://example.test/releases/rr-")
+        );
+        assert!(
+            plan.checksum_url
+                .as_deref()
+                .unwrap()
+                .starts_with("http://example.test/releases/rr-")
+        );
     }
 
     #[test]

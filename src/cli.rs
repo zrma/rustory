@@ -507,6 +507,13 @@ enum Command {
         #[arg(
             long,
             default_value_t = false,
+            help = "Allow non-HTTPS release asset/checksum URLs for a trusted private mirror"
+        )]
+        allow_insecure_download: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
             help = "Do not restart a managed Rustory daemon after replacing rr"
         )]
         no_restart_daemon: bool,
@@ -1355,6 +1362,7 @@ pub fn run() -> Result<()> {
             sha256,
             install_path,
             dry_run,
+            allow_insecure_download,
             no_restart_daemon,
         } => {
             crate::self_update::run_update(crate::self_update::UpdateRequest {
@@ -1367,6 +1375,7 @@ pub fn run() -> Result<()> {
                 install_path: install_path.map(std::path::PathBuf::from),
                 dry_run,
                 restart_daemon: !no_restart_daemon,
+                allow_insecure_download,
             })?;
         }
         Command::Hook { shell } => {

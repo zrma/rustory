@@ -9,6 +9,7 @@ use futures::StreamExt;
 use libp2p_request_response::ProtocolSupport;
 use multiaddr::Protocol;
 use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -259,8 +260,6 @@ fn build_rustory_swarm_with_identity(
 
     let (relay_transport, relay_behaviour) = libp2p::relay::client::new(local_peer_id);
     let tcp_transport = libp2p::tcp::tokio::Transport::default();
-    let tcp_transport =
-        libp2p::dns::tokio::Transport::system(tcp_transport).context("dns transport")?;
     let transport = OrTransport::new(relay_transport, tcp_transport);
 
     let pnet = libp2p::pnet::PnetConfig::new(psk);
@@ -1375,6 +1374,7 @@ fn is_disallowed_tracker_direct_addr(addr: &Multiaddr) -> bool {
                 || ip.is_unicast_link_local()
                 || ip.is_multicast()
         }
+        Protocol::Dns(_) | Protocol::Dns4(_) | Protocol::Dns6(_) | Protocol::Dnsaddr(_) => true,
         _ => false,
     })
 }
@@ -1383,6 +1383,130 @@ fn addrs_include_relay_circuit(addrs: &[Multiaddr]) -> bool {
     addrs
         .iter()
         .any(|addr| addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+}
+
+fn resolve_dns_multiaddrs(addrs: &[Multiaddr]) -> Result<Vec<Multiaddr>> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for addr in addrs {
+        for resolved in resolve_dns_multiaddr(addr)? {
+            let key = resolved.to_string();
+            if seen.insert(key) {
+                out.push(resolved);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn resolve_dns_multiaddr_first(addr: &Multiaddr) -> Result<Multiaddr> {
+    resolve_dns_multiaddr(addr)?
+        .into_iter()
+        .next()
+        .with_context(|| format!("dns multiaddr resolved to no addresses: {addr}"))
+}
+
+fn resolve_dns_multiaddr(addr: &Multiaddr) -> Result<Vec<Multiaddr>> {
+    let protocols: Vec<Protocol<'_>> = addr.iter().collect();
+    let Some((dns_index, host, family)) =
+        protocols
+            .iter()
+            .enumerate()
+            .find_map(|(index, protocol)| match protocol {
+                Protocol::Dns(host) => Some((index, host.to_string(), DnsAddressFamily::Any)),
+                Protocol::Dns4(host) => Some((index, host.to_string(), DnsAddressFamily::V4)),
+                Protocol::Dns6(host) => Some((index, host.to_string(), DnsAddressFamily::V6)),
+                Protocol::Dnsaddr(host) => {
+                    Some((index, host.to_string(), DnsAddressFamily::Dnsaddr))
+                }
+                _ => None,
+            })
+    else {
+        return Ok(vec![addr.clone()]);
+    };
+
+    if family == DnsAddressFamily::Dnsaddr {
+        anyhow::bail!("dnsaddr multiaddrs are not supported: {addr}");
+    }
+
+    let port = protocols
+        .iter()
+        .find_map(|protocol| match protocol {
+            Protocol::Tcp(port) | Protocol::Udp(port) => Some(*port),
+            _ => None,
+        })
+        .with_context(|| format!("dns multiaddr is missing tcp/udp port: {addr}"))?;
+
+    let ips = resolve_dns_host(&host, port)?;
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for ip in ips {
+        if !family.allows(ip) {
+            continue;
+        }
+
+        let mut resolved = Multiaddr::empty();
+        for (index, protocol) in protocols.iter().enumerate() {
+            if index == dns_index {
+                match ip {
+                    IpAddr::V4(ip) => resolved.push(Protocol::Ip4(ip)),
+                    IpAddr::V6(ip) => resolved.push(Protocol::Ip6(ip)),
+                }
+            } else {
+                resolved.push(protocol.clone());
+            }
+        }
+
+        let key = resolved.to_string();
+        if seen.insert(key) {
+            out.push(resolved);
+        }
+    }
+
+    if out.is_empty() {
+        anyhow::bail!("dns multiaddr resolved to no matching addresses: {addr}");
+    }
+
+    Ok(out)
+}
+
+fn resolve_dns_host(host: &str, port: u16) -> Result<Vec<IpAddr>> {
+    if host.eq_ignore_ascii_case("localhost") {
+        return Ok(vec![
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ]);
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for socket_addr in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolve dns host {host:?}"))?
+    {
+        let ip = socket_addr.ip();
+        if seen.insert(ip) {
+            out.push(ip);
+        }
+    }
+    Ok(out)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DnsAddressFamily {
+    Any,
+    V4,
+    V6,
+    Dnsaddr,
+}
+
+impl DnsAddressFamily {
+    fn allows(self, ip: IpAddr) -> bool {
+        matches!(
+            (self, ip),
+            (Self::Any, _) | (Self::V4, IpAddr::V4(_)) | (Self::V6, IpAddr::V6(_))
+        )
+    }
 }
 
 fn split_peer_multiaddr(value: &str) -> Result<(PeerId, Multiaddr)> {
@@ -1416,6 +1540,10 @@ impl P2pClient {
         psk: libp2p::pnet::PreSharedKey,
         request_retry_policy: RequestRetryPolicy,
     ) -> Result<Self> {
+        let dial_addrs = resolve_dns_multiaddrs(&dial_addrs)?;
+        let relay_addr = relay_addr
+            .map(|addr| resolve_dns_multiaddr_first(&addr))
+            .transpose()?;
         let mut swarm = build_rustory_swarm_with_identity(identity, psk)?;
         let listen: Multiaddr = "/ip4/0.0.0.0/tcp/0"
             .parse()
@@ -1976,6 +2104,8 @@ mod tests {
             format!("/ip6/::1/tcp/1234/p2p/{peer_id}"),
             format!("/ip6/fd00::1/tcp/1234/p2p/{peer_id}"),
             format!("/ip6/fe80::1/tcp/1234/p2p/{peer_id}"),
+            format!("/dns4/peer.example/tcp/1234/p2p/{peer_id}"),
+            format!("/dns6/peer.example/tcp/1234/p2p/{peer_id}"),
         ]);
         assert!(got.is_empty());
     }
@@ -2076,6 +2206,41 @@ mod tests {
 
         assert!(!addrs_include_relay_circuit(&[direct]));
         assert!(addrs_include_relay_circuit(&[relay]));
+    }
+
+    #[test]
+    fn resolve_dns_multiaddr_preserves_plain_ip_addr() {
+        let peer_id = PeerId::random();
+        let addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{peer_id}")
+            .parse()
+            .unwrap();
+
+        let got = resolve_dns_multiaddr(&addr).unwrap();
+
+        assert_eq!(got, vec![addr]);
+    }
+
+    #[test]
+    fn resolve_dns_multiaddr_expands_dns4_addr() {
+        let peer_id = PeerId::random();
+        let addr: Multiaddr = format!("/dns4/localhost/tcp/4001/p2p/{peer_id}")
+            .parse()
+            .unwrap();
+
+        let got = resolve_dns_multiaddr(&addr).unwrap();
+
+        assert_eq!(got.len(), 1);
+        assert!(got[0].to_string().starts_with("/ip4/127.0.0.1/tcp/4001/"));
+        assert!(got[0].to_string().ends_with(&format!("/p2p/{peer_id}")));
+    }
+
+    #[test]
+    fn resolve_dns_multiaddr_rejects_dnsaddr_addr() {
+        let addr: Multiaddr = "/dnsaddr/relay.example/tcp/4001".parse().unwrap();
+
+        let err = resolve_dns_multiaddr(&addr).unwrap_err().to_string();
+
+        assert!(err.contains("dnsaddr multiaddrs are not supported"));
     }
 
     #[test]

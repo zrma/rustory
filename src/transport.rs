@@ -160,9 +160,7 @@ fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Opti
     };
 
     let token = token.trim();
-    if token.is_empty() {
-        anyhow::bail!("{label} must not be empty");
-    }
+    crate::tracker::validate_tracker_token_value(token, label)?;
 
     Ok(Some(token.to_string()))
 }
@@ -303,11 +301,11 @@ fn is_authorized(req: &tiny_http::Request, token: Option<&str>) -> bool {
     if let Some(value) = header_value(req, "Authorization")
         && let Some(rest) = value.strip_prefix("Bearer ")
     {
-        return rest.trim() == token;
+        return crate::tracker::token_matches(rest, token);
     }
 
     if let Some(value) = header_value(req, "X-Rustory-Token") {
-        return value.trim() == token;
+        return crate::tracker::token_matches(&value, token);
     }
 
     false
