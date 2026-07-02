@@ -1079,12 +1079,15 @@ pub fn run() -> Result<()> {
             if watch {
                 run_sync_status_watch(
                     &store,
-                    &local_device_id,
-                    local_peer_id.as_deref(),
-                    peer.as_deref(),
-                    trackers.as_deref(),
-                    tracker_token.as_deref(),
-                    interval_sec.max(1),
+                    SyncStatusWatchConfig {
+                        local_device_id: &local_device_id,
+                        local_peer_id: local_peer_id.as_deref(),
+                        peer_filter: peer.as_deref(),
+                        trackers: trackers.as_deref(),
+                        tracker_token: tracker_token.as_deref(),
+                        user_id: cfg.user_id.as_deref(),
+                        interval_sec: interval_sec.max(1),
+                    },
                 )?;
                 return Ok(());
             }
@@ -1096,6 +1099,7 @@ pub fn run() -> Result<()> {
                 peer.as_deref(),
                 trackers.as_deref(),
                 tracker_token.as_deref(),
+                cfg.user_id.as_deref(),
             )?;
 
             if json {
@@ -1189,6 +1193,7 @@ pub fn run() -> Result<()> {
                     local_peer_id.as_deref(),
                     trackers.as_deref(),
                     tracker_token.as_deref(),
+                    cfg.user_id.as_deref(),
                     interval_sec.max(1),
                 )?;
                 return Ok(());
@@ -1201,6 +1206,7 @@ pub fn run() -> Result<()> {
                 None,
                 trackers.as_deref(),
                 tracker_token.as_deref(),
+                cfg.user_id.as_deref(),
             )?;
             let mut state = SyncStatusWatchState::default();
             let (width, height) =
@@ -2869,14 +2875,19 @@ fn resolve_local_p2p_peer_id(cfg: &config::FileConfig) -> Option<String> {
         .map(|key| key.public().to_peer_id().to_string())
 }
 
+struct SyncStatusWatchConfig<'a> {
+    local_device_id: &'a str,
+    local_peer_id: Option<&'a str>,
+    peer_filter: Option<&'a str>,
+    trackers: Option<&'a [String]>,
+    tracker_token: Option<&'a str>,
+    user_id: Option<&'a str>,
+    interval_sec: u64,
+}
+
 fn run_sync_status_watch(
     store: &storage::LocalStore,
-    local_device_id: &str,
-    local_peer_id: Option<&str>,
-    peer_filter: Option<&str>,
-    trackers: Option<&[String]>,
-    tracker_token: Option<&str>,
-    interval_sec: u64,
+    cfg: SyncStatusWatchConfig<'_>,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -2895,11 +2906,12 @@ fn run_sync_status_watch(
     while !stop.load(Ordering::SeqCst) {
         let report = match build_sync_status_report_for_cli(
             store,
-            local_device_id,
-            local_peer_id,
-            peer_filter,
-            trackers,
-            tracker_token,
+            cfg.local_device_id,
+            cfg.local_peer_id,
+            cfg.peer_filter,
+            cfg.trackers,
+            cfg.tracker_token,
+            cfg.user_id,
         ) {
             Ok(report) => report,
             Err(err) => {
@@ -2915,7 +2927,7 @@ fn run_sync_status_watch(
             render_sync_status_watch_frame(&mut state, &report, Instant::now(), frame_width);
         write!(stdout, "\x1b[H\x1b[2J{frame}")?;
         stdout.flush()?;
-        sleep_with_stop(Duration::from_secs(interval_sec.max(1)), stop.as_ref());
+        sleep_with_stop(Duration::from_secs(cfg.interval_sec.max(1)), stop.as_ref());
     }
 
     restore_sync_status_watch_terminal(&mut stdout)?;
@@ -2928,6 +2940,7 @@ fn run_mesh_watch(
     local_peer_id: Option<&str>,
     trackers: Option<&[String]>,
     tracker_token: Option<&str>,
+    user_id: Option<&str>,
     interval_sec: u64,
 ) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
@@ -2952,6 +2965,7 @@ fn run_mesh_watch(
             None,
             trackers,
             tracker_token,
+            user_id,
         ) {
             Ok(report) => report,
             Err(err) => {
@@ -4561,7 +4575,7 @@ mod tests {
             .unwrap();
 
         let report =
-            build_sync_status_report(&store, "dev-local", Some("peer-local-id"), None, None)
+            build_sync_status_report(&store, "dev-local", Some("peer-local-id"), None, None, &[])
                 .unwrap();
         assert_eq!(report.local_head, 3);
         assert_eq!(report.local_device_id, "dev-local");
@@ -4610,6 +4624,7 @@ mod tests {
             Some("peer-local-id"),
             Some("peer-a"),
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(filtered.peers.len(), 1);

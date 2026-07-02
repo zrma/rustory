@@ -1,7 +1,9 @@
 use crate::core::Entry;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, params};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
+#[cfg(test)]
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -403,6 +405,7 @@ ORDER BY ids.peer_id ASC
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    #[cfg(test)]
     pub fn list_peer_book_last_seen_map(&self) -> Result<HashMap<String, i64>> {
         let mut stmt = self
             .conn
