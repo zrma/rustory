@@ -424,10 +424,11 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
     swarm.listen_on(listen).context("listen_on")?;
 
+    let mut relay_listener_id = None;
     if let Some(relay_addr) = relay_addr.clone() {
-        let relay_listen = relay_addr.with(Protocol::P2pCircuit);
+        let relay_listen = relay_circuit_listen_addr(&relay_addr)?;
         eprintln!("p2p relay listen requested: {relay_listen}");
-        swarm.listen_on(relay_listen).context("listen_on relay")?;
+        relay_listener_id = Some(swarm.listen_on(relay_listen).context("listen_on relay")?);
     }
 
     let local_peer_id = *swarm.local_peer_id();
@@ -650,12 +651,22 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             );
                         }
                     }
-                    SwarmEvent::ListenerClosed { addresses, reason, .. } => {
+                    SwarmEvent::ListenerClosed {
+                        listener_id,
+                        addresses,
+                        reason,
+                        ..
+                    } => {
                         eprintln!(
                             "warn: p2p listener closed: addresses={addresses:?} reason={reason:?}"
                         );
+                        let is_tracked_relay_listener =
+                            relay_listener_id.as_ref() == Some(&listener_id);
+                        if is_tracked_relay_listener {
+                            relay_listener_id = None;
+                        }
                         let had_relay_listener =
-                            addresses.iter().any(is_relay_circuit_addr);
+                            is_tracked_relay_listener || addresses.iter().any(is_relay_circuit_addr);
                         if remove_known_listen_addrs(&mut known_addrs, &addresses, local_peer_id)
                             && !trackers.is_empty()
                         {
@@ -669,12 +680,25 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         if had_relay_listener
                             && let Some(relay_addr) = relay_addr.clone()
                         {
-                            let relay_listen = relay_addr.with(Protocol::P2pCircuit);
-                            eprintln!(
-                                "p2p relay listener closed; re-listen requested: {relay_listen}"
-                            );
-                            if let Err(err) = swarm.listen_on(relay_listen) {
-                                eprintln!("warn: p2p relay re-listen failed: {err:#}");
+                            match relay_circuit_listen_addr(&relay_addr) {
+                                Ok(relay_listen) => {
+                                    eprintln!(
+                                        "p2p relay listener closed; re-listen requested: {relay_listen}"
+                                    );
+                                    match swarm.listen_on(relay_listen) {
+                                        Ok(new_listener_id) => {
+                                            relay_listener_id = Some(new_listener_id);
+                                        }
+                                        Err(err) => {
+                                            eprintln!("warn: p2p relay re-listen failed: {err:#}");
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "warn: p2p relay re-listen addr resolve failed: {err:#}"
+                                    );
+                                }
                             }
                         }
                     }
@@ -1383,6 +1407,10 @@ fn addrs_include_relay_circuit(addrs: &[Multiaddr]) -> bool {
     addrs
         .iter()
         .any(|addr| addr.iter().any(|p| matches!(p, Protocol::P2pCircuit)))
+}
+
+fn relay_circuit_listen_addr(relay_addr: &Multiaddr) -> Result<Multiaddr> {
+    Ok(resolve_dns_multiaddr_first(relay_addr)?.with(Protocol::P2pCircuit))
 }
 
 fn resolve_dns_multiaddrs(addrs: &[Multiaddr]) -> Result<Vec<Multiaddr>> {
@@ -2232,6 +2260,34 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert!(got[0].to_string().starts_with("/ip4/127.0.0.1/tcp/4001/"));
         assert!(got[0].to_string().ends_with(&format!("/p2p/{peer_id}")));
+    }
+
+    #[test]
+    fn relay_circuit_listen_addr_preserves_plain_ip_relay_addr() {
+        let relay_id = PeerId::random();
+        let relay_addr: Multiaddr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+
+        let got = relay_circuit_listen_addr(&relay_addr).unwrap();
+
+        assert_eq!(got, relay_addr.with(Protocol::P2pCircuit));
+    }
+
+    #[test]
+    fn relay_circuit_listen_addr_resolves_dns4_before_p2p_circuit() {
+        let relay_id = PeerId::random();
+        let relay_addr: Multiaddr = format!("/dns4/localhost/tcp/4001/p2p/{relay_id}")
+            .parse()
+            .unwrap();
+
+        let got = relay_circuit_listen_addr(&relay_addr).unwrap();
+
+        assert!(got.to_string().starts_with("/ip4/127.0.0.1/tcp/4001/"));
+        assert!(
+            got.to_string()
+                .ends_with(&format!("/p2p/{relay_id}/p2p-circuit"))
+        );
     }
 
     #[test]
