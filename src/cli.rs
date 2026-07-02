@@ -3425,6 +3425,149 @@ struct MeshWatchTotals {
     drain_rate: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MeshPoint {
+    x: usize,
+    y: usize,
+}
+
+struct BrailleCanvas {
+    width: usize,
+    height: usize,
+    cells: Vec<u8>,
+    overlays: Vec<Option<char>>,
+}
+
+impl BrailleCanvas {
+    fn new(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            cells: vec![0; width.saturating_mul(height)],
+            overlays: vec![None; width.saturating_mul(height)],
+        }
+    }
+
+    fn set_pixel(&mut self, x: isize, y: isize) {
+        if x < 0 || y < 0 {
+            return;
+        }
+        let x = x as usize;
+        let y = y as usize;
+        let pixel_width = self.width.saturating_mul(2);
+        let pixel_height = self.height.saturating_mul(4);
+        if x >= pixel_width || y >= pixel_height {
+            return;
+        }
+        let cell_x = x / 2;
+        let cell_y = y / 4;
+        let bit = match (x % 2, y % 4) {
+            (0, 0) => 0x01,
+            (0, 1) => 0x02,
+            (0, 2) => 0x04,
+            (0, 3) => 0x40,
+            (1, 0) => 0x08,
+            (1, 1) => 0x10,
+            (1, 2) => 0x20,
+            (1, 3) => 0x80,
+            _ => 0,
+        };
+        let Some(cell) = self.cells.get_mut(cell_y * self.width + cell_x) else {
+            return;
+        };
+        *cell |= bit;
+    }
+
+    fn draw_line(&mut self, from: MeshPoint, to: MeshPoint) {
+        self.draw_pixel_line(
+            from.x.saturating_mul(2).saturating_add(1) as isize,
+            from.y.saturating_mul(4).saturating_add(2) as isize,
+            to.x.saturating_mul(2).saturating_add(1) as isize,
+            to.y.saturating_mul(4).saturating_add(2) as isize,
+        );
+    }
+
+    fn draw_pixel_line(&mut self, mut x0: isize, mut y0: isize, x1: isize, y1: isize) {
+        let dx = (x1 - x0).abs();
+        let sx = if x0 < x1 { 1 } else { -1 };
+        let dy = -(y1 - y0).abs();
+        let sy = if y0 < y1 { 1 } else { -1 };
+        let mut err = dx + dy;
+        loop {
+            self.set_pixel(x0, y0);
+            if x0 == x1 && y0 == y1 {
+                break;
+            }
+            let e2 = err.saturating_mul(2);
+            if e2 >= dy {
+                err += dy;
+                x0 += sx;
+            }
+            if e2 <= dx {
+                err += dx;
+                y0 += sy;
+            }
+        }
+    }
+
+    fn draw_circle(&mut self, center: MeshPoint, radius: usize) {
+        let cx = center.x.saturating_mul(2).saturating_add(1) as isize;
+        let cy = center.y.saturating_mul(4).saturating_add(2) as isize;
+        let radius = radius.max(1) as isize;
+        for y in -radius..=radius {
+            for x in -radius..=radius {
+                if x * x + y * y <= radius * radius {
+                    self.set_pixel(cx + x, cy + y);
+                }
+            }
+        }
+    }
+
+    fn put_char(&mut self, x: isize, y: isize, value: char) {
+        if x < 0 || y < 0 {
+            return;
+        }
+        let x = x as usize;
+        let y = y as usize;
+        if x >= self.width || y >= self.height {
+            return;
+        }
+        if let Some(slot) = self.overlays.get_mut(y * self.width + x) {
+            *slot = Some(value);
+        }
+    }
+
+    fn put_label(&mut self, x: isize, y: isize, value: &str, max_width: usize) {
+        if max_width == 0 {
+            return;
+        }
+        let text = truncate_display(value, max_width);
+        for (offset, ch) in text.chars().enumerate() {
+            self.put_char(x + offset as isize, y, ch);
+        }
+    }
+
+    fn lines(&self) -> Vec<String> {
+        let mut lines = Vec::with_capacity(self.height);
+        for y in 0..self.height {
+            let mut line = String::with_capacity(self.width);
+            for x in 0..self.width {
+                let idx = y * self.width + x;
+                if let Some(ch) = self.overlays[idx] {
+                    line.push(ch);
+                } else if self.cells[idx] == 0 {
+                    line.push(' ');
+                } else {
+                    let value = 0x2800_u32 + u32::from(self.cells[idx]);
+                    line.push(char::from_u32(value).unwrap_or(' '));
+                }
+            }
+            lines.push(line);
+        }
+        lines
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SyncStatusWatchPeerView<'a> {
     peer: &'a SyncStatusPeerReport,
@@ -3755,7 +3898,7 @@ fn render_mesh_watch_frame(
 
     let side_width = (width / 3).clamp(44, 64);
     let map_width = width.saturating_sub(side_width + display_width(PANEL_GAP));
-    let peer_ring_rows = (height / 3).clamp(6, 12);
+    let topology_rows = (height.saturating_mul(45) / 100).clamp(12, 30);
 
     let mut out = String::new();
     push_watch_line(
@@ -3776,8 +3919,8 @@ fn render_mesh_watch_frame(
     );
 
     out.push('\n');
-    let ring_panel =
-        render_mesh_peer_ring_panel(report, &peer_views, map_width, peer_ring_rows, phase);
+    let topology_panel =
+        render_mesh_topology_panel(report, &peer_views, map_width, topology_rows, phase);
     let outbox_panel = render_mesh_outbox_panel(
         report,
         &peer_views,
@@ -3786,7 +3929,7 @@ fn render_mesh_watch_frame(
         side_width,
         totals,
     );
-    for line in join_watch_panels(&ring_panel, &outbox_panel, PANEL_GAP) {
+    for line in join_watch_panels(&topology_panel, &outbox_panel, PANEL_GAP) {
         push_watch_line(&mut out, width, &line);
     }
 
@@ -3825,67 +3968,51 @@ fn record_mesh_watch_sample(
     }
 }
 
-fn render_mesh_peer_ring_panel(
+fn render_mesh_topology_panel(
     report: &SyncStatusReport,
     peer_views: &[SyncStatusWatchPeerView<'_>],
     panel_width: usize,
-    max_peer_rows: usize,
+    canvas_rows: usize,
     phase: usize,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
-    let visible_rows = peer_views.len().div_ceil(2).clamp(1, max_peer_rows.max(1));
-    let hub_width = (inner_width / 5).clamp(16, 28);
-    let connector_width = 8;
-    let side_width = inner_width
-        .saturating_sub(hub_width)
-        .saturating_sub(connector_width * 2)
-        .saturating_sub(4)
-        / 2;
-    let hub = truncate_display(&format!("◎ {}", report.local_device_id), hub_width);
-    let mut body = Vec::new();
+    let canvas_rows = canvas_rows.clamp(8, 34);
+    let mut canvas = BrailleCanvas::new(inner_width, canvas_rows);
+    let center = MeshPoint {
+        x: inner_width / 2,
+        y: canvas_rows / 2,
+    };
+    let visible = peer_views
+        .len()
+        .min(mesh_topology_visible_peer_count(inner_width, canvas_rows));
 
-    body.push(center_cell(
-        &format!("{} local hub with {} observed edges", hub, peer_views.len()),
-        inner_width,
-    ));
-    body.push(center_cell(
-        "peer ring: ● synced  ◐ queued  ◌ stale  ◆ moving",
-        inner_width,
-    ));
-    body.push(String::new());
-
-    for row in 0..visible_rows {
-        let left = peer_views.get(row * 2);
-        let right = peer_views.get(row * 2 + 1);
-        let center = if row == visible_rows / 2 {
-            fit_cell(&hub, hub_width)
-        } else {
-            center_cell("│", hub_width)
-        };
-        let left_label = left.map(mesh_node_label).unwrap_or_default();
-        let right_label = right.map(mesh_node_label).unwrap_or_default();
-        let left_flow = left
-            .map(|view| mesh_flow_segment(view, phase + row, true))
-            .unwrap_or_else(|| " ".repeat(connector_width));
-        let right_flow = right
-            .map(|view| mesh_flow_segment(view, phase + row + 2, false))
-            .unwrap_or_else(|| " ".repeat(connector_width));
-        body.push(format!(
-            "{} {} {} {} {}",
-            right_cell(&left_label, side_width),
-            left_flow,
-            center,
-            right_flow,
-            fit_cell(&right_label, side_width),
-        ));
+    canvas.draw_circle(center, 3);
+    for (idx, view) in peer_views.iter().take(visible).enumerate() {
+        let point = mesh_topology_peer_point(idx, visible.max(1), inner_width, canvas_rows);
+        canvas.draw_line(center, point);
+        canvas.draw_circle(point, mesh_topology_node_radius(view));
+        mesh_topology_put_packet(&mut canvas, center, point, view, phase + idx);
     }
 
-    let hidden = peer_views.len().saturating_sub(visible_rows * 2);
-    if hidden > 0 {
-        body.push(center_cell(
-            &format!("+ {hidden} more peers in Flow Lanes"),
+    canvas.put_label(
+        center.x.saturating_sub(10) as isize,
+        center.y as isize,
+        &format!(" ◎ {}", truncate_display(&report.local_device_id, 18)),
+        24,
+    );
+    for (idx, view) in peer_views.iter().take(visible).enumerate() {
+        let point = mesh_topology_peer_point(idx, visible.max(1), inner_width, canvas_rows);
+        mesh_topology_put_peer_label(&mut canvas, point, view, center, inner_width);
+    }
+
+    let mut body = canvas.lines();
+    let hidden = peer_views.len().saturating_sub(visible);
+    if hidden > 0 && !body.is_empty() {
+        let row = body.len().saturating_sub(1);
+        body[row] = truncate_display(
+            &format!("{}+ {hidden} more peers in Flow Lanes", body[row]),
             inner_width,
-        ));
+        );
     }
     if peer_views.is_empty() {
         body.push(center_cell(
@@ -3894,7 +4021,85 @@ fn render_mesh_peer_ring_panel(
         ));
     }
 
-    box_watch_panel("Peer Ring", panel_width, body)
+    box_watch_panel("Mesh Topology", panel_width, body)
+}
+
+fn mesh_topology_visible_peer_count(width: usize, rows: usize) -> usize {
+    let by_width = (width / 13).max(4);
+    let by_height = (rows / 2).max(4);
+    by_width.min(by_height).clamp(4, 12)
+}
+
+fn mesh_topology_peer_point(idx: usize, count: usize, width: usize, rows: usize) -> MeshPoint {
+    let center_x = width as f64 / 2.0;
+    let center_y = rows as f64 / 2.0;
+    let radius_x = (width as f64 / 2.0 - 13.0).max(8.0);
+    let radius_y = (rows as f64 / 2.0 - 2.0).max(3.0);
+    let angle =
+        -std::f64::consts::FRAC_PI_2 + std::f64::consts::TAU * (idx as f64) / (count.max(1) as f64);
+    let x = (center_x + radius_x * angle.cos()).round();
+    let y = (center_y + radius_y * angle.sin()).round();
+    MeshPoint {
+        x: (x as isize).clamp(1, width.saturating_sub(2) as isize) as usize,
+        y: (y as isize).clamp(1, rows.saturating_sub(2) as isize) as usize,
+    }
+}
+
+fn mesh_topology_node_radius(view: &SyncStatusWatchPeerView<'_>) -> usize {
+    if view.peer.outbound_push_pending >= 1000 {
+        3
+    } else if view.peer.outbound_push_pending > 0
+        || view.rates.pull_per_sec > 0.0
+        || view.rates.push_per_sec > 0.0
+    {
+        2
+    } else {
+        1
+    }
+}
+
+fn mesh_topology_put_packet(
+    canvas: &mut BrailleCanvas,
+    center: MeshPoint,
+    peer: MeshPoint,
+    view: &SyncStatusWatchPeerView<'_>,
+    phase: usize,
+) {
+    let marker = if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
+        '◆'
+    } else if view.peer.outbound_push_pending > 0 {
+        '◇'
+    } else {
+        return;
+    };
+    let steps = 10;
+    let mut slot = phase % steps;
+    if view.rates.pull_per_sec > view.rates.push_per_sec && view.peer.outbound_push_pending == 0 {
+        slot = steps.saturating_sub(1).saturating_sub(slot);
+    }
+    let t = (slot + 1) as f64 / (steps + 1) as f64;
+    let x = center.x as f64 + (peer.x as f64 - center.x as f64) * t;
+    let y = center.y as f64 + (peer.y as f64 - center.y as f64) * t;
+    canvas.put_char(x.round() as isize, y.round() as isize, marker);
+}
+
+fn mesh_topology_put_peer_label(
+    canvas: &mut BrailleCanvas,
+    point: MeshPoint,
+    view: &SyncStatusWatchPeerView<'_>,
+    center: MeshPoint,
+    width: usize,
+) {
+    let label = mesh_node_label(view);
+    let max_width = (width / 4).clamp(14, 26);
+    let y = point.y as isize;
+    let raw_x = if point.x <= center.x {
+        point.x as isize - max_width as isize - 2
+    } else {
+        point.x as isize + 2
+    };
+    let max_x = width.saturating_sub(max_width) as isize;
+    canvas.put_label(raw_x.clamp(0, max_x), y, &label, max_width);
 }
 
 fn render_mesh_outbox_panel(
@@ -4153,13 +4358,13 @@ fn mesh_node_label(view: &SyncStatusWatchPeerView<'_>) -> String {
     format!(
         "{} {}{} {}",
         mesh_peer_symbol(view),
-        truncate_display(&mesh_peer_ring_name(view), 22),
+        truncate_display(&mesh_peer_display_name(view), 22),
         queued,
         format_age_opt(peer.last_seen_age_sec),
     )
 }
 
-fn mesh_peer_ring_name(view: &SyncStatusWatchPeerView<'_>) -> String {
+fn mesh_peer_display_name(view: &SyncStatusWatchPeerView<'_>) -> String {
     view.peer
         .peer_device_id
         .clone()
@@ -4175,37 +4380,6 @@ fn mesh_peer_symbol(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
         "◐"
     } else {
         "●"
-    }
-}
-
-fn mesh_flow_segment(
-    view: &SyncStatusWatchPeerView<'_>,
-    phase: usize,
-    points_left: bool,
-) -> String {
-    const WIDTH: usize = 8;
-    let active = view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0;
-    let queued = view.peer.outbound_push_pending > 0;
-    let marker = if active {
-        "◆"
-    } else if queued {
-        "◇"
-    } else {
-        "─"
-    };
-    if marker == "─" {
-        return "─".repeat(WIDTH);
-    }
-
-    let lane_width = WIDTH.saturating_sub(1).max(1);
-    let slot = phase % lane_width;
-    let mut chars = vec!['─'; lane_width];
-    chars[slot] = marker.chars().next().unwrap_or('◆');
-    let value = chars.into_iter().collect::<String>();
-    if points_left {
-        format!("◀{value}")
-    } else {
-        format!("{value}▶")
     }
 }
 
@@ -6993,7 +7167,7 @@ mod tests {
         let frame = render_mesh_watch_frame(&mut state, &report, Instant::now(), 160, 36);
 
         assert!(frame.contains("rustory mesh watch"));
-        assert!(frame.contains("Peer Ring"));
+        assert!(frame.contains("Mesh Topology"));
         assert!(frame.contains("Outbox"));
         assert!(frame.contains("Flow Lanes"));
         assert!(frame.contains("local view: peer"));
@@ -7003,6 +7177,13 @@ mod tests {
         assert!(frame.contains("queue"));
         assert!(frame.contains("158.5k"));
         assert!(!frame.contains("Mesh Map"));
+        assert!(!frame.contains("Peer Ring"));
+        assert!(
+            frame
+                .chars()
+                .any(|ch| ('\u{2801}'..='\u{28ff}').contains(&ch)),
+            "mesh topology should use braille canvas lines: {frame}"
+        );
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
             assert!(width <= 160, "line width {width}: {line}");

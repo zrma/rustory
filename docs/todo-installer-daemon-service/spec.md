@@ -33,11 +33,12 @@
 | C15 | done | codex | `cargo test inbound_push_provenance_accepts_arch_suffix_device_renames daemon_` | 같은 PeerId가 `node1`에서 `node1-x86_64`처럼 device label만 바뀐 경우 push provenance를 같은 기기로 허용하고, daemon 기본 fan-out을 backfill 수렴 기준으로 둔다. |
 | C16 | done | codex | `cargo test advance_last_pushed_seq_never_moves_cursor_backward loopback_direct_dial_failure_is_log_noise import_hishtory_sqlite_preserves_metadata_and_is_idempotent`, `scripts/check.sh --fast` | peer가 이 노드의 데이터를 pull한 경우도 push coverage로 반영해 `sync-status`의 큰 outbound pending이 실제 전파 상태와 어긋나지 않게 하고, relay가 살아 있는 상태의 loopback direct upgrade 실패는 경고 노이즈로 분류한다. |
 | C17 | done | codex | `cargo test sync_status_watch --workspace` | `sync-status --watch` 기본 화면에서 추정 mesh graph를 제거하고 `direct`/`sent`/`to_send` 중심의 운영 대시보드로 가독성을 개선한다. |
-| C18 | done | codex | `cargo test mesh_ --workspace`, `scripts/check.sh --fast` | 최종 UX 방향에 맞춰 `rr mesh --watch`를 별도 local mesh dashboard로 추가하고, `Peer Ring`/`Outbox`/`Flow Lanes`로 tracker health, queue trend, local edge 상태를 분리해 보여준다. |
+| C18 | done | codex | `cargo test mesh_ --workspace`, `scripts/check.sh --fast` | 최종 UX 방향에 맞춰 `rr mesh --watch`를 별도 local mesh dashboard로 추가하고, `Mesh Topology`/`Outbox`/`Flow Lanes`로 tracker health, queue trend, local edge 상태를 분리해 보여준다. |
+| C19 | done | codex | `cargo test mesh_ --workspace` | `rr mesh --watch`의 상단 topology를 braille canvas 기반 시각화로 바꿔 노드/edge/packet marker가 표보다 직관적으로 보이게 한다. |
 
 ## 완료/미완료/다음 액션
 
-- 완료: C1-C6, C8-C18.
+- 완료: C1-C6, C8-C19.
 - 미완료: C7.
 - 다음 액션: release/push 후 private install archive를 public relay DNS 주소 기준으로 갱신한다. 외부 WAN L4 포워딩은 cluster/repo 내부 배포와 별도 운영 체크포인트로 확인한다.
 - 검증 증거: `python3 -m py_compile install/rustory.py`, installer temp HOME background autostart smoke, `cargo test sync_status_report_includes_pending_push_and_filter discover_targets_skips_self_peer_book_entries_by_peer_id_and_device_id`, `cargo test tracker_target`, `cargo test tracker_announce`, `cargo test inbound_push_provenance`, `cargo test discover_targets`, `cargo test daemon_`, `RUSTORY_RELEASE_LINUX_BUILDER=zig scripts/build-release-assets.sh --target x86_64-unknown-linux-gnu --dist-dir /tmp/rustory-release-portable-linux`, `strings /tmp/rustory-release-portable-linux/rr-x86_64-unknown-linux-gnu | rg GLIBC_ | sort -u` (max `GLIBC_2.17`), `cargo fmt --all --check`, `cargo test relay_addr_warning_flags_tailnet_and_private_addresses`, `cargo test advance_last_pushed_seq_never_moves_cursor_backward`, `cargo test loopback_direct_dial_failure_is_log_noise`, `cargo test import_hishtory_sqlite_preserves_metadata_and_is_idempotent`, `cargo test mesh_ --workspace`, `cargo test sync_status_watch --workspace`, `target/debug/rr mesh`, `cargo test p2p --workspace`, `cargo test --workspace` (226 passed), `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check.sh --fast`, k8s `rustory-relay` Pod/Service Running, internal DNS `rustory-relay` TCP/4001 success, public WAN IP TCP/4001 refused.
