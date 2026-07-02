@@ -218,7 +218,23 @@ rr prune --older-than-days 180 --keep-recent 5000 --dry-run
 rr prune --older-than-days 180 --keep-recent 5000
 ```
 
-### 2-7) (선택) 민감 로컬 엔트리 삭제
+### 2-7) (선택) 동일 명령 중복 로컬 정리
+같은 UTC 날짜, 같은 `device_id`, hostname, CWD, command, exit code가 반복된 row를 먼저 확인한다. 기본 scope는 현재 device id이며, 실제 삭제는 하지 않는다.
+
+```sh
+rr dedupe
+```
+
+결과가 의도와 같으면 명시 적용한다. 기본 보존 대상은 최신 row이며, 필요하면 oldest를 남길 수 있다.
+
+```sh
+rr dedupe --apply
+rr dedupe --keep oldest --older-than-days 14 --apply --vacuum
+```
+
+`rr dedupe`는 local-only 작업이다. 아직 peer로 push되지 않은 row는 peer push cursor 기준으로 삭제 후보에서 제외되며, 이미 다른 peer로 sync된 중복 row를 grid 전체에서 정리하려면 각 peer에서 별도로 실행해야 한다.
+
+### 2-8) (선택) 민감 로컬 엔트리 삭제
 `record_ignore_regex`는 기록/import 전 차단이 목적이다. 이미 들어간 로컬 row는 먼저 dry-run으로 확인한다.
 
 ```sh

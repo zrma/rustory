@@ -1,6 +1,6 @@
 use crate::libp2p;
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use multiaddr::Protocol;
 use rand::RngExt;
 
@@ -359,6 +359,40 @@ enum Command {
         )]
         vacuum: bool,
     },
+    #[command(about = "Trim duplicate local history entries")]
+    Dedupe {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Delete duplicate rows after reporting the plan"
+        )]
+        apply: bool,
+
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = DedupeKeepArg::Newest,
+            help = "Which row to keep in each duplicate group"
+        )]
+        keep: DedupeKeepArg,
+
+        #[arg(long, help = "Only consider entries older than this many days")]
+        older_than_days: Option<u64>,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Include every device id stored in this local database"
+        )]
+        all_devices: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Run SQLite WAL checkpoint and VACUUM after deletion"
+        )]
+        vacuum: bool,
+    },
     #[command(about = "Show local pull and push cursor status")]
     SyncStatus {
         #[arg(long, help = "Show status for one peer id only")]
@@ -675,6 +709,36 @@ enum Command {
         )]
         home: Option<String>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DedupeKeepArg {
+    Newest,
+    Oldest,
+}
+
+impl DedupeKeepArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Newest => "newest",
+            Self::Oldest => "oldest",
+        }
+    }
+}
+
+impl std::fmt::Display for DedupeKeepArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
+impl From<DedupeKeepArg> for storage::DedupeKeep {
+    fn from(value: DedupeKeepArg) -> Self {
+        match value {
+            DedupeKeepArg::Newest => Self::Newest,
+            DedupeKeepArg::Oldest => Self::Oldest,
+        }
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -1049,6 +1113,63 @@ pub fn run() -> Result<()> {
                 println!(
                     "delete: selectors={} matched={} deleted={} compacted={}",
                     selector_count, stats.matched, stats.deleted, compacted
+                );
+            }
+        }
+        Command::Dedupe {
+            apply,
+            keep,
+            older_than_days,
+            all_devices,
+            vacuum,
+        } => {
+            let store = storage::LocalStore::open(&db_path)?;
+            let local_device_id = resolve_device_id(&cfg);
+            let source_device_id = if all_devices {
+                None
+            } else {
+                Some(local_device_id.as_str())
+            };
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            let older_than_unix = older_than_days
+                .map(|days| compute_prune_cutoff_unix(now_unix, days))
+                .transpose()?;
+            let stats = store.dedupe_entries_same_day(
+                keep.into(),
+                source_device_id,
+                older_than_unix,
+                !apply,
+            )?;
+
+            let mut compacted = false;
+            if apply && vacuum && stats.deleted > 0 {
+                store.compact_storage()?;
+                compacted = true;
+            }
+
+            let scope = source_device_id.unwrap_or("all-devices");
+            let older_than_label = older_than_days
+                .map(|days| days.to_string())
+                .unwrap_or_else(|| "none".to_string());
+            if apply {
+                println!(
+                    "dedupe: scope={} keep={} older_than_days={} groups={} matched={} deleted={} compacted={}",
+                    scope,
+                    keep.as_str(),
+                    older_than_label,
+                    stats.groups,
+                    stats.matched,
+                    stats.deleted,
+                    compacted
+                );
+            } else {
+                println!(
+                    "dedupe dry-run: scope={} keep={} older_than_days={} groups={} matched={} deleted=0",
+                    scope,
+                    keep.as_str(),
+                    older_than_label,
+                    stats.groups,
+                    stats.matched
                 );
             }
         }
@@ -4508,6 +4629,37 @@ mod tests {
                 assert!(vacuum);
             }
             _ => panic!("expected delete"),
+        }
+    }
+
+    #[test]
+    fn dedupe_parses_scope_and_safety_flags() {
+        let app = App::parse_from([
+            "rr",
+            "dedupe",
+            "--apply",
+            "--keep",
+            "oldest",
+            "--older-than-days",
+            "14",
+            "--all-devices",
+            "--vacuum",
+        ]);
+        match app.cmd {
+            Command::Dedupe {
+                apply,
+                keep,
+                older_than_days,
+                all_devices,
+                vacuum,
+            } => {
+                assert!(apply);
+                assert_eq!(keep, DedupeKeepArg::Oldest);
+                assert_eq!(older_than_days, Some(14));
+                assert!(all_devices);
+                assert!(vacuum);
+            }
+            _ => panic!("expected dedupe"),
         }
     }
 

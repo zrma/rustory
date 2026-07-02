@@ -29,6 +29,19 @@ pub struct PruneStats {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DedupeStats {
+    pub groups: usize,
+    pub matched: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupeKeep {
+    Newest,
+    Oldest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteStats {
     pub matched: usize,
     pub deleted: usize,
@@ -595,6 +608,93 @@ WHERE ts < ?
 
         Ok(PruneStats {
             matched: matched as usize,
+            deleted,
+        })
+    }
+
+    pub fn dedupe_entries_same_day(
+        &self,
+        keep: DedupeKeep,
+        source_device_id: Option<&str>,
+        older_than_unix: Option<i64>,
+        dry_run: bool,
+    ) -> Result<DedupeStats> {
+        let pushed_floor_seq = self.prune_pushed_floor_seq()?;
+        let order_by = match keep {
+            DedupeKeep::Newest => "ts DESC, ingest_seq DESC",
+            DedupeKeep::Oldest => "ts ASC, ingest_seq ASC",
+        };
+        let ranked_cte = format!(
+            r#"
+WITH ranked AS (
+  SELECT
+    entry_id,
+    ROW_NUMBER() OVER (
+      PARTITION BY device_id, hostname, cwd, cmd, exit_code, CAST(ts / 86400 AS INTEGER)
+      ORDER BY {order_by}
+    ) AS rank_in_group,
+    COUNT(*) OVER (
+      PARTITION BY device_id, hostname, cwd, cmd, exit_code, CAST(ts / 86400 AS INTEGER)
+    ) AS group_count
+  FROM entries
+  WHERE (?1 IS NULL OR device_id = ?1)
+    AND (?2 IS NULL OR ts < ?2)
+    AND (?3 IS NULL OR ingest_seq <= ?3)
+)
+"#
+        );
+        let count_sql = format!(
+            r#"
+{ranked_cte}
+SELECT
+  COALESCE(SUM(CASE WHEN group_count > 1 AND rank_in_group = 1 THEN 1 ELSE 0 END), 0),
+  COALESCE(SUM(CASE WHEN group_count > 1 AND rank_in_group > 1 THEN 1 ELSE 0 END), 0)
+FROM ranked
+"#
+        );
+
+        let (groups, matched): (i64, i64) = self
+            .conn
+            .query_row(
+                count_sql.as_str(),
+                params![source_device_id, older_than_unix, pushed_floor_seq],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .context("count dedupe candidates")?;
+
+        let groups = groups.max(0) as usize;
+        let matched = matched.max(0) as usize;
+        if dry_run || matched == 0 {
+            return Ok(DedupeStats {
+                groups,
+                matched,
+                deleted: 0,
+            });
+        }
+
+        let delete_sql = format!(
+            r#"
+DELETE FROM entries
+WHERE entry_id IN (
+  {ranked_cte}
+  SELECT entry_id
+  FROM ranked
+  WHERE group_count > 1
+    AND rank_in_group > 1
+)
+"#
+        );
+        let deleted = self
+            .conn
+            .execute(
+                delete_sql.as_str(),
+                params![source_device_id, older_than_unix, pushed_floor_seq],
+            )
+            .context("delete duplicate same-day entries")?;
+
+        Ok(DedupeStats {
+            groups,
+            matched,
             deleted,
         })
     }
@@ -1624,6 +1724,125 @@ mod tests {
         assert_eq!(
             applied,
             PruneStats {
+                matched: 2,
+                deleted: 2
+            }
+        );
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-3");
+    }
+
+    #[test]
+    fn dedupe_entries_same_day_keeps_newest_by_default_scope() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let e1 = entry("id-1", 86_400 + 10, "echo same");
+        let e2 = entry("id-2", 86_400 + 20, "echo same");
+        let e3 = entry("id-3", 86_400 + 30, "echo same");
+        let e4 = entry("id-4", 172_800 + 10, "echo same");
+        let mut e5 = entry("id-5", 86_400 + 40, "echo same");
+        e5.exit_code = 1;
+        let mut e6 = entry("id-6", 86_400 + 50, "echo same");
+        e6.device_id = "dev2".to_string();
+        store.insert_entries(&[e1, e2, e3, e4, e5, e6]).unwrap();
+
+        let dry = store
+            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, true)
+            .unwrap();
+        assert_eq!(
+            dry,
+            DedupeStats {
+                groups: 1,
+                matched: 2,
+                deleted: 0
+            }
+        );
+        assert_eq!(store.list_recent(10).unwrap().len(), 6);
+
+        let applied = store
+            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, false)
+            .unwrap();
+        assert_eq!(
+            applied,
+            DedupeStats {
+                groups: 1,
+                matched: 2,
+                deleted: 2
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 4);
+        assert!(remaining.iter().any(|e| e.entry_id == "id-3"));
+        assert!(remaining.iter().any(|e| e.entry_id == "id-4"));
+        assert!(remaining.iter().any(|e| e.entry_id == "id-5"));
+        assert!(remaining.iter().any(|e| e.entry_id == "id-6"));
+    }
+
+    #[test]
+    fn dedupe_entries_same_day_can_keep_oldest() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .insert_entries(&[
+                entry("id-1", 86_400 + 10, "echo same"),
+                entry("id-2", 86_400 + 20, "echo same"),
+                entry("id-3", 86_400 + 30, "echo same"),
+            ])
+            .unwrap();
+
+        let applied = store
+            .dedupe_entries_same_day(DedupeKeep::Oldest, Some("dev1"), None, false)
+            .unwrap();
+        assert_eq!(
+            applied,
+            DedupeStats {
+                groups: 1,
+                matched: 2,
+                deleted: 2
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-1");
+    }
+
+    #[test]
+    fn dedupe_entries_same_day_respects_push_floor() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .insert_entries(&[
+                entry("id-1", 86_400 + 10, "echo same"),
+                entry("id-2", 86_400 + 20, "echo same"),
+                entry("id-3", 86_400 + 30, "echo same"),
+            ])
+            .unwrap();
+
+        store.set_last_pushed_seq("peer-slow", 1).unwrap();
+        let blocked = store
+            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, false)
+            .unwrap();
+        assert_eq!(
+            blocked,
+            DedupeStats {
+                groups: 0,
+                matched: 0,
+                deleted: 0
+            }
+        );
+        assert_eq!(store.list_recent(10).unwrap().len(), 3);
+
+        store.set_last_pushed_seq("peer-slow", 3).unwrap();
+        let applied = store
+            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, false)
+            .unwrap();
+        assert_eq!(
+            applied,
+            DedupeStats {
+                groups: 1,
                 matched: 2,
                 deleted: 2
             }
