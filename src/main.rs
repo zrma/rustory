@@ -15,6 +15,7 @@ mod storage;
 mod sync;
 mod tracker;
 mod transport;
+mod watch_tui;
 
 fn main() {
     if let Err(err) = cli::run() {
