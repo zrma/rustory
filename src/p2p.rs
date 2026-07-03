@@ -2015,6 +2015,8 @@ pub(crate) fn p2p_request_failure_log_level(err: &anyhow::Error) -> &'static str
 }
 
 fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
+    let rendered = format!("{err:#}");
+
     // payload-too-large는 상위 로직(배치 limit 축소)에 맡긴다.
     if crate::sync::is_payload_too_large_error(err) {
         return false;
@@ -2022,9 +2024,10 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
 
     // request-response 자체를 `tokio::select!`로 타임아웃 처리할 때는 anyhow string-only 에러가 된다.
     // 이 경우도 일시 오류로 보고 retryable로 취급한다.
-    if err
-        .chain()
-        .any(|cause| cause.to_string().contains("p2p request timeout after"))
+    if rendered.contains("p2p request timeout after")
+        || err
+            .chain()
+            .any(|cause| cause.to_string().contains("p2p request timeout after"))
     {
         return true;
     }
@@ -2032,9 +2035,10 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     // connection establishment 자체의 timeout은 relay reservation 갱신/상대 peer fanout 중
     // 흔히 섞일 수 있는 일시 실패다. 성공한 다른 circuit/peer summary가 있으면 운영상
     // 조치할 warning이 아니므로 retryable/noisy 경로로 분류한다.
-    if err
-        .chain()
-        .any(|cause| cause.to_string().contains("dial timeout after"))
+    if rendered.contains("dial timeout after")
+        || err
+            .chain()
+            .any(|cause| cause.to_string().contains("dial timeout after"))
     {
         return true;
     }
@@ -3031,6 +3035,16 @@ mod tests {
         assert_eq!(p2p_request_failure_log_level(&err), "info");
 
         let err = anyhow::anyhow!("p2p pull peer: peer-a: p2p request timeout after 12s");
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
+
+        let err = anyhow::anyhow!(
+            "p2p pull peer: 12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU: dial timeout after 12s"
+        );
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
+
+        let err = anyhow::anyhow!(
+            "p2p-sync failed: p2p push peer: 12D3KooWR5pDejvzADvcn84vjMNXPnWxMrD7mBHe2jE27SmGgy9w: dial timeout after 12s"
+        );
         assert_eq!(p2p_request_failure_log_level(&err), "info");
 
         let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
