@@ -232,7 +232,7 @@ rr dedupe --apply
 rr dedupe --keep oldest --older-than-days 14 --apply --vacuum
 ```
 
-`rr dedupe`는 local-only 작업이다. 아직 peer로 push되지 않은 row는 peer push cursor 기준으로 삭제 후보에서 제외되며, 이미 다른 peer로 sync된 중복 row를 grid 전체에서 정리하려면 각 peer에서 별도로 실행해야 한다.
+`rr dedupe --apply`는 삭제 tombstone을 남겨 peer로 전파된다. 아직 peer로 push되지 않은 row는 peer push cursor 기준으로 삭제 후보에서 제외되며, tombstone 자체도 각 peer의 delete cursor가 따라올 때까지 `rr sync-status --json`의 deletion pending으로 보일 수 있다.
 
 ### 2-8) (선택) 민감 로컬 엔트리 삭제
 `record_ignore_regex`는 기록/import 전 차단이 목적이다. 이미 들어간 로컬 row는 먼저 dry-run으로 확인한다.
@@ -248,7 +248,7 @@ rr delete --cmd-regex '(?i)(password|token|secret|authorization:|bearer )' --yes
 rr delete --entry-id '<entry_id>' --yes --vacuum
 ```
 
-`rr delete`는 local-only 작업이다. 이미 다른 peer로 sync된 민감 row는 각 peer에서 같은 삭제를 수행해야 한다.
+`rr delete`는 삭제 tombstone을 남겨 peer로 전파된다. 민감 row를 이미 여러 peer로 sync한 뒤 삭제했다면 `rr sync-status --json --with-tracker`에서 deletion pending이 0까지 줄어드는지 확인한다.
 
 ## 다음 문서
 - 배포/installer/self-update: `docs/distribution.md`

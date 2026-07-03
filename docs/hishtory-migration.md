@@ -271,8 +271,8 @@ relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문
 - import는 삭제 이력이나 tombstone을 옮기지 않는다.
 - Hishtory DB가 실행 중인 Hishtory 프로세스에 의해 갱신 중이면 import는 읽는 시점의 SQLite snapshot 기준으로 수행된다.
 - 서로 다른 `user_id`로 import하면 Hishtory `entry_id`가 같아도 Rustory entry id가 달라진다.
-- Hishtory import 후 같은 명령이 여러 번 남아 있으면 `rr dedupe`로 로컬 중복 row를 먼저 dry-run 확인한 뒤 `--apply`로 정리할 수 있다. 이 정리는 sync tombstone이 아니라 local-only 작업이다.
-- `rr delete`는 sync tombstone이 아니라 local-only 삭제다. 이미 다른 peer로 전파된 민감 row는 각 peer에서 같은 삭제를 수행해야 한다.
+- Hishtory import 후 같은 명령이 여러 번 남아 있으면 `rr dedupe`로 로컬 중복 row를 먼저 dry-run 확인한 뒤 `--apply`로 정리할 수 있다. 적용 시 삭제 tombstone이 남고 peer로 전파된다.
+- `rr delete`도 삭제 tombstone을 남겨 peer로 전파된다. 이미 다른 peer로 전파된 민감 row는 `rr sync-status --json --with-tracker`에서 deletion pending이 0까지 줄어드는지 확인한다.
 - SQLite 파일/WAL에 남은 삭제 흔적까지 줄여야 하면 `rr delete ... --yes --vacuum`을 사용한다.
 
 ## 검증 경로

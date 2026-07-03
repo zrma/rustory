@@ -1277,13 +1277,19 @@ pub fn run() -> Result<()> {
                         .map(|age| age.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "peer={} device={} pull_cursor={} push_cursor={} outbound_push_pending={} pending_push={} last_seen_unix={} last_seen_age_sec={}",
+                        "peer={} device={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={}",
                         status.peer_id,
                         status.peer_device_id.as_deref().unwrap_or("-"),
                         status.pull_cursor,
+                        status.pull_delete_cursor,
                         status.push_cursor,
+                        status.push_delete_cursor,
                         status.outbound_push_pending,
+                        status.outbound_push_pending_entries,
+                        status.outbound_push_pending_deletions,
                         status.pending_push,
+                        status.pending_push_entries,
+                        status.pending_push_deletions,
                         last_seen,
                         last_seen_age
                     );
@@ -4735,12 +4741,17 @@ mod tests {
                 entry("id-1", 1, "dev-local"),
                 entry("id-2", 2, "dev-remote"),
                 entry("id-3", 3, "dev-local"),
+                entry("id-4", 4, "dev-local"),
             ])
+            .unwrap();
+        store
+            .tombstone_entries_by_ids(&["id-3".to_string()], "user1", "dev-local", false)
             .unwrap();
         store.set_last_cursor("peer-a", 2).unwrap();
         store.set_last_pushed_seq("peer-a", 1).unwrap();
-        store.set_last_cursor("peer-b", 3).unwrap();
-        store.set_last_pushed_seq("peer-b", 3).unwrap();
+        store.set_last_cursor("peer-b", 4).unwrap();
+        store.set_last_pushed_seq("peer-b", 4).unwrap();
+        store.advance_last_pushed_delete_seq("peer-b", 1).unwrap();
         store.set_last_cursor("peer-self", 1).unwrap();
         store.set_last_cursor("peer-local-id", 1).unwrap();
         store.set_last_cursor("peer-self-spaced", 1).unwrap();
@@ -4775,7 +4786,7 @@ mod tests {
         let report =
             build_sync_status_report(&store, "dev-local", Some("peer-local-id"), None, None, &[])
                 .unwrap();
-        assert_eq!(report.local_head, 3);
+        assert_eq!(report.local_head, 4);
         assert_eq!(report.local_device_id, "dev-local");
         assert_eq!(report.peers.len(), 2);
         assert!(report.tracker_status.is_none());
@@ -4801,8 +4812,14 @@ mod tests {
         assert_eq!(peer_a.pull_cursor, 2);
         assert_eq!(peer_a.push_cursor, 1);
         assert_eq!(peer_a.peer_device_id.as_deref(), Some("dev-remote"));
-        assert_eq!(peer_a.outbound_push_pending, 1);
-        assert_eq!(peer_a.pending_push, 1);
+        assert_eq!(peer_a.outbound_push_pending, 2);
+        assert_eq!(peer_a.outbound_push_pending_entries, 1);
+        assert_eq!(peer_a.outbound_push_pending_deletions, 1);
+        assert_eq!(peer_a.pending_push, 2);
+        assert_eq!(peer_a.pending_push_entries, 1);
+        assert_eq!(peer_a.pending_push_deletions, 1);
+        assert_eq!(peer_a.pull_delete_cursor, 0);
+        assert_eq!(peer_a.push_delete_cursor, 0);
         assert_eq!(peer_a.last_seen_unix, Some(99));
         assert!(peer_a.last_seen_age_sec.is_some());
 
@@ -4812,7 +4829,12 @@ mod tests {
             .find(|peer| peer.peer_id == "peer-b")
             .unwrap();
         assert_eq!(peer_b.outbound_push_pending, 0);
+        assert_eq!(peer_b.outbound_push_pending_entries, 0);
+        assert_eq!(peer_b.outbound_push_pending_deletions, 0);
         assert_eq!(peer_b.pending_push, 0);
+        assert_eq!(peer_b.pending_push_entries, 0);
+        assert_eq!(peer_b.pending_push_deletions, 0);
+        assert_eq!(peer_b.push_delete_cursor, 1);
         assert_eq!(peer_b.last_seen_unix, None);
         assert_eq!(peer_b.last_seen_age_sec, None);
 
@@ -4833,7 +4855,13 @@ mod tests {
         assert!(json.contains("\"local_device_id\""));
         assert!(json.contains("\"peer_device_id\""));
         assert!(json.contains("\"outbound_push_pending\""));
+        assert!(json.contains("\"outbound_push_pending_entries\""));
+        assert!(json.contains("\"outbound_push_pending_deletions\""));
         assert!(json.contains("\"pending_push\""));
+        assert!(json.contains("\"pending_push_entries\""));
+        assert!(json.contains("\"pending_push_deletions\""));
+        assert!(json.contains("\"pull_delete_cursor\""));
+        assert!(json.contains("\"push_delete_cursor\""));
         assert!(json.contains("\"last_seen_unix\""));
         assert!(json.contains("\"last_seen_age_sec\""));
     }

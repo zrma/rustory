@@ -108,7 +108,7 @@ push 응답(ack)에는 (가능하면) `inserted`/`ignored` 카운트가 포함�
 
 동기화 중에는 peer별로 요약 로그가 1줄씩 출력될 수 있다(의미가 있을 때만 출력).
 - pull: `p2p pull summary: <peer>: received=<n> inserted=<n> ignored=<n>`
-- push: `p2p push summary: <peer>: sent=<n> inserted=<n> ignored=<n>`
+- push: `p2p push summary: <peer>: sent=<n> inserted=<n> ignored=<n> entry_inserted=<n> entry_ignored=<n> deletion_inserted=<n> deletion_ignored=<n> deletion_deleted=<n>`
 
 `rr p2p-serve`는 relay circuit listen 주소와 libp2p가 발견한 public **external address candidate**(상대가 dial 가능할 수 있는 후보 주소)를 tracker에 등록한다.
 loopback/private/listen-only 주소는 tracker에 광고하지 않는다.
@@ -187,10 +187,11 @@ p2p_watch_start_jitter_sec = 10
   - `rr doctor --auto-fix`는 config/db/key 경로의 private permission과 누락된 기본 secret-filter regex처럼 안전하게 자동 보정 가능한 로컬 hygiene만 고친다.
   - 텍스트/JSON 출력 필드와 오류 표시는 `rr doctor --help`, `rr doctor --json`, 관련 코드가 소유한다.
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
-  - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push 커서가 전진하지 않은 로컬 엔트리 수다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
+  - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push/delete 커서가 전진하지 않은 로컬 엔트리와 deletion tombstone의 합계다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
+  - JSON/text 출력의 `outbound_push_pending_entries`, `outbound_push_pending_deletions`, `pending_push_entries`, `pending_push_deletions`, `pull_delete_cursor`, `push_delete_cursor`는 row backlog와 삭제 tombstone backlog를 분리해 보여준다.
   - `--watch`는 alternate screen TUI로 tracker 상태, 로컬 outbox 요약, 큐가 남은 peer, peer별 `direct`/`sent`/`to_send`/`drain/s`를 계속 갱신한다.
   - watch 화면의 `direct`는 이 노드가 해당 peer에서 직접 pull 완료한 cursor다. 이 값이 `0`이어도 inbound push나 다른 peer 경유 전파로 데이터가 들어올 수 있으므로 단독으로 데이터 유실 신호로 보지 않는다.
-  - watch 화면의 `sent`는 이 노드의 로컬 엔트리를 해당 peer가 받아들인 push cursor이고, `to_send`는 아직 해당 peer에 수락되지 않은 로컬 엔트리 수다.
+  - watch 화면의 `sent`는 이 노드의 로컬 엔트리를 해당 peer가 받아들인 push cursor이고, `to_send`는 아직 해당 peer에 수락되지 않은 로컬 엔트리와 deletion tombstone 수다.
   - 다른 peer끼리 실제로 주고받는 global active flow는 아직 원격 daemon telemetry가 없으므로 fake mesh graph로 추정하지 않는다.
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
 - `rr mesh [--watch] [--no-tracker]`: `sync-status`와 같은 로컬 cursor 데이터를 사람이 보기 쉬운 mesh dashboard로 렌더링한다.

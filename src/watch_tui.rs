@@ -280,10 +280,15 @@ pub(crate) fn render_sync_status_watch_frame(
     state.frame = state.frame.wrapping_add(1);
 
     let mut out = String::new();
-    let total_outbound_pending: usize = report
+    let total_pending_entries: usize = report
         .peers
         .iter()
-        .map(|peer| peer.outbound_push_pending)
+        .map(|peer| peer.outbound_push_pending_entries)
+        .sum();
+    let total_pending_deletions: usize = report
+        .peers
+        .iter()
+        .map(|peer| peer.outbound_push_pending_deletions)
         .sum();
     let peer_views =
         build_sync_status_watch_peer_views(state, report, now, SyncStatusWatchPeerOrder::Attention);
@@ -296,7 +301,7 @@ pub(crate) fn render_sync_status_watch_frame(
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
-            format_count_usize(total_outbound_pending)
+            compact_pending_breakdown_counts(total_pending_entries, total_pending_deletions)
         ),
     );
 
@@ -387,6 +392,14 @@ pub(crate) fn render_mesh_watch_frame(
         .iter()
         .map(|view| view.peer.outbound_push_pending)
         .sum();
+    let total_pending_entries: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending_entries)
+        .sum();
+    let total_pending_deletions: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending_deletions)
+        .sum();
     let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
     let total_progress = outbound_push_progress_percent(total_pending, total_baseline);
     let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
@@ -421,7 +434,7 @@ pub(crate) fn render_mesh_watch_frame(
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
-            format_count_usize(total_pending),
+            compact_pending_breakdown_counts(total_pending_entries, total_pending_deletions),
         ),
     );
     push_watch_line(
@@ -699,7 +712,7 @@ fn render_mesh_outbox_panel(
             &format!(
                 "{}  {} left  {}",
                 truncate_display(&view.peer_name, 22),
-                format_count_usize(view.peer.outbound_push_pending),
+                compact_peer_pending_breakdown(view.peer),
                 link_push_progress_line(view.progress, 14),
             ),
             inner_width,
@@ -710,7 +723,7 @@ fn render_mesh_outbox_panel(
         .all(|view| view.peer.outbound_push_pending == 0)
     {
         body.push(truncate_display(
-            "steady: no queued local rows",
+            "steady: no queued local rows/deletions",
             inner_width,
         ));
     }
@@ -786,10 +799,7 @@ fn render_mesh_lanes_wide(
             right_cell(&format_count_i64(view.peer.pull_cursor), DIRECT_COL),
             right_cell(&format_rate(view.rates.pull_per_sec), PULL_RATE_COL),
             right_cell(&format_count_i64(view.peer.push_cursor), SENT_COL),
-            right_cell(
-                &format_count_usize(view.peer.outbound_push_pending),
-                PENDING_COL,
-            ),
+            right_cell(&compact_peer_pending_breakdown(view.peer), PENDING_COL),
             right_cell(
                 &format_rate(view.rates.pending_drain_per_sec.max(0.0)),
                 DRAIN_COL,
@@ -839,10 +849,7 @@ fn render_mesh_lanes_compact(
             fit_cell(sync_status_watch_peer_status(view), state_col),
             right_cell(&format_age_opt(view.peer.last_seen_age_sec), seen_col),
             fit_cell(&cursor, cursor_col),
-            right_cell(
-                &format_count_usize(view.peer.outbound_push_pending),
-                pending_col,
-            ),
+            right_cell(&compact_peer_pending_breakdown(view.peer), pending_col),
             link_push_progress_line(view.progress, progress_col),
         ));
     }
@@ -863,7 +870,7 @@ fn append_hidden_peer_count(body: &mut Vec<String>, total: usize, visible: usize
 fn mesh_node_label(view: &SyncStatusWatchPeerView<'_>) -> String {
     let peer = view.peer;
     let queued = if peer.outbound_push_pending > 0 {
-        format!(" {} left", format_count_usize(peer.outbound_push_pending))
+        format!(" {} left", compact_peer_pending_breakdown(peer))
     } else {
         String::new()
     };
@@ -963,6 +970,14 @@ fn render_overview_panel(
         .iter()
         .map(|view| view.peer.outbound_push_pending)
         .sum();
+    let total_pending_entries: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending_entries)
+        .sum();
+    let total_pending_deletions: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending_deletions)
+        .sum();
     let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
     let progress = outbound_push_progress_percent(total_pending, total_baseline);
     let queued = peer_views
@@ -999,8 +1014,8 @@ fn render_overview_panel(
         traffic_kv_line(
             "outbox",
             &format!(
-                "{} rows queued across {} peers",
-                format_count_usize(total_pending),
+                "{} queued across {} peers",
+                pending_breakdown_counts(total_pending_entries, total_pending_deletions),
                 queued
             ),
             inner_width,
@@ -1023,7 +1038,7 @@ fn render_overview_panel(
         ),
         String::new(),
         truncate_display(
-            "read: to_send is local rows not yet accepted by that peer",
+            "read: to_send is local rows/deletions not yet accepted by that peer",
             inner_width,
         ),
         truncate_display(
@@ -1044,6 +1059,14 @@ fn render_traffic_panel(
     let total_pending: usize = peer_views
         .iter()
         .map(|view| view.peer.outbound_push_pending)
+        .sum();
+    let total_pending_entries: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending_entries)
+        .sum();
+    let total_pending_deletions: usize = peer_views
+        .iter()
+        .map(|view| view.peer.outbound_push_pending_deletions)
         .sum();
     let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
     let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
@@ -1078,17 +1101,16 @@ fn render_traffic_panel(
         traffic_rate_line("pull", total_pull_rate, inner_width),
         traffic_rate_line("push", total_push_rate, inner_width),
         traffic_rate_line("drain", total_drain_rate, inner_width),
-        traffic_progress_line("to_send", progress, total_pending, inner_width),
+        traffic_progress_line_with_text(
+            "to_send",
+            progress,
+            &pending_breakdown_counts(total_pending_entries, total_pending_deletions),
+            inner_width,
+        ),
     ];
 
     if let Some(view) = hottest {
-        body.push(traffic_hot_line(
-            &view.peer_name,
-            view.peer.pull_cursor,
-            view.peer.push_cursor,
-            view.peer.outbound_push_pending,
-            inner_width,
-        ));
+        body.push(traffic_hot_line(&view.peer_name, view.peer, inner_width));
     }
 
     body.push(String::new());
@@ -1103,12 +1125,15 @@ fn render_traffic_panel(
         .iter()
         .all(|view| view.peer.outbound_push_pending == 0)
     {
-        body.push(truncate_display("no queued local rows", inner_width));
+        body.push(truncate_display(
+            "no queued local rows/deletions",
+            inner_width,
+        ));
     }
 
     body.extend([
         String::new(),
-        traffic_kv_line("state", "sending drains queued rows", inner_width),
+        traffic_kv_line("state", "sending drains queued rows/deletions", inner_width),
         traffic_kv_line("", "queued waits for an accepted push", inner_width),
         traffic_kv_line(
             "",
@@ -1142,27 +1167,30 @@ fn traffic_progress_line(
     pending: usize,
     inner_width: usize,
 ) -> String {
+    traffic_progress_line_with_text(label, progress, &format_count_usize(pending), inner_width)
+}
+
+fn traffic_progress_line_with_text(
+    label: &str,
+    progress: usize,
+    pending_text: &str,
+    inner_width: usize,
+) -> String {
     let left = format!("{} [{}]", fit_cell(label, 8), progress_bar(progress, 14));
     let right = format!(
         "{} {} left",
         right_cell(&format!("{progress}%"), 5),
-        right_cell(&format_count_usize(pending), 7)
+        pending_text
     );
     align_left_right(&left, &right, inner_width)
 }
 
-fn traffic_hot_line(
-    peer_name: &str,
-    pull_cursor: i64,
-    push_cursor: i64,
-    pending: usize,
-    inner_width: usize,
-) -> String {
+fn traffic_hot_line(peer_name: &str, peer: &SyncStatusPeerReport, inner_width: usize) -> String {
     let right = format!(
         "direct {}  sent {}  {} left",
-        right_cell(&format_count_i64(pull_cursor), 7),
-        right_cell(&format_count_i64(push_cursor), 7),
-        right_cell(&format_count_usize(pending), 7)
+        right_cell(&format_count_i64(peer.pull_cursor), 7),
+        right_cell(&format_count_i64(peer.push_cursor), 7),
+        compact_peer_pending_breakdown(peer)
     );
     let label_width = 9;
     let peer_width = inner_width
@@ -1182,7 +1210,7 @@ fn traffic_peer_queue_line(view: &SyncStatusWatchPeerView<'_>, inner_width: usiz
     let right = format!(
         "sent {}  {} left",
         right_cell(&format_count_i64(peer.push_cursor), 7),
-        right_cell(&format_count_usize(peer.outbound_push_pending), 7)
+        compact_peer_pending_breakdown(peer)
     );
     let label_width = 9;
     let peer_width = inner_width
@@ -1279,7 +1307,7 @@ fn render_link_panel_wide(
             right_cell(&format_count_i64(peer.pull_cursor), PULL_CURSOR_COL),
             right_cell(&format_rate(view.rates.pull_per_sec), PULL_RATE_COL),
             right_cell(&format_count_i64(peer.push_cursor), PUSH_CURSOR_COL),
-            right_cell(&format_count_usize(peer.outbound_push_pending), PENDING_COL),
+            right_cell(&compact_peer_pending_breakdown(peer), PENDING_COL),
             right_cell(
                 &format_rate(view.rates.pending_drain_per_sec.max(0.0)),
                 DRAIN_COL
@@ -1327,7 +1355,7 @@ fn render_link_panel_compact(
         let push = format!(
             "sent {} to_send {} {}",
             format_count_i64(peer.push_cursor),
-            format_count_usize(peer.outbound_push_pending),
+            compact_peer_pending_breakdown(peer),
             link_push_progress_line(view.progress, 12),
         );
         body.push(format!(
@@ -1559,6 +1587,39 @@ fn format_count_usize(value: usize) -> String {
     }
 }
 
+fn pending_breakdown_counts(entries: usize, deletions: usize) -> String {
+    match (entries, deletions) {
+        (0, 0) => "0 rows".to_string(),
+        (_, 0) => format!("{} rows", format_count_usize(entries)),
+        (0, _) => format!("{} deletions", format_count_usize(deletions)),
+        _ => format!(
+            "{} rows + {} deletions",
+            format_count_usize(entries),
+            format_count_usize(deletions)
+        ),
+    }
+}
+
+fn compact_pending_breakdown_counts(entries: usize, deletions: usize) -> String {
+    match (entries, deletions) {
+        (0, 0) => "0".to_string(),
+        (_, 0) => format_count_usize(entries),
+        (0, _) => format!("{}d", format_count_usize(deletions)),
+        _ => format!(
+            "{}r+{}d",
+            format_count_usize(entries),
+            format_count_usize(deletions)
+        ),
+    }
+}
+
+fn compact_peer_pending_breakdown(peer: &SyncStatusPeerReport) -> String {
+    compact_pending_breakdown_counts(
+        peer.outbound_push_pending_entries,
+        peer.outbound_push_pending_deletions,
+    )
+}
+
 fn push_watch_line(out: &mut String, width: usize, line: &str) {
     out.push_str(&truncate_display(line, width));
     out.push('\n');
@@ -1628,9 +1689,15 @@ mod tests {
             peer_id: peer_id.to_string(),
             peer_device_id: Some(device.to_string()),
             pull_cursor: 100,
+            pull_delete_cursor: 0,
             push_cursor: 200,
+            push_delete_cursor: 0,
             outbound_push_pending,
+            outbound_push_pending_entries: outbound_push_pending,
+            outbound_push_pending_deletions: 0,
             pending_push: outbound_push_pending,
+            pending_push_entries: outbound_push_pending,
+            pending_push_deletions: 0,
             last_seen_unix: Some(1),
             last_seen_age_sec: Some(last_seen_age_sec),
         }
@@ -1729,9 +1796,15 @@ mod tests {
                         "sample-node-x86_64-with-a-very-long-device-name".to_string(),
                     ),
                     pull_cursor: 1_526_049,
+                    pull_delete_cursor: 0,
                     push_cursor: 1_968_089,
+                    push_delete_cursor: 0,
                     outbound_push_pending: 2_311,
+                    outbound_push_pending_entries: 2_311,
+                    outbound_push_pending_deletions: 0,
                     pending_push: 2_311,
+                    pending_push_entries: 2_311,
+                    pending_push_deletions: 0,
                     last_seen_unix: Some(1),
                     last_seen_age_sec: Some(7),
                 },
@@ -1739,9 +1812,15 @@ mod tests {
                     peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
                     peer_device_id: Some("node3".to_string()),
                     pull_cursor: 1_818_365,
+                    pull_delete_cursor: 0,
                     push_cursor: 2_122_722,
+                    push_delete_cursor: 0,
                     outbound_push_pending: 0,
+                    outbound_push_pending_entries: 0,
+                    outbound_push_pending_deletions: 0,
                     pending_push: 0,
+                    pending_push_entries: 0,
+                    pending_push_deletions: 0,
                     last_seen_unix: Some(1),
                     last_seen_age_sec: Some(123_456),
                 },
@@ -1786,9 +1865,15 @@ mod tests {
                     peer_id: "12D3KooWE3u4VEsbCGR7w53rbBYi1mZ3kADAgAhDYTj8ACiPBC1M".to_string(),
                     peer_device_id: Some("sample-node-x86_64".to_string()),
                     pull_cursor: 4_400_747,
+                    pull_delete_cursor: 0,
                     push_cursor: 4_494_530,
+                    push_delete_cursor: 0,
                     outbound_push_pending: 0,
+                    outbound_push_pending_entries: 0,
+                    outbound_push_pending_deletions: 0,
                     pending_push: 0,
+                    pending_push_entries: 0,
+                    pending_push_deletions: 0,
                     last_seen_unix: Some(1),
                     last_seen_age_sec: Some(27),
                 },
@@ -1796,9 +1881,15 @@ mod tests {
                     peer_id: "12D3KooWJSi7WKtoW8wp2MnxhheB3Y62fAN9FRHGMspc5fQZfZnH".to_string(),
                     peer_device_id: Some("samplex-x86_64-with-long-name".to_string()),
                     pull_cursor: 0,
+                    pull_delete_cursor: 0,
                     push_cursor: 3_678_638,
+                    push_delete_cursor: 0,
                     outbound_push_pending: 158_485,
+                    outbound_push_pending_entries: 158_485,
+                    outbound_push_pending_deletions: 0,
                     pending_push: 158_485,
+                    pending_push_entries: 158_485,
+                    pending_push_deletions: 0,
                     last_seen_unix: Some(1),
                     last_seen_age_sec: Some(602),
                 },
@@ -1806,9 +1897,15 @@ mod tests {
                     peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
                     peer_device_id: Some("node3-x86_64".to_string()),
                     pull_cursor: 4_345_857,
+                    pull_delete_cursor: 0,
                     push_cursor: 4_494_530,
+                    push_delete_cursor: 0,
                     outbound_push_pending: 2,
+                    outbound_push_pending_entries: 2,
+                    outbound_push_pending_deletions: 0,
                     pending_push: 2,
+                    pending_push_entries: 2,
+                    pending_push_deletions: 0,
                     last_seen_unix: Some(1),
                     last_seen_age_sec: Some(3),
                 },
@@ -1850,19 +1947,16 @@ mod tests {
     #[test]
     fn sync_status_watch_status_lines_align_right_columns() {
         let backlog = traffic_progress_line("to_send", 5, 16, 52);
-        let hot = traffic_hot_line(
-            "node0 12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR",
-            1_526_049,
-            1_968_089,
-            13,
-            52,
-        );
+        let mut peer = sample_watch_peer("node0", "12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR", 13, 9);
+        peer.pull_cursor = 1_526_049;
+        peer.push_cursor = 1_968_089;
+        let hot = traffic_hot_line("node0 12D3KooWQJ8wUaWhMxSGwGD65PsQFoYaR", &peer, 52);
         let progress = link_push_progress_line(66, 24);
 
         assert_eq!(unicode_width::UnicodeWidthStr::width(backlog.as_str()), 52);
         assert_eq!(unicode_width::UnicodeWidthStr::width(hot.as_str()), 52);
         assert_eq!(unicode_width::UnicodeWidthStr::width(progress.as_str()), 24);
-        assert!(backlog.ends_with("   5%      16 left"));
+        assert!(backlog.ends_with("   5% 16 left"));
         assert!(hot.contains("direct"));
         assert!(hot.contains("sent"));
         assert!(hot.ends_with("13 left"));

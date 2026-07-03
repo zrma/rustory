@@ -1125,18 +1125,32 @@ async fn sync_async(
             match push_res {
                 Ok(pushed) => {
                     progress.mark_push_ok(push_needed);
-                    if let Some((inserted, ignored)) = client.take_push_ack_stats() {
+                    if let Some(stats) = client.take_push_ack_stats() {
                         eprintln!(
-                            "p2p push summary: {}: sent={pushed} inserted={inserted} ignored={ignored}",
-                            t.peer_key
+                            "p2p push summary: {}: sent={pushed} inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
+                            t.peer_key,
+                            stats.total_inserted(),
+                            stats.total_ignored(),
+                            stats.entry_inserted,
+                            stats.entry_ignored,
+                            stats.deletion_inserted,
+                            stats.deletion_ignored,
+                            stats.deletion_deleted,
                         );
                     }
                 }
                 Err(err) => {
-                    if let Some((inserted, ignored)) = client.take_push_ack_stats() {
+                    if let Some(stats) = client.take_push_ack_stats() {
                         eprintln!(
-                            "warn: p2p push partial: {}: inserted={inserted} ignored={ignored}",
-                            t.peer_key
+                            "warn: p2p push partial: {}: inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
+                            t.peer_key,
+                            stats.total_inserted(),
+                            stats.total_ignored(),
+                            stats.entry_inserted,
+                            stats.entry_ignored,
+                            stats.deletion_inserted,
+                            stats.deletion_ignored,
+                            stats.deletion_deleted,
                         );
                     }
                     log_p2p_sync_failure("push", &t.peer_key, &err);
@@ -1655,9 +1669,27 @@ struct P2pClient {
     relay_addr: Option<Multiaddr>,
     request_retry_policy: RequestRetryPolicy,
     push_ack_stats_known: bool,
-    push_ack_inserted_total: usize,
-    push_ack_ignored_total: usize,
+    push_ack_stats: PushAckStats,
     swarm: Swarm<RustoryBehaviour>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PushAckStats {
+    entry_inserted: usize,
+    entry_ignored: usize,
+    deletion_inserted: usize,
+    deletion_ignored: usize,
+    deletion_deleted: usize,
+}
+
+impl PushAckStats {
+    fn total_inserted(self) -> usize {
+        self.entry_inserted + self.deletion_inserted
+    }
+
+    fn total_ignored(self) -> usize {
+        self.entry_ignored + self.deletion_ignored
+    }
 }
 
 impl P2pClient {
@@ -1685,23 +1717,21 @@ impl P2pClient {
             relay_addr,
             request_retry_policy,
             push_ack_stats_known: false,
-            push_ack_inserted_total: 0,
-            push_ack_ignored_total: 0,
+            push_ack_stats: PushAckStats::default(),
             swarm,
         })
     }
 
     fn reset_push_ack_stats(&mut self) {
         self.push_ack_stats_known = false;
-        self.push_ack_inserted_total = 0;
-        self.push_ack_ignored_total = 0;
+        self.push_ack_stats = PushAckStats::default();
     }
 
-    fn take_push_ack_stats(&mut self) -> Option<(usize, usize)> {
+    fn take_push_ack_stats(&mut self) -> Option<PushAckStats> {
         if !self.push_ack_stats_known {
             return None;
         }
-        let out = (self.push_ack_inserted_total, self.push_ack_ignored_total);
+        let out = self.push_ack_stats;
         self.reset_push_ack_stats();
         Some(out)
     }
@@ -2027,8 +2057,8 @@ impl P2pClient {
                                                 && (ignored > 0 || inserted != entries_len)
                                             {
                                                 self.push_ack_stats_known = true;
-                                                self.push_ack_inserted_total += inserted;
-                                                self.push_ack_ignored_total += ignored;
+                                                self.push_ack_stats.entry_inserted += inserted;
+                                                self.push_ack_stats.entry_ignored += ignored;
                                                 eprintln!(
                                                     "p2p push ack: inserted={inserted} ignored={ignored}"
                                                 );
@@ -2036,8 +2066,8 @@ impl P2pClient {
                                                 (response.inserted, response.ignored)
                                             {
                                                 self.push_ack_stats_known = true;
-                                                self.push_ack_inserted_total += inserted;
-                                                self.push_ack_ignored_total += ignored;
+                                                self.push_ack_stats.entry_inserted += inserted;
+                                                self.push_ack_stats.entry_ignored += ignored;
                                             }
                                             if let (
                                                 Some(deletion_inserted),
@@ -2049,8 +2079,12 @@ impl P2pClient {
                                                 response.deletion_deleted,
                                             ) {
                                                 self.push_ack_stats_known = true;
-                                                self.push_ack_inserted_total += deletion_inserted;
-                                                self.push_ack_ignored_total += deletion_ignored;
+                                                self.push_ack_stats.deletion_inserted +=
+                                                    deletion_inserted;
+                                                self.push_ack_stats.deletion_ignored +=
+                                                    deletion_ignored;
+                                                self.push_ack_stats.deletion_deleted +=
+                                                    deletion_deleted;
                                                 if deletion_ignored > 0
                                                     || deletion_inserted != deletions_len
                                                 {

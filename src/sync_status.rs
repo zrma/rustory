@@ -12,9 +12,15 @@ pub(crate) struct SyncStatusPeerReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) peer_device_id: Option<String>,
     pub(crate) pull_cursor: i64,
+    pub(crate) pull_delete_cursor: i64,
     pub(crate) push_cursor: i64,
+    pub(crate) push_delete_cursor: i64,
     pub(crate) outbound_push_pending: usize,
+    pub(crate) outbound_push_pending_entries: usize,
+    pub(crate) outbound_push_pending_deletions: usize,
     pub(crate) pending_push: usize,
+    pub(crate) pending_push_entries: usize,
+    pub(crate) pending_push_deletions: usize,
     pub(crate) last_seen_unix: Option<i64>,
     pub(crate) last_seen_age_sec: Option<i64>,
 }
@@ -90,15 +96,27 @@ pub(crate) fn build_sync_status_report(
         if sync_device_id_matches(peer_device_id.as_deref(), local_device_id) {
             continue;
         }
-        let pending_push = store.count_pending_push_items(&peer_id, Some(local_device_id))?;
+        let pending_push_entries =
+            store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
+        let pending_push_deletions =
+            store.count_pending_push_deletions(&peer_id, Some(local_device_id))?;
+        let pending_push = pending_push_entries + pending_push_deletions;
+        let pull_delete_cursor = store.get_last_delete_cursor(&peer_id)?;
+        let push_delete_cursor = store.get_last_pushed_delete_seq(&peer_id)?;
         let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
         peers.push(SyncStatusPeerReport {
             peer_device_id,
             peer_id,
             pull_cursor: status.last_cursor,
+            pull_delete_cursor,
             push_cursor: status.last_pushed_seq,
+            push_delete_cursor,
             outbound_push_pending: pending_push,
+            outbound_push_pending_entries: pending_push_entries,
+            outbound_push_pending_deletions: pending_push_deletions,
             pending_push,
+            pending_push_entries,
+            pending_push_deletions,
             last_seen_unix,
             last_seen_age_sec,
         });
