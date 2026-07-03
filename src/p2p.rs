@@ -2024,7 +2024,7 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     // 이 경우도 일시 오류로 보고 retryable로 취급한다.
     if err
         .chain()
-        .any(|cause| cause.to_string().starts_with("p2p request timeout after"))
+        .any(|cause| cause.to_string().contains("p2p request timeout after"))
     {
         return true;
     }
@@ -2034,7 +2034,7 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     // 조치할 warning이 아니므로 retryable/noisy 경로로 분류한다.
     if err
         .chain()
-        .any(|cause| cause.to_string().starts_with("dial timeout after"))
+        .any(|cause| cause.to_string().contains("dial timeout after"))
     {
         return true;
     }
@@ -3025,6 +3025,12 @@ mod tests {
     #[test]
     fn p2p_request_failure_log_level_downgrades_retryable_timeouts() {
         let err = anyhow::anyhow!("dial timeout after 12s").context("p2p push peer: peer-a");
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
+
+        let err = anyhow::anyhow!("p2p push peer: peer-a: dial timeout after 12s");
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
+
+        let err = anyhow::anyhow!("p2p pull peer: peer-a: p2p request timeout after 12s");
         assert_eq!(p2p_request_failure_log_level(&err), "info");
 
         let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
