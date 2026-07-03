@@ -326,7 +326,7 @@ pub(crate) fn render_sync_status_watch_frame(
     push_watch_line(
         &mut out,
         width,
-        "ctrl+c to exit  •  direct_pull is only this node's direct pull cursor; inbound pushes can still keep data current",
+        "ctrl+c to exit  •  to_send R=row D=delete  •  direct_pull is only this node's pull cursor; inbound pushes can still keep data current",
     );
     out
 }
@@ -471,7 +471,7 @@ pub(crate) fn render_mesh_watch_frame(
     push_watch_line(
         &mut out,
         width,
-        "ctrl+c to exit  •  global peer↔peer flow needs future daemon telemetry; this view is this node's measured mesh edge state",
+        "ctrl+c to exit  •  to_send R=row D=delete  •  global peer ↔ peer flow needs future daemon telemetry; local view only",
     );
     out
 }
@@ -1603,10 +1603,10 @@ fn pending_breakdown_counts(entries: usize, deletions: usize) -> String {
 fn compact_pending_breakdown_counts(entries: usize, deletions: usize) -> String {
     match (entries, deletions) {
         (0, 0) => "0".to_string(),
-        (_, 0) => format_count_usize(entries),
-        (0, _) => format!("{}d", format_count_usize(deletions)),
+        (_, 0) => format!("R{}", format_count_usize(entries)),
+        (0, _) => format!("D{}", format_count_usize(deletions)),
         _ => format!(
-            "{}r+{}d",
+            "R{} D{}",
             format_count_usize(entries),
             format_count_usize(deletions)
         ),
@@ -1784,6 +1784,14 @@ mod tests {
     }
 
     #[test]
+    fn compact_pending_breakdown_uses_unambiguous_prefixes() {
+        assert_eq!(compact_pending_breakdown_counts(0, 0), "0");
+        assert_eq!(compact_pending_breakdown_counts(42, 0), "R42");
+        assert_eq!(compact_pending_breakdown_counts(0, 2), "D2");
+        assert_eq!(compact_pending_breakdown_counts(1, 9), "R1 D9");
+    }
+
+    #[test]
     fn sync_status_watch_frame_stays_bounded_for_long_values() {
         let mut state = SyncStatusWatchState::default();
         let report = SyncStatusReport {
@@ -1846,6 +1854,7 @@ mod tests {
         assert!(frame.contains("drain/s"));
         assert!(frame.contains("2.3k"));
         assert!(frame.contains("2.0M"));
+        assert!(frame.contains("to_send R=row D=delete"));
         assert!(frame.contains("direct_pull is only"));
         assert!(!frame.contains("Mesh Map"));
         for line in frame.lines() {
@@ -1926,6 +1935,8 @@ mod tests {
         assert!(frame.contains("Flow Lanes"));
         assert!(frame.contains("local view: peer"));
         assert!(frame.contains("global peer"));
+        assert!(frame.contains("peer ↔ peer"));
+        assert!(frame.contains("to_send R=row D=delete"));
         assert!(frame.contains("to_send"));
         assert!(frame.contains("coverage"));
         assert!(frame.contains("queue"));
