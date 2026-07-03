@@ -116,9 +116,10 @@ loopback/private/listen-only 주소는 tracker에 광고하지 않는다.
 
 ## Hole Punching(DCUtR)
 - relay 경유로 연결이 수립되면(libp2p `/p2p-circuit`), **가능하면 direct 연결로 업그레이드**(hole punching)한다.
-- 업그레이드 성공/실패는 로그로 확인할 수 있다.
+- 기본 daemon 로그는 sync summary와 non-retryable warning 중심으로 유지한다. relay/dial/connection/DCUtR 상세 이벤트가 필요하면 `RUSTORY_P2P_LOG=verbose`를 설정하고 daemon 또는 대상 명령을 다시 시작한다.
+- verbose 모드에서는 업그레이드 성공/실패를 로그로 확인할 수 있다.
   - 성공 예: `dcutr: upgraded to direct: peer=<peer_id> connection_id=<...>`
-  - 실패 예: `dcutr: upgrade failed: peer=<peer_id> error=<...>`
+  - 실패 예: `warn: dcutr direct upgrade failed: peer=<peer_id> error=<...>`
 - 업그레이드가 실패해도 에러로 종료하지 않고, 기존처럼 relay 연결로 동기화를 계속한다.
 
 ### 단계 1: 수동 multiaddr (legacy)

@@ -421,13 +421,16 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
     let store = LocalStore::open(db_path)?;
     let mut swarm = build_rustory_swarm_with_identity(identity, psk)?;
+    let verbose_event_logs = p2p_verbose_event_logs_enabled();
 
     swarm.listen_on(listen).context("listen_on")?;
 
     let mut relay_listener_id = None;
     if let Some(relay_addr) = relay_addr.clone() {
         let relay_listen = relay_circuit_listen_addr(&relay_addr)?;
-        eprintln!("p2p relay listen requested: {relay_listen}");
+        if verbose_event_logs {
+            eprintln!("p2p relay listen requested: {relay_listen}");
+        }
         relay_listener_id = Some(swarm.listen_on(relay_listen).context("listen_on relay")?);
     }
 
@@ -475,7 +478,9 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             continue;
                         }
 
-                        eprintln!("p2p external addr candidate: {full}");
+                        if verbose_event_logs {
+                            eprintln!("p2p external addr candidate: {full}");
+                        }
                         if !trackers.is_empty() {
                             spawn_register_all(
                                 trackers.clone(),
@@ -495,7 +500,9 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             continue;
                         }
 
-                        eprintln!("p2p external addr confirmed: {full}");
+                        if verbose_event_logs {
+                            eprintln!("p2p external addr confirmed: {full}");
+                        }
                         if !trackers.is_empty() {
                             spawn_register_all(
                                 trackers.clone(),
@@ -613,24 +620,30 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             renewal,
                             ..
                         } => {
-                            eprintln!(
-                                "p2p relay reservation accepted: relay={relay_peer_id} renewal={renewal}"
-                            );
+                            if verbose_event_logs {
+                                eprintln!(
+                                    "p2p relay reservation accepted: relay={relay_peer_id} renewal={renewal}"
+                                );
+                            }
                         }
                         libp2p::relay::client::Event::OutboundCircuitEstablished {
                             relay_peer_id,
                             ..
                         } => {
-                            eprintln!("p2p relay outbound circuit established: relay={relay_peer_id}");
+                            if verbose_event_logs {
+                                eprintln!("p2p relay outbound circuit established: relay={relay_peer_id}");
+                            }
                         }
                         libp2p::relay::client::Event::InboundCircuitEstablished {
                             src_peer_id,
                             ..
                         } => {
-                            eprintln!("p2p relay inbound circuit established: src={src_peer_id}");
+                            if verbose_event_logs {
+                                eprintln!("p2p relay inbound circuit established: src={src_peer_id}");
+                            }
                         }
                     },
-                    SwarmEvent::Dialing { peer_id, connection_id } => {
+                    SwarmEvent::Dialing { peer_id, connection_id } if verbose_event_logs => {
                         eprintln!("p2p dialing: peer={peer_id:?} connection_id={connection_id:?}");
                     }
                     SwarmEvent::ConnectionEstablished {
@@ -638,14 +651,20 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         connection_id,
                         endpoint,
                         ..
-                    } => {
+                    } if verbose_event_logs => {
                         eprintln!(
                             "p2p connection established: peer={peer_id} connection_id={connection_id:?} endpoint={endpoint:?}"
                         );
                     }
                     SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
                         let error = error.to_string();
-                        if !is_loopback_direct_dial_noise(&error) {
+                        if is_routine_outgoing_connection_noise(&error) {
+                            if verbose_event_logs {
+                                eprintln!(
+                                    "info: p2p outgoing connection noise: peer={peer_id:?} error={error}"
+                                );
+                            }
+                        } else {
                             eprintln!(
                                 "warn: p2p outgoing connection error: peer={peer_id:?} error={error}"
                             );
@@ -1972,17 +1991,53 @@ fn is_loopback_direct_dial_noise(message: &str) -> bool {
     has_loopback && msg.contains("connection refused")
 }
 
+fn is_routine_outgoing_connection_noise(message: &str) -> bool {
+    is_loopback_direct_dial_noise(message) || is_loopback_protocol_negotiation_noise(message)
+}
+
+fn is_loopback_protocol_negotiation_noise(message: &str) -> bool {
+    let msg = message.to_ascii_lowercase();
+    let has_loopback = msg.contains("/ip4/127.")
+        || msg.contains("/ip6/::1")
+        || msg.contains("/ip6/0:0:0:0:0:0:0:1");
+    has_loopback
+        && (msg.contains("protocol negotiation failed")
+            || msg.contains("multistream select failed"))
+}
+
+pub(crate) fn p2p_verbose_event_logs_enabled() -> bool {
+    std::env::var("RUSTORY_P2P_LOG")
+        .ok()
+        .is_some_and(|value| p2p_log_value_enables_verbose(&value))
+}
+
+fn p2p_log_value_enables_verbose(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "verbose" | "debug" | "trace"
+    )
+}
+
 fn log_dcutr_event(event: &libp2p::dcutr::Event) {
     match &event.result {
         Ok(connection_id) => {
-            eprintln!(
-                "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
-                event.remote_peer_id
-            );
+            if p2p_verbose_event_logs_enabled() {
+                eprintln!(
+                    "dcutr: upgraded to direct: peer={} connection_id={connection_id:?}",
+                    event.remote_peer_id
+                );
+            }
         }
         Err(err) => {
             let error = err.to_string();
-            if !is_dcutr_direct_upgrade_noise(&error) {
+            if is_dcutr_direct_upgrade_noise(&error) {
+                if p2p_verbose_event_logs_enabled() {
+                    eprintln!(
+                        "info: dcutr direct upgrade noise: peer={} error={error}",
+                        event.remote_peer_id
+                    );
+                }
+            } else {
                 eprintln!(
                     "warn: dcutr direct upgrade failed: peer={} error={error}",
                     event.remote_peer_id
@@ -2003,6 +2058,9 @@ fn is_dcutr_direct_upgrade_noise(message: &str) -> bool {
 
 fn log_p2p_sync_failure(action: &str, peer_key: &str, err: &anyhow::Error) {
     let level = p2p_request_failure_log_level(err);
+    if level == "info" && !p2p_verbose_event_logs_enabled() {
+        return;
+    }
     eprintln!("{level}: p2p {action} failed: {peer_key}: {err:#}");
 }
 
@@ -2012,6 +2070,14 @@ pub(crate) fn p2p_request_failure_log_level(err: &anyhow::Error) -> &'static str
     } else {
         "warn"
     }
+}
+
+pub(crate) fn p2p_request_failure_should_log(err: &anyhow::Error) -> bool {
+    p2p_request_failure_should_log_with_verbose(err, p2p_verbose_event_logs_enabled())
+}
+
+fn p2p_request_failure_should_log_with_verbose(err: &anyhow::Error, verbose: bool) -> bool {
+    verbose || p2p_request_failure_log_level(err) == "warn"
 }
 
 fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
@@ -3030,6 +3096,8 @@ mod tests {
     fn p2p_request_failure_log_level_downgrades_retryable_timeouts() {
         let err = anyhow::anyhow!("dial timeout after 12s").context("p2p push peer: peer-a");
         assert_eq!(p2p_request_failure_log_level(&err), "info");
+        assert!(!p2p_request_failure_should_log_with_verbose(&err, false));
+        assert!(p2p_request_failure_should_log_with_verbose(&err, true));
 
         let err = anyhow::anyhow!("p2p push peer: peer-a: dial timeout after 12s");
         assert_eq!(p2p_request_failure_log_level(&err), "info");
@@ -3049,6 +3117,7 @@ mod tests {
 
         let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
         assert_eq!(p2p_request_failure_log_level(&err), "warn");
+        assert!(p2p_request_failure_should_log_with_verbose(&err, false));
     }
 
     #[test]
@@ -3057,9 +3126,33 @@ mod tests {
 	 - Connection refused (os error 111): Connection refused (os error 111))]";
 
         assert!(is_loopback_direct_dial_noise(err));
+        assert!(is_routine_outgoing_connection_noise(err));
         assert!(!is_loopback_direct_dial_noise(
             "Failed to negotiate transport protocol(s): [(/dns4/rustory-relay.example/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooW: relay rejected)]"
         ));
+    }
+
+    #[test]
+    fn loopback_protocol_negotiation_failure_is_log_noise() {
+        let err = "Failed to negotiate transport protocol(s): [(/ip4/127.0.0.6/tcp/43895/p2p/12D3KooW: : Multistream select failed: Protocol negotiation failed.)]";
+
+        assert!(is_loopback_protocol_negotiation_noise(err));
+        assert!(is_routine_outgoing_connection_noise(err));
+        assert!(!is_routine_outgoing_connection_noise(
+            "Failed to negotiate transport protocol(s): [(/dns4/rustory-relay.example/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooW: : Multistream select failed: Protocol negotiation failed.)]"
+        ));
+    }
+
+    #[test]
+    fn p2p_log_value_enables_verbose_only_for_explicit_values() {
+        for value in [
+            "1", "true", "TRUE", "yes", "on", "verbose", "debug", "trace",
+        ] {
+            assert!(p2p_log_value_enables_verbose(value), "{value}");
+        }
+        for value in ["", "0", "false", "quiet", "info", "normal"] {
+            assert!(!p2p_log_value_enables_verbose(value), "{value}");
+        }
     }
 
     #[test]
