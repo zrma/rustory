@@ -73,19 +73,20 @@
 - 동기화는 relay가 설정되어 있으면 relay 경유 dial을 우선 시도하고, 실패 시 direct 후보로 fallback 한다.
 - relay 경유 연결이 수립되면, 가능하면 dcutr(DCUtR)로 direct 업그레이드(hole punching)를 시도한다(실패해도 relay로 계속 진행).
 - 동기화 메시지(개념):
-  - `SyncPull { cursor, limit } -> SyncBatch { entries, next_cursor }`
-  - `EntriesPush { entries } -> PushAck { inserted, ignored }` (옵션)
+  - `SyncPull { cursor, delete_cursor, limit } -> SyncBatch { entries, next_cursor, deletions, next_delete_cursor }`
+  - `EntriesPush { entries, deletions } -> PushAck { inserted, ignored, deletion_inserted, deletion_ignored, deletion_deleted }` (옵션)
+  - history 삭제는 hard delete가 아니라 `entry_deletions` tombstone stream으로 전파한다. Tombstone이 있는 `entry_id`는 이후 entry batch로 다시 들어와도 재삽입하지 않는다.
 - 개발 순서(권장): 먼저 HTTP(디버그)로 end-to-end 동작을 검증한 뒤, transport만 P2P로 치환한다
 
 ### HTTP (옵션/디버그)
 P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보조 수단으로 둘 수 있다.
 - POST /api/v1/entries
-  - body: `[Entry]` 또는 `{ "entries": [Entry] }`
-  - 동작: entry_id 기준 upsert/ignore (idempotent)
+  - body: `[Entry]` 또는 `{ "entries": [Entry], "deletions": [EntryDeletion] }`
+  - 동작: entry_id 기준 upsert/ignore (idempotent), tombstone 적용
 - GET /api/v1/entries
-  - query: cursor=<cursor>, limit=<n> (초안 예시: cursor=0, limit=1000)
-  - 동작: cursor 이후 배치 반환 (cursor는 피어 기준 ingest_seq)
-  - response: `{ "entries": [Entry], "next_cursor": <cursor|null> }`
+  - query: cursor=<cursor>, delete_cursor=<delete_cursor>, limit=<n> (초안 예시: cursor=0, delete_cursor=0, limit=1000)
+  - 동작: cursor 이후 entry와 delete_cursor 이후 deletion 배치 반환
+  - response: `{ "entries": [Entry], "next_cursor": <cursor|null>, "deletions": [EntryDeletion], "next_delete_cursor": <cursor|null> }`
 - GET /api/v1/ping
 
 ## 클라이언트 동기화

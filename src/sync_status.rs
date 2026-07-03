@@ -90,7 +90,7 @@ pub(crate) fn build_sync_status_report(
         if sync_device_id_matches(peer_device_id.as_deref(), local_device_id) {
             continue;
         }
-        let pending_push = store.count_pending_push_entries(&peer_id, Some(local_device_id))?;
+        let pending_push = store.count_pending_push_items(&peer_id, Some(local_device_id))?;
         let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
         peers.push(SyncStatusPeerReport {
             peer_device_id,

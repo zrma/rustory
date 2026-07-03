@@ -1,6 +1,6 @@
-use crate::core::Entry;
+use crate::core::{Entry, EntryDeletion};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::collections::BTreeSet;
 #[cfg(test)]
 use std::collections::HashMap;
@@ -14,6 +14,19 @@ pub const DEFAULT_DB_PATH: &str = "~/.rustory/history.db";
 pub struct PullBatch {
     pub entries: Vec<Entry>,
     pub next_cursor: Option<i64>,
+    pub deletions: Vec<EntryDeletion>,
+    pub next_delete_cursor: Option<i64>,
+}
+
+impl PullBatch {
+    pub fn entries_only(entries: Vec<Entry>, next_cursor: Option<i64>) -> Self {
+        Self {
+            entries,
+            next_cursor,
+            deletions: Vec::new(),
+            next_delete_cursor: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,6 +57,13 @@ pub enum DedupeKeep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeleteStats {
     pub matched: usize,
+    pub deleted: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeletionApplyStats {
+    pub inserted: usize,
+    pub ignored: usize,
     pub deleted: usize,
 }
 
@@ -131,7 +151,13 @@ INSERT OR IGNORE INTO entries (
   shell,
   hostname,
   version
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+)
+SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM entry_deletions
+  WHERE entry_id = ?
+)
 "#,
                 )
                 .context("prepare insert")?;
@@ -151,6 +177,7 @@ INSERT OR IGNORE INTO entries (
                         e.shell,
                         e.hostname,
                         e.version,
+                        e.entry_id,
                     ])
                     .context("insert entry")?;
             }
@@ -237,10 +264,7 @@ LIMIT ?
             entries.push(entry);
         }
 
-        Ok(PullBatch {
-            entries,
-            next_cursor: last_cursor,
-        })
+        Ok(PullBatch::entries_only(entries, last_cursor))
     }
 
     pub fn pull_since_cursor_for_device(
@@ -291,10 +315,128 @@ LIMIT ?
             entries.push(entry);
         }
 
+        Ok(PullBatch::entries_only(entries, last_cursor))
+    }
+
+    pub fn pull_sync_batch(
+        &self,
+        cursor: i64,
+        delete_cursor: i64,
+        limit: usize,
+    ) -> Result<PullBatch> {
+        let entry_batch = self.pull_since_cursor(cursor, limit)?;
+        let (deletions, next_delete_cursor) =
+            self.pull_deletions_since_cursor(delete_cursor, limit)?;
         Ok(PullBatch {
-            entries,
-            next_cursor: last_cursor,
+            entries: entry_batch.entries,
+            next_cursor: entry_batch.next_cursor,
+            deletions,
+            next_delete_cursor,
         })
+    }
+
+    pub fn pull_sync_batch_for_device(
+        &self,
+        cursor: i64,
+        delete_cursor: i64,
+        limit: usize,
+        device_id: &str,
+    ) -> Result<PullBatch> {
+        let entry_batch = self.pull_since_cursor_for_device(cursor, limit, device_id)?;
+        let (deletions, next_delete_cursor) =
+            self.pull_deletions_since_cursor_for_device(delete_cursor, limit, device_id)?;
+        Ok(PullBatch {
+            entries: entry_batch.entries,
+            next_cursor: entry_batch.next_cursor,
+            deletions,
+            next_delete_cursor,
+        })
+    }
+
+    fn pull_deletions_since_cursor(
+        &self,
+        cursor: i64,
+        limit: usize,
+    ) -> Result<(Vec<EntryDeletion>, Option<i64>)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT
+  delete_seq,
+  entry_id,
+  user_id,
+  device_id,
+  deleted_at
+FROM entry_deletions
+WHERE delete_seq > ?
+ORDER BY delete_seq ASC
+LIMIT ?
+"#,
+            )
+            .context("prepare pull_deletions_since_cursor")?;
+
+        let rows = stmt
+            .query_map(params![cursor, limit as i64], |row| {
+                let delete_seq: i64 = row.get(0)?;
+                let deletion = row_to_entry_deletion_with_offset(row, 1)?;
+                Ok((delete_seq, deletion))
+            })
+            .context("query pull_deletions_since_cursor")?;
+
+        let mut deletions = Vec::new();
+        let mut last_cursor = None;
+        for item in rows {
+            let (delete_seq, deletion) = item?;
+            last_cursor = Some(delete_seq);
+            deletions.push(deletion);
+        }
+
+        Ok((deletions, last_cursor))
+    }
+
+    fn pull_deletions_since_cursor_for_device(
+        &self,
+        cursor: i64,
+        limit: usize,
+        device_id: &str,
+    ) -> Result<(Vec<EntryDeletion>, Option<i64>)> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT
+  delete_seq,
+  entry_id,
+  user_id,
+  device_id,
+  deleted_at
+FROM entry_deletions
+WHERE delete_seq > ?
+  AND device_id = ?
+ORDER BY delete_seq ASC
+LIMIT ?
+"#,
+            )
+            .context("prepare pull_deletions_since_cursor_for_device")?;
+
+        let rows = stmt
+            .query_map(params![cursor, device_id, limit as i64], |row| {
+                let delete_seq: i64 = row.get(0)?;
+                let deletion = row_to_entry_deletion_with_offset(row, 1)?;
+                Ok((delete_seq, deletion))
+            })
+            .context("query pull_deletions_since_cursor_for_device")?;
+
+        let mut deletions = Vec::new();
+        let mut last_cursor = None;
+        for item in rows {
+            let (delete_seq, deletion) = item?;
+            last_cursor = Some(delete_seq);
+            deletions.push(deletion);
+        }
+
+        Ok((deletions, last_cursor))
     }
 
     pub fn get_last_cursor(&self, peer_id: &str) -> Result<i64> {
@@ -327,6 +469,36 @@ ON CONFLICT(peer_id) DO UPDATE SET last_cursor = excluded.last_cursor
         Ok(())
     }
 
+    pub fn get_last_delete_cursor(&self, peer_id: &str) -> Result<i64> {
+        Ok(self.get_last_delete_cursor_opt(peer_id)?.unwrap_or(0))
+    }
+
+    pub fn get_last_delete_cursor_opt(&self, peer_id: &str) -> Result<Option<i64>> {
+        match self.conn.query_row(
+            "SELECT last_delete_cursor FROM peer_delete_state WHERE peer_id = ?",
+            params![peer_id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err).context("query peer_delete_state"),
+        }
+    }
+
+    pub fn set_last_delete_cursor(&self, peer_id: &str, cursor: i64) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO peer_delete_state(peer_id, last_delete_cursor)
+VALUES (?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET last_delete_cursor = excluded.last_delete_cursor
+"#,
+                params![peer_id, cursor],
+            )
+            .context("upsert peer_delete_state")?;
+        Ok(())
+    }
+
     pub fn get_last_pushed_seq(&self, peer_id: &str) -> Result<i64> {
         Ok(self.get_last_pushed_seq_opt(peer_id)?.unwrap_or(0))
     }
@@ -354,6 +526,40 @@ ON CONFLICT(peer_id) DO UPDATE SET last_pushed_seq = excluded.last_pushed_seq
                 params![peer_id, seq],
             )
             .context("upsert peer_push_state")?;
+        Ok(())
+    }
+
+    pub fn get_last_pushed_delete_seq(&self, peer_id: &str) -> Result<i64> {
+        Ok(self.get_last_pushed_delete_seq_opt(peer_id)?.unwrap_or(0))
+    }
+
+    pub fn get_last_pushed_delete_seq_opt(&self, peer_id: &str) -> Result<Option<i64>> {
+        match self.conn.query_row(
+            "SELECT last_pushed_delete_seq FROM peer_delete_push_state WHERE peer_id = ?",
+            params![peer_id],
+            |row| row.get(0),
+        ) {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(err) => Err(err).context("query peer_delete_push_state"),
+        }
+    }
+
+    pub fn advance_last_pushed_delete_seq(&self, peer_id: &str, seq: i64) -> Result<()> {
+        self.conn
+            .execute(
+                r#"
+INSERT INTO peer_delete_push_state(peer_id, last_pushed_delete_seq)
+VALUES (?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET
+  last_pushed_delete_seq = MAX(
+    peer_delete_push_state.last_pushed_delete_seq,
+    excluded.last_pushed_delete_seq
+  )
+"#,
+                params![peer_id, seq],
+            )
+            .context("advance peer_delete_push_state")?;
         Ok(())
     }
 
@@ -395,6 +601,10 @@ FROM (
   SELECT peer_id FROM peer_state
   UNION
   SELECT peer_id FROM peer_push_state
+  UNION
+  SELECT peer_id FROM peer_delete_state
+  UNION
+  SELECT peer_id FROM peer_delete_push_state
   UNION
   SELECT peer_id FROM peer_book
 ) ids
@@ -485,6 +695,59 @@ WHERE ingest_seq > ?
     ) -> Result<usize> {
         let last_pushed_seq = self.get_last_pushed_seq(peer_id)?;
         self.count_entries_after_seq(last_pushed_seq, source_device_id)
+    }
+
+    pub fn count_deletions_after_seq(
+        &self,
+        seq: i64,
+        source_device_id: Option<&str>,
+    ) -> Result<usize> {
+        let count: i64 = if let Some(device_id) = source_device_id {
+            self.conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entry_deletions
+WHERE delete_seq > ?
+  AND device_id = ?
+"#,
+                    params![seq, device_id],
+                    |row| row.get(0),
+                )
+                .context("count deletions after seq for device")?
+        } else {
+            self.conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entry_deletions
+WHERE delete_seq > ?
+"#,
+                    params![seq],
+                    |row| row.get(0),
+                )
+                .context("count deletions after seq")?
+        };
+
+        Ok(count.max(0) as usize)
+    }
+
+    pub fn count_pending_push_deletions(
+        &self,
+        peer_id: &str,
+        source_device_id: Option<&str>,
+    ) -> Result<usize> {
+        let last_pushed_delete_seq = self.get_last_pushed_delete_seq(peer_id)?;
+        self.count_deletions_after_seq(last_pushed_delete_seq, source_device_id)
+    }
+
+    pub fn count_pending_push_items(
+        &self,
+        peer_id: &str,
+        source_device_id: Option<&str>,
+    ) -> Result<usize> {
+        Ok(self.count_pending_push_entries(peer_id, source_device_id)?
+            + self.count_pending_push_deletions(peer_id, source_device_id)?)
     }
 
     pub fn prune_entries_older_than(
@@ -617,6 +880,8 @@ WHERE ts < ?
         keep: DedupeKeep,
         source_device_id: Option<&str>,
         older_than_unix: Option<i64>,
+        tombstone_user_id: &str,
+        tombstone_device_id: &str,
         dry_run: bool,
     ) -> Result<DedupeStats> {
         let pushed_floor_seq = self.prune_pushed_floor_seq()?;
@@ -672,30 +937,42 @@ FROM ranked
             });
         }
 
-        let delete_sql = format!(
+        let select_sql = format!(
             r#"
-DELETE FROM entries
-WHERE entry_id IN (
-  {ranked_cte}
-  SELECT entry_id
-  FROM ranked
-  WHERE group_count > 1
-    AND rank_in_group > 1
-)
+{ranked_cte}
+SELECT entry_id
+FROM ranked
+WHERE group_count > 1
+  AND rank_in_group > 1
 "#
         );
-        let deleted = self
+        let mut stmt = self
             .conn
-            .execute(
-                delete_sql.as_str(),
+            .prepare(select_sql.as_str())
+            .context("prepare duplicate same-day tombstones")?;
+        let rows = stmt
+            .query_map(
                 params![source_device_id, older_than_unix, pushed_floor_seq],
+                |row| row.get::<_, String>(0),
             )
-            .context("delete duplicate same-day entries")?;
+            .context("query duplicate same-day tombstones")?;
+        let deleted_at = OffsetDateTime::now_utc().unix_timestamp();
+        let mut deletions = Vec::new();
+        for row in rows {
+            let entry_id = row?;
+            deletions.push(EntryDeletion {
+                entry_id,
+                user_id: tombstone_user_id.to_string(),
+                device_id: tombstone_device_id.to_string(),
+                deleted_at,
+            });
+        }
+        let deletion_stats = self.apply_entry_deletions_with_stats(&deletions)?;
 
         Ok(DedupeStats {
             groups,
             matched,
-            deleted,
+            deleted: deletion_stats.deleted,
         })
     }
 
@@ -721,9 +998,11 @@ WHERE entry_id IN (
         Ok(ids)
     }
 
-    pub fn delete_entries_by_ids(
+    pub fn tombstone_entries_by_ids(
         &self,
         entry_ids: &[String],
+        user_id: &str,
+        device_id: &str,
         dry_run: bool,
     ) -> Result<DeleteStats> {
         let ids: Vec<String> = entry_ids
@@ -742,22 +1021,56 @@ WHERE entry_id IN (
             });
         }
 
-        let mut matched = 0usize;
+        let mut matched_ids = Vec::new();
         for id in &ids {
-            let count: i64 = self
+            let matched = self
                 .conn
                 .query_row(
-                    "SELECT COUNT(*) FROM entries WHERE entry_id = ?",
+                    "SELECT 1 FROM entries WHERE entry_id = ? LIMIT 1",
                     params![id],
-                    |row| row.get(0),
+                    |row| row.get::<_, i64>(0),
                 )
-                .context("count entries selected for delete")?;
-            matched += count.max(0) as usize;
+                .optional()
+                .context("select entries selected for tombstone")?
+                .is_some();
+            if matched {
+                matched_ids.push(id.clone());
+            }
         }
 
-        if dry_run || matched == 0 {
+        if dry_run || matched_ids.is_empty() {
             return Ok(DeleteStats {
-                matched,
+                matched: matched_ids.len(),
+                deleted: 0,
+            });
+        }
+
+        let deleted_at = OffsetDateTime::now_utc().unix_timestamp();
+        let deletions: Vec<EntryDeletion> = matched_ids
+            .iter()
+            .map(|entry_id| EntryDeletion {
+                entry_id: entry_id.clone(),
+                user_id: user_id.to_string(),
+                device_id: device_id.to_string(),
+                deleted_at,
+            })
+            .collect();
+        let stats = self.apply_entry_deletions_with_stats(&deletions)?;
+
+        Ok(DeleteStats {
+            matched: matched_ids.len(),
+            deleted: stats.deleted,
+        })
+    }
+
+    pub fn apply_entry_deletions_with_stats(
+        &self,
+        deletions: &[EntryDeletion],
+    ) -> Result<DeletionApplyStats> {
+        if deletions.is_empty() {
+            return Ok(DeletionApplyStats {
+                inserted: 0,
+                ignored: 0,
                 deleted: 0,
             });
         }
@@ -765,20 +1078,63 @@ WHERE entry_id IN (
         let tx = self
             .conn
             .unchecked_transaction()
-            .context("begin delete tx")?;
-        let deleted = {
-            let mut stmt = tx
-                .prepare("DELETE FROM entries WHERE entry_id = ?")
-                .context("prepare delete entries by id")?;
-            let mut deleted = 0usize;
-            for id in &ids {
-                deleted += stmt.execute(params![id]).context("delete selected entry")?;
-            }
-            deleted
-        };
-        tx.commit().context("commit delete tx")?;
+            .context("begin entry deletion tx")?;
+        let mut inserted = 0usize;
+        let mut ignored = 0usize;
+        let mut deleted = 0usize;
 
-        Ok(DeleteStats { matched, deleted })
+        for deletion in deletions {
+            let entry_id = deletion.entry_id.trim();
+            if entry_id.is_empty() {
+                ignored += 1;
+                continue;
+            }
+
+            let existing_deleted_at = tx
+                .query_row(
+                    "SELECT deleted_at FROM entry_deletions WHERE entry_id = ?",
+                    params![entry_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .context("query existing entry deletion")?;
+
+            if existing_deleted_at.is_some_and(|ts| ts >= deletion.deleted_at) {
+                ignored += 1;
+            } else {
+                tx.execute(
+                    r#"
+INSERT INTO entry_deletions(entry_id, user_id, device_id, deleted_at)
+VALUES (?, ?, ?, ?)
+ON CONFLICT(entry_id) DO UPDATE SET
+  user_id = excluded.user_id,
+  device_id = excluded.device_id,
+  deleted_at = excluded.deleted_at
+WHERE excluded.deleted_at > entry_deletions.deleted_at
+"#,
+                    params![
+                        entry_id,
+                        deletion.user_id,
+                        deletion.device_id,
+                        deletion.deleted_at
+                    ],
+                )
+                .context("upsert entry deletion")?;
+                inserted += 1;
+            }
+
+            deleted += tx
+                .execute("DELETE FROM entries WHERE entry_id = ?", params![entry_id])
+                .context("delete tombstoned entry")?;
+        }
+
+        tx.commit().context("commit entry deletion tx")?;
+
+        Ok(DeletionApplyStats {
+            inserted,
+            ignored,
+            deleted,
+        })
     }
 
     pub fn compact_storage(&self) -> Result<()> {
@@ -1255,6 +1611,17 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS idx_entries_ts ON entries(ts);
 CREATE INDEX IF NOT EXISTS idx_entries_device_id ON entries(device_id);
 
+CREATE TABLE IF NOT EXISTS entry_deletions (
+  delete_seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  entry_id TEXT NOT NULL UNIQUE,
+  user_id TEXT NOT NULL,
+  device_id TEXT NOT NULL,
+  deleted_at INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_entry_deletions_device_seq
+ON entry_deletions(device_id, delete_seq);
+
 CREATE TABLE IF NOT EXISTS peer_state (
   peer_id TEXT PRIMARY KEY,
   last_cursor INTEGER NOT NULL
@@ -1263,6 +1630,16 @@ CREATE TABLE IF NOT EXISTS peer_state (
 CREATE TABLE IF NOT EXISTS peer_push_state (
   peer_id TEXT PRIMARY KEY,
   last_pushed_seq INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peer_delete_state (
+  peer_id TEXT PRIMARY KEY,
+  last_delete_cursor INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS peer_delete_push_state (
+  peer_id TEXT PRIMARY KEY,
+  last_pushed_delete_seq INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS peer_book (
@@ -1309,6 +1686,18 @@ fn row_to_entry_with_offset(row: &rusqlite::Row<'_>, offset: usize) -> rusqlite:
         shell: row.get(offset + 8)?,
         hostname: row.get(offset + 9)?,
         version: row.get(offset + 10)?,
+    })
+}
+
+fn row_to_entry_deletion_with_offset(
+    row: &rusqlite::Row<'_>,
+    offset: usize,
+) -> rusqlite::Result<EntryDeletion> {
+    Ok(EntryDeletion {
+        entry_id: row.get(offset)?,
+        user_id: row.get(offset + 1)?,
+        device_id: row.get(offset + 2)?,
+        deleted_at: row.get(offset + 3)?,
     })
 }
 
@@ -1392,8 +1781,11 @@ mod tests {
         names.sort();
 
         assert!(names.iter().any(|n| n == "entries"));
+        assert!(names.iter().any(|n| n == "entry_deletions"));
         assert!(names.iter().any(|n| n == "peer_state"));
+        assert!(names.iter().any(|n| n == "peer_delete_state"));
         assert!(names.iter().any(|n| n == "peer_push_state"));
+        assert!(names.iter().any(|n| n == "peer_delete_push_state"));
         assert!(names.iter().any(|n| n == "peer_book"));
     }
 
@@ -1748,7 +2140,14 @@ mod tests {
         store.insert_entries(&[e1, e2, e3, e4, e5, e6]).unwrap();
 
         let dry = store
-            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, true)
+            .dedupe_entries_same_day(
+                DedupeKeep::Newest,
+                Some("dev1"),
+                None,
+                "user1",
+                "dev1",
+                true,
+            )
             .unwrap();
         assert_eq!(
             dry,
@@ -1761,7 +2160,14 @@ mod tests {
         assert_eq!(store.list_recent(10).unwrap().len(), 6);
 
         let applied = store
-            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, false)
+            .dedupe_entries_same_day(
+                DedupeKeep::Newest,
+                Some("dev1"),
+                None,
+                "user1",
+                "dev1",
+                false,
+            )
             .unwrap();
         assert_eq!(
             applied,
@@ -1793,7 +2199,14 @@ mod tests {
             .unwrap();
 
         let applied = store
-            .dedupe_entries_same_day(DedupeKeep::Oldest, Some("dev1"), None, false)
+            .dedupe_entries_same_day(
+                DedupeKeep::Oldest,
+                Some("dev1"),
+                None,
+                "user1",
+                "dev1",
+                false,
+            )
             .unwrap();
         assert_eq!(
             applied,
@@ -1823,7 +2236,14 @@ mod tests {
 
         store.set_last_pushed_seq("peer-slow", 1).unwrap();
         let blocked = store
-            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, false)
+            .dedupe_entries_same_day(
+                DedupeKeep::Newest,
+                Some("dev1"),
+                None,
+                "user1",
+                "dev1",
+                false,
+            )
             .unwrap();
         assert_eq!(
             blocked,
@@ -1837,7 +2257,14 @@ mod tests {
 
         store.set_last_pushed_seq("peer-slow", 3).unwrap();
         let applied = store
-            .dedupe_entries_same_day(DedupeKeep::Newest, Some("dev1"), None, false)
+            .dedupe_entries_same_day(
+                DedupeKeep::Newest,
+                Some("dev1"),
+                None,
+                "user1",
+                "dev1",
+                false,
+            )
             .unwrap();
         assert_eq!(
             applied,
@@ -1853,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_entries_by_ids_supports_dry_run_and_apply() {
+    fn tombstone_entries_by_ids_supports_dry_run_and_apply() {
         let store = LocalStore::open(":memory:").unwrap();
 
         store
@@ -1865,12 +2292,14 @@ mod tests {
             .unwrap();
 
         let dry = store
-            .delete_entries_by_ids(
+            .tombstone_entries_by_ids(
                 &[
                     "id-1".to_string(),
                     "id-1".to_string(),
                     "missing".to_string(),
                 ],
+                "user1",
+                "dev1",
                 true,
             )
             .unwrap();
@@ -1882,9 +2311,15 @@ mod tests {
             }
         );
         assert_eq!(store.list_recent(10).unwrap().len(), 3);
+        assert_eq!(store.count_deletions_after_seq(0, None).unwrap(), 0);
 
         let applied = store
-            .delete_entries_by_ids(&["id-1".to_string(), "id-3".to_string()], false)
+            .tombstone_entries_by_ids(
+                &["id-1".to_string(), "id-3".to_string()],
+                "user1",
+                "dev1",
+                false,
+            )
             .unwrap();
         assert_eq!(
             applied,
@@ -1897,6 +2332,70 @@ mod tests {
         let remaining = store.list_recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].entry_id, "id-2");
+        assert_eq!(store.count_deletions_after_seq(0, Some("dev1")).unwrap(), 2);
+    }
+
+    #[test]
+    fn tombstoned_entries_do_not_resurrect_on_insert() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let e1 = entry("id-1", 10, "echo 1");
+        let e2 = entry("id-2", 20, "echo 2");
+        store.insert_entries(&[e1.clone(), e2.clone()]).unwrap();
+
+        store
+            .tombstone_entries_by_ids(&["id-1".to_string()], "user1", "dev1", false)
+            .unwrap();
+        assert_eq!(store.list_recent(10).unwrap().len(), 1);
+
+        let stats = store.insert_entries_with_stats(&[e1]).unwrap();
+        assert_eq!(
+            stats,
+            InsertStats {
+                inserted: 0,
+                ignored: 1
+            }
+        );
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-2");
+    }
+
+    #[test]
+    fn count_pending_push_items_tracks_entries_and_deletions() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 1, "echo 1");
+        e1.device_id = "dev-local".to_string();
+        let mut e2 = entry("id-2", 2, "echo 2");
+        e2.device_id = "dev-local".to_string();
+
+        store.insert_entries(&[e1, e2]).unwrap();
+        store
+            .tombstone_entries_by_ids(&["id-1".to_string()], "user1", "dev-local", false)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .count_pending_push_items("peer-a", Some("dev-local"))
+                .unwrap(),
+            2
+        );
+
+        store.set_last_pushed_seq("peer-a", 2).unwrap();
+        assert_eq!(
+            store
+                .count_pending_push_items("peer-a", Some("dev-local"))
+                .unwrap(),
+            1
+        );
+
+        store.advance_last_pushed_delete_seq("peer-a", 1).unwrap();
+        assert_eq!(
+            store
+                .count_pending_push_items("peer-a", Some("dev-local"))
+                .unwrap(),
+            0
+        );
     }
 
     #[test]

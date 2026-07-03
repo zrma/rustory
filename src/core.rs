@@ -18,6 +18,14 @@ pub struct Entry {
     pub version: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EntryDeletion {
+    pub entry_id: EntryId,
+    pub user_id: String,
+    pub device_id: String,
+    pub deleted_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct EntryInput {
     pub device_id: String,

@@ -1045,8 +1045,15 @@ pub fn run() -> Result<()> {
 
             let store = storage::LocalStore::open(&db_path)?;
             let entries = store.list_recent(limit)?;
+            let user_id = resolve_user_id(&cfg);
+            let device_id = resolve_device_id(&cfg);
             match search::select_action(&entries, |entry_id| {
-                store.delete_entries_by_ids(&[entry_id.to_string()], false)?;
+                store.tombstone_entries_by_ids(
+                    &[entry_id.to_string()],
+                    &user_id,
+                    &device_id,
+                    false,
+                )?;
                 Ok(())
             })? {
                 Some(search::SearchAction::Select(cmd)) => {
@@ -1107,7 +1114,10 @@ pub fn run() -> Result<()> {
                 selector_count += 1;
             }
 
-            let stats = store.delete_entries_by_ids(&selected_ids, dry_run)?;
+            let user_id = resolve_user_id(&cfg);
+            let device_id = resolve_device_id(&cfg);
+            let stats =
+                store.tombstone_entries_by_ids(&selected_ids, &user_id, &device_id, dry_run)?;
             let mut compacted = false;
             if vacuum && !dry_run {
                 store.compact_storage()?;
@@ -1144,10 +1154,13 @@ pub fn run() -> Result<()> {
             let older_than_unix = older_than_days
                 .map(|days| compute_prune_cutoff_unix(now_unix, days))
                 .transpose()?;
+            let user_id = resolve_user_id(&cfg);
             let stats = store.dedupe_entries_same_day(
                 keep.into(),
                 source_device_id,
                 older_than_unix,
+                &user_id,
+                &local_device_id,
                 !apply,
             )?;
 
@@ -1158,13 +1171,15 @@ pub fn run() -> Result<()> {
             }
 
             let scope = source_device_id.unwrap_or("all-devices");
+            let exact_key = "device_id,hostname,cwd,cmd,exit_code,utc_day";
             let older_than_label = older_than_days
                 .map(|days| days.to_string())
                 .unwrap_or_else(|| "none".to_string());
             if apply {
                 println!(
-                    "dedupe: scope={} keep={} older_than_days={} groups={} matched={} deleted={} compacted={}",
+                    "dedupe: scope={} exact_key={} keep={} older_than_days={} groups={} matched={} deleted={} compacted={}",
                     scope,
+                    exact_key,
                     keep.as_str(),
                     older_than_label,
                     stats.groups,
@@ -1174,8 +1189,9 @@ pub fn run() -> Result<()> {
                 );
             } else {
                 println!(
-                    "dedupe dry-run: scope={} keep={} older_than_days={} groups={} matched={} deleted=0",
+                    "dedupe dry-run: scope={} exact_key={} keep={} older_than_days={} groups={} matched={} deleted=0",
                     scope,
+                    exact_key,
                     keep.as_str(),
                     older_than_label,
                     stats.groups,

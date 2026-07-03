@@ -1,3 +1,4 @@
+use crate::core::EntryDeletion;
 use crate::libp2p;
 use crate::libp2p::core::transport::choice::OrTransport;
 use crate::libp2p::core::upgrade::Version;
@@ -156,6 +157,8 @@ impl RelayLimits {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct SyncPull {
     cursor: i64,
+    #[serde(default)]
+    delete_cursor: i64,
     limit: usize,
 }
 
@@ -163,11 +166,17 @@ struct SyncPull {
 struct SyncBatch {
     entries: Vec<crate::core::Entry>,
     next_cursor: Option<i64>,
+    #[serde(default)]
+    deletions: Vec<EntryDeletion>,
+    #[serde(default)]
+    next_delete_cursor: Option<i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct EntriesPush {
     entries: Vec<crate::core::Entry>,
+    #[serde(default)]
+    deletions: Vec<EntryDeletion>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -175,6 +184,9 @@ struct PushAck {
     ok: bool,
     inserted: Option<usize>,
     ignored: Option<usize>,
+    deletion_inserted: Option<usize>,
+    deletion_ignored: Option<usize>,
+    deletion_deleted: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,16 +538,22 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                     continue;
                                 }
 
-                                let batch = store.pull_since_cursor(
+                                let batch = store.pull_sync_batch(
                                     request.cursor,
+                                    request.delete_cursor,
                                     clamp_remote_pull_limit(request.limit),
                                 )?;
                                 let resp = SyncBatch {
                                     entries: batch.entries,
                                     next_cursor: batch.next_cursor,
+                                    deletions: batch.deletions,
+                                    next_delete_cursor: batch.next_delete_cursor,
                                 };
-                                if let Some(next_cursor) = resp.next_cursor {
-                                    pending_pull_responses.insert((peer, request_id), next_cursor);
+                                if resp.next_cursor.is_some() || resp.next_delete_cursor.is_some() {
+                                    pending_pull_responses.insert(
+                                        (peer, request_id),
+                                        (resp.next_cursor, resp.next_delete_cursor),
+                                    );
                                 }
                                 if swarm
                                     .behaviour_mut()
@@ -561,15 +579,26 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             request_id,
                             ..
                         } => {
-                            if let Some(next_cursor) =
+                            if let Some((next_cursor, next_delete_cursor)) =
                                 pending_pull_responses.remove(&(peer, request_id))
                             {
                                 let peer_key = peer.to_string();
-                                if let Err(err) =
-                                    store.advance_last_pushed_seq(&peer_key, next_cursor)
+                                if let Some(next_cursor) = next_cursor
+                                    && let Err(err) =
+                                        store.advance_last_pushed_seq(&peer_key, next_cursor)
                                 {
                                     eprintln!(
                                         "warn: p2p pull response cursor update failed: peer={peer} cursor={next_cursor} error={err:#}"
+                                    );
+                                }
+                                if let Some(next_delete_cursor) = next_delete_cursor
+                                    && let Err(err) = store.advance_last_pushed_delete_seq(
+                                        &peer_key,
+                                        next_delete_cursor,
+                                    )
+                                {
+                                    eprintln!(
+                                        "warn: p2p pull response delete cursor update failed: peer={peer} cursor={next_delete_cursor} error={err:#}"
                                     );
                                 }
                             }
@@ -586,12 +615,23 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                 )
                                 .and_then(|authorized| {
                                     validate_push_provenance(&request.entries, &authorized)?;
-                                    store.insert_entries_with_stats(&request.entries)
+                                    validate_deletion_provenance(
+                                        &request.deletions,
+                                        &authorized,
+                                    )?;
+                                    let entry_stats =
+                                        store.insert_entries_with_stats(&request.entries)?;
+                                    let deletion_stats = store
+                                        .apply_entry_deletions_with_stats(&request.deletions)?;
+                                    Ok((entry_stats, deletion_stats))
                                 }) {
-                                    Ok(stats) => PushAck {
+                                    Ok((entry_stats, deletion_stats)) => PushAck {
                                         ok: true,
-                                        inserted: Some(stats.inserted),
-                                        ignored: Some(stats.ignored),
+                                        inserted: Some(entry_stats.inserted),
+                                        ignored: Some(entry_stats.ignored),
+                                        deletion_inserted: Some(deletion_stats.inserted),
+                                        deletion_ignored: Some(deletion_stats.ignored),
+                                        deletion_deleted: Some(deletion_stats.deleted),
                                     },
                                     Err(err) => {
                                         eprintln!("warn: p2p push rejected: peer={peer} error={err:#}");
@@ -599,6 +639,9 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                             ok: false,
                                             inserted: None,
                                             ignored: None,
+                                            deletion_inserted: None,
+                                            deletion_ignored: None,
+                                            deletion_deleted: None,
                                         }
                                     }
                                 };
@@ -872,6 +915,36 @@ fn validate_push_provenance(entries: &[crate::core::Entry], peer: &AuthorizedPee
     Ok(())
 }
 
+fn validate_deletion_provenance(deletions: &[EntryDeletion], peer: &AuthorizedPeer) -> Result<()> {
+    let user_id = peer
+        .user_id
+        .as_deref()
+        .context("authorized peer is missing user_id")?;
+    let device_id = peer
+        .device_id
+        .as_deref()
+        .context("authorized peer is missing device_id")?;
+
+    for deletion in deletions {
+        if deletion.user_id != user_id {
+            anyhow::bail!(
+                "entry deletion user_id mismatch for peer {}: got={} want={user_id}",
+                peer.peer_id,
+                deletion.user_id
+            );
+        }
+        if !device_ids_match(&deletion.device_id, device_id) {
+            anyhow::bail!(
+                "entry deletion device_id mismatch for peer {}: got={} want={device_id}",
+                peer.peer_id,
+                deletion.device_id
+            );
+        }
+    }
+
+    Ok(())
+}
+
 fn clamp_remote_pull_limit(limit: usize) -> usize {
     limit.clamp(1, crate::sync::SERVER_SYNC_PULL_LIMIT_MAX)
 }
@@ -1003,10 +1076,19 @@ async fn sync_async(
         match pull_res {
             Ok(stats) => {
                 progress.mark_pull_ok();
-                if stats.received > 0 || stats.inserted > 0 {
+                if stats.received > 0
+                    || stats.inserted > 0
+                    || stats.deletion_received > 0
+                    || stats.deletion_deleted > 0
+                {
                     eprintln!(
-                        "p2p pull summary: {}: received={} inserted={} ignored={}",
-                        t.peer_key, stats.received, stats.inserted, stats.ignored
+                        "p2p pull summary: {}: received={} inserted={} ignored={} deletions_received={} deletions_deleted={}",
+                        t.peer_key,
+                        stats.received,
+                        stats.inserted,
+                        stats.ignored,
+                        stats.deletion_received,
+                        stats.deletion_deleted
                     );
                 }
             }
@@ -1017,7 +1099,7 @@ async fn sync_async(
         }
 
         if push {
-            let pending_push = match store.count_pending_push_entries(&t.peer_key, push_device_id) {
+            let pending_push = match store.count_pending_push_items(&t.peer_key, push_device_id) {
                 Ok(count) => count,
                 Err(err) => {
                     eprintln!("warn: p2p push preflight failed: {}: {err:#}", t.peer_key);
@@ -1751,7 +1833,12 @@ impl P2pClient {
         }
     }
 
-    async fn pull_batch_with_retries(&mut self, cursor: i64, limit: usize) -> Result<PullBatch> {
+    async fn pull_batch_with_retries(
+        &mut self,
+        cursor: i64,
+        delete_cursor: i64,
+        limit: usize,
+    ) -> Result<PullBatch> {
         // mutable borrow(&mut self) 중에도 policy 값을 쓰기 위해 복사해 둔다.
         let attempts = self.request_retry_policy.attempts;
         let timeout_base = self.request_retry_policy.timeout_base;
@@ -1762,7 +1849,10 @@ impl P2pClient {
         for attempt in 0..attempts {
             let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
 
-            match self.pull_batch_once(cursor, limit, timeout).await {
+            match self
+                .pull_batch_once(cursor, delete_cursor, limit, timeout)
+                .await
+            {
                 Ok(v) => return Ok(v),
                 Err(err) => {
                     if !is_retryable_p2p_request_error(&err) || attempt + 1 >= attempts {
@@ -1787,12 +1877,17 @@ impl P2pClient {
     async fn pull_batch_once(
         &mut self,
         cursor: i64,
+        delete_cursor: i64,
         limit: usize,
         timeout: Duration,
     ) -> Result<PullBatch> {
         self.ensure_connected().await?;
 
-        let req = SyncPull { cursor, limit };
+        let req = SyncPull {
+            cursor,
+            delete_cursor,
+            limit,
+        };
         let request_id = self
             .swarm
             .behaviour_mut()
@@ -1819,6 +1914,8 @@ impl P2pClient {
                                         return Ok(PullBatch {
                                             entries: response.entries,
                                             next_cursor: response.next_cursor,
+                                            deletions: response.deletions,
+                                            next_delete_cursor: response.next_delete_cursor,
                                         });
                                     }
                                 }
@@ -1847,8 +1944,12 @@ impl P2pClient {
         }
     }
 
-    async fn push_batch_with_retries(&mut self, entries: Vec<crate::core::Entry>) -> Result<()> {
-        if entries.is_empty() {
+    async fn push_batch_with_retries(
+        &mut self,
+        entries: Vec<crate::core::Entry>,
+        deletions: Vec<EntryDeletion>,
+    ) -> Result<()> {
+        if entries.is_empty() && deletions.is_empty() {
             return Ok(());
         }
 
@@ -1862,7 +1963,10 @@ impl P2pClient {
         for attempt in 0..attempts {
             let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
 
-            match self.push_batch_once(entries.clone(), timeout).await {
+            match self
+                .push_batch_once(entries.clone(), deletions.clone(), timeout)
+                .await
+            {
                 Ok(()) => return Ok(()),
                 Err(err) => {
                     if !is_retryable_p2p_request_error(&err) || attempt + 1 >= attempts {
@@ -1886,12 +1990,14 @@ impl P2pClient {
     async fn push_batch_once(
         &mut self,
         entries: Vec<crate::core::Entry>,
+        deletions: Vec<EntryDeletion>,
         timeout: Duration,
     ) -> Result<()> {
         self.ensure_connected().await?;
 
         let entries_len = entries.len();
-        let req = EntriesPush { entries };
+        let deletions_len = deletions.len();
+        let req = EntriesPush { entries, deletions };
         let request_id = self
             .swarm
             .behaviour_mut()
@@ -1933,6 +2039,26 @@ impl P2pClient {
                                                 self.push_ack_inserted_total += inserted;
                                                 self.push_ack_ignored_total += ignored;
                                             }
+                                            if let (
+                                                Some(deletion_inserted),
+                                                Some(deletion_ignored),
+                                                Some(deletion_deleted),
+                                            ) = (
+                                                response.deletion_inserted,
+                                                response.deletion_ignored,
+                                                response.deletion_deleted,
+                                            ) {
+                                                self.push_ack_stats_known = true;
+                                                self.push_ack_inserted_total += deletion_inserted;
+                                                self.push_ack_ignored_total += deletion_ignored;
+                                                if deletion_ignored > 0
+                                                    || deletion_inserted != deletions_len
+                                                {
+                                                    eprintln!(
+                                                        "p2p push deletion ack: inserted={deletion_inserted} ignored={deletion_ignored} deleted={deletion_deleted}"
+                                                    );
+                                                }
+                                            }
                                             return Ok(());
                                         }
                                         anyhow::bail!("p2p push rejected");
@@ -1968,9 +2094,10 @@ impl crate::sync::Puller for P2pClient {
     fn pull<'a>(
         &'a mut self,
         cursor: i64,
+        delete_cursor: i64,
         limit: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<PullBatch>> + 'a>> {
-        Box::pin(self.pull_batch_with_retries(cursor, limit))
+        Box::pin(self.pull_batch_with_retries(cursor, delete_cursor, limit))
     }
 }
 
@@ -1978,8 +2105,9 @@ impl crate::sync::Pusher for P2pClient {
     fn push<'a>(
         &'a mut self,
         entries: Vec<crate::core::Entry>,
+        deletions: Vec<EntryDeletion>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + 'a>> {
-        Box::pin(self.push_batch_with_retries(entries))
+        Box::pin(self.push_batch_with_retries(entries, deletions))
     }
 }
 
@@ -2773,6 +2901,7 @@ mod tests {
             &server_peer,
             SyncPull {
                 cursor: 0,
+                delete_cursor: 0,
                 limit: 10,
             },
         );
@@ -2786,11 +2915,13 @@ mod tests {
                             && let libp2p_request_response::Message::Request { request, channel, .. } = message
                         {
                             let batch = remote
-                                .pull_since_cursor(request.cursor, request.limit)
+                                .pull_sync_batch(request.cursor, request.delete_cursor, request.limit)
                                 .unwrap();
                             let resp = SyncBatch {
                                 entries: batch.entries,
                                 next_cursor: batch.next_cursor,
+                                deletions: batch.deletions,
+                                next_delete_cursor: batch.next_delete_cursor,
                             };
                             let _ = server.behaviour_mut().sync.send_response(channel, resp);
                         }
@@ -2812,6 +2943,8 @@ mod tests {
 
         assert_eq!(result.entries.len(), 2);
         assert_eq!(result.next_cursor, Some(2));
+        assert!(result.deletions.is_empty());
+        assert_eq!(result.next_delete_cursor, None);
         assert_eq!(result.entries[0].entry_id, "id-1");
         assert_eq!(result.entries[1].entry_id, "id-2");
     }
@@ -2849,6 +2982,7 @@ mod tests {
             &server_peer,
             EntriesPush {
                 entries: vec![entry.clone()],
+                deletions: vec![],
             },
         );
 
@@ -2860,8 +2994,19 @@ mod tests {
                             && let libp2p_request_response::Event::Message { message, .. } = event
                             && let libp2p_request_response::Message::Request { request, channel, .. } = message
                         {
-                            remote.insert_entries(&request.entries).unwrap();
-                            let _ = server.behaviour_mut().push.send_response(channel, PushAck { ok: true, inserted: None, ignored: None });
+                            let entry_stats = remote.insert_entries_with_stats(&request.entries).unwrap();
+                            let deletion_stats = remote.apply_entry_deletions_with_stats(&request.deletions).unwrap();
+                            let _ = server.behaviour_mut().push.send_response(
+                                channel,
+                                PushAck {
+                                    ok: true,
+                                    inserted: Some(entry_stats.inserted),
+                                    ignored: Some(entry_stats.ignored),
+                                    deletion_inserted: Some(deletion_stats.inserted),
+                                    deletion_ignored: Some(deletion_stats.ignored),
+                                    deletion_deleted: Some(deletion_stats.deleted),
+                                },
+                            );
                         }
                     }
                     e = client.select_next_some() => {

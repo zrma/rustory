@@ -1,4 +1,8 @@
-use crate::{core::Entry, storage::LocalStore, sync};
+use crate::{
+    core::{Entry, EntryDeletion},
+    storage::{LocalStore, PullBatch},
+    sync,
+};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -82,6 +86,10 @@ pub fn sync(
 struct EntriesResponse {
     entries: Vec<Entry>,
     next_cursor: Option<i64>,
+    #[serde(default)]
+    deletions: Vec<EntryDeletion>,
+    #[serde(default)]
+    next_delete_cursor: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -89,13 +97,20 @@ struct PushResponse {
     ok: bool,
     inserted: usize,
     ignored: usize,
+    deletion_inserted: usize,
+    deletion_ignored: usize,
+    deletion_deleted: usize,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(untagged)]
 enum EntriesRequest {
     Array(Vec<Entry>),
-    Object { entries: Vec<Entry> },
+    Object {
+        entries: Vec<Entry>,
+        #[serde(default)]
+        deletions: Vec<EntryDeletion>,
+    },
 }
 
 fn serve_http(bind: &str, store: LocalStore, cfg: ServeConfig) -> Result<()> {
@@ -119,8 +134,8 @@ fn sync_pull_http_peer(
     token: Option<&str>,
 ) -> Result<sync::PullStats> {
     let peer_key = normalize_peer_base_url(peer_base_url)?;
-    sync::sync_pull_from_peer(local, &peer_key, limit, |cursor, limit| {
-        http_pull_batch(&peer_key, cursor, limit, token)
+    sync::sync_pull_from_peer(local, &peer_key, limit, |cursor, delete_cursor, limit| {
+        http_pull_batch(&peer_key, cursor, delete_cursor, limit, token)
     })
 }
 
@@ -132,9 +147,13 @@ fn sync_push_http_peer(
     token: Option<&str>,
 ) -> Result<usize> {
     let peer_key = normalize_peer_base_url(peer_base_url)?;
-    sync::sync_push_to_peer(local, &peer_key, limit, local_device_id, |entries| {
-        http_push_batch(&peer_key, entries, token)
-    })
+    sync::sync_push_to_peer(
+        local,
+        &peer_key,
+        limit,
+        local_device_id,
+        |entries, deletions| http_push_batch(&peer_key, entries, deletions, token),
+    )
 }
 
 fn count_pending_http_push_entries(
@@ -143,7 +162,7 @@ fn count_pending_http_push_entries(
     local_device_id: Option<&str>,
 ) -> Result<usize> {
     let peer_key = normalize_peer_base_url(peer_base_url)?;
-    local.count_pending_push_entries(&peer_key, local_device_id)
+    local.count_pending_push_items(&peer_key, local_device_id)
 }
 
 fn normalize_peer_base_url(value: &str) -> Result<String> {
@@ -168,13 +187,15 @@ fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Opti
 fn http_pull_batch(
     peer_base_url: &str,
     cursor: i64,
+    delete_cursor: i64,
     limit: usize,
     token: Option<&str>,
-) -> Result<crate::storage::PullBatch> {
+) -> Result<PullBatch> {
     let url = format!(
-        "{}/api/v1/entries?cursor={}&limit={}",
+        "{}/api/v1/entries?cursor={}&delete_cursor={}&limit={}",
         peer_base_url.trim_end_matches('/'),
         cursor,
+        delete_cursor,
         limit
     );
 
@@ -197,16 +218,24 @@ fn http_pull_batch(
     let parsed: EntriesResponse =
         serde_json::from_str(&body).context("parse entries response json")?;
 
-    Ok(crate::storage::PullBatch {
+    Ok(PullBatch {
         entries: parsed.entries,
         next_cursor: parsed.next_cursor,
+        deletions: parsed.deletions,
+        next_delete_cursor: parsed.next_delete_cursor,
     })
 }
 
-fn http_push_batch(peer_base_url: &str, entries: Vec<Entry>, token: Option<&str>) -> Result<()> {
+fn http_push_batch(
+    peer_base_url: &str,
+    entries: Vec<Entry>,
+    deletions: Vec<EntryDeletion>,
+    token: Option<&str>,
+) -> Result<()> {
     let url = format!("{}/api/v1/entries", peer_base_url.trim_end_matches('/'));
 
-    let body = serde_json::to_vec(&entries).context("serialize entries json")?;
+    let body = serde_json::to_vec(&EntriesRequest::Object { entries, deletions })
+        .context("serialize entries json")?;
     let resp = crate::http_retry::request_with_retry(
         crate::http_retry::RetryPolicy::transport(),
         |agent| {
@@ -245,13 +274,15 @@ fn route_http_request(
             if !is_authorized(req, token) {
                 return Ok(respond_text(401, "unauthorized\n"));
             }
-            let (cursor, limit) = parse_cursor_limit(query)?;
-            let batch = store.pull_since_cursor(cursor, limit)?;
+            let (cursor, delete_cursor, limit) = parse_cursor_limit(query)?;
+            let batch = store.pull_sync_batch(cursor, delete_cursor, limit)?;
             respond_json(
                 200,
                 &EntriesResponse {
                     entries: batch.entries,
                     next_cursor: batch.next_cursor,
+                    deletions: batch.deletions,
+                    next_delete_cursor: batch.next_delete_cursor,
                 },
             )
         }
@@ -271,17 +302,21 @@ fn route_http_request(
 
             let req_body: EntriesRequest =
                 serde_json::from_slice(&buf).context("parse entries request json")?;
-            let entries = match req_body {
-                EntriesRequest::Array(entries) => entries,
-                EntriesRequest::Object { entries } => entries,
+            let (entries, deletions) = match req_body {
+                EntriesRequest::Array(entries) => (entries, Vec::new()),
+                EntriesRequest::Object { entries, deletions } => (entries, deletions),
             };
             let stats = store.insert_entries_with_stats(&entries)?;
+            let deletion_stats = store.apply_entry_deletions_with_stats(&deletions)?;
             respond_json(
                 200,
                 &PushResponse {
                     ok: true,
                     inserted: stats.inserted,
                     ignored: stats.ignored,
+                    deletion_inserted: deletion_stats.inserted,
+                    deletion_ignored: deletion_stats.ignored,
+                    deletion_deleted: deletion_stats.deleted,
                 },
             )
         }
@@ -328,8 +363,9 @@ fn max_request_body_bytes() -> usize {
     16 * 1024 * 1024
 }
 
-fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, usize)> {
+fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, i64, usize)> {
     let mut cursor: i64 = 0;
+    let mut delete_cursor: i64 = 0;
     let mut limit: usize = 1000;
     if let Some(query) = query {
         for part in query.split('&') {
@@ -338,6 +374,7 @@ fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, usize)> {
             };
             match k {
                 "cursor" => cursor = v.parse().context("parse cursor")?,
+                "delete_cursor" => delete_cursor = v.parse().context("parse delete cursor")?,
                 "limit" => limit = v.parse().context("parse limit")?,
                 _ => {}
             }
@@ -345,6 +382,7 @@ fn parse_cursor_limit(query: Option<&str>) -> Result<(i64, usize)> {
     }
     Ok((
         cursor,
+        delete_cursor,
         limit.clamp(1, crate::sync::SERVER_SYNC_PULL_LIMIT_MAX),
     ))
 }
@@ -445,11 +483,13 @@ mod tests {
 
     #[test]
     fn parse_cursor_limit_clamps_remote_limit_before_storage() {
-        let (cursor, limit) = parse_cursor_limit(Some("cursor=7&limit=999999")).unwrap();
+        let (cursor, delete_cursor, limit) =
+            parse_cursor_limit(Some("cursor=7&delete_cursor=9&limit=999999")).unwrap();
         assert_eq!(cursor, 7);
+        assert_eq!(delete_cursor, 9);
         assert_eq!(limit, crate::sync::SERVER_SYNC_PULL_LIMIT_MAX);
 
-        let (_, limit) = parse_cursor_limit(Some("limit=0")).unwrap();
+        let (_, _, limit) = parse_cursor_limit(Some("limit=0")).unwrap();
         assert_eq!(limit, 1);
     }
 
@@ -665,6 +705,8 @@ mod tests {
                                 &EntriesResponse {
                                     entries: vec![],
                                     next_cursor: None,
+                                    deletions: vec![],
+                                    next_delete_cursor: None,
                                 },
                             )
                             .unwrap(),

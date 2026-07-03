@@ -1,4 +1,7 @@
-use crate::storage::{LocalStore, PullBatch};
+use crate::{
+    core::{Entry, EntryDeletion},
+    storage::{LocalStore, PullBatch},
+};
 use anyhow::{Context, Result};
 use std::{future::Future, pin::Pin};
 
@@ -9,6 +12,10 @@ pub struct PullStats {
     pub received: usize,
     pub inserted: usize,
     pub ignored: usize,
+    pub deletion_received: usize,
+    pub deletion_inserted: usize,
+    pub deletion_ignored: usize,
+    pub deletion_deleted: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -59,20 +66,25 @@ pub fn sync_pull_from_peer<F>(
     mut pull: F,
 ) -> Result<PullStats>
 where
-    F: FnMut(i64, usize) -> Result<PullBatch>,
+    F: FnMut(i64, i64, usize) -> Result<PullBatch>,
 {
     if limit == 0 {
         return Ok(PullStats::default());
     }
 
     let mut cursor = local.get_last_cursor(peer_id)?;
+    let mut delete_cursor = local.get_last_delete_cursor(peer_id)?;
     let mut received_total = 0usize;
     let mut inserted_total = 0usize;
     let mut ignored_total = 0usize;
+    let mut deletion_received_total = 0usize;
+    let mut deletion_inserted_total = 0usize;
+    let mut deletion_ignored_total = 0usize;
+    let mut deletion_deleted_total = 0usize;
     let mut batch_limit = limit;
 
     loop {
-        let batch = match pull(cursor, batch_limit) {
+        let batch = match pull(cursor, delete_cursor, batch_limit) {
             Ok(v) => v,
             Err(err) => {
                 if is_payload_too_large_error(&err) {
@@ -85,29 +97,53 @@ where
                 return Err(err);
             }
         };
-        if batch.entries.is_empty() {
+        if batch.entries.is_empty() && batch.deletions.is_empty() {
             break;
         }
 
         let stats = local.insert_entries_with_stats(&batch.entries)?;
+        let deletion_stats = local.apply_entry_deletions_with_stats(&batch.deletions)?;
         received_total += batch.entries.len();
         inserted_total += stats.inserted;
         ignored_total += stats.ignored;
+        deletion_received_total += batch.deletions.len();
+        deletion_inserted_total += deletion_stats.inserted;
+        deletion_ignored_total += deletion_stats.ignored;
+        deletion_deleted_total += deletion_stats.deleted;
 
-        let Some(next_cursor) = batch.next_cursor else {
-            anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
-        };
-        if next_cursor <= cursor {
-            anyhow::bail!("invalid pull batch: next_cursor did not advance");
+        if !batch.entries.is_empty() {
+            let Some(next_cursor) = batch.next_cursor else {
+                anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
+            };
+            if next_cursor <= cursor {
+                anyhow::bail!("invalid pull batch: next_cursor did not advance");
+            }
+            cursor = next_cursor;
+            local.set_last_cursor(peer_id, cursor)?;
         }
-        cursor = next_cursor;
-        local.set_last_cursor(peer_id, cursor)?;
+
+        if !batch.deletions.is_empty() {
+            let Some(next_delete_cursor) = batch.next_delete_cursor else {
+                anyhow::bail!(
+                    "invalid pull batch: deletions is non-empty but next_delete_cursor is None"
+                );
+            };
+            if next_delete_cursor <= delete_cursor {
+                anyhow::bail!("invalid pull batch: next_delete_cursor did not advance");
+            }
+            delete_cursor = next_delete_cursor;
+            local.set_last_delete_cursor(peer_id, delete_cursor)?;
+        }
     }
 
     Ok(PullStats {
         received: received_total,
         inserted: inserted_total,
         ignored: ignored_total,
+        deletion_received: deletion_received_total,
+        deletion_inserted: deletion_inserted_total,
+        deletion_ignored: deletion_ignored_total,
+        deletion_deleted: deletion_deleted_total,
     })
 }
 
@@ -115,6 +151,7 @@ pub trait Puller {
     fn pull<'a>(
         &'a mut self,
         cursor: i64,
+        delete_cursor: i64,
         limit: usize,
     ) -> Pin<Box<dyn Future<Output = Result<PullBatch>> + 'a>>;
 }
@@ -122,7 +159,8 @@ pub trait Puller {
 pub trait Pusher {
     fn push<'a>(
         &'a mut self,
-        entries: Vec<crate::core::Entry>,
+        entries: Vec<Entry>,
+        deletions: Vec<EntryDeletion>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>>;
 }
 
@@ -140,13 +178,18 @@ where
     }
 
     let mut cursor = local.get_last_cursor(peer_id)?;
+    let mut delete_cursor = local.get_last_delete_cursor(peer_id)?;
     let mut received_total = 0usize;
     let mut inserted_total = 0usize;
     let mut ignored_total = 0usize;
+    let mut deletion_received_total = 0usize;
+    let mut deletion_inserted_total = 0usize;
+    let mut deletion_ignored_total = 0usize;
+    let mut deletion_deleted_total = 0usize;
     let mut batch_limit = limit;
 
     loop {
-        let batch = match puller.pull(cursor, batch_limit).await {
+        let batch = match puller.pull(cursor, delete_cursor, batch_limit).await {
             Ok(v) => v,
             Err(err) => {
                 if is_payload_too_large_error(&err) {
@@ -159,29 +202,53 @@ where
                 return Err(err);
             }
         };
-        if batch.entries.is_empty() {
+        if batch.entries.is_empty() && batch.deletions.is_empty() {
             break;
         }
 
         let stats = local.insert_entries_with_stats(&batch.entries)?;
+        let deletion_stats = local.apply_entry_deletions_with_stats(&batch.deletions)?;
         received_total += batch.entries.len();
         inserted_total += stats.inserted;
         ignored_total += stats.ignored;
+        deletion_received_total += batch.deletions.len();
+        deletion_inserted_total += deletion_stats.inserted;
+        deletion_ignored_total += deletion_stats.ignored;
+        deletion_deleted_total += deletion_stats.deleted;
 
-        let Some(next_cursor) = batch.next_cursor else {
-            anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
-        };
-        if next_cursor <= cursor {
-            anyhow::bail!("invalid pull batch: next_cursor did not advance");
+        if !batch.entries.is_empty() {
+            let Some(next_cursor) = batch.next_cursor else {
+                anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
+            };
+            if next_cursor <= cursor {
+                anyhow::bail!("invalid pull batch: next_cursor did not advance");
+            }
+            cursor = next_cursor;
+            local.set_last_cursor(peer_id, cursor)?;
         }
-        cursor = next_cursor;
-        local.set_last_cursor(peer_id, cursor)?;
+
+        if !batch.deletions.is_empty() {
+            let Some(next_delete_cursor) = batch.next_delete_cursor else {
+                anyhow::bail!(
+                    "invalid pull batch: deletions is non-empty but next_delete_cursor is None"
+                );
+            };
+            if next_delete_cursor <= delete_cursor {
+                anyhow::bail!("invalid pull batch: next_delete_cursor did not advance");
+            }
+            delete_cursor = next_delete_cursor;
+            local.set_last_delete_cursor(peer_id, delete_cursor)?;
+        }
     }
 
     Ok(PullStats {
         received: received_total,
         inserted: inserted_total,
         ignored: ignored_total,
+        deletion_received: deletion_received_total,
+        deletion_inserted: deletion_inserted_total,
+        deletion_ignored: deletion_ignored_total,
+        deletion_deleted: deletion_deleted_total,
     })
 }
 
@@ -197,30 +264,33 @@ pub fn sync_push_to_peer<F>(
     mut push: F,
 ) -> Result<usize>
 where
-    F: FnMut(Vec<crate::core::Entry>) -> Result<()>,
+    F: FnMut(Vec<Entry>, Vec<EntryDeletion>) -> Result<()>,
 {
     if limit == 0 {
         return Ok(0);
     }
 
     let mut cursor = local.get_last_pushed_seq(peer_id)?;
+    let mut delete_cursor = local.get_last_pushed_delete_seq(peer_id)?;
     let mut pushed_total = 0usize;
     let mut batch_limit = limit;
 
     loop {
         let batch = match source_device_id {
             Some(device_id) => {
-                local.pull_since_cursor_for_device(cursor, batch_limit, device_id)?
+                local.pull_sync_batch_for_device(cursor, delete_cursor, batch_limit, device_id)?
             }
-            None => local.pull_since_cursor(cursor, batch_limit)?,
+            None => local.pull_sync_batch(cursor, delete_cursor, batch_limit)?,
         };
-        if batch.entries.is_empty() {
+        if batch.entries.is_empty() && batch.deletions.is_empty() {
             break;
         }
 
         let entries = batch.entries;
+        let deletions = batch.deletions;
         let entries_len = entries.len();
-        match push(entries) {
+        let deletions_len = deletions.len();
+        match push(entries, deletions) {
             Ok(()) => {}
             Err(err) => {
                 if is_payload_too_large_error(&err) {
@@ -233,16 +303,33 @@ where
                 return Err(err);
             }
         }
-        pushed_total += entries_len;
+        pushed_total += entries_len + deletions_len;
 
-        let Some(next_cursor) = batch.next_cursor else {
-            anyhow::bail!("invalid local push batch: entries is non-empty but next_cursor is None");
-        };
-        if next_cursor <= cursor {
-            anyhow::bail!("invalid local push batch: next_cursor did not advance");
+        if entries_len > 0 {
+            let Some(next_cursor) = batch.next_cursor else {
+                anyhow::bail!(
+                    "invalid local push batch: entries is non-empty but next_cursor is None"
+                );
+            };
+            if next_cursor <= cursor {
+                anyhow::bail!("invalid local push batch: next_cursor did not advance");
+            }
+            cursor = next_cursor;
+            local.advance_last_pushed_seq(peer_id, cursor)?;
         }
-        cursor = next_cursor;
-        local.advance_last_pushed_seq(peer_id, cursor)?;
+
+        if deletions_len > 0 {
+            let Some(next_delete_cursor) = batch.next_delete_cursor else {
+                anyhow::bail!(
+                    "invalid local push batch: deletions is non-empty but next_delete_cursor is None"
+                );
+            };
+            if next_delete_cursor <= delete_cursor {
+                anyhow::bail!("invalid local push batch: next_delete_cursor did not advance");
+            }
+            delete_cursor = next_delete_cursor;
+            local.advance_last_pushed_delete_seq(peer_id, delete_cursor)?;
+        }
     }
 
     Ok(pushed_total)
@@ -263,23 +350,26 @@ where
     }
 
     let mut cursor = local.get_last_pushed_seq(peer_id)?;
+    let mut delete_cursor = local.get_last_pushed_delete_seq(peer_id)?;
     let mut pushed_total = 0usize;
     let mut batch_limit = limit;
 
     loop {
         let batch = match source_device_id {
             Some(device_id) => {
-                local.pull_since_cursor_for_device(cursor, batch_limit, device_id)?
+                local.pull_sync_batch_for_device(cursor, delete_cursor, batch_limit, device_id)?
             }
-            None => local.pull_since_cursor(cursor, batch_limit)?,
+            None => local.pull_sync_batch(cursor, delete_cursor, batch_limit)?,
         };
-        if batch.entries.is_empty() {
+        if batch.entries.is_empty() && batch.deletions.is_empty() {
             break;
         }
 
         let entries = batch.entries;
+        let deletions = batch.deletions;
         let entries_len = entries.len();
-        match pusher.push(entries).await {
+        let deletions_len = deletions.len();
+        match pusher.push(entries, deletions).await {
             Ok(()) => {}
             Err(err) => {
                 if is_payload_too_large_error(&err) {
@@ -292,16 +382,33 @@ where
                 return Err(err);
             }
         }
-        pushed_total += entries_len;
+        pushed_total += entries_len + deletions_len;
 
-        let Some(next_cursor) = batch.next_cursor else {
-            anyhow::bail!("invalid local push batch: entries is non-empty but next_cursor is None");
-        };
-        if next_cursor <= cursor {
-            anyhow::bail!("invalid local push batch: next_cursor did not advance");
+        if entries_len > 0 {
+            let Some(next_cursor) = batch.next_cursor else {
+                anyhow::bail!(
+                    "invalid local push batch: entries is non-empty but next_cursor is None"
+                );
+            };
+            if next_cursor <= cursor {
+                anyhow::bail!("invalid local push batch: next_cursor did not advance");
+            }
+            cursor = next_cursor;
+            local.advance_last_pushed_seq(peer_id, cursor)?;
         }
-        cursor = next_cursor;
-        local.advance_last_pushed_seq(peer_id, cursor)?;
+
+        if deletions_len > 0 {
+            let Some(next_delete_cursor) = batch.next_delete_cursor else {
+                anyhow::bail!(
+                    "invalid local push batch: deletions is non-empty but next_delete_cursor is None"
+                );
+            };
+            if next_delete_cursor <= delete_cursor {
+                anyhow::bail!("invalid local push batch: next_delete_cursor did not advance");
+            }
+            delete_cursor = next_delete_cursor;
+            local.advance_last_pushed_delete_seq(peer_id, delete_cursor)?;
+        }
     }
 
     Ok(pushed_total)
@@ -343,10 +450,11 @@ mod tests {
         fn pull<'a>(
             &'a mut self,
             cursor: i64,
+            delete_cursor: i64,
             limit: usize,
         ) -> Pin<Box<dyn Future<Output = Result<PullBatch>> + 'a>> {
             let remote = self.remote;
-            Box::pin(async move { remote.pull_since_cursor(cursor, limit) })
+            Box::pin(async move { remote.pull_sync_batch(cursor, delete_cursor, limit) })
         }
     }
 
@@ -412,8 +520,8 @@ mod tests {
             .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
             .unwrap();
 
-        let pulled = sync_pull_from_peer(&local, "peer-1", 100, |cursor, limit| {
-            remote.pull_since_cursor(cursor, limit)
+        let pulled = sync_pull_from_peer(&local, "peer-1", 100, |cursor, delete_cursor, limit| {
+            remote.pull_sync_batch(cursor, delete_cursor, limit)
         })
         .unwrap();
 
@@ -433,8 +541,8 @@ mod tests {
             .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
             .unwrap();
 
-        let a = sync_pull_from_peer(&local, "peer-1", 1, |cursor, limit| {
-            remote.pull_since_cursor(cursor, limit)
+        let a = sync_pull_from_peer(&local, "peer-1", 1, |cursor, delete_cursor, limit| {
+            remote.pull_sync_batch(cursor, delete_cursor, limit)
         })
         .unwrap();
         assert_eq!(a.received, 2);
@@ -442,8 +550,8 @@ mod tests {
         assert_eq!(a.ignored, 0);
         assert_eq!(local.list_recent(10).unwrap().len(), 2);
 
-        let b = sync_pull_from_peer(&local, "peer-1", 1, |cursor, limit| {
-            remote.pull_since_cursor(cursor, limit)
+        let b = sync_pull_from_peer(&local, "peer-1", 1, |cursor, delete_cursor, limit| {
+            remote.pull_sync_batch(cursor, delete_cursor, limit)
         })
         .unwrap();
         assert_eq!(b.received, 0);
@@ -511,16 +619,18 @@ mod tests {
             .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
             .unwrap();
 
-        let a = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries| {
+        let a = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries, deletions| {
             remote.insert_entries(&entries)?;
+            remote.apply_entry_deletions_with_stats(&deletions)?;
             Ok(())
         })
         .unwrap();
         assert_eq!(a, 2);
         assert_eq!(remote.list_recent(10).unwrap().len(), 2);
 
-        let b = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries| {
+        let b = sync_push_to_peer(&local, "peer-1", 1, Some("dev1"), |entries, deletions| {
             remote.insert_entries(&entries)?;
+            remote.apply_entry_deletions_with_stats(&deletions)?;
             Ok(())
         })
         .unwrap();
@@ -536,9 +646,15 @@ mod tests {
             .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
             .unwrap();
 
-        let err = sync_push_to_peer(&local, "peer-1", 100, Some("dev1"), |_entries| {
-            anyhow::bail!("network error");
-        })
+        let err = sync_push_to_peer(
+            &local,
+            "peer-1",
+            100,
+            Some("dev1"),
+            |_entries, _deletions| {
+                anyhow::bail!("network error");
+            },
+        )
         .unwrap_err();
         assert!(err.to_string().contains("network error"));
         assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 0);
@@ -558,10 +674,17 @@ mod tests {
 
         local.insert_entries(&[e1, e2, e3]).unwrap();
 
-        let pushed = sync_push_to_peer(&local, "peer-1", 100, Some("dev-local"), |entries| {
-            remote.insert_entries(&entries)?;
-            Ok(())
-        })
+        let pushed = sync_push_to_peer(
+            &local,
+            "peer-1",
+            100,
+            Some("dev-local"),
+            |entries, deletions| {
+                remote.insert_entries(&entries)?;
+                remote.apply_entry_deletions_with_stats(&deletions)?;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(pushed, 2);
         assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 3);
@@ -587,12 +710,12 @@ mod tests {
             .unwrap();
 
         let mut call_limits: Vec<usize> = Vec::new();
-        let pulled = sync_pull_from_peer(&local, "peer-1", 8, |cursor, limit| {
+        let pulled = sync_pull_from_peer(&local, "peer-1", 8, |cursor, delete_cursor, limit| {
             call_limits.push(limit);
             if limit > 1 {
                 return Err(payload_too_large_err());
             }
-            remote.pull_since_cursor(cursor, limit)
+            remote.pull_sync_batch(cursor, delete_cursor, limit)
         })
         .unwrap();
 
@@ -621,20 +744,110 @@ mod tests {
         local.insert_entries(&[e1, e2, e3]).unwrap();
 
         let mut call_sizes: Vec<usize> = Vec::new();
-        let pushed = sync_push_to_peer(&local, "peer-1", 8, Some("dev-local"), |entries| {
-            call_sizes.push(entries.len());
-            if entries.len() > 1 {
-                return Err(payload_too_large_err());
-            }
-            remote.insert_entries(&entries)?;
-            Ok(())
-        })
+        let pushed = sync_push_to_peer(
+            &local,
+            "peer-1",
+            8,
+            Some("dev-local"),
+            |entries, deletions| {
+                call_sizes.push(entries.len() + deletions.len());
+                if entries.len() + deletions.len() > 1 {
+                    return Err(payload_too_large_err());
+                }
+                remote.insert_entries(&entries)?;
+                remote.apply_entry_deletions_with_stats(&deletions)?;
+                Ok(())
+            },
+        )
         .unwrap();
 
         assert_eq!(pushed, 3);
         assert_eq!(remote.list_recent(10).unwrap().len(), 3);
         assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 3);
 
+        assert!(call_sizes.contains(&1));
+        assert!(call_sizes.first().copied().unwrap_or(0) > 1);
+    }
+
+    #[test]
+    fn sync_pushes_and_pulls_deletion_tombstones() {
+        let source = LocalStore::open(":memory:").unwrap();
+        let relay = LocalStore::open(":memory:").unwrap();
+        let target = LocalStore::open(":memory:").unwrap();
+
+        source
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+        relay
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+        target
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+
+        source
+            .tombstone_entries_by_ids(&["id-1".to_string()], "user1", "dev1", false)
+            .unwrap();
+
+        let pushed =
+            sync_push_to_peer(&source, "relay", 100, Some("dev1"), |entries, deletions| {
+                relay.insert_entries(&entries)?;
+                relay.apply_entry_deletions_with_stats(&deletions)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(pushed, 2);
+        assert_eq!(relay.list_recent(10).unwrap().len(), 1);
+
+        let pulled = sync_pull_from_peer(&target, "relay", 100, |cursor, delete_cursor, limit| {
+            relay.pull_sync_batch(cursor, delete_cursor, limit)
+        })
+        .unwrap();
+        assert_eq!(pulled.deletion_received, 1);
+        assert_eq!(pulled.deletion_deleted, 1);
+        let remaining = target.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-2");
+        assert_eq!(target.get_last_delete_cursor("relay").unwrap(), 1);
+    }
+
+    #[test]
+    fn sync_push_adapts_limit_when_deletion_payload_too_large() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let remote = LocalStore::open(":memory:").unwrap();
+
+        let entries = [
+            entry("id-1", 1, "echo 1"),
+            entry("id-2", 2, "echo 2"),
+            entry("id-3", 3, "echo 3"),
+        ];
+        local.insert_entries(&entries).unwrap();
+        remote.insert_entries(&entries).unwrap();
+        local
+            .tombstone_entries_by_ids(
+                &["id-1".to_string(), "id-2".to_string(), "id-3".to_string()],
+                "user1",
+                "dev1",
+                false,
+            )
+            .unwrap();
+        local.set_last_pushed_seq("peer-1", 3).unwrap();
+
+        let mut call_sizes: Vec<usize> = Vec::new();
+        let pushed = sync_push_to_peer(&local, "peer-1", 8, Some("dev1"), |entries, deletions| {
+            call_sizes.push(entries.len() + deletions.len());
+            if entries.len() + deletions.len() > 1 {
+                return Err(payload_too_large_err());
+            }
+            remote.insert_entries(&entries)?;
+            remote.apply_entry_deletions_with_stats(&deletions)?;
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(pushed, 3);
+        assert_eq!(remote.list_recent(10).unwrap().len(), 0);
+        assert_eq!(local.get_last_pushed_delete_seq("peer-1").unwrap(), 3);
         assert!(call_sizes.contains(&1));
         assert!(call_sizes.first().copied().unwrap_or(0) > 1);
     }

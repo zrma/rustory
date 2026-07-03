@@ -1087,8 +1087,9 @@ INSERT INTO history_entries (
             "peer-1",
             100,
             Some("rustory-device-a"),
-            |entries| {
+            |entries, deletions| {
                 remote.insert_entries(&entries)?;
+                remote.apply_entry_deletions_with_stats(&deletions)?;
                 Ok(())
             },
         )
