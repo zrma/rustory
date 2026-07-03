@@ -895,7 +895,8 @@ pub fn run() -> Result<()> {
 
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
                     if let Err(err) = p2p::sync(&peers, limit, &db_path, sync_cfg.clone(), push) {
-                        eprintln!("warn: p2p-sync failed: {err:#}");
+                        let level = p2p::p2p_request_failure_log_level(&err);
+                        eprintln!("{level}: p2p-sync failed: {err:#}");
                     }
 
                     sleep_with_stop(interval, stop.as_ref());

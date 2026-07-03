@@ -992,7 +992,7 @@ async fn sync_async(
                 }
             }
             Err(err) => {
-                eprintln!("warn: p2p pull failed: {}: {err:#}", t.peer_key);
+                log_p2p_sync_failure("pull", &t.peer_key, &err);
                 last_err = Some(err);
             }
         }
@@ -1038,7 +1038,7 @@ async fn sync_async(
                             t.peer_key
                         );
                     }
-                    eprintln!("warn: p2p push failed: {}: {err:#}", t.peer_key);
+                    log_p2p_sync_failure("push", &t.peer_key, &err);
                     last_err = Some(err);
                 }
             }
@@ -2001,6 +2001,19 @@ fn is_dcutr_direct_upgrade_noise(message: &str) -> bool {
             || msg.contains("protocol error"))
 }
 
+fn log_p2p_sync_failure(action: &str, peer_key: &str, err: &anyhow::Error) {
+    let level = p2p_request_failure_log_level(err);
+    eprintln!("{level}: p2p {action} failed: {peer_key}: {err:#}");
+}
+
+pub(crate) fn p2p_request_failure_log_level(err: &anyhow::Error) -> &'static str {
+    if is_retryable_p2p_request_error(err) {
+        "info"
+    } else {
+        "warn"
+    }
+}
+
 fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     // payload-too-large는 상위 로직(배치 limit 축소)에 맡긴다.
     if crate::sync::is_payload_too_large_error(err) {
@@ -2012,6 +2025,16 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     if err
         .chain()
         .any(|cause| cause.to_string().starts_with("p2p request timeout after"))
+    {
+        return true;
+    }
+
+    // connection establishment 자체의 timeout은 relay reservation 갱신/상대 peer fanout 중
+    // 흔히 섞일 수 있는 일시 실패다. 성공한 다른 circuit/peer summary가 있으면 운영상
+    // 조치할 warning이 아니므로 retryable/noisy 경로로 분류한다.
+    if err
+        .chain()
+        .any(|cause| cause.to_string().starts_with("dial timeout after"))
     {
         return true;
     }
@@ -2975,6 +2998,10 @@ mod tests {
         let err = anyhow::anyhow!("p2p request timeout after 5s");
         assert!(is_retryable_p2p_request_error(&err));
 
+        let err = anyhow::anyhow!("dial timeout after 12s").context("p2p pull peer: peer-a");
+        assert!(is_retryable_p2p_request_error(&err));
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
+
         let err = anyhow::anyhow!(
             "dial failed: Failed to connect to destination.: Remote reported resource limit exceeded."
         );
@@ -2992,6 +3019,16 @@ mod tests {
 
         let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
         assert!(!is_retryable_p2p_request_error(&err));
+        assert_eq!(p2p_request_failure_log_level(&err), "warn");
+    }
+
+    #[test]
+    fn p2p_request_failure_log_level_downgrades_retryable_timeouts() {
+        let err = anyhow::anyhow!("dial timeout after 12s").context("p2p push peer: peer-a");
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
+
+        let err = anyhow::anyhow!("dial failed: no relay addr and no dial addrs");
+        assert_eq!(p2p_request_failure_log_level(&err), "warn");
     }
 
     #[test]
