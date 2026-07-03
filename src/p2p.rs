@@ -2869,6 +2869,97 @@ mod tests {
         .expect("relay reservation timeout");
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_reservation_accepts_dns_relay_listen_addr() {
+        let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
+
+        let mut relay = build_relay_swarm_with_identity(
+            libp2p::identity::Keypair::generate_ed25519(),
+            psk,
+            RelayLimits::default(),
+        )
+        .unwrap();
+        relay
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let relay_peer_id = *relay.local_peer_id();
+
+        let relay_port = loop {
+            let event = relay.select_next_some().await;
+            if let SwarmEvent::NewListenAddr { address, .. } = event {
+                relay.add_external_address(address.clone());
+                let Some(Protocol::Tcp(port)) =
+                    address.iter().find(|p| matches!(p, Protocol::Tcp(_)))
+                else {
+                    panic!("relay listen addr missing tcp port: {address}");
+                };
+                break port;
+            }
+        };
+
+        let mut client = build_rustory_swarm(psk).unwrap();
+        let client_peer_id = *client.local_peer_id();
+        let dns_relay_addr: Multiaddr =
+            format!("/dns4/localhost/tcp/{relay_port}/p2p/{relay_peer_id}")
+                .parse()
+                .unwrap();
+        let client_addr = relay_circuit_listen_addr(&dns_relay_addr).unwrap();
+
+        assert!(client_addr.to_string().starts_with("/ip4/127.0.0.1/"));
+        assert!(
+            client_addr
+                .to_string()
+                .ends_with(&format!("/p2p/{relay_peer_id}/p2p-circuit"))
+        );
+
+        client.listen_on(client_addr.clone()).unwrap();
+
+        let expected_listen_addr = client_addr.with(Protocol::P2p(client_peer_id));
+        let mut reservation_accepted = false;
+        let mut listen_addr_reported = false;
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !reservation_accepted || !listen_addr_reported {
+                tokio::select! {
+                    event = relay.select_next_some() => {
+                        match event {
+                            SwarmEvent::NewListenAddr { address, .. } => {
+                                relay.add_external_address(address);
+                            }
+                            SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(
+                                libp2p::relay::Event::ReservationReqAccepted { .. },
+                            )) => {}
+                            _ => {}
+                        }
+                    }
+                    event = client.select_next_some() => {
+                        match event {
+                            SwarmEvent::Behaviour(RustoryBehaviourEvent::Relay(
+                                libp2p::relay::client::Event::ReservationReqAccepted {
+                                    relay_peer_id: got,
+                                    renewal,
+                                    ..
+                                },
+                            )) => {
+                                assert_eq!(got, relay_peer_id);
+                                assert!(!renewal);
+                                reservation_accepted = true;
+                            }
+                            SwarmEvent::NewListenAddr { address, .. }
+                                if address == expected_listen_addr =>
+                            {
+                                listen_addr_reported = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("dns relay reservation timeout");
+    }
+
     #[test]
     fn is_retryable_p2p_request_error_marks_only_transient_failures_as_retryable() {
         let err = anyhow::Error::new(OutboundFailure::UnsupportedProtocols);
