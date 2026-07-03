@@ -744,7 +744,10 @@ fn stop_stale_background_rr_processes(install_path: &Path) -> std::io::Result<us
         if !is_managed_background_rr_cmdline(&cmdline) {
             continue;
         }
-        if process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path) {
+        if process_exe_matches(pid, install_path)
+            || cmdline_exe_matches(&cmdline, install_path)
+            || cmdline_looks_like_default_rustory_background(&cmdline)
+        {
             targets.push(pid);
         }
     }
@@ -806,6 +809,48 @@ fn cmdline_exe_matches(cmdline: &[String], install_path: &Path) -> bool {
         .first()
         .map(|exe| paths_match_after_deleted_suffix(Path::new(exe), install_path))
         .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_looks_like_default_rustory_background(cmdline: &[String]) -> bool {
+    if !cmdline_rr_basename_is_rr(cmdline) || !is_managed_background_rr_cmdline(cmdline) {
+        return false;
+    }
+
+    if cmdline.iter().any(|arg| arg == "daemon") {
+        return cmdline
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "--interval-sec" | "--start-jitter-sec"));
+    }
+
+    let has_watch_child = cmdline
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "p2p-serve" | "p2p-sync"))
+        && cmdline.iter().any(|arg| arg == "--watch");
+    has_watch_child && cmdline_has_default_rustory_db_path(cmdline)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_rr_basename_is_rr(cmdline: &[String]) -> bool {
+    cmdline
+        .first()
+        .and_then(|arg| Path::new(arg).file_name())
+        .map(|name| name == "rr")
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_has_default_rustory_db_path(cmdline: &[String]) -> bool {
+    cmdline
+        .windows(2)
+        .any(|window| window[0] == "--db-path" && is_default_rustory_db_path(&window[1]))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_default_rustory_db_path(path: &str) -> bool {
+    path == "~/.rustory/history.db"
+        || path == "$HOME/.rustory/history.db"
+        || path.ends_with("/.rustory/history.db")
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1147,6 +1192,37 @@ mod tests {
             "/home/user/.local/bin/rr".to_string(),
             "sync-status".to_string(),
             "--with-tracker".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn default_rustory_background_cmdline_matches_stale_children_without_full_path() {
+        assert!(cmdline_looks_like_default_rustory_background(&[
+            "rr".to_string(),
+            "--db-path".to_string(),
+            "~/.rustory/history.db".to_string(),
+            "p2p-sync".to_string(),
+            "--watch".to_string(),
+            "--max-peers-per-tick".to_string(),
+            "1".to_string(),
+        ]));
+        assert!(cmdline_looks_like_default_rustory_background(&[
+            "/home/user/.local/bin/rr".to_string(),
+            "daemon".to_string(),
+            "--interval-sec".to_string(),
+            "60".to_string(),
+        ]));
+        assert!(!cmdline_looks_like_default_rustory_background(&[
+            "rr".to_string(),
+            "sync-status".to_string(),
+            "--watch".to_string(),
+        ]));
+        assert!(!cmdline_looks_like_default_rustory_background(&[
+            "rr".to_string(),
+            "--db-path".to_string(),
+            "/tmp/other.db".to_string(),
+            "p2p-sync".to_string(),
+            "--watch".to_string(),
         ]));
     }
 

@@ -802,7 +802,11 @@ def stop_stale_background_daemon_processes(install_path: Path) -> int:
         cmdline = read_proc_cmdline(pid)
         if not is_managed_background_cmdline(cmdline):
             continue
-        if proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path):
+        if (
+            proc_exe_matches(pid, install_path)
+            or cmdline_exe_matches(cmdline, install_path)
+            or cmdline_looks_like_default_rustory_background(cmdline)
+        ):
             targets.append(pid)
 
     stopped = 0
@@ -852,6 +856,34 @@ def proc_exe_matches(pid: int, install_path: Path) -> bool:
 
 def cmdline_exe_matches(cmdline: list[str], install_path: Path) -> bool:
     return bool(cmdline) and paths_match_after_deleted_suffix(Path(cmdline[0]), install_path)
+
+
+def cmdline_looks_like_default_rustory_background(cmdline: list[str]) -> bool:
+    if not cmdline_rr_basename_is_rr(cmdline) or not is_managed_background_cmdline(cmdline):
+        return False
+    if "daemon" in cmdline:
+        return "--interval-sec" in cmdline or "--start-jitter-sec" in cmdline
+    has_watch_child = ("p2p-serve" in cmdline or "p2p-sync" in cmdline) and "--watch" in cmdline
+    return has_watch_child and cmdline_has_default_rustory_db_path(cmdline)
+
+
+def cmdline_rr_basename_is_rr(cmdline: list[str]) -> bool:
+    return bool(cmdline) and Path(cmdline[0]).name == "rr"
+
+
+def cmdline_has_default_rustory_db_path(cmdline: list[str]) -> bool:
+    for idx, arg in enumerate(cmdline[:-1]):
+        if arg == "--db-path" and is_default_rustory_db_path(cmdline[idx + 1]):
+            return True
+    return False
+
+
+def is_default_rustory_db_path(path: str) -> bool:
+    return (
+        path == "~/.rustory/history.db"
+        or path == "$HOME/.rustory/history.db"
+        or path.endswith("/.rustory/history.db")
+    )
 
 
 def paths_match_after_deleted_suffix(left: Path, right: Path) -> bool:
