@@ -1613,8 +1613,8 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         cfg,
     )?;
 
-    if args.preflight {
-        run_daemon_preflight(&trackers, tracker_token.as_deref())?;
+    if run_daemon_preflight_if_requested(args.preflight, &trackers, tracker_token.as_deref())? {
+        return Ok(());
     }
 
     let specs = build_daemon_child_specs(db_path, &args);
@@ -1659,6 +1659,18 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
     )?;
 
     supervise_daemon_children(&mut serve, &mut sync, stop.as_ref())
+}
+
+fn run_daemon_preflight_if_requested(
+    preflight: bool,
+    trackers: &[String],
+    tracker_token: Option<&str>,
+) -> Result<bool> {
+    if !preflight {
+        return Ok(false);
+    }
+    run_daemon_preflight(trackers, tracker_token)?;
+    Ok(true)
 }
 
 fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<()> {
@@ -4523,6 +4535,12 @@ mod tests {
         assert!(text.contains("daemon preflight failed"));
         assert!(text.contains("http://tracker-b"));
         assert!(text.contains("status 401"));
+    }
+
+    #[test]
+    fn daemon_preflight_mode_exits_after_validation() {
+        assert!(!run_daemon_preflight_if_requested(false, &[], None).unwrap());
+        assert!(run_daemon_preflight_if_requested(true, &[], None).unwrap());
     }
 
     #[test]

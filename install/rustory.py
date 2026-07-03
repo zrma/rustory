@@ -632,6 +632,9 @@ def install_systemd_user_daemon(daemon_args: list[str], start: bool, args: argpa
     print(f"daemon=installed manager=systemd-user unit={unit_path}")
 
     if start:
+        stopped = stop_stale_background_daemon_processes(Path(daemon_args[0]))
+        if stopped:
+            print(f"daemon=stale_processes_stopped manager=systemd-user count={stopped}")
         for step in (["daemon-reload"], ["enable", "rustory.service"], ["restart", "rustory.service"]):
             try:
                 run_systemd_user(step)

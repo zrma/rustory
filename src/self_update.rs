@@ -476,6 +476,8 @@ fn restart_managed_daemon(install_path: &Path) {
 
     #[cfg(target_os = "linux")]
     {
+        stop_stale_managed_rr_processes_before_restart(install_path);
+
         let systemd_bus_unavailable = match restart_systemd_user_daemon() {
             DaemonRestartStatus::Restarted => return,
             DaemonRestartStatus::Failed(error) if systemd_user_bus_unavailable_text(&error) => {
@@ -502,6 +504,17 @@ fn restart_managed_daemon(install_path: &Path) {
     }
 
     println!("daemon=restart_skipped reason=no_managed_daemon_detected");
+}
+
+#[cfg(target_os = "linux")]
+fn stop_stale_managed_rr_processes_before_restart(install_path: &Path) {
+    match stop_stale_background_rr_processes(install_path) {
+        Ok(0) => {}
+        Ok(count) => println!("daemon=stale_processes_stopped manager=pre_restart count={count}"),
+        Err(err) => {
+            println!("warn: daemon stale process cleanup failed manager=pre_restart detail={err}")
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1211,6 +1224,15 @@ mod tests {
             "daemon".to_string(),
             "--interval-sec".to_string(),
             "60".to_string(),
+        ]));
+        assert!(cmdline_looks_like_default_rustory_background(&[
+            "rr".to_string(),
+            "daemon".to_string(),
+            "--preflight".to_string(),
+            "--interval-sec".to_string(),
+            "60".to_string(),
+            "--start-jitter-sec".to_string(),
+            "10".to_string(),
         ]));
         assert!(!cmdline_looks_like_default_rustory_background(&[
             "rr".to_string(),
