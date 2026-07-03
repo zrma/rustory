@@ -713,6 +713,10 @@ def start_background_daemon(daemon_args: list[str], restart: bool = False) -> No
             return
         print(f"daemon=stopping manager=background pid={existing_pid}")
         stop_background_daemon(existing_pid)
+    if restart:
+        stopped = stop_stale_background_daemon_processes(Path(daemon_args[0]))
+        if stopped:
+            print(f"daemon=stale_processes_stopped manager=background count={stopped}")
 
     with log_path.open("ab") as log_file:
         proc = subprocess.Popen(
@@ -745,12 +749,7 @@ def start_background_daemon(daemon_args: list[str], restart: bool = False) -> No
 
 
 def stop_background_daemon(pid: int) -> None:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    except PermissionError as exc:
-        raise SystemExit(f"daemon=failed manager=background step=stop pid={pid} detail={exc}") from exc
+    signal_background_process(pid, signal.SIGTERM)
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
@@ -758,7 +757,113 @@ def stop_background_daemon(pid: int) -> None:
             return
         time.sleep(0.1)
 
-    raise SystemExit(f"daemon=failed manager=background step=stop pid={pid} detail=timeout_after_sigterm")
+    signal_background_process(pid, signal.SIGKILL)
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if not pid_is_running(pid):
+            return
+        time.sleep(0.1)
+
+    raise SystemExit(f"daemon=failed manager=background step=stop pid={pid} detail=timeout_after_sigterm_sigkill")
+
+
+def signal_background_process(pid: int, sig: signal.Signals) -> None:
+    try:
+        os.killpg(pid, sig)
+        return
+    except ProcessLookupError:
+        pass
+    except PermissionError:
+        pass
+
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return
+    except PermissionError as exc:
+        raise SystemExit(f"daemon=failed manager=background step=stop pid={pid} detail={exc}") from exc
+
+
+def stop_stale_background_daemon_processes(install_path: Path) -> int:
+    if sys.platform != "linux":
+        return 0
+    proc_dir = Path("/proc")
+    if not proc_dir.exists():
+        return 0
+
+    current_pid = os.getpid()
+    targets: list[int] = []
+    for child in proc_dir.iterdir():
+        if not child.name.isdigit():
+            continue
+        pid = int(child.name)
+        if pid == current_pid or not proc_is_current_user(pid):
+            continue
+        cmdline = read_proc_cmdline(pid)
+        if not is_managed_background_cmdline(cmdline):
+            continue
+        if proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path):
+            targets.append(pid)
+
+    stopped = 0
+    for pid in sorted(set(targets)):
+        if not pid_is_running(pid):
+            continue
+        signal_background_process(pid, signal.SIGTERM)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and pid_is_running(pid):
+            time.sleep(0.1)
+        if pid_is_running(pid):
+            try:
+                signal_background_process(pid, signal.SIGKILL)
+            except SystemExit:
+                pass
+        stopped += 1
+    return stopped
+
+
+def proc_is_current_user(pid: int) -> bool:
+    try:
+        status = Path(f"/proc/{pid}/status").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in status.splitlines():
+        if line.startswith("Uid:"):
+            fields = line.split()
+            return len(fields) > 1 and fields[1].isdigit() and int(fields[1]) == os.getuid()
+    return False
+
+
+def read_proc_cmdline(pid: int) -> list[str]:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def proc_exe_matches(pid: int, install_path: Path) -> bool:
+    try:
+        exe = Path(os.readlink(f"/proc/{pid}/exe"))
+    except OSError:
+        return False
+    return paths_match_after_deleted_suffix(exe, install_path)
+
+
+def cmdline_exe_matches(cmdline: list[str], install_path: Path) -> bool:
+    return bool(cmdline) and paths_match_after_deleted_suffix(Path(cmdline[0]), install_path)
+
+
+def paths_match_after_deleted_suffix(left: Path, right: Path) -> bool:
+    return strip_deleted_suffix(str(left)) == strip_deleted_suffix(str(right))
+
+
+def strip_deleted_suffix(value: str) -> str:
+    return value[:-10] if value.endswith(" (deleted)") else value
+
+
+def is_managed_background_cmdline(cmdline: list[str]) -> bool:
+    return any(arg in ("daemon", "p2p-serve", "p2p-sync") for arg in cmdline)
 
 
 def install_background_daemon_autostart(daemon_args: list[str], args: argparse.Namespace) -> None:
@@ -794,7 +899,11 @@ def render_daemon_autostart_block(daemon_args: list[str]) -> str:
             "    fi",
             '    if [ "$__rustory_daemon_running" != "1" ]; then',
             '      mkdir -p "$__rustory_daemon_state_dir"',
-            f'      nohup {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
+            "      if command -v setsid >/dev/null 2>&1; then",
+            f'        setsid {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
+            "      else",
+            f'        nohup {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
+            "      fi",
             '      echo $! > "$__rustory_daemon_pid_file"',
             '      chmod 600 "$__rustory_daemon_pid_file" "$__rustory_daemon_log_file" 2>/dev/null || true',
             "    fi",

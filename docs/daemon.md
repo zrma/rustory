@@ -50,6 +50,13 @@ macOS launchd, Linux systemd-user, Linux background fallback pid 파일을 순�
 `rr update --no-restart-daemon`을 사용했거나 service/fallback이 아직 설치되지 않은 머신에서는
 아래 플랫폼별 수동 명령으로 직접 재시작한다.
 
+Linux background fallback은 `daemon.pid`의 process 하나만 종료하지 않고, daemon이 독립 process
+group leader인 경우 그 group을 종료한 뒤 같은 설치 경로에서 떠 있는 오래된 `rr daemon`/`rr p2p-serve`/`rr p2p-sync`
+잔여 process도 정리하고 새 daemon을 띄운다. fallback shell autostart는 `setsid`가 있으면 새 session으로
+daemon을 시작한다. 외부망 컨테이너 로그에서 같은 파일에 `info:`와
+`warn:` timeout 로그가 섞이거나 새 default와 맞지 않는 `p2p-sync tick`이 계속 보이면 오래된
+fallback child가 남은 신호로 보고 `rr update`를 다시 실행해 정리한다.
+
 ## 권장 전제
 - 설정은 `~/.config/rustory/config.toml`에 넣고, 데몬 실행 커맨드는 짧게 유지한다.
   - `trackers`, `relay_addr`, `swarm_key_path`, `p2p_identity_key_path`, `tracker_token` 등

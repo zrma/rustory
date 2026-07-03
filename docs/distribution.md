@@ -169,7 +169,9 @@ daemon restart는 계속 시도한다. 이 때문에 이미 최신 버전이어�
 - macOS: `com.rustory.daemon` launchd user agent가 있으면 `launchctl kickstart -k`로 재시작한다.
 - Linux systemd-user: `~/.config/systemd/user/rustory.service`가 있으면 `systemctl --user restart`를 시도한다.
 - Linux container/background fallback: systemd user bus가 없거나 fallback pid가 있으면
-  `~/.local/state/rustory/daemon.pid`의 기존 process를 종료하고 새 binary로 `rr daemon`을 다시 띄운다.
+  `~/.local/state/rustory/daemon.pid`의 daemon이 독립 process group leader일 때 그 group을
+  종료하고, 같은 설치 경로의 오래된 `rr daemon`/`rr p2p-serve`/`rr p2p-sync` 잔여 process를
+  추가로 정리한 뒤 새 binary로 `rr daemon`을 다시 띄운다.
 
 자동 재시작을 원하지 않으면 `--no-restart-daemon`을 사용한다. one-shot installer를
 `--install-daemon`과 함께 다시 실행하는 경우에도 service 파일을 갱신하고 시작 경로를 다시 밟으므로,

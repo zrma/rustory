@@ -570,11 +570,26 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
         && pid_is_running(pid)
     {
         println!("daemon=stopping manager=background pid={pid}");
-        if let Err(err) = terminate_pid(pid) {
-            return DaemonRestartStatus::Failed(format!("terminate pid {pid}: {err}"));
+        if let Err(err) = terminate_background_process(pid, libc::SIGTERM) {
+            return DaemonRestartStatus::Failed(format!(
+                "terminate background process {pid}: {err}"
+            ));
         }
         if !wait_pid_stopped(pid, Duration::from_secs(5)) {
-            return DaemonRestartStatus::Failed(format!("pid {pid} did not stop after SIGTERM"));
+            let _ = terminate_background_process(pid, libc::SIGKILL);
+            if !wait_pid_stopped(pid, Duration::from_secs(2)) {
+                return DaemonRestartStatus::Failed(format!(
+                    "pid {pid} did not stop after SIGTERM/SIGKILL"
+                ));
+            }
+        }
+    }
+
+    match stop_stale_background_rr_processes(install_path) {
+        Ok(0) => {}
+        Ok(count) => println!("daemon=stale_processes_stopped manager=background count={count}"),
+        Err(err) => {
+            println!("warn: daemon stale process cleanup failed manager=background detail={err}")
         }
     }
 
@@ -679,8 +694,24 @@ fn pid_is_running(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn terminate_pid(pid: u32) -> std::io::Result<()> {
-    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+fn terminate_background_process(pid: u32, signal: libc::c_int) -> std::io::Result<()> {
+    if pid == 0 {
+        return Ok(());
+    }
+
+    let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
+    if pgid == pid as libc::pid_t && pgid > 1 {
+        let rc = unsafe { libc::kill(-pgid, signal) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(err);
+        }
+    }
+
+    let rc = unsafe { libc::kill(pid as libc::pid_t, signal) };
     if rc == 0 {
         return Ok(());
     }
@@ -689,6 +720,112 @@ fn terminate_pid(pid: u32) -> std::io::Result<()> {
         return Ok(());
     }
     Err(err)
+}
+
+#[cfg(target_os = "linux")]
+fn stop_stale_background_rr_processes(install_path: &Path) -> std::io::Result<usize> {
+    let current_pid = std::process::id();
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid || !process_is_current_user(pid) {
+            continue;
+        }
+        let Some(cmdline) = read_proc_cmdline(pid) else {
+            continue;
+        };
+        if !is_managed_background_rr_cmdline(&cmdline) {
+            continue;
+        }
+        if process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path) {
+            targets.push(pid);
+        }
+    }
+
+    targets.sort_unstable();
+    targets.dedup();
+
+    let mut stopped = 0;
+    for pid in targets {
+        if !pid_is_running(pid) {
+            continue;
+        }
+        terminate_background_process(pid, libc::SIGTERM)?;
+        if !wait_pid_stopped(pid, Duration::from_secs(2)) {
+            let _ = terminate_background_process(pid, libc::SIGKILL);
+            let _ = wait_pid_stopped(pid, Duration::from_secs(1));
+        }
+        stopped += 1;
+    }
+    Ok(stopped)
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_current_user(pid: u32) -> bool {
+    let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+        return false;
+    };
+    let uid = unsafe { libc::getuid() };
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|value| value.parse::<u32>().ok())
+        == Some(uid)
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cmdline(pid: u32) -> Option<Vec<String>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    let parts = bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect::<Vec<_>>();
+    (!parts.is_empty()).then_some(parts)
+}
+
+#[cfg(target_os = "linux")]
+fn process_exe_matches(pid: u32, install_path: &Path) -> bool {
+    let Ok(exe) = std::fs::read_link(format!("/proc/{pid}/exe")) else {
+        return false;
+    };
+    paths_match_after_deleted_suffix(&exe, install_path)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn cmdline_exe_matches(cmdline: &[String], install_path: &Path) -> bool {
+    cmdline
+        .first()
+        .map(|exe| paths_match_after_deleted_suffix(Path::new(exe), install_path))
+        .unwrap_or(false)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn paths_match_after_deleted_suffix(left: &Path, right: &Path) -> bool {
+    normalize_deleted_exe_path(left) == normalize_deleted_exe_path(right)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn normalize_deleted_exe_path(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    raw.strip_suffix(" (deleted)")
+        .unwrap_or(raw.as_ref())
+        .to_string()
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn is_managed_background_rr_cmdline(cmdline: &[String]) -> bool {
+    cmdline
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "daemon" | "p2p-serve" | "p2p-sync"))
 }
 
 #[cfg(target_os = "linux")]
@@ -974,6 +1111,43 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(!installed_binary_matches(&path, b"rr-binary").unwrap());
+    }
+
+    #[test]
+    fn deleted_exe_path_normalization_matches_current_install_path() {
+        assert!(paths_match_after_deleted_suffix(
+            Path::new("/home/user/.local/bin/rr (deleted)"),
+            Path::new("/home/user/.local/bin/rr")
+        ));
+        assert!(!paths_match_after_deleted_suffix(
+            Path::new("/home/user/.local/bin/other"),
+            Path::new("/home/user/.local/bin/rr")
+        ));
+        assert!(cmdline_exe_matches(
+            &[
+                "/home/user/.local/bin/rr (deleted)".to_string(),
+                "p2p-sync".to_string(),
+            ],
+            Path::new("/home/user/.local/bin/rr")
+        ));
+    }
+
+    #[test]
+    fn managed_background_cmdline_matches_only_daemon_children() {
+        assert!(is_managed_background_rr_cmdline(&[
+            "/home/user/.local/bin/rr".to_string(),
+            "daemon".to_string(),
+        ]));
+        assert!(is_managed_background_rr_cmdline(&[
+            "/home/user/.local/bin/rr".to_string(),
+            "p2p-sync".to_string(),
+            "--watch".to_string(),
+        ]));
+        assert!(!is_managed_background_rr_cmdline(&[
+            "/home/user/.local/bin/rr".to_string(),
+            "sync-status".to_string(),
+            "--with-tracker".to_string(),
+        ]));
     }
 
     #[test]
