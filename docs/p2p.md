@@ -189,6 +189,7 @@ p2p_watch_start_jitter_sec = 10
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
   - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push/delete 커서가 전진하지 않은 로컬 엔트리와 deletion tombstone의 합계다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
   - JSON/text 출력의 `outbound_push_pending_entries`, `outbound_push_pending_deletions`, `pending_push_entries`, `pending_push_deletions`, `pull_delete_cursor`, `push_delete_cursor`는 row backlog와 삭제 tombstone backlog를 분리해 보여준다.
+  - deletion tombstone backlog가 0으로 안정된 뒤에만 오래된 tombstone을 `rr tombstone-gc`로 정리한다. GC는 알려진 peer의 delete push cursor floor를 넘지 않는 tombstone만 삭제한다.
   - `--watch`는 alternate screen TUI로 tracker 상태, 로컬 outbox 요약, 큐가 남은 peer, peer별 `direct`/`sent`/`to_send`/`drain/s`를 계속 갱신한다.
   - watch 화면의 `direct`는 이 노드가 해당 peer에서 직접 pull 완료한 cursor다. 이 값이 `0`이어도 inbound push나 다른 peer 경유 전파로 데이터가 들어올 수 있으므로 단독으로 데이터 유실 신호로 보지 않는다.
   - watch 화면의 `sent`는 이 노드의 로컬 엔트리를 해당 peer가 받아들인 push cursor이고, `to_send`는 아직 해당 peer에 수락되지 않은 로컬 엔트리와 deletion tombstone 수다.

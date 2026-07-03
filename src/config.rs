@@ -44,6 +44,11 @@ pub struct FileConfig {
     pub auto_prune_interval_sec: Option<u64>,
     pub auto_prune_keep_recent: Option<usize>,
     pub auto_prune_marker_path: Option<String>,
+
+    pub auto_tombstone_gc: Option<bool>,
+    pub auto_tombstone_gc_days: Option<u64>,
+    pub auto_tombstone_gc_interval_sec: Option<u64>,
+    pub auto_tombstone_gc_marker_path: Option<String>,
 }
 
 pub fn load_default() -> Result<FileConfig> {
@@ -224,6 +229,10 @@ auto_prune_days = 90
 auto_prune_interval_sec = 3600
 auto_prune_keep_recent = 1000
 auto_prune_marker_path = "~/.config/rustory/auto-prune.custom.last"
+auto_tombstone_gc = true
+auto_tombstone_gc_days = 45
+auto_tombstone_gc_interval_sec = 7200
+auto_tombstone_gc_marker_path = "~/.config/rustory/auto-tombstone-gc.custom.last"
 "#,
         )
         .unwrap();
@@ -254,6 +263,13 @@ auto_prune_marker_path = "~/.config/rustory/auto-prune.custom.last"
         assert_eq!(
             cfg.auto_prune_marker_path.as_deref(),
             Some("~/.config/rustory/auto-prune.custom.last")
+        );
+        assert_eq!(cfg.auto_tombstone_gc, Some(true));
+        assert_eq!(cfg.auto_tombstone_gc_days, Some(45));
+        assert_eq!(cfg.auto_tombstone_gc_interval_sec, Some(7200));
+        assert_eq!(
+            cfg.auto_tombstone_gc_marker_path.as_deref(),
+            Some("~/.config/rustory/auto-tombstone-gc.custom.last")
         );
     }
 

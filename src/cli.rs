@@ -12,15 +12,18 @@ use crate::daemon::{
 };
 #[cfg(test)]
 use crate::runtime_tasks::{
-    AsyncUploadRuntimeSettings, AutoPruneRuntimeSettings, DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC,
-    DEFAULT_ASYNC_UPLOAD_LIMIT, DEFAULT_ASYNC_UPLOAD_MARKER_PATH, DEFAULT_AUTO_PRUNE_DAYS,
+    AsyncUploadRuntimeSettings, AutoPruneRuntimeSettings, AutoTombstoneGcRuntimeSettings,
+    DEFAULT_ASYNC_UPLOAD_INTERVAL_SEC, DEFAULT_ASYNC_UPLOAD_LIMIT,
+    DEFAULT_ASYNC_UPLOAD_MARKER_PATH, DEFAULT_AUTO_PRUNE_DAYS, DEFAULT_AUTO_TOMBSTONE_GC_DAYS,
     compute_next_due_in_sec, read_rate_limit_marker, resolve_bool_setting, resolve_string_setting,
     resolve_u64_setting, resolve_usize_setting, should_trigger_interval, write_rate_limit_marker,
 };
 use crate::runtime_tasks::{
     compute_prune_cutoff_unix, load_async_upload_runtime_settings,
-    load_auto_prune_runtime_settings, maybe_run_auto_prune, maybe_spawn_async_upload,
-    parse_env_bool, summarize_async_upload_runtime, summarize_auto_prune_runtime,
+    load_auto_prune_runtime_settings, load_auto_tombstone_gc_runtime_settings,
+    maybe_run_auto_prune, maybe_run_auto_tombstone_gc, maybe_spawn_async_upload, parse_env_bool,
+    summarize_async_upload_runtime, summarize_auto_prune_runtime,
+    summarize_auto_tombstone_gc_runtime,
 };
 use crate::sync_status::{
     SyncStatusTrackerReport, build_sync_status_report_for_cli, build_tracker_status_report,
@@ -325,6 +328,25 @@ enum Command {
             help = "Report matching rows without deleting"
         )]
         dry_run: bool,
+    },
+    #[command(about = "Garbage-collect synced deletion tombstones")]
+    TombstoneGc {
+        #[arg(long, help = "Delete tombstones older than this many days")]
+        older_than_days: u64,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Delete matching tombstones after reporting the plan"
+        )]
+        apply: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Run SQLite WAL checkpoint and VACUUM after deletion"
+        )]
+        vacuum: bool,
     },
     #[command(about = "Delete selected local history entries")]
     Delete {
@@ -1039,6 +1061,11 @@ pub fn run() -> Result<()> {
                 // 기록 성공을 우선하고, 자동 보관 실패는 경고로만 남긴다.
                 eprintln!("warn: auto prune failed: {err:#}");
             }
+
+            if let Err(err) = maybe_run_auto_tombstone_gc(&store, &cfg) {
+                // 기록 성공을 우선하고, tombstone GC 실패는 경고로만 남긴다.
+                eprintln!("warn: auto tombstone gc failed: {err:#}");
+            }
         }
         Command::Search { limit } => {
             let limit = resolve_search_limit(limit, &cfg)?;
@@ -1082,6 +1109,34 @@ pub fn run() -> Result<()> {
                 println!(
                     "prune: older_than_days={} keep_recent={} cutoff_unix={} matched={} deleted={}",
                     older_than_days, keep_recent, cutoff_unix, stats.matched, stats.deleted
+                );
+            }
+        }
+        Command::TombstoneGc {
+            older_than_days,
+            apply,
+            vacuum,
+        } => {
+            let store = storage::LocalStore::open(&db_path)?;
+            let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+            let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
+            let stats = store.gc_tombstones_older_than(cutoff_unix, !apply)?;
+
+            let mut compacted = false;
+            if apply && vacuum && stats.deleted > 0 {
+                store.compact_storage()?;
+                compacted = true;
+            }
+
+            if apply {
+                println!(
+                    "tombstone-gc: older_than_days={} cutoff_unix={} matched={} deleted={} compacted={}",
+                    older_than_days, cutoff_unix, stats.matched, stats.deleted, compacted
+                );
+            } else {
+                println!(
+                    "tombstone-gc dry-run: older_than_days={} cutoff_unix={} matched={} deleted=0",
+                    older_than_days, cutoff_unix, stats.matched
                 );
             }
         }
@@ -1859,6 +1914,14 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push_str("# auto_prune_interval_sec = 86400 # optional\n");
     out.push_str("# auto_prune_keep_recent = 0 # optional\n");
     out.push_str("# auto_prune_marker_path = \"~/.config/rustory/auto-prune.last\" # optional\n");
+    out.push_str(
+        "# auto_tombstone_gc = false # optional; env RUSTORY_AUTO_TOMBSTONE_GC overrides\n",
+    );
+    out.push_str("# auto_tombstone_gc_days = 90 # optional\n");
+    out.push_str("# auto_tombstone_gc_interval_sec = 86400 # optional\n");
+    out.push_str(
+        "# auto_tombstone_gc_marker_path = \"~/.config/rustory/auto-tombstone-gc.last\" # optional\n",
+    );
 
     Ok(out)
 }
@@ -1892,6 +1955,7 @@ struct DoctorReport {
     record_ignore_regex: DoctorRecordIgnoreRegexReport,
     async_upload: DoctorAsyncUploadStatusReport,
     auto_prune: DoctorAutoPruneStatusReport,
+    auto_tombstone_gc: DoctorAutoTombstoneGcStatusReport,
     swarm_key: DoctorKeyStatusReport,
     p2p_identity_key: DoctorKeyStatusReport,
     relay_identity_key: DoctorKeyStatusReport,
@@ -1957,6 +2021,17 @@ struct DoctorAutoPruneStatusReport {
     older_than_days: Option<u64>,
     interval_sec: Option<u64>,
     keep_recent: Option<usize>,
+    marker_path: Option<String>,
+    last_trigger_unix: Option<i64>,
+    next_due_in_sec: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorAutoTombstoneGcStatusReport {
+    enabled: Option<bool>,
+    older_than_days: Option<u64>,
+    interval_sec: Option<u64>,
     marker_path: Option<String>,
     last_trigger_unix: Option<i64>,
     next_due_in_sec: Option<u64>,
@@ -2134,6 +2209,30 @@ fn build_doctor_report(
         },
     };
 
+    let auto_tombstone_gc = match load_auto_tombstone_gc_runtime_settings(cfg) {
+        Ok(settings) => {
+            let report = summarize_auto_tombstone_gc_runtime(settings, now_unix);
+            DoctorAutoTombstoneGcStatusReport {
+                enabled: Some(report.enabled),
+                older_than_days: Some(report.older_than_days),
+                interval_sec: Some(report.interval_sec),
+                marker_path: Some(report.marker_path.display().to_string()),
+                last_trigger_unix: report.last_trigger_unix,
+                next_due_in_sec: Some(report.next_due_in_sec),
+                error: None,
+            }
+        }
+        Err(err) => DoctorAutoTombstoneGcStatusReport {
+            enabled: None,
+            older_than_days: None,
+            interval_sec: None,
+            marker_path: None,
+            last_trigger_unix: None,
+            next_due_in_sec: None,
+            error: Some(format!("{err:#}")),
+        },
+    };
+
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
     let (swarm_value, swarm_load_error) = match config::load_swarm_key(&swarm_key_path) {
         Ok(value) => (
@@ -2217,6 +2316,7 @@ fn build_doctor_report(
         record_ignore_regex,
         async_upload,
         auto_prune,
+        auto_tombstone_gc,
         swarm_key,
         p2p_identity_key,
         relay_identity_key,
@@ -2506,6 +2606,25 @@ fn run_doctor(
             );
         }
         Err(err) => println!("auto prune: invalid: {err:#}"),
+    }
+    match load_auto_tombstone_gc_runtime_settings(cfg) {
+        Ok(settings) => {
+            let report = summarize_auto_tombstone_gc_runtime(settings, now_unix);
+            let last_trigger = report
+                .last_trigger_unix
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "auto tombstone gc: enabled={} older_than_days={} interval_sec={} marker_path={} last_trigger_unix={} next_due_in_sec={}",
+                report.enabled,
+                report.older_than_days,
+                report.interval_sec,
+                report.marker_path.display(),
+                last_trigger,
+                report.next_due_in_sec,
+            );
+        }
+        Err(err) => println!("auto tombstone gc: invalid: {err:#}"),
     }
 
     let swarm_key_path = resolve_swarm_key_path(None, cfg);
@@ -3987,6 +4106,7 @@ mod tests {
         assert!(json.contains("\"hook\""));
         assert!(json.contains("\"async_upload\""));
         assert!(json.contains("\"auto_prune\""));
+        assert!(json.contains("\"auto_tombstone_gc\""));
         assert!(json.contains("\"relay_addr\""));
         assert!(json.contains("\"tracker_token\""));
     }
@@ -4654,6 +4774,30 @@ mod tests {
     }
 
     #[test]
+    fn tombstone_gc_parses_flags() {
+        let app = App::parse_from([
+            "rr",
+            "tombstone-gc",
+            "--older-than-days",
+            "30",
+            "--apply",
+            "--vacuum",
+        ]);
+        match app.cmd {
+            Command::TombstoneGc {
+                older_than_days,
+                apply,
+                vacuum,
+            } => {
+                assert_eq!(older_than_days, 30);
+                assert!(apply);
+                assert!(vacuum);
+            }
+            _ => panic!("expected tombstone-gc"),
+        }
+    }
+
+    #[test]
     fn delete_parses_selectors_and_safety_flags() {
         let app = App::parse_from([
             "rr",
@@ -5019,6 +5163,19 @@ mod tests {
             .contains("auto_prune_days must be >= 1")
         );
         assert!(
+            resolve_u64_setting(
+                "RUSTORY_AUTO_TOMBSTONE_GC_DAYS",
+                "auto_tombstone_gc_days",
+                None,
+                Some(0),
+                DEFAULT_AUTO_TOMBSTONE_GC_DAYS,
+                1,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("auto_tombstone_gc_days must be >= 1")
+        );
+        assert!(
             resolve_usize_setting(
                 "RUSTORY_ASYNC_UPLOAD_LIMIT",
                 "async_upload_limit",
@@ -5087,6 +5244,26 @@ mod tests {
         assert_eq!(report.older_than_days, 180);
         assert_eq!(report.interval_sec, 86_400);
         assert_eq!(report.keep_recent, 5000);
+        assert_eq!(report.last_trigger_unix, Some(1_000_000));
+        assert_eq!(report.next_due_in_sec, 86_100);
+    }
+
+    #[test]
+    fn summarize_auto_tombstone_gc_runtime_reports_marker_and_next_due() {
+        let report = summarize_auto_tombstone_gc_runtime(
+            AutoTombstoneGcRuntimeSettings {
+                enabled: true,
+                older_than_days: 90,
+                interval_sec: 86_400,
+                marker_path: std::path::PathBuf::from("/tmp/auto-tombstone-gc.last"),
+                last_trigger_unix: Some(1_000_000),
+            },
+            1_000_300,
+        );
+
+        assert!(report.enabled);
+        assert_eq!(report.older_than_days, 90);
+        assert_eq!(report.interval_sec, 86_400);
         assert_eq!(report.last_trigger_unix, Some(1_000_000));
         assert_eq!(report.next_due_in_sec, 86_100);
     }
@@ -5235,6 +5412,7 @@ mod tests {
         assert!(text.contains("record_ignore_regex"));
         assert!(text.contains("async_upload"));
         assert!(text.contains("auto_prune"));
+        assert!(text.contains("auto_tombstone_gc"));
     }
 
     #[test]

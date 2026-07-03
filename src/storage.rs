@@ -628,6 +628,35 @@ ORDER BY ids.peer_id ASC
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
+    fn known_sync_peer_ids(&self) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                r#"
+SELECT peer_id
+FROM (
+  SELECT peer_id FROM peer_state
+  UNION
+  SELECT peer_id FROM peer_push_state
+  UNION
+  SELECT peer_id FROM peer_delete_state
+  UNION
+  SELECT peer_id FROM peer_delete_push_state
+  UNION
+  SELECT peer_id FROM peer_book
+) ids
+ORDER BY peer_id ASC
+"#,
+            )
+            .context("prepare known_sync_peer_ids")?;
+
+        let rows = stmt
+            .query_map([], |row| row.get(0))
+            .context("query known_sync_peer_ids")?;
+
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
     #[cfg(test)]
     pub fn list_peer_book_last_seen_map(&self) -> Result<HashMap<String, i64>> {
         let mut stmt = self
@@ -867,6 +896,91 @@ WHERE ts < ?
                     params![cutoff_unix],
                 )
                 .context("delete pruned entries")?,
+        };
+
+        Ok(PruneStats {
+            matched: matched as usize,
+            deleted,
+        })
+    }
+
+    fn tombstone_gc_delete_floor_seq(&self) -> Result<Option<i64>> {
+        let peer_ids = self.known_sync_peer_ids()?;
+        if peer_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let mut floor = i64::MAX;
+        for peer_id in peer_ids {
+            let seq = self.get_last_pushed_delete_seq_opt(&peer_id)?.unwrap_or(0);
+            floor = floor.min(seq);
+        }
+
+        Ok(Some(floor))
+    }
+
+    pub fn gc_tombstones_older_than(&self, cutoff_unix: i64, dry_run: bool) -> Result<PruneStats> {
+        let delete_floor_seq = self.tombstone_gc_delete_floor_seq()?;
+
+        let matched: i64 = match delete_floor_seq {
+            Some(delete_floor_seq) => self
+                .conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entry_deletions
+WHERE deleted_at < ?
+  AND delete_seq <= ?
+"#,
+                    params![cutoff_unix, delete_floor_seq],
+                    |row| row.get(0),
+                )
+                .context("count tombstone gc candidates with delete push floor")?,
+            None => self
+                .conn
+                .query_row(
+                    r#"
+SELECT COUNT(*)
+FROM entry_deletions
+WHERE deleted_at < ?
+"#,
+                    params![cutoff_unix],
+                    |row| row.get(0),
+                )
+                .context("count tombstone gc candidates")?,
+        };
+
+        if dry_run || matched <= 0 {
+            return Ok(PruneStats {
+                matched: matched.max(0) as usize,
+                deleted: 0,
+            });
+        }
+
+        // 삭제 tombstone은 오래된 peer의 재삽입을 막는 유일한 장치다.
+        // 알려진 peer가 하나라도 해당 delete_seq를 못 받았으면 지우지 않는다.
+        let deleted = match delete_floor_seq {
+            Some(delete_floor_seq) => self
+                .conn
+                .execute(
+                    r#"
+DELETE FROM entry_deletions
+WHERE deleted_at < ?
+  AND delete_seq <= ?
+"#,
+                    params![cutoff_unix, delete_floor_seq],
+                )
+                .context("delete tombstones with delete push floor")?,
+            None => self
+                .conn
+                .execute(
+                    r#"
+DELETE FROM entry_deletions
+WHERE deleted_at < ?
+"#,
+                    params![cutoff_unix],
+                )
+                .context("delete tombstones")?,
         };
 
         Ok(PruneStats {
@@ -1622,6 +1736,9 @@ CREATE TABLE IF NOT EXISTS entry_deletions (
 CREATE INDEX IF NOT EXISTS idx_entry_deletions_device_seq
 ON entry_deletions(device_id, delete_seq);
 
+CREATE INDEX IF NOT EXISTS idx_entry_deletions_deleted_at_seq
+ON entry_deletions(deleted_at, delete_seq);
+
 CREATE TABLE IF NOT EXISTS peer_state (
   peer_id TEXT PRIMARY KEY,
   last_cursor INTEGER NOT NULL
@@ -2123,6 +2240,124 @@ mod tests {
         let remaining = store.list_recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].entry_id, "id-3");
+    }
+
+    #[test]
+    fn gc_tombstones_older_than_supports_dry_run_and_apply_without_peers() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let e1 = entry("id-1", 10, "echo 1");
+        let e2 = entry("id-2", 20, "echo 2");
+        store.insert_entries(&[e1, e2]).unwrap();
+        store
+            .apply_entry_deletions_with_stats(&[
+                EntryDeletion {
+                    entry_id: "id-1".to_string(),
+                    user_id: "user1".to_string(),
+                    device_id: "dev1".to_string(),
+                    deleted_at: 100,
+                },
+                EntryDeletion {
+                    entry_id: "id-2".to_string(),
+                    user_id: "user1".to_string(),
+                    device_id: "dev1".to_string(),
+                    deleted_at: 120,
+                },
+            ])
+            .unwrap();
+
+        let dry = store.gc_tombstones_older_than(200, true).unwrap();
+        assert_eq!(
+            dry,
+            PruneStats {
+                matched: 2,
+                deleted: 0
+            }
+        );
+        assert_eq!(store.count_deletions_after_seq(0, None).unwrap(), 2);
+
+        let applied = store.gc_tombstones_older_than(200, false).unwrap();
+        assert_eq!(
+            applied,
+            PruneStats {
+                matched: 2,
+                deleted: 2
+            }
+        );
+        assert_eq!(store.count_deletions_after_seq(0, None).unwrap(), 0);
+    }
+
+    #[test]
+    fn gc_tombstones_older_than_waits_for_known_delete_push_peers() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some("dev-a".to_string()),
+                last_seen_unix: 100,
+            })
+            .unwrap();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-b".to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/2/p2p/peer-b".to_string()],
+                user_id: Some("user1".to_string()),
+                device_id: Some("dev-b".to_string()),
+                last_seen_unix: 100,
+            })
+            .unwrap();
+
+        let e1 = entry("id-1", 10, "echo 1");
+        let e2 = entry("id-2", 20, "echo 2");
+        store.insert_entries(&[e1, e2]).unwrap();
+        store
+            .apply_entry_deletions_with_stats(&[
+                EntryDeletion {
+                    entry_id: "id-1".to_string(),
+                    user_id: "user1".to_string(),
+                    device_id: "dev1".to_string(),
+                    deleted_at: 100,
+                },
+                EntryDeletion {
+                    entry_id: "id-2".to_string(),
+                    user_id: "user1".to_string(),
+                    device_id: "dev1".to_string(),
+                    deleted_at: 120,
+                },
+            ])
+            .unwrap();
+
+        store.advance_last_pushed_delete_seq("peer-a", 2).unwrap();
+        assert_eq!(
+            store.gc_tombstones_older_than(200, false).unwrap(),
+            PruneStats {
+                matched: 0,
+                deleted: 0
+            }
+        );
+
+        store.advance_last_pushed_delete_seq("peer-b", 1).unwrap();
+        assert_eq!(
+            store.gc_tombstones_older_than(200, false).unwrap(),
+            PruneStats {
+                matched: 1,
+                deleted: 1
+            }
+        );
+        assert_eq!(store.count_deletions_after_seq(0, None).unwrap(), 1);
+
+        store.advance_last_pushed_delete_seq("peer-b", 2).unwrap();
+        assert_eq!(
+            store.gc_tombstones_older_than(200, false).unwrap(),
+            PruneStats {
+                matched: 1,
+                deleted: 1
+            }
+        );
+        assert_eq!(store.count_deletions_after_seq(0, None).unwrap(), 0);
     }
 
     #[test]

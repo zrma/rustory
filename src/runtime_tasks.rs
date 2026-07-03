@@ -11,6 +11,10 @@ pub(crate) const DEFAULT_AUTO_PRUNE_DAYS: u64 = 180;
 pub(crate) const DEFAULT_AUTO_PRUNE_INTERVAL_SEC: u64 = 86_400;
 pub(crate) const DEFAULT_AUTO_PRUNE_KEEP_RECENT: usize = 0;
 pub(crate) const DEFAULT_AUTO_PRUNE_MARKER_PATH: &str = "~/.config/rustory/auto-prune.last";
+pub(crate) const DEFAULT_AUTO_TOMBSTONE_GC_DAYS: u64 = 90;
+pub(crate) const DEFAULT_AUTO_TOMBSTONE_GC_INTERVAL_SEC: u64 = 86_400;
+pub(crate) const DEFAULT_AUTO_TOMBSTONE_GC_MARKER_PATH: &str =
+    "~/.config/rustory/auto-tombstone-gc.last";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AsyncUploadRuntimeSettings {
@@ -32,10 +36,29 @@ pub(crate) struct AutoPruneRuntimeSettings {
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct AutoTombstoneGcRuntimeSettings {
+    pub(crate) enabled: bool,
+    pub(crate) older_than_days: u64,
+    pub(crate) interval_sec: u64,
+    pub(crate) marker_path: PathBuf,
+    pub(crate) last_trigger_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct AsyncUploadDoctorReport {
     pub(crate) enabled: bool,
     pub(crate) interval_sec: u64,
     pub(crate) limit: usize,
+    pub(crate) marker_path: PathBuf,
+    pub(crate) last_trigger_unix: Option<i64>,
+    pub(crate) next_due_in_sec: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct AutoTombstoneGcDoctorReport {
+    pub(crate) enabled: bool,
+    pub(crate) older_than_days: u64,
+    pub(crate) interval_sec: u64,
     pub(crate) marker_path: PathBuf,
     pub(crate) last_trigger_unix: Option<i64>,
     pub(crate) next_due_in_sec: u64,
@@ -122,6 +145,40 @@ pub(crate) fn summarize_auto_prune_runtime(
     }
 }
 
+pub(crate) fn load_auto_tombstone_gc_runtime_settings(
+    cfg: &config::FileConfig,
+) -> Result<AutoTombstoneGcRuntimeSettings> {
+    let marker_path_raw = resolve_auto_tombstone_gc_marker_path(cfg);
+    let marker_path = config::expand_home_path(&marker_path_raw)
+        .with_context(|| format!("expand auto tombstone gc marker path: {marker_path_raw}"))?;
+
+    Ok(AutoTombstoneGcRuntimeSettings {
+        enabled: resolve_auto_tombstone_gc_enabled(cfg)?,
+        older_than_days: resolve_auto_tombstone_gc_days(cfg)?,
+        interval_sec: resolve_auto_tombstone_gc_interval_sec(cfg)?,
+        last_trigger_unix: read_rate_limit_marker(&marker_path)?,
+        marker_path,
+    })
+}
+
+pub(crate) fn summarize_auto_tombstone_gc_runtime(
+    settings: AutoTombstoneGcRuntimeSettings,
+    now_unix: i64,
+) -> AutoTombstoneGcDoctorReport {
+    AutoTombstoneGcDoctorReport {
+        enabled: settings.enabled,
+        older_than_days: settings.older_than_days,
+        interval_sec: settings.interval_sec,
+        marker_path: settings.marker_path,
+        last_trigger_unix: settings.last_trigger_unix,
+        next_due_in_sec: compute_next_due_in_sec(
+            now_unix,
+            settings.last_trigger_unix,
+            settings.interval_sec,
+        ),
+    }
+}
+
 pub(crate) fn compute_next_due_in_sec(
     now_unix: i64,
     last_trigger_unix: Option<i64>,
@@ -197,6 +254,38 @@ pub(crate) fn maybe_run_auto_prune(
         eprintln!(
             "info: auto prune deleted={} older_than_days={} keep_recent={} cutoff_unix={}",
             stats.deleted, older_than_days, keep_recent, cutoff_unix
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) fn maybe_run_auto_tombstone_gc(
+    store: &storage::LocalStore,
+    cfg: &config::FileConfig,
+) -> Result<()> {
+    if !resolve_auto_tombstone_gc_enabled(cfg)? {
+        return Ok(());
+    }
+
+    let older_than_days = resolve_auto_tombstone_gc_days(cfg)?;
+    let min_interval_sec = resolve_auto_tombstone_gc_interval_sec(cfg)?;
+    let marker_path = config::expand_home_path(&resolve_auto_tombstone_gc_marker_path(cfg))?;
+
+    let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let last_trigger_unix = read_rate_limit_marker(&marker_path)?;
+    if !should_trigger_interval(now_unix, last_trigger_unix, min_interval_sec) {
+        return Ok(());
+    }
+
+    let cutoff_unix = compute_prune_cutoff_unix(now_unix, older_than_days)?;
+    let stats = store.gc_tombstones_older_than(cutoff_unix, false)?;
+    write_rate_limit_marker(&marker_path, now_unix)?;
+
+    if stats.deleted > 0 {
+        eprintln!(
+            "info: auto tombstone gc deleted={} older_than_days={} cutoff_unix={}",
+            stats.deleted, older_than_days, cutoff_unix
         );
     }
 
@@ -430,6 +519,45 @@ fn resolve_auto_prune_marker_path(cfg: &config::FileConfig) -> String {
         env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH"),
         cfg.auto_prune_marker_path.clone(),
         DEFAULT_AUTO_PRUNE_MARKER_PATH,
+    )
+}
+
+fn resolve_auto_tombstone_gc_enabled(cfg: &config::FileConfig) -> Result<bool> {
+    resolve_bool_setting(
+        "RUSTORY_AUTO_TOMBSTONE_GC",
+        env_nonempty("RUSTORY_AUTO_TOMBSTONE_GC"),
+        cfg.auto_tombstone_gc,
+        false,
+    )
+}
+
+fn resolve_auto_tombstone_gc_days(cfg: &config::FileConfig) -> Result<u64> {
+    resolve_u64_setting(
+        "RUSTORY_AUTO_TOMBSTONE_GC_DAYS",
+        "auto_tombstone_gc_days",
+        env_nonempty("RUSTORY_AUTO_TOMBSTONE_GC_DAYS"),
+        cfg.auto_tombstone_gc_days,
+        DEFAULT_AUTO_TOMBSTONE_GC_DAYS,
+        1,
+    )
+}
+
+fn resolve_auto_tombstone_gc_interval_sec(cfg: &config::FileConfig) -> Result<u64> {
+    resolve_u64_setting(
+        "RUSTORY_AUTO_TOMBSTONE_GC_INTERVAL_SEC",
+        "auto_tombstone_gc_interval_sec",
+        env_nonempty("RUSTORY_AUTO_TOMBSTONE_GC_INTERVAL_SEC"),
+        cfg.auto_tombstone_gc_interval_sec,
+        DEFAULT_AUTO_TOMBSTONE_GC_INTERVAL_SEC,
+        1,
+    )
+}
+
+fn resolve_auto_tombstone_gc_marker_path(cfg: &config::FileConfig) -> String {
+    resolve_string_setting(
+        env_nonempty("RUSTORY_AUTO_TOMBSTONE_GC_MARKER_PATH"),
+        cfg.auto_tombstone_gc_marker_path.clone(),
+        DEFAULT_AUTO_TOMBSTONE_GC_MARKER_PATH,
     )
 }
 

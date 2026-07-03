@@ -273,6 +273,7 @@ relay circuit 관측 기준은 `docs/p2p.md`와 Docker relay-only acceptance 문
 - 서로 다른 `user_id`로 import하면 Hishtory `entry_id`가 같아도 Rustory entry id가 달라진다.
 - Hishtory import 후 같은 명령이 여러 번 남아 있으면 `rr dedupe`로 로컬 중복 row를 먼저 dry-run 확인한 뒤 `--apply`로 정리할 수 있다. 적용 시 삭제 tombstone이 남고 peer로 전파된다.
 - `rr delete`도 삭제 tombstone을 남겨 peer로 전파된다. 이미 다른 peer로 전파된 민감 row는 `rr sync-status --json --with-tracker`에서 deletion pending이 0까지 줄어드는지 확인한다.
+- 삭제 tombstone은 stale peer의 재삽입 방지 장치다. 충분히 오래 보존하고 모든 알려진 peer의 delete cursor가 따라온 뒤에만 `rr tombstone-gc --older-than-days <days> --apply`로 정리한다.
 - SQLite 파일/WAL에 남은 삭제 흔적까지 줄여야 하면 `rr delete ... --yes --vacuum`을 사용한다.
 
 ## 검증 경로

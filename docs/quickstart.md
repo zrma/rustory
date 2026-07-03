@@ -234,7 +234,34 @@ rr dedupe --keep oldest --older-than-days 14 --apply --vacuum
 
 `rr dedupe --apply`는 삭제 tombstone을 남겨 peer로 전파된다. 아직 peer로 push되지 않은 row는 peer push cursor 기준으로 삭제 후보에서 제외되며, tombstone 자체도 각 peer의 delete cursor가 따라올 때까지 `rr sync-status --json`의 deletion pending으로 보일 수 있다.
 
-### 2-8) (선택) 민감 로컬 엔트리 삭제
+### 2-8) (선택) 전파 완료된 삭제 tombstone 정리
+삭제 tombstone은 이미 삭제한 row가 오래된 peer나 재import 경로에서 다시 살아나는 것을 막는다. 따라서 바로 지우지 말고, 먼저 오래된 tombstone 후보만 확인한다.
+
+```sh
+rr tombstone-gc --older-than-days 90
+```
+
+결과가 의도와 같으면 명시 적용한다. SQLite 파일 크기까지 줄여야 하면 `--vacuum`을 같이 쓴다.
+
+```sh
+rr tombstone-gc --older-than-days 90 --apply
+rr tombstone-gc --older-than-days 90 --apply --vacuum
+```
+
+알려진 peer가 하나라도 있으면 Rustory는 각 peer의 delete push cursor가 해당 tombstone의 `delete_seq`를 따라온 것만 GC한다. 알려진 peer가 전혀 없는 단일 머신 DB에서는 age 기준만 적용된다. 몇 주 이상 꺼져 있던 새/구 peer는 GC된 tombstone을 받을 수 없으므로, 운영 grid에서는 `rr sync-status --json --with-tracker`의 deletion pending이 0으로 안정된 뒤 긴 보존 기간을 두고 실행한다.
+
+자동 정리가 필요하면 기본 off 상태에서 명시적으로 켠다.
+
+```toml
+auto_tombstone_gc = true
+auto_tombstone_gc_days = 90
+auto_tombstone_gc_interval_sec = 86400
+auto_tombstone_gc_marker_path = "~/.config/rustory/auto-tombstone-gc.last"
+```
+
+설정 해석/주기 상태는 `rr doctor`의 `auto tombstone gc` 라인에서 확인한다.
+
+### 2-9) (선택) 민감 로컬 엔트리 삭제
 `record_ignore_regex`는 기록/import 전 차단이 목적이다. 이미 들어간 로컬 row는 먼저 dry-run으로 확인한다.
 
 ```sh
