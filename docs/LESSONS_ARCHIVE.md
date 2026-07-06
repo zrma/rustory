@@ -4,6 +4,7 @@
 
 ## Todo Closure Tokens
 
+- 2026-07-06: `todo-shell-hook-replace-buffer`
 - 2026-07-03: `todo-release-v1-0-27`
 - 2026-07-02: `todo-release-v1-0-26`
 - 2026-07-02: `todo-mesh-watch-stable-order`

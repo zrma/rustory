@@ -391,13 +391,19 @@ esac
 
 __rustory_ctrl_r() {
   __rustory_hook_disabled && return 0
-  local selected
+  local original_line original_point selected
+  original_line="$READLINE_LINE"
+  original_point="$READLINE_POINT"
   # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
-  selected="$(rr search)" || return 0
-  [[ -z "$selected" ]] && return 0
+  selected="$(rr search)" || selected=""
+  if [[ -z "$selected" ]]; then
+    READLINE_LINE="$original_line"
+    READLINE_POINT="$original_point"
+    return 0
+  fi
 
-  READLINE_LINE="${READLINE_LINE:0:$READLINE_POINT}$selected${READLINE_LINE:$READLINE_POINT}"
-  READLINE_POINT=$(( READLINE_POINT + ${#selected} ))
+  READLINE_LINE="$selected"
+  READLINE_POINT=${#READLINE_LINE}
 }
 
 bind -x '"\C-r":__rustory_ctrl_r'
@@ -485,12 +491,18 @@ add-zsh-hook precmd __rustory_precmd
 
 __rustory_widget_ctrl_r() {
   __rustory_hook_disabled && return 0
+  local original_buffer original_cursor selected
+  original_buffer="$BUFFER"
+  original_cursor="$CURSOR"
   zle -I
-  local selected
   # RUSTORY_SEARCH_LIMIT는 rr search 내부에서 config.toml보다 우선한다.
-  selected="$(rr search)" || return 0
+  selected="$(rr search)" || selected=""
   if [[ -n "$selected" ]]; then
-    LBUFFER+="$selected"
+    BUFFER="$selected"
+    CURSOR=${#BUFFER}
+  else
+    BUFFER="$original_buffer"
+    CURSOR="$original_cursor"
   fi
   zle redisplay
 }
@@ -517,6 +529,11 @@ mod tests {
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
+        assert!(got.contains("original_line=\"$READLINE_LINE\""));
+        assert!(got.contains("original_point=\"$READLINE_POINT\""));
+        assert!(got.contains("READLINE_LINE=\"$selected\""));
+        assert!(got.contains("READLINE_POINT=${#READLINE_LINE}"));
+        assert!(!got.contains("READLINE_LINE=\"${READLINE_LINE:0:$READLINE_POINT}$selected"));
         assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
         assert!(got.contains("trap '__rustory_preexec' DEBUG"));
         assert!(got.contains("__rustory_epoch_ms()"));
@@ -536,6 +553,11 @@ mod tests {
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
+        assert!(got.contains("original_buffer=\"$BUFFER\""));
+        assert!(got.contains("original_cursor=\"$CURSOR\""));
+        assert!(got.contains("BUFFER=\"$selected\""));
+        assert!(got.contains("CURSOR=${#BUFFER}"));
+        assert!(!got.contains("LBUFFER+=\"$selected\""));
         assert!(got.contains("bindkey '^R'"));
         assert!(got.contains("zle -I"));
         assert!(got.contains("[[ -o interactive ]]"));
