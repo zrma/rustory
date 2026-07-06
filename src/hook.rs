@@ -279,10 +279,6 @@ fn render_bash_hook() -> String {
     r#"# rustory (rr) bash hook
 # 설치(예): source <(rr hook --shell bash)
 
-if [[ -n "${__RUSTORY_HOOK_INSTALLED:-}" ]]; then
-  export RUSTORY_HOOK_INSTALLED=1
-  return 0
-fi
 __RUSTORY_HOOK_INSTALLED=1
 export RUSTORY_HOOK_INSTALLED=1
 
@@ -415,10 +411,6 @@ fn render_zsh_hook() -> String {
     r#"# rustory (rr) zsh hook
 # 설치(예): source <(rr hook --shell zsh)
 
-if [[ -n "${__RUSTORY_HOOK_INSTALLED:-}" ]]; then
-  export RUSTORY_HOOK_INSTALLED=1
-  return 0
-fi
 typeset -g __RUSTORY_HOOK_INSTALLED=1
 export RUSTORY_HOOK_INSTALLED=1
 
@@ -486,6 +478,8 @@ __rustory_precmd() {
   ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "zsh" --hostname "${HOST:-}" >/dev/null 2>&1 ) &!
 }
 
+add-zsh-hook -d preexec __rustory_preexec 2>/dev/null || true
+add-zsh-hook -d precmd __rustory_precmd 2>/dev/null || true
 add-zsh-hook preexec __rustory_preexec
 add-zsh-hook precmd __rustory_precmd
 
@@ -526,6 +520,7 @@ mod tests {
         assert!(got.contains("__rustory_hook_disabled()"));
         assert!(got.contains("0|false|False|FALSE|no|No|NO|off|Off|OFF"));
         assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
+        assert!(!got.contains("${__RUSTORY_HOOK_INSTALLED:-}"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
@@ -550,6 +545,9 @@ mod tests {
         assert!(got.contains("__rustory_hook_disabled()"));
         assert!(got.contains("0|false|False|FALSE|no|No|NO|off|Off|OFF"));
         assert!(got.contains("export RUSTORY_HOOK_INSTALLED=1"));
+        assert!(!got.contains("${__RUSTORY_HOOK_INSTALLED:-}"));
+        assert!(got.contains("add-zsh-hook -d preexec __rustory_preexec"));
+        assert!(got.contains("add-zsh-hook -d precmd __rustory_precmd"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
