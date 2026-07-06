@@ -1378,10 +1378,16 @@ fn sync_target_is_self(
     }
     match (peer_device_id, local_device_id) {
         (Some(peer_device_id), Some(local_device_id)) => {
-            device_ids_match(peer_device_id, local_device_id)
+            device_ids_are_exact_match(peer_device_id, local_device_id)
         }
         _ => false,
     }
+}
+
+fn device_ids_are_exact_match(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    !a.is_empty() && a == b
 }
 
 fn device_ids_match(a: &str, b: &str) -> bool {
@@ -2687,6 +2693,7 @@ mod tests {
         let local_peer_id = identity.public().to_peer_id().to_string();
         let stale_self_peer_id = PeerId::random().to_string();
         let remote_peer_id = PeerId::random().to_string();
+        let same_stem_remote_peer_id = PeerId::random().to_string();
         let relay_id = PeerId::random();
         let relay_addr = format!("/ip4/127.0.0.1/tcp/4001/p2p/{relay_id}");
 
@@ -2694,8 +2701,9 @@ mod tests {
             (local_peer_id.clone(), "remote-looking-device"),
             (stale_self_peer_id, " dev-local "),
             (remote_peer_id.clone(), "dev-remote"),
+            (same_stem_remote_peer_id.clone(), "dev-local-x86_64"),
         ] {
-            let addrs = if peer_id == remote_peer_id {
+            let addrs = if peer_id == remote_peer_id || peer_id == same_stem_remote_peer_id {
                 vec![format!("{relay_addr}/p2p-circuit/p2p/{peer_id}")]
             } else {
                 vec![format!("/ip4/127.0.0.1/tcp/1234/p2p/{peer_id}")]
@@ -2724,8 +2732,32 @@ mod tests {
         };
 
         let got = discover_targets(&store, &cfg).unwrap();
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].peer_key, remote_peer_id);
+        let got_keys: HashSet<_> = got.iter().map(|target| target.peer_key.as_str()).collect();
+        assert_eq!(got_keys.len(), 2);
+        assert!(got_keys.contains(remote_peer_id.as_str()));
+        assert!(got_keys.contains(same_stem_remote_peer_id.as_str()));
+    }
+
+    #[test]
+    fn sync_target_is_self_does_not_collapse_arch_suffix_devices() {
+        assert!(sync_target_is_self(
+            "peer-remote",
+            Some(" samplex-arm64 "),
+            "peer-local",
+            Some("samplex-arm64")
+        ));
+        assert!(!sync_target_is_self(
+            "peer-remote",
+            Some("samplex-x86_64"),
+            "peer-local",
+            Some("samplex-arm64")
+        ));
+        assert!(!sync_target_is_self(
+            "peer-remote",
+            Some("node1-x86_64"),
+            "peer-local",
+            Some("node1")
+        ));
     }
 
     #[test]
@@ -2837,13 +2869,6 @@ mod tests {
         renamed.device_id = "node1-x86_64".to_string();
 
         validate_push_provenance(&[renamed], &authorized).unwrap();
-
-        assert!(sync_target_is_self(
-            "peer-remote",
-            Some("node1-x86_64"),
-            "peer-local",
-            Some("node1")
-        ));
     }
 
     #[test]
