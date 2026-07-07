@@ -28,12 +28,20 @@ struct SyncStatusWatchPeerRates {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MeshWatchTotals {
+struct SyncStatusWatchTotals {
     progress: usize,
     pending: usize,
+    pending_entries: usize,
+    pending_deletions: usize,
     pull_rate: f64,
     push_rate: f64,
     drain_rate: f64,
+    queued: usize,
+    stale: usize,
+    active: usize,
+    idle: usize,
+    direct_pull_zero: usize,
+    oldest_seen_age_sec: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -206,12 +214,12 @@ enum SyncStatusWatchPeerUiState {
 
 impl SyncStatusWatchPeerUiState {
     fn classify(view: &SyncStatusWatchPeerView<'_>) -> Self {
-        let old_seen = sync_status_watch_peer_seen_is_old(view);
-        let queued = sync_status_watch_peer_has_pending(view);
-        let active = sync_status_watch_peer_is_active(view);
+        let old_seen = view.seen_is_old();
+        let queued = view.has_pending();
+        let active = view.is_active();
         if old_seen && queued {
             Self::Stale
-        } else if queued && sync_status_watch_peer_is_push_moving(view) {
+        } else if queued && view.is_push_moving() {
             Self::Sending
         } else if queued {
             Self::Queued
@@ -242,6 +250,93 @@ impl SyncStatusWatchPeerUiState {
             Self::Active => "active",
             Self::Idle => "idle",
             Self::Ok => "ok",
+        }
+    }
+}
+
+impl SyncStatusWatchPeerView<'_> {
+    fn state(&self) -> SyncStatusWatchPeerUiState {
+        SyncStatusWatchPeerUiState::classify(self)
+    }
+
+    fn has_pending(&self) -> bool {
+        self.peer.outbound_push_pending > 0
+    }
+
+    fn is_active(&self) -> bool {
+        self.rates.pull_per_sec > 0.0 || self.rates.push_per_sec > 0.0
+    }
+
+    fn is_push_moving(&self) -> bool {
+        self.rates.pending_drain_per_sec > 0.0 || self.rates.push_per_sec > 0.0
+    }
+
+    fn seen_is_old(&self) -> bool {
+        self.peer.last_seen_age_sec.is_some_and(|age| age > 300)
+    }
+}
+
+impl SyncStatusWatchTotals {
+    fn from_peer_views(peer_views: &[SyncStatusWatchPeerView<'_>]) -> Self {
+        let pending: usize = peer_views
+            .iter()
+            .map(|view| view.peer.outbound_push_pending)
+            .sum();
+        let pending_entries: usize = peer_views
+            .iter()
+            .map(|view| view.peer.outbound_push_pending_entries)
+            .sum();
+        let pending_deletions: usize = peer_views
+            .iter()
+            .map(|view| view.peer.outbound_push_pending_deletions)
+            .sum();
+        let baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
+        let pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
+        let push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
+        let drain_rate: f64 = peer_views
+            .iter()
+            .map(|view| view.rates.pending_drain_per_sec.max(0.0))
+            .sum();
+
+        let mut queued = 0;
+        let mut stale = 0;
+        let mut active = 0;
+        let mut idle = 0;
+        let mut direct_pull_zero = 0;
+        let mut oldest_seen_age_sec = None;
+
+        for view in peer_views {
+            if view.has_pending() {
+                queued += 1;
+            }
+            if view.is_active() {
+                active += 1;
+            }
+            if view.peer.pull_cursor == 0 {
+                direct_pull_zero += 1;
+            }
+            oldest_seen_age_sec = oldest_seen_age_sec.max(view.peer.last_seen_age_sec);
+            match view.state() {
+                SyncStatusWatchPeerUiState::Stale => stale += 1,
+                SyncStatusWatchPeerUiState::Idle => idle += 1,
+                _ => {}
+            }
+        }
+
+        Self {
+            progress: outbound_push_progress_percent(pending, baseline),
+            pending,
+            pending_entries,
+            pending_deletions,
+            pull_rate,
+            push_rate,
+            drain_rate,
+            queued,
+            stale,
+            active,
+            idle,
+            direct_pull_zero,
+            oldest_seen_age_sec,
         }
     }
 }
@@ -287,23 +382,7 @@ fn sync_status_watch_peer_status(view: &SyncStatusWatchPeerView<'_>) -> &'static
 }
 
 fn sync_status_watch_peer_state(view: &SyncStatusWatchPeerView<'_>) -> SyncStatusWatchPeerUiState {
-    SyncStatusWatchPeerUiState::classify(view)
-}
-
-fn sync_status_watch_peer_has_pending(view: &SyncStatusWatchPeerView<'_>) -> bool {
-    view.peer.outbound_push_pending > 0
-}
-
-fn sync_status_watch_peer_is_active(view: &SyncStatusWatchPeerView<'_>) -> bool {
-    view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0
-}
-
-fn sync_status_watch_peer_is_push_moving(view: &SyncStatusWatchPeerView<'_>) -> bool {
-    view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0
-}
-
-fn sync_status_watch_peer_seen_is_old(view: &SyncStatusWatchPeerView<'_>) -> bool {
-    view.peer.last_seen_age_sec.is_some_and(|age| age > 300)
+    view.state()
 }
 
 pub(crate) fn render_sync_status_watch_frame(
@@ -325,18 +404,9 @@ pub(crate) fn render_sync_status_watch_frame(
     state.frame = state.frame.wrapping_add(1);
 
     let mut out = String::new();
-    let total_pending_entries: usize = report
-        .peers
-        .iter()
-        .map(|peer| peer.outbound_push_pending_entries)
-        .sum();
-    let total_pending_deletions: usize = report
-        .peers
-        .iter()
-        .map(|peer| peer.outbound_push_pending_deletions)
-        .sum();
     let peer_views =
         build_sync_status_watch_peer_views(state, report, now, SyncStatusWatchPeerOrder::Attention);
+    let totals = SyncStatusWatchTotals::from_peer_views(&peer_views);
 
     push_watch_line(
         &mut out,
@@ -346,18 +416,14 @@ pub(crate) fn render_sync_status_watch_frame(
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
-            compact_pending_breakdown_counts(total_pending_entries, total_pending_deletions)
+            compact_pending_breakdown_counts(totals.pending_entries, totals.pending_deletions)
         ),
     );
 
     out.push('\n');
-    let mesh_panel = render_overview_panel(
-        report,
-        &peer_views,
-        report.tracker_status.as_deref(),
-        mesh_width,
-    );
-    let traffic_panel = render_traffic_panel(report, &peer_views, traffic_width);
+    let mesh_panel =
+        render_overview_panel(report, report.tracker_status.as_deref(), totals, mesh_width);
+    let traffic_panel = render_traffic_panel(report, &peer_views, totals, traffic_width);
     for line in join_watch_panels(&mesh_panel, &traffic_panel, PANEL_GAP) {
         push_watch_line(&mut out, width, &line);
     }
@@ -433,37 +499,11 @@ pub(crate) fn render_mesh_watch_frame(
         now,
         SyncStatusWatchPeerOrder::StableName,
     );
-    let total_pending: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending)
-        .sum();
-    let total_pending_entries: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending_entries)
-        .sum();
-    let total_pending_deletions: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending_deletions)
-        .sum();
-    let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
-    let total_progress = outbound_push_progress_percent(total_pending, total_baseline);
-    let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
-    let total_push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
-    let total_drain_rate: f64 = peer_views
-        .iter()
-        .map(|view| view.rates.pending_drain_per_sec.max(0.0))
-        .sum();
-    let totals = MeshWatchTotals {
-        progress: total_progress,
-        pending: total_pending,
-        pull_rate: total_pull_rate,
-        push_rate: total_push_rate,
-        drain_rate: total_drain_rate,
-    };
+    let totals = SyncStatusWatchTotals::from_peer_views(&peer_views);
     record_mesh_watch_sample(
         state,
-        total_pending,
-        total_pull_rate + total_push_rate + total_drain_rate,
+        totals.pending,
+        totals.pull_rate + totals.push_rate + totals.drain_rate,
     );
 
     let side_width = (width / 3).clamp(44, 64);
@@ -479,7 +519,7 @@ pub(crate) fn render_mesh_watch_frame(
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
-            compact_pending_breakdown_counts(total_pending_entries, total_pending_deletions),
+            compact_pending_breakdown_counts(totals.pending_entries, totals.pending_deletions),
         ),
     );
     push_watch_line(
@@ -678,36 +718,14 @@ fn render_mesh_outbox_panel(
     trackers: Option<&[SyncStatusTrackerReport]>,
     state: &SyncStatusWatchState,
     panel_width: usize,
-    totals: MeshWatchTotals,
+    totals: SyncStatusWatchTotals,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
-    let queued = peer_views
-        .iter()
-        .filter(|view| view.peer.outbound_push_pending > 0)
-        .count();
-    let stale = peer_views
-        .iter()
-        .filter(|view| {
-            sync_status_watch_peer_seen_is_old(view) && sync_status_watch_peer_has_pending(view)
-        })
-        .count();
-    let old_seen = peer_views
-        .iter()
-        .filter(|view| {
-            sync_status_watch_peer_seen_is_old(view) && !sync_status_watch_peer_has_pending(view)
-        })
-        .count();
-    let active = peer_views
-        .iter()
-        .filter(|view| view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0)
-        .count();
     let hottest = peer_views
         .iter()
         .max_by_key(|view| view.peer.outbound_push_pending);
-    let oldest_seen = peer_views
-        .iter()
-        .filter_map(|view| view.peer.last_seen_age_sec)
-        .max()
+    let oldest_seen = totals
+        .oldest_seen_age_sec
         .map(|age| format!("oldest {}", format_age_sec(age)))
         .unwrap_or_else(|| "oldest unknown".to_string());
 
@@ -754,7 +772,10 @@ fn render_mesh_outbox_panel(
         ),
         traffic_kv_line(
             "health",
-            &format!("{queued} queued   {active} active   {stale} stale   {old_seen} idle"),
+            &format!(
+                "{} queued   {} active   {} stale   {} idle",
+                totals.queued, totals.active, totals.stale, totals.idle
+            ),
             inner_width,
         ),
     ];
@@ -944,7 +965,7 @@ fn mesh_peer_display_name(view: &SyncStatusWatchPeerView<'_>) -> String {
 }
 
 fn mesh_peer_symbol(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
-    if sync_status_watch_peer_seen_is_old(view) {
+    if view.seen_is_old() {
         "◌"
     } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
         "◆"
@@ -1014,51 +1035,11 @@ fn sparkline_f64(values: &[f64], width: usize) -> String {
 
 fn render_overview_panel(
     report: &SyncStatusReport,
-    peer_views: &[SyncStatusWatchPeerView<'_>],
     trackers: Option<&[SyncStatusTrackerReport]>,
+    totals: SyncStatusWatchTotals,
     panel_width: usize,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
-    let total_pending: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending)
-        .sum();
-    let total_pending_entries: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending_entries)
-        .sum();
-    let total_pending_deletions: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending_deletions)
-        .sum();
-    let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
-    let progress = outbound_push_progress_percent(total_pending, total_baseline);
-    let queued = peer_views
-        .iter()
-        .filter(|view| view.peer.outbound_push_pending > 0)
-        .count();
-    let stale = peer_views
-        .iter()
-        .filter(|view| {
-            sync_status_watch_peer_seen_is_old(view) && sync_status_watch_peer_has_pending(view)
-        })
-        .count();
-    let old_seen = peer_views
-        .iter()
-        .filter(|view| {
-            sync_status_watch_peer_seen_is_old(view) && !sync_status_watch_peer_has_pending(view)
-        })
-        .count();
-    let direct_zero = peer_views
-        .iter()
-        .filter(|view| view.peer.pull_cursor == 0)
-        .count();
-    let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
-    let total_push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
-    let total_drain_rate: f64 = peer_views
-        .iter()
-        .map(|view| view.rates.pending_drain_per_sec.max(0.0))
-        .sum();
 
     let body = vec![
         tracker_summary_line(trackers),
@@ -1076,25 +1057,28 @@ fn render_overview_panel(
             "outbox",
             &format!(
                 "{} queued across {} peers",
-                pending_breakdown_counts(total_pending_entries, total_pending_deletions),
-                queued
+                pending_breakdown_counts(totals.pending_entries, totals.pending_deletions),
+                totals.queued
             ),
             inner_width,
         ),
-        traffic_progress_line("progress", progress, total_pending, inner_width),
+        traffic_progress_line("progress", totals.progress, totals.pending, inner_width),
         traffic_kv_line(
             "rates",
             &format!(
                 "pull {}/s   push {}/s   drain {}/s",
-                format_rate(total_pull_rate),
-                format_rate(total_push_rate),
-                format_rate(total_drain_rate)
+                format_rate(totals.pull_rate),
+                format_rate(totals.push_rate),
+                format_rate(totals.drain_rate)
             ),
             inner_width,
         ),
         traffic_kv_line(
             "health",
-            &format!("{stale} stale   {old_seen} idle   {direct_zero} direct_pull=0"),
+            &format!(
+                "{} stale   {} idle   {} direct_pull=0",
+                totals.stale, totals.idle, totals.direct_pull_zero
+            ),
             inner_width,
         ),
         String::new(),
@@ -1114,37 +1098,16 @@ fn render_overview_panel(
 fn render_traffic_panel(
     report: &SyncStatusReport,
     peer_views: &[SyncStatusWatchPeerView<'_>],
+    totals: SyncStatusWatchTotals,
     panel_width: usize,
 ) -> Vec<String> {
     let inner_width = panel_width.saturating_sub(2);
-    let total_pending: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending)
-        .sum();
-    let total_pending_entries: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending_entries)
-        .sum();
-    let total_pending_deletions: usize = peer_views
-        .iter()
-        .map(|view| view.peer.outbound_push_pending_deletions)
-        .sum();
-    let total_baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
-    let total_pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
-    let total_push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
-    let total_drain_rate: f64 = peer_views
-        .iter()
-        .map(|view| view.rates.pending_drain_per_sec.max(0.0))
-        .sum();
-    let progress = outbound_push_progress_percent(total_pending, total_baseline);
     let hottest = peer_views
         .iter()
         .max_by_key(|view| view.peer.outbound_push_pending);
-    let seen = peer_views
-        .iter()
-        .filter_map(|view| view.peer.last_seen_age_sec)
-        .max()
-        .map(|age| format!("oldest {age}s"))
+    let seen = totals
+        .oldest_seen_age_sec
+        .map(|age| format!("oldest {}", format_age_sec(age)))
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut body = vec![
@@ -1159,13 +1122,13 @@ fn render_traffic_panel(
         ),
         traffic_kv_line("seen", &seen, inner_width),
         String::new(),
-        traffic_rate_line("pull", total_pull_rate, inner_width),
-        traffic_rate_line("push", total_push_rate, inner_width),
-        traffic_rate_line("drain", total_drain_rate, inner_width),
+        traffic_rate_line("pull", totals.pull_rate, inner_width),
+        traffic_rate_line("push", totals.push_rate, inner_width),
+        traffic_rate_line("drain", totals.drain_rate, inner_width),
         traffic_progress_line_with_text(
             "to_send",
-            progress,
-            &pending_breakdown_counts(total_pending_entries, total_pending_deletions),
+            totals.progress,
+            &pending_breakdown_counts(totals.pending_entries, totals.pending_deletions),
             inner_width,
         ),
     ];
@@ -1902,6 +1865,104 @@ mod tests {
         assert_eq!(compact_pending_breakdown_counts(42, 0), "R42");
         assert_eq!(compact_pending_breakdown_counts(0, 2), "D2");
         assert_eq!(compact_pending_breakdown_counts(1, 9), "R1 D9");
+    }
+
+    #[test]
+    fn sync_status_watch_totals_preserve_peer_state_accounting() {
+        let mut row_peer = sample_watch_peer(
+            "rows",
+            "12D3KooWR11111111111111111111111111111111111111111111",
+            3,
+            20,
+        );
+        row_peer.pull_cursor = 0;
+        let mut delete_peer = sample_watch_peer(
+            "deletes",
+            "12D3KooWD1111111111111111111111111111111111111111111",
+            2,
+            601,
+        );
+        delete_peer.outbound_push_pending_entries = 0;
+        delete_peer.outbound_push_pending_deletions = 2;
+        let active_peer = sample_watch_peer(
+            "active",
+            "12D3KooWA1111111111111111111111111111111111111111111",
+            0,
+            10,
+        );
+        let idle_peer = sample_watch_peer(
+            "idle",
+            "12D3KooWI1111111111111111111111111111111111111111111",
+            0,
+            601,
+        );
+        let peer_views = vec![
+            SyncStatusWatchPeerView {
+                peer: &row_peer,
+                rates: SyncStatusWatchPeerRates {
+                    pull_per_sec: 0.0,
+                    push_per_sec: 2.0,
+                    pending_drain_per_sec: 1.0,
+                },
+                baseline: 6,
+                progress: 50,
+                peer_name: "rows".to_string(),
+            },
+            SyncStatusWatchPeerView {
+                peer: &delete_peer,
+                rates: SyncStatusWatchPeerRates {
+                    pull_per_sec: 0.0,
+                    push_per_sec: 0.0,
+                    pending_drain_per_sec: -1.0,
+                },
+                baseline: 4,
+                progress: 50,
+                peer_name: "deletes".to_string(),
+            },
+            SyncStatusWatchPeerView {
+                peer: &active_peer,
+                rates: SyncStatusWatchPeerRates {
+                    pull_per_sec: 4.0,
+                    push_per_sec: 0.0,
+                    pending_drain_per_sec: 0.0,
+                },
+                baseline: 0,
+                progress: 100,
+                peer_name: "active".to_string(),
+            },
+            SyncStatusWatchPeerView {
+                peer: &idle_peer,
+                rates: SyncStatusWatchPeerRates {
+                    pull_per_sec: 0.0,
+                    push_per_sec: 0.0,
+                    pending_drain_per_sec: 0.0,
+                },
+                baseline: 0,
+                progress: 100,
+                peer_name: "idle".to_string(),
+            },
+        ];
+
+        assert_eq!(peer_views[0].state(), SyncStatusWatchPeerUiState::Sending);
+        assert_eq!(peer_views[1].state(), SyncStatusWatchPeerUiState::Stale);
+        assert_eq!(peer_views[2].state(), SyncStatusWatchPeerUiState::Active);
+        assert_eq!(peer_views[3].state(), SyncStatusWatchPeerUiState::Idle);
+
+        let totals = SyncStatusWatchTotals::from_peer_views(&peer_views);
+
+        assert_eq!(totals.progress, 50);
+        assert_eq!(totals.pending, 5);
+        assert_eq!(totals.pending_entries, 3);
+        assert_eq!(totals.pending_deletions, 2);
+        assert_eq!(totals.queued, 2);
+        assert_eq!(totals.stale, 1);
+        assert_eq!(totals.active, 2);
+        assert_eq!(totals.idle, 1);
+        assert_eq!(totals.direct_pull_zero, 1);
+        assert_eq!(totals.oldest_seen_age_sec, Some(601));
+        assert_eq!(totals.pull_rate, 4.0);
+        assert_eq!(totals.push_rate, 2.0);
+        assert_eq!(totals.drain_rate, 1.0);
     }
 
     #[test]
