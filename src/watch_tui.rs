@@ -27,12 +27,55 @@ struct SyncStatusWatchPeerRates {
     pending_drain_per_sec: f64,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PendingBreakdown {
+    entries: usize,
+    deletions: usize,
+}
+
+impl PendingBreakdown {
+    fn from_peer(peer: &SyncStatusPeerReport) -> Self {
+        Self {
+            entries: peer.outbound_push_pending_entries,
+            deletions: peer.outbound_push_pending_deletions,
+        }
+    }
+
+    fn total(self) -> usize {
+        self.entries + self.deletions
+    }
+
+    fn human(self) -> String {
+        match (self.entries, self.deletions) {
+            (0, 0) => "0 rows".to_string(),
+            (_, 0) => format!("{} rows", format_count_usize(self.entries)),
+            (0, _) => format!("{} deletions", format_count_usize(self.deletions)),
+            _ => format!(
+                "{} rows + {} deletions",
+                format_count_usize(self.entries),
+                format_count_usize(self.deletions)
+            ),
+        }
+    }
+
+    fn compact(self) -> String {
+        match (self.entries, self.deletions) {
+            (0, 0) => "0".to_string(),
+            (_, 0) => format!("R{}", format_count_usize(self.entries)),
+            (0, _) => format!("D{}", format_count_usize(self.deletions)),
+            _ => format!(
+                "R{} D{}",
+                format_count_usize(self.entries),
+                format_count_usize(self.deletions)
+            ),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SyncStatusWatchTotals {
     progress: usize,
-    pending: usize,
-    pending_entries: usize,
-    pending_deletions: usize,
+    pending: PendingBreakdown,
     pull_rate: f64,
     push_rate: f64,
     drain_rate: f64,
@@ -278,18 +321,16 @@ impl SyncStatusWatchPeerView<'_> {
 
 impl SyncStatusWatchTotals {
     fn from_peer_views(peer_views: &[SyncStatusWatchPeerView<'_>]) -> Self {
-        let pending: usize = peer_views
-            .iter()
-            .map(|view| view.peer.outbound_push_pending)
-            .sum();
-        let pending_entries: usize = peer_views
-            .iter()
-            .map(|view| view.peer.outbound_push_pending_entries)
-            .sum();
-        let pending_deletions: usize = peer_views
-            .iter()
-            .map(|view| view.peer.outbound_push_pending_deletions)
-            .sum();
+        let pending = PendingBreakdown {
+            entries: peer_views
+                .iter()
+                .map(|view| view.peer.outbound_push_pending_entries)
+                .sum(),
+            deletions: peer_views
+                .iter()
+                .map(|view| view.peer.outbound_push_pending_deletions)
+                .sum(),
+        };
         let baseline: usize = peer_views.iter().map(|view| view.baseline).sum();
         let pull_rate: f64 = peer_views.iter().map(|view| view.rates.pull_per_sec).sum();
         let push_rate: f64 = peer_views.iter().map(|view| view.rates.push_per_sec).sum();
@@ -324,10 +365,8 @@ impl SyncStatusWatchTotals {
         }
 
         Self {
-            progress: outbound_push_progress_percent(pending, baseline),
+            progress: outbound_push_progress_percent(pending.total(), baseline),
             pending,
-            pending_entries,
-            pending_deletions,
             pull_rate,
             push_rate,
             drain_rate,
@@ -416,7 +455,7 @@ pub(crate) fn render_sync_status_watch_frame(
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
-            compact_pending_breakdown_counts(totals.pending_entries, totals.pending_deletions)
+            totals.pending.compact()
         ),
     );
 
@@ -502,7 +541,7 @@ pub(crate) fn render_mesh_watch_frame(
     let totals = SyncStatusWatchTotals::from_peer_views(&peer_views);
     record_mesh_watch_sample(
         state,
-        totals.pending,
+        totals.pending.total(),
         totals.pull_rate + totals.push_rate + totals.drain_rate,
     );
 
@@ -519,7 +558,7 @@ pub(crate) fn render_mesh_watch_frame(
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
             report.peers.len(),
-            compact_pending_breakdown_counts(totals.pending_entries, totals.pending_deletions),
+            totals.pending.compact(),
         ),
     );
     push_watch_line(
@@ -743,7 +782,12 @@ fn render_mesh_outbox_panel(
         ),
         traffic_kv_line("seen", &oldest_seen, inner_width),
         String::new(),
-        traffic_progress_line("to_send", totals.progress, totals.pending, inner_width),
+        traffic_progress_line(
+            "to_send",
+            totals.progress,
+            totals.pending.total(),
+            inner_width,
+        ),
         traffic_kv_line(
             "trend",
             &format!(
@@ -786,7 +830,7 @@ fn render_mesh_outbox_panel(
             &format!(
                 "{}  {} left  {}",
                 truncate_display(&view.peer_name, 22),
-                compact_peer_pending_breakdown(view.peer),
+                PendingBreakdown::from_peer(view.peer).compact(),
                 link_push_progress_line(view.progress, 14),
             ),
             inner_width,
@@ -1057,12 +1101,17 @@ fn render_overview_panel(
             "outbox",
             &format!(
                 "{} queued across {} peers",
-                pending_breakdown_counts(totals.pending_entries, totals.pending_deletions),
+                totals.pending.human(),
                 totals.queued
             ),
             inner_width,
         ),
-        traffic_progress_line("progress", totals.progress, totals.pending, inner_width),
+        traffic_progress_line(
+            "progress",
+            totals.progress,
+            totals.pending.total(),
+            inner_width,
+        ),
         traffic_kv_line(
             "rates",
             &format!(
@@ -1128,7 +1177,7 @@ fn render_traffic_panel(
         traffic_progress_line_with_text(
             "to_send",
             totals.progress,
-            &pending_breakdown_counts(totals.pending_entries, totals.pending_deletions),
+            &totals.pending.human(),
             inner_width,
         ),
     ];
@@ -1611,37 +1660,8 @@ fn format_count_usize(value: usize) -> String {
     }
 }
 
-fn pending_breakdown_counts(entries: usize, deletions: usize) -> String {
-    match (entries, deletions) {
-        (0, 0) => "0 rows".to_string(),
-        (_, 0) => format!("{} rows", format_count_usize(entries)),
-        (0, _) => format!("{} deletions", format_count_usize(deletions)),
-        _ => format!(
-            "{} rows + {} deletions",
-            format_count_usize(entries),
-            format_count_usize(deletions)
-        ),
-    }
-}
-
-fn compact_pending_breakdown_counts(entries: usize, deletions: usize) -> String {
-    match (entries, deletions) {
-        (0, 0) => "0".to_string(),
-        (_, 0) => format!("R{}", format_count_usize(entries)),
-        (0, _) => format!("D{}", format_count_usize(deletions)),
-        _ => format!(
-            "R{} D{}",
-            format_count_usize(entries),
-            format_count_usize(deletions)
-        ),
-    }
-}
-
 fn compact_peer_pending_breakdown(peer: &SyncStatusPeerReport) -> String {
-    compact_pending_breakdown_counts(
-        peer.outbound_push_pending_entries,
-        peer.outbound_push_pending_deletions,
-    )
+    PendingBreakdown::from_peer(peer).compact()
 }
 
 fn push_watch_line(out: &mut String, width: usize, line: &str) {
@@ -1861,10 +1881,38 @@ mod tests {
 
     #[test]
     fn compact_pending_breakdown_uses_unambiguous_prefixes() {
-        assert_eq!(compact_pending_breakdown_counts(0, 0), "0");
-        assert_eq!(compact_pending_breakdown_counts(42, 0), "R42");
-        assert_eq!(compact_pending_breakdown_counts(0, 2), "D2");
-        assert_eq!(compact_pending_breakdown_counts(1, 9), "R1 D9");
+        assert_eq!(
+            PendingBreakdown {
+                entries: 0,
+                deletions: 0
+            }
+            .compact(),
+            "0"
+        );
+        assert_eq!(
+            PendingBreakdown {
+                entries: 42,
+                deletions: 0
+            }
+            .compact(),
+            "R42"
+        );
+        assert_eq!(
+            PendingBreakdown {
+                entries: 0,
+                deletions: 2
+            }
+            .compact(),
+            "D2"
+        );
+        assert_eq!(
+            PendingBreakdown {
+                entries: 1,
+                deletions: 9
+            }
+            .compact(),
+            "R1 D9"
+        );
     }
 
     #[test]
@@ -1951,9 +1999,14 @@ mod tests {
         let totals = SyncStatusWatchTotals::from_peer_views(&peer_views);
 
         assert_eq!(totals.progress, 50);
-        assert_eq!(totals.pending, 5);
-        assert_eq!(totals.pending_entries, 3);
-        assert_eq!(totals.pending_deletions, 2);
+        assert_eq!(
+            totals.pending,
+            PendingBreakdown {
+                entries: 3,
+                deletions: 2
+            }
+        );
+        assert_eq!(totals.pending.total(), 5);
         assert_eq!(totals.queued, 2);
         assert_eq!(totals.stale, 1);
         assert_eq!(totals.active, 2);
