@@ -193,6 +193,7 @@ p2p_watch_start_jitter_sec = 10
   - `--watch`는 alternate screen TUI로 tracker 상태, 로컬 outbox 요약, 큐가 남은 peer, peer별 `direct`/`sent`/`to_send`/`drain/s`를 계속 갱신한다.
   - watch 화면의 `direct`는 이 노드가 해당 peer에서 직접 pull 완료한 cursor다. 이 값이 `0`이어도 inbound push나 다른 peer 경유 전파로 데이터가 들어올 수 있으므로 단독으로 데이터 유실 신호로 보지 않는다.
   - watch 화면의 `sent`는 이 노드의 로컬 엔트리를 해당 peer가 받아들인 push cursor이고, `to_send`는 아직 해당 peer에 수락되지 않은 로컬 엔트리와 deletion tombstone 수다.
+  - watch/mesh 화면의 `idle`은 tracker heartbeat가 오래됐지만 이 노드에서 해당 peer로 보낼 row/delete backlog가 없다는 뜻이다. `stale`은 오래된 heartbeat와 남은 `to_send`가 동시에 있을 때만 표시한다.
   - 다른 peer끼리 실제로 주고받는 global active flow는 아직 원격 daemon telemetry가 없으므로 fake mesh graph로 추정하지 않는다.
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
 - `rr mesh [--watch] [--no-tracker]`: `sync-status`와 같은 로컬 cursor 데이터를 사람이 보기 쉬운 mesh dashboard로 렌더링한다.

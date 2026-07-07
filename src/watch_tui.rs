@@ -227,17 +227,15 @@ fn sync_status_watch_peer_stable_name_cmp(
 }
 
 fn sync_status_watch_peer_severity(view: &SyncStatusWatchPeerView<'_>) -> u8 {
-    let stale = view.peer.last_seen_age_sec.is_some_and(|age| age > 300);
-    let queued = view.peer.outbound_push_pending > 0;
+    let old_seen = sync_status_watch_peer_seen_is_old(view);
+    let queued = sync_status_watch_peer_has_pending(view);
     let moving = view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0;
-    if stale && queued {
+    if old_seen && queued {
         5
     } else if queued && moving {
         4
     } else if queued {
         3
-    } else if stale {
-        2
     } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
         1
     } else {
@@ -246,19 +244,28 @@ fn sync_status_watch_peer_severity(view: &SyncStatusWatchPeerView<'_>) -> u8 {
 }
 
 fn sync_status_watch_peer_status(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
-    if view.peer.last_seen_age_sec.is_some_and(|age| age > 300) {
+    let queued = sync_status_watch_peer_has_pending(view);
+    if sync_status_watch_peer_seen_is_old(view) && queued {
         "stale"
-    } else if view.peer.outbound_push_pending > 0
-        && (view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0)
-    {
+    } else if queued && (view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0) {
         "sending"
-    } else if view.peer.outbound_push_pending > 0 {
+    } else if queued {
         "queued"
     } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
         "active"
+    } else if sync_status_watch_peer_seen_is_old(view) {
+        "idle"
     } else {
         "ok"
     }
+}
+
+fn sync_status_watch_peer_has_pending(view: &SyncStatusWatchPeerView<'_>) -> bool {
+    view.peer.outbound_push_pending > 0
+}
+
+fn sync_status_watch_peer_seen_is_old(view: &SyncStatusWatchPeerView<'_>) -> bool {
+    view.peer.last_seen_age_sec.is_some_and(|age| age > 300)
 }
 
 pub(crate) fn render_sync_status_watch_frame(
@@ -642,7 +649,15 @@ fn render_mesh_outbox_panel(
         .count();
     let stale = peer_views
         .iter()
-        .filter(|view| view.peer.last_seen_age_sec.is_some_and(|age| age > 300))
+        .filter(|view| {
+            sync_status_watch_peer_seen_is_old(view) && sync_status_watch_peer_has_pending(view)
+        })
+        .count();
+    let old_seen = peer_views
+        .iter()
+        .filter(|view| {
+            sync_status_watch_peer_seen_is_old(view) && !sync_status_watch_peer_has_pending(view)
+        })
         .count();
     let active = peer_views
         .iter()
@@ -701,7 +716,7 @@ fn render_mesh_outbox_panel(
         ),
         traffic_kv_line(
             "health",
-            &format!("{queued} queued   {active} active   {stale} stale"),
+            &format!("{queued} queued   {active} active   {stale} stale   {old_seen} idle"),
             inner_width,
         ),
     ];
@@ -891,7 +906,7 @@ fn mesh_peer_display_name(view: &SyncStatusWatchPeerView<'_>) -> String {
 }
 
 fn mesh_peer_symbol(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
-    if view.peer.last_seen_age_sec.is_some_and(|age| age > 300) {
+    if sync_status_watch_peer_seen_is_old(view) {
         "◌"
     } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
         "◆"
@@ -986,7 +1001,15 @@ fn render_overview_panel(
         .count();
     let stale = peer_views
         .iter()
-        .filter(|view| view.peer.last_seen_age_sec.is_some_and(|age| age > 300))
+        .filter(|view| {
+            sync_status_watch_peer_seen_is_old(view) && sync_status_watch_peer_has_pending(view)
+        })
+        .count();
+    let old_seen = peer_views
+        .iter()
+        .filter(|view| {
+            sync_status_watch_peer_seen_is_old(view) && !sync_status_watch_peer_has_pending(view)
+        })
         .count();
     let direct_zero = peer_views
         .iter()
@@ -1033,7 +1056,7 @@ fn render_overview_panel(
         ),
         traffic_kv_line(
             "health",
-            &format!("{stale} stale   {direct_zero} direct_pull=0"),
+            &format!("{stale} stale   {old_seen} idle   {direct_zero} direct_pull=0"),
             inner_width,
         ),
         String::new(),
@@ -1137,7 +1160,7 @@ fn render_traffic_panel(
         traffic_kv_line("", "queued waits for an accepted push", inner_width),
         traffic_kv_line(
             "",
-            "stale means tracker has not seen peer recently",
+            "idle can mean old heartbeat with no local rows/deletions left to send",
             inner_width,
         ),
     ]);
@@ -1781,6 +1804,50 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(devices, vec!["alpha", "bravo", "zulu"]);
+    }
+
+    #[test]
+    fn old_seen_without_pending_is_idle_not_stale() {
+        let mut state = SyncStatusWatchState::default();
+        let report = SyncStatusReport {
+            local_head: 300,
+            local_device_id: "local".to_string(),
+            peers: vec![
+                sample_watch_peer(
+                    "quiet",
+                    "12D3KooWQ11111111111111111111111111111111111111111111",
+                    0,
+                    602,
+                ),
+                sample_watch_peer(
+                    "blocked",
+                    "12D3KooWB22222222222222222222222222222222222222222222",
+                    2,
+                    602,
+                ),
+            ],
+            tracker_status: None,
+        };
+        let peer_views = build_sync_status_watch_peer_views(
+            &mut state,
+            &report,
+            Instant::now(),
+            SyncStatusWatchPeerOrder::StableName,
+        );
+
+        let quiet = peer_views
+            .iter()
+            .find(|view| view.peer.peer_device_id.as_deref() == Some("quiet"))
+            .expect("quiet peer");
+        let blocked = peer_views
+            .iter()
+            .find(|view| view.peer.peer_device_id.as_deref() == Some("blocked"))
+            .expect("blocked peer");
+
+        assert_eq!(sync_status_watch_peer_status(quiet), "idle");
+        assert_eq!(sync_status_watch_peer_severity(quiet), 0);
+        assert_eq!(sync_status_watch_peer_status(blocked), "stale");
+        assert!(sync_status_watch_peer_severity(blocked) > sync_status_watch_peer_severity(quiet));
     }
 
     #[test]
