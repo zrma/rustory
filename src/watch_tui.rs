@@ -194,6 +194,58 @@ enum SyncStatusWatchPeerOrder {
     StableName,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncStatusWatchPeerUiState {
+    Stale,
+    Sending,
+    Queued,
+    Active,
+    Idle,
+    Ok,
+}
+
+impl SyncStatusWatchPeerUiState {
+    fn classify(view: &SyncStatusWatchPeerView<'_>) -> Self {
+        let old_seen = sync_status_watch_peer_seen_is_old(view);
+        let queued = sync_status_watch_peer_has_pending(view);
+        let active = sync_status_watch_peer_is_active(view);
+        if old_seen && queued {
+            Self::Stale
+        } else if queued && sync_status_watch_peer_is_push_moving(view) {
+            Self::Sending
+        } else if queued {
+            Self::Queued
+        } else if active {
+            Self::Active
+        } else if old_seen {
+            Self::Idle
+        } else {
+            Self::Ok
+        }
+    }
+
+    fn severity(self) -> u8 {
+        match self {
+            Self::Stale => 5,
+            Self::Sending => 4,
+            Self::Queued => 3,
+            Self::Active => 1,
+            Self::Idle | Self::Ok => 0,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Stale => "stale",
+            Self::Sending => "sending",
+            Self::Queued => "queued",
+            Self::Active => "active",
+            Self::Idle => "idle",
+            Self::Ok => "ok",
+        }
+    }
+}
+
 fn sync_status_watch_peer_attention_cmp(
     left: &SyncStatusWatchPeerView<'_>,
     right: &SyncStatusWatchPeerView<'_>,
@@ -227,41 +279,27 @@ fn sync_status_watch_peer_stable_name_cmp(
 }
 
 fn sync_status_watch_peer_severity(view: &SyncStatusWatchPeerView<'_>) -> u8 {
-    let old_seen = sync_status_watch_peer_seen_is_old(view);
-    let queued = sync_status_watch_peer_has_pending(view);
-    let moving = view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0;
-    if old_seen && queued {
-        5
-    } else if queued && moving {
-        4
-    } else if queued {
-        3
-    } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
-        1
-    } else {
-        0
-    }
+    sync_status_watch_peer_state(view).severity()
 }
 
 fn sync_status_watch_peer_status(view: &SyncStatusWatchPeerView<'_>) -> &'static str {
-    let queued = sync_status_watch_peer_has_pending(view);
-    if sync_status_watch_peer_seen_is_old(view) && queued {
-        "stale"
-    } else if queued && (view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0) {
-        "sending"
-    } else if queued {
-        "queued"
-    } else if view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0 {
-        "active"
-    } else if sync_status_watch_peer_seen_is_old(view) {
-        "idle"
-    } else {
-        "ok"
-    }
+    sync_status_watch_peer_state(view).label()
+}
+
+fn sync_status_watch_peer_state(view: &SyncStatusWatchPeerView<'_>) -> SyncStatusWatchPeerUiState {
+    SyncStatusWatchPeerUiState::classify(view)
 }
 
 fn sync_status_watch_peer_has_pending(view: &SyncStatusWatchPeerView<'_>) -> bool {
     view.peer.outbound_push_pending > 0
+}
+
+fn sync_status_watch_peer_is_active(view: &SyncStatusWatchPeerView<'_>) -> bool {
+    view.rates.pull_per_sec > 0.0 || view.rates.push_per_sec > 0.0
+}
+
+fn sync_status_watch_peer_is_push_moving(view: &SyncStatusWatchPeerView<'_>) -> bool {
+    view.rates.pending_drain_per_sec > 0.0 || view.rates.push_per_sec > 0.0
 }
 
 fn sync_status_watch_peer_seen_is_old(view: &SyncStatusWatchPeerView<'_>) -> bool {
@@ -1844,8 +1882,16 @@ mod tests {
             .find(|view| view.peer.peer_device_id.as_deref() == Some("blocked"))
             .expect("blocked peer");
 
+        assert_eq!(
+            sync_status_watch_peer_state(quiet),
+            SyncStatusWatchPeerUiState::Idle
+        );
         assert_eq!(sync_status_watch_peer_status(quiet), "idle");
         assert_eq!(sync_status_watch_peer_severity(quiet), 0);
+        assert_eq!(
+            sync_status_watch_peer_state(blocked),
+            SyncStatusWatchPeerUiState::Stale
+        );
         assert_eq!(sync_status_watch_peer_status(blocked), "stale");
         assert!(sync_status_watch_peer_severity(blocked) > sync_status_watch_peer_severity(quiet));
     }
