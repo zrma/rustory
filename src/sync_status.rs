@@ -6,11 +6,15 @@ use anyhow::Result;
 use crate::storage;
 use crate::tracker;
 
+const ACTIVE_DUPLICATE_LAST_SEEN_MAX_AGE_SEC: i64 = 5 * 60;
+
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct SyncStatusPeerReport {
     pub(crate) peer_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) peer_device_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_hostname: Option<String>,
     pub(crate) pull_cursor: i64,
     pub(crate) pull_delete_cursor: i64,
     pub(crate) push_cursor: i64,
@@ -26,6 +30,41 @@ pub(crate) struct SyncStatusPeerReport {
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub(crate) struct SyncStatusWarning {
+    pub(crate) code: String,
+    pub(crate) message: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) peer_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) device_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) hostnames: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SyncStatusPeerMetadata {
+    pub(crate) peer_id: String,
+    pub(crate) device_id: Option<String>,
+    pub(crate) hostname: Option<String>,
+    pub(crate) last_seen_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PeerMetadata {
+    device_id: Option<String>,
+    hostname: Option<String>,
+    last_seen_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MembershipPeer {
+    peer_id: String,
+    device_id: Option<String>,
+    hostname: Option<String>,
+    last_seen_age_sec: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct SyncStatusTrackerReport {
     pub(crate) base_url: String,
     pub(crate) reachable: bool,
@@ -38,6 +77,8 @@ pub(crate) struct SyncStatusReport {
     pub(crate) local_head: i64,
     pub(crate) local_device_id: String,
     pub(crate) peers: Vec<SyncStatusPeerReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) warnings: Vec<SyncStatusWarning>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) tracker_status: Option<Vec<SyncStatusTrackerReport>>,
 }
@@ -52,32 +93,40 @@ pub(crate) fn build_sync_status_report(
     local_peer_id: Option<&str>,
     peer_filter: Option<&str>,
     tracker_status: Option<Vec<SyncStatusTrackerReport>>,
-    tracker_peers: &[storage::PeerBookPeer],
+    tracker_peers: &[SyncStatusPeerMetadata],
 ) -> Result<SyncStatusReport> {
     let local_head = store.latest_ingest_seq()?;
     let mut peer_metadata = store
         .list_peer_book(None, 0, 1000)?
         .into_iter()
-        .map(|peer| (peer.peer_id, (peer.device_id, peer.last_seen_unix)))
+        .map(|peer| {
+            (
+                peer.peer_id,
+                PeerMetadata {
+                    device_id: peer.device_id,
+                    hostname: None,
+                    last_seen_unix: peer.last_seen_unix,
+                },
+            )
+        })
         .collect::<HashMap<_, _>>();
     for peer in tracker_peers {
-        if local_peer_id == Some(peer.peer_id.as_str()) {
-            continue;
-        }
-        if sync_device_id_matches(peer.device_id.as_deref(), local_device_id) {
-            continue;
-        }
         match peer_metadata.get(&peer.peer_id) {
-            Some((_device_id, last_seen)) if *last_seen > peer.last_seen_unix => {}
+            Some(existing) if existing.last_seen_unix > peer.last_seen_unix => {}
             _ => {
                 peer_metadata.insert(
                     peer.peer_id.clone(),
-                    (peer.device_id.clone(), peer.last_seen_unix),
+                    PeerMetadata {
+                        device_id: peer.device_id.clone(),
+                        hostname: peer.hostname.clone(),
+                        last_seen_unix: peer.last_seen_unix,
+                    },
                 );
             }
         }
     }
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let membership_peers = build_membership_peers(&peer_metadata, now_unix);
     let mut statuses = store.list_peer_sync_status()?;
     if let Some(peer_id) = peer_filter {
         statuses.retain(|status| status.peer_id == peer_id);
@@ -89,10 +138,10 @@ pub(crate) fn build_sync_status_report(
         if local_peer_id == Some(peer_id.as_str()) {
             continue;
         }
-        let (peer_device_id, last_seen_unix) = peer_metadata
-            .get(&peer_id)
-            .map(|(device_id, last_seen_unix)| (device_id.clone(), Some(*last_seen_unix)))
-            .unwrap_or((None, None));
+        let metadata = peer_metadata.get(&peer_id);
+        let peer_device_id = metadata.and_then(|metadata| metadata.device_id.clone());
+        let peer_hostname = metadata.and_then(|metadata| metadata.hostname.clone());
+        let last_seen_unix = metadata.map(|metadata| metadata.last_seen_unix);
         if sync_device_id_matches(peer_device_id.as_deref(), local_device_id) {
             continue;
         }
@@ -106,6 +155,7 @@ pub(crate) fn build_sync_status_report(
         let last_seen_age_sec = compute_last_seen_age_sec(now_unix, last_seen_unix);
         peers.push(SyncStatusPeerReport {
             peer_device_id,
+            peer_hostname,
             peer_id,
             pull_cursor: status.last_cursor,
             pull_delete_cursor,
@@ -121,11 +171,13 @@ pub(crate) fn build_sync_status_report(
             last_seen_age_sec,
         });
     }
+    let warnings = build_sync_status_warnings(&membership_peers);
 
     Ok(SyncStatusReport {
         local_head,
         local_device_id: local_device_id.to_string(),
         peers,
+        warnings,
         tracker_status,
     })
 }
@@ -158,7 +210,7 @@ pub(crate) fn list_tracker_peers_for_status(
     trackers: &[String],
     tracker_token: Option<&str>,
     user_id: Option<&str>,
-) -> Vec<storage::PeerBookPeer> {
+) -> Vec<SyncStatusPeerMetadata> {
     let mut peers = Vec::new();
     for base_url in trackers {
         let client = tracker::TrackerClient::new(
@@ -172,15 +224,118 @@ pub(crate) fn list_tracker_peers_for_status(
                 continue;
             }
         };
-        peers.extend(list.peers.into_iter().map(|peer| storage::PeerBookPeer {
+        peers.extend(list.peers.into_iter().map(|peer| SyncStatusPeerMetadata {
             peer_id: peer.peer_id,
-            addrs: peer.addrs,
-            user_id: peer.meta.as_ref().and_then(|meta| meta.user_id.clone()),
             device_id: peer.meta.as_ref().and_then(|meta| meta.device_id.clone()),
+            hostname: peer.meta.as_ref().and_then(|meta| meta.hostname.clone()),
             last_seen_unix: peer.last_seen_unix,
         }));
     }
     peers
+}
+
+fn build_membership_peers(
+    peer_metadata: &HashMap<String, PeerMetadata>,
+    now_unix: i64,
+) -> Vec<MembershipPeer> {
+    peer_metadata
+        .iter()
+        .map(|(peer_id, metadata)| MembershipPeer {
+            peer_id: peer_id.clone(),
+            device_id: metadata.device_id.clone(),
+            hostname: metadata.hostname.clone(),
+            last_seen_age_sec: compute_last_seen_age_sec(now_unix, Some(metadata.last_seen_unix)),
+        })
+        .collect()
+}
+
+fn build_sync_status_warnings(peers: &[MembershipPeer]) -> Vec<SyncStatusWarning> {
+    let mut warnings = Vec::new();
+    warnings.extend(build_active_duplicate_warnings(
+        peers,
+        "active_duplicate_hostname",
+        "hostname",
+        |peer| peer.hostname.as_deref(),
+    ));
+    warnings.extend(build_active_duplicate_warnings(
+        peers,
+        "active_duplicate_device_id",
+        "device_id",
+        |peer| peer.device_id.as_deref(),
+    ));
+    warnings
+}
+
+fn build_active_duplicate_warnings<F>(
+    peers: &[MembershipPeer],
+    code: &str,
+    field_label: &str,
+    value_of: F,
+) -> Vec<SyncStatusWarning>
+where
+    F: Fn(&MembershipPeer) -> Option<&str>,
+{
+    let mut groups: HashMap<String, Vec<&MembershipPeer>> = HashMap::new();
+    for peer in peers {
+        let Some(value) = value_of(peer).and_then(normalize_membership_key) else {
+            continue;
+        };
+        if !is_active_membership_peer(peer) {
+            continue;
+        }
+        groups.entry(value).or_default().push(peer);
+    }
+
+    let mut warnings = groups
+        .into_iter()
+        .filter_map(|(value, group)| {
+            if group.len() < 2 {
+                return None;
+            }
+            let mut peer_ids = group
+                .iter()
+                .map(|peer| peer.peer_id.clone())
+                .collect::<Vec<_>>();
+            peer_ids.sort();
+            peer_ids.dedup();
+            let mut device_ids = group
+                .iter()
+                .filter_map(|peer| peer.device_id.clone())
+                .collect::<Vec<_>>();
+            device_ids.sort();
+            device_ids.dedup();
+            let mut hostnames = group
+                .iter()
+                .filter_map(|peer| peer.hostname.clone())
+                .collect::<Vec<_>>();
+            hostnames.sort();
+            hostnames.dedup();
+
+            Some(SyncStatusWarning {
+                code: code.to_string(),
+                message: format!(
+                    "multiple active peers share {field_label} '{value}'; if this followed uninstall/rejoin, retire the old identity or keep only one active node"
+                ),
+                peer_ids,
+                device_ids,
+                hostnames,
+            })
+        })
+        .collect::<Vec<_>>();
+    warnings.sort_by(|a, b| a.code.cmp(&b.code).then(a.message.cmp(&b.message)));
+    warnings
+}
+
+fn normalize_membership_key(value: &str) -> Option<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn is_active_membership_peer(peer: &MembershipPeer) -> bool {
+    matches!(
+        peer.last_seen_age_sec,
+        Some(age) if age <= ACTIVE_DUPLICATE_LAST_SEEN_MAX_AGE_SEC
+    )
 }
 
 fn sync_device_id_matches(peer_device_id: Option<&str>, local_device_id: &str) -> bool {
@@ -264,13 +419,10 @@ mod tests {
             })
             .unwrap();
 
-        let tracker_peers = vec![storage::PeerBookPeer {
+        let tracker_peers = vec![SyncStatusPeerMetadata {
             peer_id: "peer-a".to_string(),
-            addrs: vec![
-                "/dns4/relay.example/tcp/4001/p2p/relay/p2p-circuit/p2p/peer-a".to_string(),
-            ],
-            user_id: Some("user1".to_string()),
             device_id: Some("new-device".to_string()),
+            hostname: Some("new-host".to_string()),
             last_seen_unix: 200,
         }];
 
@@ -283,6 +435,7 @@ mod tests {
             .find(|peer| peer.peer_id == "peer-a")
             .unwrap();
         assert_eq!(peer.peer_device_id.as_deref(), Some("new-device"));
+        assert_eq!(peer.peer_hostname.as_deref(), Some("new-host"));
         assert_eq!(peer.last_seen_unix, Some(200));
     }
 
@@ -300,13 +453,10 @@ mod tests {
             })
             .unwrap();
 
-        let tracker_peers = vec![storage::PeerBookPeer {
+        let tracker_peers = vec![SyncStatusPeerMetadata {
             peer_id: "peer-a".to_string(),
-            addrs: vec![
-                "/dns4/relay.example/tcp/4001/p2p/relay/p2p-circuit/p2p/peer-a".to_string(),
-            ],
-            user_id: Some("user1".to_string()),
             device_id: Some("tracker-older-device".to_string()),
+            hostname: Some("tracker-older-host".to_string()),
             last_seen_unix: 200,
         }];
 
@@ -319,6 +469,145 @@ mod tests {
             .find(|peer| peer.peer_id == "peer-a")
             .unwrap();
         assert_eq!(peer.peer_device_id.as_deref(), Some("local-newer-device"));
+        assert_eq!(peer.peer_hostname.as_deref(), None);
         assert_eq!(peer.last_seen_unix, Some(300));
+    }
+
+    #[test]
+    fn sync_status_report_warns_for_active_duplicate_hostnames() {
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store.set_last_cursor("peer-a", 10).unwrap();
+        store.set_last_cursor("peer-b", 20).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tracker_peers = vec![
+            SyncStatusPeerMetadata {
+                peer_id: "peer-a".to_string(),
+                device_id: Some("host-a-old".to_string()),
+                hostname: Some("workstation".to_string()),
+                last_seen_unix: now - 30,
+            },
+            SyncStatusPeerMetadata {
+                peer_id: "peer-b".to_string(),
+                device_id: Some("host-a-new".to_string()),
+                hostname: Some("WORKSTATION ".to_string()),
+                last_seen_unix: now - 40,
+            },
+        ];
+
+        let report =
+            build_sync_status_report(&store, "local-device", None, None, None, &tracker_peers)
+                .unwrap();
+
+        assert_eq!(report.warnings.len(), 1);
+        let warning = &report.warnings[0];
+        assert_eq!(warning.code, "active_duplicate_hostname");
+        assert!(warning.message.contains("workstation"));
+        assert_eq!(warning.peer_ids, vec!["peer-a", "peer-b"]);
+        assert_eq!(warning.device_ids, vec!["host-a-new", "host-a-old"]);
+        assert_eq!(warning.hostnames, vec!["WORKSTATION ", "workstation"]);
+    }
+
+    #[test]
+    fn sync_status_report_ignores_stale_duplicate_hostnames() {
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store.set_last_cursor("peer-a", 10).unwrap();
+        store.set_last_cursor("peer-b", 20).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tracker_peers = vec![
+            SyncStatusPeerMetadata {
+                peer_id: "peer-a".to_string(),
+                device_id: Some("host-a-old".to_string()),
+                hostname: Some("workstation".to_string()),
+                last_seen_unix: now - ACTIVE_DUPLICATE_LAST_SEEN_MAX_AGE_SEC - 1,
+            },
+            SyncStatusPeerMetadata {
+                peer_id: "peer-b".to_string(),
+                device_id: Some("host-a-new".to_string()),
+                hostname: Some("workstation".to_string()),
+                last_seen_unix: now - 30,
+            },
+        ];
+
+        let report =
+            build_sync_status_report(&store, "local-device", None, None, None, &tracker_peers)
+                .unwrap();
+
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn sync_status_report_warns_for_active_duplicate_device_ids() {
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store.set_last_cursor("peer-a", 10).unwrap();
+        store.set_last_cursor("peer-b", 20).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tracker_peers = vec![
+            SyncStatusPeerMetadata {
+                peer_id: "peer-a".to_string(),
+                device_id: Some("same-device".to_string()),
+                hostname: Some("host-a".to_string()),
+                last_seen_unix: now - 30,
+            },
+            SyncStatusPeerMetadata {
+                peer_id: "peer-b".to_string(),
+                device_id: Some(" same-device ".to_string()),
+                hostname: Some("host-b".to_string()),
+                last_seen_unix: now - 40,
+            },
+        ];
+
+        let report =
+            build_sync_status_report(&store, "local-device", None, None, None, &tracker_peers)
+                .unwrap();
+
+        assert_eq!(report.warnings.len(), 1);
+        let warning = &report.warnings[0];
+        assert_eq!(warning.code, "active_duplicate_device_id");
+        assert_eq!(warning.peer_ids, vec!["peer-a", "peer-b"]);
+    }
+
+    #[test]
+    fn sync_status_report_warns_for_active_duplicate_local_identity_hidden_from_rows() {
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store.set_last_cursor("old-peer", 10).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tracker_peers = vec![
+            SyncStatusPeerMetadata {
+                peer_id: "current-peer".to_string(),
+                device_id: Some("local-device".to_string()),
+                hostname: Some("workstation".to_string()),
+                last_seen_unix: now - 10,
+            },
+            SyncStatusPeerMetadata {
+                peer_id: "old-peer".to_string(),
+                device_id: Some("local-device".to_string()),
+                hostname: Some("workstation".to_string()),
+                last_seen_unix: now - 20,
+            },
+        ];
+
+        let report = build_sync_status_report(
+            &store,
+            "local-device",
+            Some("current-peer"),
+            None,
+            None,
+            &tracker_peers,
+        )
+        .unwrap();
+
+        assert!(report.peers.is_empty());
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "active_duplicate_hostname")
+        );
+        assert!(
+            report
+                .warnings
+                .iter()
+                .any(|warning| warning.code == "active_duplicate_device_id")
+        );
     }
 }

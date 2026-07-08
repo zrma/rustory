@@ -277,6 +277,43 @@ rr delete --entry-id '<entry_id>' --yes --vacuum
 
 `rr delete`는 삭제 tombstone을 남겨 peer로 전파된다. 민감 row를 이미 여러 peer로 sync한 뒤 삭제했다면 `rr sync-status --json --with-tracker`에서 deletion pending이 0까지 줄어드는지 확인한다.
 
+### 2-10) (선택) 노드 이탈과 재가입
+현재 머신을 Rustory grid에서 빼려면 대상 머신에서 직접 uninstall을 실행한다.
+
+```sh
+rr uninstall --yes
+```
+
+기본 uninstall은 관리 중인 daemon을 멈추고, shell hook과 daemon autostart/service를 제거하며,
+tracker에 현재 PeerId unregister를 시도한다. 또한 로컬 DB/config/state를 제거한다. binary까지 지우려면
+명시적으로 `--remove-binary`를 붙인다.
+
+```sh
+rr uninstall --yes --remove-binary
+```
+
+로컬 DB나 config/key를 보존해야 하는 점검 상황에서는 keep flag를 먼저 dry-run으로 확인한다.
+
+```sh
+rr uninstall --dry-run --keep-db --keep-config
+rr uninstall --yes --keep-db --keep-config
+```
+
+uninstall은 현재 머신의 membership 정리일 뿐이다. 이미 다른 peer가 받은 history row를 되돌리거나,
+다른 머신 DB에 남은 과거 hostname/device metadata를 삭제하지 않는다. 따라서 같은 hostname의 과거
+history row가 검색되는 것은 정상이다.
+
+재가입은 새 설치와 같은 절차를 따른다. `identity.key`를 보존하지 않고 다시 설치하면 새 PeerId로
+grid에 들어오며, historical row의 과거 `device_id`/hostname과 새 peer identity가 함께 보일 수 있다.
+이 자체는 데이터 손상이 아니다. 다만 `rr sync-status --json --with-tracker`나 watch UI에서 같은
+hostname 또는 같은 `device_id`가 동시에 active duplicate warning으로 나오면 이전 daemon이 아직
+살아 있거나 같은 config/key를 다른 환경에 복제한 상태일 수 있으므로 대상 노드의 process/config를
+먼저 정리한다.
+
+원격 노드 강제 uninstall은 현재 지원하지 않는다. 인증된 원격 제어면과 대상 사용자 확인 없이 다른
+머신의 hook/DB/config를 지우는 기능은 grid 안정성과 보안 경계를 동시에 깨뜨릴 수 있으므로, 운영
+절차는 대상 노드에서 직접 `rr uninstall --yes`를 실행하는 방식으로 제한한다.
+
 ## 다음 문서
 - 배포/installer/self-update: `docs/distribution.md`
 - P2P 상세/트러블슈팅: `docs/p2p.md`

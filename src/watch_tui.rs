@@ -817,8 +817,12 @@ fn render_mesh_outbox_panel(
         traffic_kv_line(
             "health",
             &format!(
-                "{} queued   {} active   {} stale   {} idle",
-                totals.queued, totals.active, totals.stale, totals.idle
+                "{} queued   {} active   {} stale   {} idle{}",
+                totals.queued,
+                totals.active,
+                totals.stale,
+                totals.idle,
+                warning_count_suffix(report)
             ),
             inner_width,
         ),
@@ -1125,8 +1129,11 @@ fn render_overview_panel(
         traffic_kv_line(
             "health",
             &format!(
-                "{} stale   {} idle   {} direct_pull=0",
-                totals.stale, totals.idle, totals.direct_pull_zero
+                "{} stale   {} idle   {} direct_pull=0{}",
+                totals.stale,
+                totals.idle,
+                totals.direct_pull_zero,
+                warning_count_suffix(report)
             ),
             inner_width,
         ),
@@ -1664,6 +1671,14 @@ fn compact_peer_pending_breakdown(peer: &SyncStatusPeerReport) -> String {
     PendingBreakdown::from_peer(peer).compact()
 }
 
+fn warning_count_suffix(report: &SyncStatusReport) -> String {
+    if report.warnings.is_empty() {
+        String::new()
+    } else {
+        format!("   {} warning", report.warnings.len())
+    }
+}
+
 fn push_watch_line(out: &mut String, width: usize, line: &str) {
     out.push_str(&truncate_display(line, width));
     out.push('\n');
@@ -1732,6 +1747,7 @@ mod tests {
         SyncStatusPeerReport {
             peer_id: peer_id.to_string(),
             peer_device_id: Some(device.to_string()),
+            peer_hostname: None,
             pull_cursor: 100,
             pull_delete_cursor: 0,
             push_cursor: 200,
@@ -1771,6 +1787,7 @@ mod tests {
                     30,
                 ),
             ],
+            warnings: Vec::new(),
             tracker_status: None,
         }
     }
@@ -1847,6 +1864,7 @@ mod tests {
                     602,
                 ),
             ],
+            warnings: Vec::new(),
             tracker_status: None,
         };
         let peer_views = build_sync_status_watch_peer_views(
@@ -2030,6 +2048,7 @@ mod tests {
                     peer_device_id: Some(
                         "sample-node-x86_64-with-a-very-long-device-name".to_string(),
                     ),
+                    peer_hostname: None,
                     pull_cursor: 1_526_049,
                     pull_delete_cursor: 0,
                     push_cursor: 1_968_089,
@@ -2046,6 +2065,7 @@ mod tests {
                 SyncStatusPeerReport {
                     peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
                     peer_device_id: Some("node3".to_string()),
+                    peer_hostname: None,
                     pull_cursor: 1_818_365,
                     pull_delete_cursor: 0,
                     push_cursor: 2_122_722,
@@ -2060,6 +2080,7 @@ mod tests {
                     last_seen_age_sec: Some(123_456),
                 },
             ],
+            warnings: Vec::new(),
             tracker_status: Some(vec![SyncStatusTrackerReport {
                 base_url: "https://tracker.example.com/with/a/long/path".to_string(),
                 reachable: false,
@@ -2100,6 +2121,7 @@ mod tests {
                 SyncStatusPeerReport {
                     peer_id: "12D3KooWE3u4VEsbCGR7w53rbBYi1mZ3kADAgAhDYTj8ACiPBC1M".to_string(),
                     peer_device_id: Some("sample-node-x86_64".to_string()),
+                    peer_hostname: None,
                     pull_cursor: 4_400_747,
                     pull_delete_cursor: 0,
                     push_cursor: 4_494_530,
@@ -2116,6 +2138,7 @@ mod tests {
                 SyncStatusPeerReport {
                     peer_id: "12D3KooWJSi7WKtoW8wp2MnxhheB3Y62fAN9FRHGMspc5fQZfZnH".to_string(),
                     peer_device_id: Some("samplex-x86_64-with-long-name".to_string()),
+                    peer_hostname: None,
                     pull_cursor: 0,
                     pull_delete_cursor: 0,
                     push_cursor: 3_678_638,
@@ -2132,6 +2155,7 @@ mod tests {
                 SyncStatusPeerReport {
                     peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
                     peer_device_id: Some("node3-x86_64".to_string()),
+                    peer_hostname: None,
                     pull_cursor: 4_345_857,
                     pull_delete_cursor: 0,
                     push_cursor: 4_494_530,
@@ -2146,6 +2170,7 @@ mod tests {
                     last_seen_age_sec: Some(3),
                 },
             ],
+            warnings: Vec::new(),
             tracker_status: Some(vec![SyncStatusTrackerReport {
                 base_url: "https://tracker.example.com".to_string(),
                 reachable: true,

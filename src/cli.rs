@@ -1355,6 +1355,9 @@ pub fn run() -> Result<()> {
 
             println!("local ingest head: {}", report.local_head);
             println!("local device id: {}", report.local_device_id);
+            for warning in &report.warnings {
+                println!("warning={} message={}", warning.code, warning.message);
+            }
 
             if report.peers.is_empty() {
                 if let Some(peer_id) = peer.as_deref() {
@@ -1363,7 +1366,7 @@ pub fn run() -> Result<()> {
                     println!("peer sync state: (empty)");
                 }
             } else {
-                for status in report.peers {
+                for status in &report.peers {
                     let last_seen = status
                         .last_seen_unix
                         .map(|ts| ts.to_string())
@@ -1373,9 +1376,10 @@ pub fn run() -> Result<()> {
                         .map(|age| age.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "peer={} device={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={}",
+                        "peer={} device={} hostname={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={}",
                         status.peer_id,
                         status.peer_device_id.as_deref().unwrap_or("-"),
+                        status.peer_hostname.as_deref().unwrap_or("-"),
                         status.pull_cursor,
                         status.pull_delete_cursor,
                         status.push_cursor,
@@ -1392,7 +1396,7 @@ pub fn run() -> Result<()> {
                 }
             }
 
-            if let Some(trackers) = report.tracker_status {
+            if let Some(trackers) = &report.tracker_status {
                 if trackers.is_empty() {
                     println!("tracker status: (none)");
                 } else {
@@ -1401,7 +1405,7 @@ pub fn run() -> Result<()> {
                             .latency_ms
                             .map(|ms| ms.to_string())
                             .unwrap_or_else(|| "-".to_string());
-                        if let Some(error) = tracker.error {
+                        if let Some(error) = &tracker.error {
                             println!(
                                 "tracker={} reachable={} latency_ms={} error={error}",
                                 tracker.base_url, tracker.reachable, latency
