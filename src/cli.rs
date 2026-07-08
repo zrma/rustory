@@ -36,6 +36,7 @@ use crate::watch_tui::{
 };
 use crate::{
     config, hishtory_cleanup, history_import, hook, p2p, search, storage, tracker, transport,
+    uninstall,
 };
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -539,6 +540,46 @@ enum Command {
             help = "Do not restart a managed Rustory daemon after replacing rr"
         )]
         no_restart_daemon: bool,
+    },
+    #[command(about = "Uninstall Rustory from this device and leave the P2P grid")]
+    Uninstall {
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Print the uninstall plan without changing files"
+        )]
+        dry_run: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Required to apply uninstall changes"
+        )]
+        yes: bool,
+
+        #[arg(long, default_value_t = false, help = "Keep the local history DB")]
+        keep_db: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Keep config, swarm key, identity key, and relay key files"
+        )]
+        keep_config: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Keep daemon state and log files"
+        )]
+        keep_state: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Also remove the current rr binary"
+        )]
+        remove_binary: bool,
     },
     #[command(about = "Print a bash or zsh shell hook")]
     Hook {
@@ -1458,6 +1499,35 @@ pub fn run() -> Result<()> {
                 allow_insecure_download,
             })?;
         }
+        Command::Uninstall {
+            dry_run,
+            yes,
+            keep_db,
+            keep_config,
+            keep_state,
+            remove_binary,
+        } => {
+            let install_path = std::env::current_exe().context("resolve current rr executable")?;
+            let config_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+            let db_path = config::expand_home_path(&db_path)?;
+            let trackers = resolve_trackers(Vec::new(), &cfg)?;
+            let tracker_token = resolve_tracker_token(None, &cfg)?;
+            let local_peer_id = resolve_local_p2p_peer_id(&cfg);
+            uninstall::run_uninstall(uninstall::UninstallRequest {
+                apply: yes && !dry_run,
+                dry_run,
+                keep_db,
+                keep_config,
+                keep_state,
+                remove_binary,
+                install_path,
+                config_path,
+                db_path,
+                trackers,
+                tracker_token,
+                local_peer_id,
+            })?;
+        }
         Command::Hook { shell } => {
             let shell = hook::Shell::parse(shell.as_str())?;
             let content = hook::render_hook(shell);
@@ -1648,6 +1718,7 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
         Command::Doctor { .. }
             | Command::Version { .. }
             | Command::Update { .. }
+            | Command::Uninstall { .. }
             | Command::CleanupHishtory { .. }
             | Command::Init { force: true, .. }
     )
@@ -4060,6 +4131,40 @@ mod tests {
                 assert!(*no_restart_daemon);
             }
             _ => panic!("expected update"),
+        }
+        assert!(can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn uninstall_command_parses_and_ignores_config_load_errors() {
+        let app = App::parse_from([
+            "rr",
+            "uninstall",
+            "--dry-run",
+            "--yes",
+            "--keep-db",
+            "--keep-config",
+            "--keep-state",
+            "--remove-binary",
+        ]);
+
+        match &app.cmd {
+            Command::Uninstall {
+                dry_run,
+                yes,
+                keep_db,
+                keep_config,
+                keep_state,
+                remove_binary,
+            } => {
+                assert!(*dry_run);
+                assert!(*yes);
+                assert!(*keep_db);
+                assert!(*keep_config);
+                assert!(*keep_state);
+                assert!(*remove_binary);
+            }
+            _ => panic!("expected uninstall"),
         }
         assert!(can_continue_after_config_load_error(&app.cmd));
     }

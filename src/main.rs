@@ -18,6 +18,7 @@ mod sync;
 mod sync_status;
 mod tracker;
 mod transport;
+mod uninstall;
 mod watch_tui;
 
 fn main() {

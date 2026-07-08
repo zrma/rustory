@@ -506,6 +506,56 @@ fn restart_managed_daemon(install_path: &Path) {
     println!("daemon=restart_skipped reason=no_managed_daemon_detected");
 }
 
+pub fn stop_managed_daemon(install_path: &Path) {
+    #[cfg(not(target_os = "linux"))]
+    let _ = install_path;
+
+    let mut stopped = false;
+
+    #[cfg(target_os = "macos")]
+    {
+        match stop_launchd_daemon() {
+            DaemonRestartStatus::Restarted => {
+                stopped = true;
+            }
+            DaemonRestartStatus::Failed(error) => {
+                println!("warn: daemon stop failed manager=launchd detail={error}");
+            }
+            DaemonRestartStatus::Skipped => {}
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        match stop_systemd_user_daemon() {
+            DaemonRestartStatus::Restarted => {
+                stopped = true;
+            }
+            DaemonRestartStatus::Failed(error) if systemd_user_bus_unavailable_text(&error) => {
+                println!("daemon=stop_deferred manager=systemd-user reason=user_bus_unavailable");
+            }
+            DaemonRestartStatus::Failed(error) => {
+                println!("warn: daemon stop failed manager=systemd-user detail={error}");
+            }
+            DaemonRestartStatus::Skipped => {}
+        }
+
+        match stop_background_daemon(install_path) {
+            DaemonRestartStatus::Restarted => {
+                stopped = true;
+            }
+            DaemonRestartStatus::Failed(error) => {
+                println!("warn: daemon stop failed manager=background detail={error}");
+            }
+            DaemonRestartStatus::Skipped => {}
+        }
+    }
+
+    if !stopped {
+        println!("daemon=stop_skipped reason=no_managed_daemon_detected");
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn stop_stale_managed_rr_processes_before_restart(install_path: &Path) {
     match stop_stale_background_rr_processes(install_path) {
@@ -515,6 +565,52 @@ fn stop_stale_managed_rr_processes_before_restart(install_path: &Path) {
             println!("warn: daemon stale process cleanup failed manager=pre_restart detail={err}")
         }
     }
+}
+
+#[cfg(target_os = "macos")]
+fn stop_launchd_daemon() -> DaemonRestartStatus {
+    let label = "com.rustory.daemon";
+    let uid = unsafe { libc::getuid() };
+    let target = format!("gui/{uid}/{label}");
+    let plist_path = home_dir()
+        .join("Library/LaunchAgents")
+        .join(format!("{label}.plist"));
+    if !plist_path.exists()
+        && !process_status(ProcessCommand::new("launchctl").arg("print").arg(&target))
+    {
+        return DaemonRestartStatus::Skipped;
+    }
+
+    let output = ProcessCommand::new("launchctl")
+        .arg("bootout")
+        .arg(&target)
+        .output();
+    match output {
+        Ok(output) if output.status.success() => {
+            println!("daemon=stopped manager=launchd label={label}");
+            DaemonRestartStatus::Restarted
+        }
+        Ok(output) if launchd_service_missing_output(&output) => {
+            println!("daemon=stop_skipped manager=launchd reason=service_not_loaded");
+            DaemonRestartStatus::Skipped
+        }
+        Ok(output) => DaemonRestartStatus::Failed(one_line_output(&output)),
+        Err(err) => DaemonRestartStatus::Failed(err.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_service_missing_output(output: &std::process::Output) -> bool {
+    let text = format!(
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    text.contains("could not find service")
+        || text.contains("service is disabled")
+        || text.contains("no such process")
+        || text.contains("does not exist")
 }
 
 #[cfg(target_os = "macos")]
@@ -547,6 +643,29 @@ fn restart_launchd_daemon() -> DaemonRestartStatus {
 }
 
 #[cfg(target_os = "linux")]
+fn stop_systemd_user_daemon() -> DaemonRestartStatus {
+    let unit_path = home_dir().join(".config/systemd/user/rustory.service");
+    if !unit_path.exists() {
+        return DaemonRestartStatus::Skipped;
+    }
+
+    for args in [
+        &["--user", "stop", "rustory.service"][..],
+        &["--user", "disable", "rustory.service"][..],
+        &["--user", "daemon-reload"][..],
+    ] {
+        let output = ProcessCommand::new("systemctl").args(args).output();
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => return DaemonRestartStatus::Failed(one_line_output(&output)),
+            Err(err) => return DaemonRestartStatus::Failed(err.to_string()),
+        }
+    }
+    println!("daemon=stopped manager=systemd-user unit=rustory.service");
+    DaemonRestartStatus::Restarted
+}
+
+#[cfg(target_os = "linux")]
 fn restart_systemd_user_daemon() -> DaemonRestartStatus {
     let unit_path = home_dir().join(".config/systemd/user/rustory.service");
     if !unit_path.exists() {
@@ -566,6 +685,54 @@ fn restart_systemd_user_daemon() -> DaemonRestartStatus {
     }
     println!("daemon=restarted manager=systemd-user unit=rustory.service");
     DaemonRestartStatus::Restarted
+}
+
+#[cfg(target_os = "linux")]
+fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
+    let state_dir = rustory_state_dir();
+    let pid_path = state_dir.join("daemon.pid");
+    let pid = read_pid_file(&pid_path);
+    let mut stopped = false;
+
+    if let Some(pid) = pid
+        && pid_is_running(pid)
+    {
+        println!("daemon=stopping manager=background pid={pid}");
+        if let Err(err) = terminate_background_process(pid, libc::SIGTERM) {
+            return DaemonRestartStatus::Failed(format!(
+                "terminate background process {pid}: {err}"
+            ));
+        }
+        if !wait_pid_stopped(pid, Duration::from_secs(5)) {
+            let _ = terminate_background_process(pid, libc::SIGKILL);
+            if !wait_pid_stopped(pid, Duration::from_secs(2)) {
+                return DaemonRestartStatus::Failed(format!(
+                    "pid {pid} did not stop after SIGTERM/SIGKILL"
+                ));
+            }
+        }
+        stopped = true;
+    }
+
+    match stop_stale_background_rr_processes(install_path) {
+        Ok(0) => {}
+        Ok(count) => {
+            stopped = true;
+            println!("daemon=stale_processes_stopped manager=background count={count}");
+        }
+        Err(err) => {
+            println!("warn: daemon stale process cleanup failed manager=background detail={err}")
+        }
+    }
+
+    let _ = std::fs::remove_file(&pid_path);
+
+    if stopped {
+        println!("daemon=stopped manager=background");
+        DaemonRestartStatus::Restarted
+    } else {
+        DaemonRestartStatus::Skipped
+    }
 }
 
 #[cfg(target_os = "linux")]

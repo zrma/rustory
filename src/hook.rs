@@ -81,6 +81,43 @@ pub fn auto_fix_existing_managed_hook_blocks(
     Ok(reports)
 }
 
+pub fn remove_existing_managed_hook_blocks() -> Result<Vec<ManagedHookFixReport>> {
+    let mut reports = Vec::new();
+    for (rc_file, shell) in managed_hook_candidate_files()? {
+        let existing = match std::fs::read_to_string(&rc_file) {
+            Ok(content) => content,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                return Err(err).with_context(|| format!("read rc file: {}", rc_file.display()));
+            }
+        };
+        if !contains_managed_hook_block(&existing) {
+            continue;
+        }
+
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&existing);
+        if cleaned == existing {
+            reports.push(ManagedHookFixReport {
+                rc_file,
+                shell,
+                status: ManagedHookFixStatus::Ok,
+                removed_blocks,
+            });
+            continue;
+        }
+
+        std::fs::write(&rc_file, cleaned)
+            .with_context(|| format!("write rc file: {}", rc_file.display()))?;
+        reports.push(ManagedHookFixReport {
+            rc_file,
+            shell,
+            status: ManagedHookFixStatus::Fixed,
+            removed_blocks,
+        });
+    }
+    Ok(reports)
+}
+
 fn managed_hook_candidate_files() -> Result<Vec<(PathBuf, Shell)>> {
     let home = home_dir()?;
     let mut candidates = Vec::new();
@@ -600,6 +637,30 @@ mod tests {
         assert!(!content.contains(LEGACY_HOOK_START));
         assert!(content.contains("export KEEP=1"));
         assert!(content.contains("source <(rr hook --shell zsh)"));
+    }
+
+    #[test]
+    fn strip_managed_hook_blocks_removes_current_and_legacy_blocks() {
+        let content = [
+            "export KEEP=1\n",
+            LEGACY_HOOK_START,
+            "\nsource <(rr hook --shell zsh)\n",
+            LEGACY_HOOK_END,
+            "\n\n",
+            HOOK_START,
+            "\nsource <(rr hook --shell bash)\n",
+            HOOK_END,
+            "\nexport KEEP_TOO=1\n",
+        ]
+        .join("");
+
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content);
+
+        assert_eq!(removed_blocks, 2);
+        assert!(!cleaned.contains(LEGACY_HOOK_START));
+        assert!(!cleaned.contains(HOOK_START));
+        assert!(cleaned.contains("export KEEP=1"));
+        assert!(cleaned.contains("export KEEP_TOO=1"));
     }
 
     #[test]

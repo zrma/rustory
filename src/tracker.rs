@@ -31,6 +31,17 @@ pub struct RegisterResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterRequest {
+    pub peer_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UnregisterResponse {
+    pub ok: bool,
+    pub removed: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerInfo {
     pub peer_id: String,
     pub addrs: Vec<String>,
@@ -155,6 +166,38 @@ fn route_http_request(
             }
 
             respond_json(200, &RegisterResponse { ok: true, ttl_sec })
+        }
+        ("POST", "/api/v1/peers/unregister") => {
+            let mut buf = Vec::new();
+            let max = max_request_body_bytes();
+            req.as_reader()
+                .take((max as u64).saturating_add(1))
+                .read_to_end(&mut buf)
+                .context("read request body")?;
+            if buf.len() > max {
+                return Ok(respond_text(413, "payload too large\n"));
+            }
+
+            let unregister: UnregisterRequest =
+                serde_json::from_slice(&buf).context("parse unregister request json")?;
+            let peer_id = unregister.peer_id.trim();
+            if peer_id.is_empty() {
+                return Ok(respond_text(400, "peer_id required\n"));
+            }
+            let peer_id: PeerId = match peer_id.parse() {
+                Ok(peer_id) => peer_id,
+                Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
+            };
+            let peer_id = peer_id.to_string();
+
+            let now = OffsetDateTime::now_utc();
+            let removed = {
+                let mut locked = state.lock().unwrap();
+                prune_expired(&mut locked, now, ttl_sec);
+                locked.peers.remove(&peer_id).is_some()
+            };
+
+            respond_json(200, &UnregisterResponse { ok: true, removed })
         }
         ("GET", "/api/v1/peers") => {
             let user_id = match query.and_then(|q| query_get(q, "user_id")) {
@@ -399,6 +442,30 @@ impl TrackerClient {
         serde_json::from_str(&text).context("parse register response json")
     }
 
+    pub fn unregister(&self, req: &UnregisterRequest) -> Result<UnregisterResponse> {
+        let url = format!("{}/api/v1/peers/unregister", self.base_url);
+        let body = serde_json::to_vec(req).context("serialize unregister request")?;
+
+        let token = self.token.clone();
+        let resp = crate::http_retry::request_with_retry(
+            crate::http_retry::RetryPolicy::tracker(),
+            |agent| {
+                let mut r = agent.post(&url).header("Content-Type", "application/json");
+                if let Some(token) = &token {
+                    r = r.header("Authorization", format!("Bearer {}", token.trim()));
+                }
+                r.send(&body)
+            },
+        )
+        .with_context(|| format!("POST {url}"))?;
+        let mut resp = resp;
+        let text = resp
+            .body_mut()
+            .read_to_string()
+            .context("read response body")?;
+        serde_json::from_str(&text).context("parse unregister response json")
+    }
+
     pub fn list(&self, user_id: Option<&str>) -> Result<ListResponse> {
         let mut url = format!("{}/api/v1/peers", self.base_url);
         if let Some(user_id) = user_id {
@@ -553,6 +620,44 @@ mod tests {
         let list = client.list(Some(user_id)).unwrap();
         assert_eq!(list.peers.len(), 1);
         assert_eq!(list.peers[0].peer_id, peer_id);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn tracker_unregister_removes_registered_peer() {
+        let server = start_test_server(60, None);
+        let client = TrackerClient::new(server.base_url.clone(), None);
+
+        let peer_id = PeerId::random().to_string();
+        let req = RegisterRequest {
+            peer_id: peer_id.clone(),
+            addrs: vec!["/ip4/127.0.0.1/tcp/1234".to_string()],
+            meta: Some(PeerMeta {
+                user_id: Some("u1".to_string()),
+                device_id: Some("d1".to_string()),
+                hostname: None,
+                version: None,
+                build_revision: None,
+                build_dirty: None,
+            }),
+        };
+        let resp = client.register(&req).unwrap();
+        assert!(resp.ok);
+        assert_eq!(client.list(Some("u1")).unwrap().peers.len(), 1);
+
+        let resp = client
+            .unregister(&UnregisterRequest {
+                peer_id: peer_id.clone(),
+            })
+            .unwrap();
+        assert!(resp.ok);
+        assert!(resp.removed);
+        assert!(client.list(Some("u1")).unwrap().peers.is_empty());
+
+        let resp = client.unregister(&UnregisterRequest { peer_id }).unwrap();
+        assert!(resp.ok);
+        assert!(!resp.removed);
 
         server.shutdown();
     }
