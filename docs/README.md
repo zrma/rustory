@@ -17,6 +17,7 @@
 - [운영 모델](OPERATING_MODEL.md)
 - [README 운영 정책](README_OPERATING_POLICY.md)
 - [스킬 운영 가이드](SKILL_OPERATING_GUIDE.md)
+- [장기 유지보수 축](MAINTENANCE_PILLARS.md)
 - [지속 개선 루프](IMPROVEMENT_LOOP.md)
 - [에스컬레이션 정책](ESCALATION_POLICY.md)
 - [교훈 로그](LESSONS_LOG.md)

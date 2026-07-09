@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-29
+- Last Verified: 2026-07-09
 
 이 문서는 `rustory` 루트에서 작업 시작 시 사용하는 단일 네비게이션 문서다.
 
@@ -72,7 +72,7 @@
 - 에이전트 실행 규칙/가드레일: `AGENTS.md`
 - 전체 문서 인덱스(단일 기준): `docs/README.md`
 - `docs/README.md`는 인덱스 전용이다. 실행 방법론과 출고 경계는 `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`를 따르고, 실제 옵션/분기는 대상 스크립트와 CLI help를 직접 확인한다.
-- 운영 제약/문서 경계: `docs/OPERATING_MODEL.md`, `docs/README_OPERATING_POLICY.md`, `docs/SKILL_OPERATING_GUIDE.md`
+- 운영 제약/문서 경계: `docs/OPERATING_MODEL.md`, `docs/MAINTENANCE_PILLARS.md`, `docs/README_OPERATING_POLICY.md`, `docs/SKILL_OPERATING_GUIDE.md`
 - 구현/출고/개선 경로: `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`, `docs/IMPROVEMENT_LOOP.md`, `docs/ESCALATION_POLICY.md`
 - 저장소 메타/검증 명령: `docs/REPO_MANIFEST.yaml`
 - Rustory 실사용 문서: `docs/quickstart.md`, `docs/distribution.md`, `docs/p2p.md`, `docs/daemon.md`, `docs/hook.md`, `docs/dev-playbook.md`

@@ -19,6 +19,7 @@ repositories:
       - docs/CHANGE_CONTROL.md
       - docs/REPO_MANIFEST.yaml
       - docs/OPERATING_MODEL.md
+      - docs/MAINTENANCE_PILLARS.md
       - docs/README_OPERATING_POLICY.md
       - docs/SKILL_OPERATING_GUIDE.md
       - docs/IMPROVEMENT_LOOP.md
