@@ -58,7 +58,7 @@ pub fn auto_fix_existing_managed_hook_blocks(
         .parent()
         .with_context(|| format!("install path has no parent: {}", install_path.display()))?;
     let mut reports = Vec::new();
-    for (rc_file, shell) in managed_hook_candidate_files()? {
+    for (rc_file, shell) in managed_hook_candidate_files(&[])? {
         let existing = match std::fs::read_to_string(&rc_file) {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -81,9 +81,11 @@ pub fn auto_fix_existing_managed_hook_blocks(
     Ok(reports)
 }
 
-pub fn remove_existing_managed_hook_blocks() -> Result<Vec<ManagedHookFixReport>> {
+pub fn remove_existing_managed_hook_blocks(
+    extra_rc_files: &[PathBuf],
+) -> Result<Vec<ManagedHookFixReport>> {
     let mut reports = Vec::new();
-    for (rc_file, shell) in managed_hook_candidate_files()? {
+    for (rc_file, shell) in managed_hook_candidate_files(extra_rc_files)? {
         let existing = match std::fs::read_to_string(&rc_file) {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
@@ -118,7 +120,7 @@ pub fn remove_existing_managed_hook_blocks() -> Result<Vec<ManagedHookFixReport>
     Ok(reports)
 }
 
-fn managed_hook_candidate_files() -> Result<Vec<(PathBuf, Shell)>> {
+fn managed_hook_candidate_files(extra_rc_files: &[PathBuf]) -> Result<Vec<(PathBuf, Shell)>> {
     let home = home_dir()?;
     let mut candidates = Vec::new();
     if let Some(shell) = default_shell() {
@@ -130,7 +132,27 @@ fn managed_hook_candidate_files() -> Result<Vec<(PathBuf, Shell)>> {
             candidates.push((path, shell));
         }
     }
+    for path in extra_rc_files {
+        if !candidates.iter().any(|(candidate, _)| candidate == path) {
+            candidates.push((path.clone(), shell_for_rc_file(path)));
+        }
+    }
     Ok(candidates)
+}
+
+fn shell_for_rc_file(path: &Path) -> Shell {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if name.contains("zsh") {
+        Shell::Zsh
+    } else if name.contains("bash") {
+        Shell::Bash
+    } else {
+        default_shell().unwrap_or(Shell::Bash)
+    }
 }
 
 fn update_managed_hook_block(
@@ -188,7 +210,8 @@ fn update_managed_hook_block(
 }
 
 fn contains_managed_hook_block(content: &str) -> bool {
-    content.contains(HOOK_START) || content.contains(LEGACY_HOOK_START)
+    find_line_marker(content, HOOK_START).is_some()
+        || find_line_marker(content, LEGACY_HOOK_START).is_some()
 }
 
 fn strip_managed_hook_blocks(content: &str) -> (String, usize) {
@@ -197,31 +220,50 @@ fn strip_managed_hook_blocks(content: &str) -> (String, usize) {
     let mut removed = 0;
     while let Some((start, start_marker, end_marker)) = find_next_managed_block_start(rest) {
         output.push_str(&rest[..start]);
-        let after_start = &rest[start + start_marker.len()..];
-        let Some(end) = after_start.find(end_marker) else {
+        let after_start_offset = marker_line_end(rest, start, start_marker);
+        let after_start = &rest[after_start_offset..];
+        let Some(end) = find_line_marker(after_start, end_marker) else {
             output.push_str(&rest[start..]);
             return (output, removed);
         };
-        let mut skip = start + start_marker.len() + end + end_marker.len();
-        if rest[skip..].starts_with('\n') {
-            skip += 1;
-        }
+        let skip = after_start_offset + marker_line_end(after_start, end, end_marker);
         rest = &rest[skip..];
         removed += 1;
     }
     output.push_str(rest);
-    (trim_repeated_blank_lines(&output), removed)
+    (output, removed)
 }
 
 fn find_next_managed_block_start(content: &str) -> Option<(usize, &'static str, &'static str)> {
     [(HOOK_START, HOOK_END), (LEGACY_HOOK_START, LEGACY_HOOK_END)]
         .into_iter()
         .filter_map(|(start_marker, end_marker)| {
-            content
-                .find(start_marker)
-                .map(|offset| (offset, start_marker, end_marker))
+            find_line_marker(content, start_marker).map(|offset| (offset, start_marker, end_marker))
         })
         .min_by_key(|(offset, _, _)| *offset)
+}
+
+fn find_line_marker(content: &str, marker: &str) -> Option<usize> {
+    content.match_indices(marker).find_map(|(offset, _)| {
+        let starts_line = offset == 0 || content.as_bytes().get(offset - 1) == Some(&b'\n');
+        let after = offset + marker.len();
+        let ends_line = after == content.len()
+            || content.as_bytes().get(after) == Some(&b'\n')
+            || (content.as_bytes().get(after) == Some(&b'\r')
+                && content.as_bytes().get(after + 1) == Some(&b'\n'));
+        (starts_line && ends_line).then_some(offset)
+    })
+}
+
+fn marker_line_end(content: &str, offset: usize, marker: &str) -> usize {
+    let after = offset + marker.len();
+    if content[after..].starts_with("\r\n") {
+        after + 2
+    } else if content[after..].starts_with('\n') {
+        after + 1
+    } else {
+        after
+    }
 }
 
 fn append_managed_block(existing: &str, block: &str) -> String {
@@ -229,21 +271,6 @@ fn append_managed_block(existing: &str, block: &str) -> String {
         return block.to_string();
     }
     format!("{}\n\n{}", existing.trim_end(), block)
-}
-
-fn trim_repeated_blank_lines(content: &str) -> String {
-    let mut result = String::with_capacity(content.len());
-    let mut blank = false;
-    for line in content.lines() {
-        let is_blank = line.trim().is_empty();
-        if is_blank && blank {
-            continue;
-        }
-        result.push_str(line);
-        result.push('\n');
-        blank = is_blank;
-    }
-    result.trim_matches('\n').to_string()
 }
 
 fn render_managed_source_block(shell: Shell, bin_dir: &Path) -> String {
@@ -661,6 +688,44 @@ mod tests {
         assert!(!cleaned.contains(HOOK_START));
         assert!(cleaned.contains("export KEEP=1"));
         assert!(cleaned.contains("export KEEP_TOO=1"));
+    }
+
+    #[test]
+    fn strip_managed_hook_blocks_preserves_unmanaged_layout() {
+        let prefix = "export KEEP=1\n\n\n";
+        let managed = [
+            HOOK_START,
+            "\nsource <(rr hook --shell zsh)\n",
+            HOOK_END,
+            "\n",
+        ]
+        .join("");
+        let suffix = "\n\nexport KEEP_TOO=1\n\n\n";
+        let content = format!("{prefix}{managed}{suffix}");
+
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content);
+
+        assert_eq!(removed_blocks, 1);
+        assert_eq!(cleaned, format!("{prefix}{suffix}"));
+    }
+
+    #[test]
+    fn strip_managed_hook_blocks_ignores_quoted_marker_text() {
+        let content = format!("echo '{HOOK_START}'\nexport KEEP=1\necho '{HOOK_END}'\n");
+
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content);
+
+        assert_eq!(removed_blocks, 0);
+        assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn managed_hook_candidates_include_custom_rc_file() {
+        let custom = PathBuf::from("/tmp/rustory-custom-shell.rc");
+
+        let candidates = managed_hook_candidate_files(std::slice::from_ref(&custom)).unwrap();
+
+        assert!(candidates.iter().any(|(path, _)| path == &custom));
     }
 
     #[test]

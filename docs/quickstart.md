@@ -288,6 +288,10 @@ rr uninstall --yes
 tracker에 현재 PeerId unregister를 시도한다. 또한 로컬 DB/config/state를 제거한다. binary까지 지우려면
 명시적으로 `--remove-binary`를 붙인다.
 
+apply 전에 `--dry-run`으로 DB, config/key, runtime marker, state/log, custom rc 경로를 확인한다.
+config를 읽을 수 없거나 관리 daemon 정지가 불완전하면 로컬 데이터 삭제 전에 중단한다. DB/config
+디렉터리의 알 수 없는 sibling 파일은 재귀 삭제하지 않고 남겨 사용자 파일을 보존한다.
+
 ```sh
 rr uninstall --yes --remove-binary
 ```
@@ -297,6 +301,14 @@ rr uninstall --yes --remove-binary
 ```sh
 rr uninstall --dry-run --keep-db --keep-config
 rr uninstall --yes --keep-db --keep-config
+```
+
+installer에서 `--rc-file <path>`로 비표준 shell 시작 파일을 지정했다면 uninstall에도 같은 경로를
+전달해 그 파일의 Rustory hook/daemon autostart 관리 블록까지 제거한다.
+
+```sh
+rr uninstall --dry-run --rc-file "~/.config/custom-shell.rc"
+rr uninstall --yes --rc-file "~/.config/custom-shell.rc"
 ```
 
 uninstall은 현재 머신의 membership 정리일 뿐이다. 이미 다른 peer가 받은 history row를 되돌리거나,

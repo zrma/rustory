@@ -464,7 +464,7 @@ fn resolve_async_upload_limit(cfg: &config::FileConfig) -> Result<usize> {
     )
 }
 
-fn resolve_async_upload_marker_path(cfg: &config::FileConfig) -> String {
+pub(crate) fn resolve_async_upload_marker_path(cfg: &config::FileConfig) -> String {
     resolve_string_setting(
         env_nonempty("RUSTORY_ASYNC_UPLOAD_MARKER_PATH"),
         cfg.async_upload_marker_path.clone(),
@@ -514,7 +514,7 @@ fn resolve_auto_prune_keep_recent(cfg: &config::FileConfig) -> Result<usize> {
     )
 }
 
-fn resolve_auto_prune_marker_path(cfg: &config::FileConfig) -> String {
+pub(crate) fn resolve_auto_prune_marker_path(cfg: &config::FileConfig) -> String {
     resolve_string_setting(
         env_nonempty("RUSTORY_AUTO_PRUNE_MARKER_PATH"),
         cfg.auto_prune_marker_path.clone(),
@@ -553,7 +553,7 @@ fn resolve_auto_tombstone_gc_interval_sec(cfg: &config::FileConfig) -> Result<u6
     )
 }
 
-fn resolve_auto_tombstone_gc_marker_path(cfg: &config::FileConfig) -> String {
+pub(crate) fn resolve_auto_tombstone_gc_marker_path(cfg: &config::FileConfig) -> String {
     resolve_string_setting(
         env_nonempty("RUSTORY_AUTO_TOMBSTONE_GC_MARKER_PATH"),
         cfg.auto_tombstone_gc_marker_path.clone(),

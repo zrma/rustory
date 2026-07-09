@@ -506,11 +506,12 @@ fn restart_managed_daemon(install_path: &Path) {
     println!("daemon=restart_skipped reason=no_managed_daemon_detected");
 }
 
-pub fn stop_managed_daemon(install_path: &Path) {
+pub fn stop_managed_daemon(install_path: &Path) -> Result<()> {
     #[cfg(not(target_os = "linux"))]
     let _ = install_path;
 
     let mut stopped = false;
+    let mut failures: Vec<String> = Vec::new();
 
     #[cfg(target_os = "macos")]
     {
@@ -520,6 +521,7 @@ pub fn stop_managed_daemon(install_path: &Path) {
             }
             DaemonRestartStatus::Failed(error) => {
                 println!("warn: daemon stop failed manager=launchd detail={error}");
+                failures.push(format!("launchd: {error}"));
             }
             DaemonRestartStatus::Skipped => {}
         }
@@ -533,9 +535,11 @@ pub fn stop_managed_daemon(install_path: &Path) {
             }
             DaemonRestartStatus::Failed(error) if systemd_user_bus_unavailable_text(&error) => {
                 println!("daemon=stop_deferred manager=systemd-user reason=user_bus_unavailable");
+                failures.push(format!("systemd-user bus unavailable: {error}"));
             }
             DaemonRestartStatus::Failed(error) => {
                 println!("warn: daemon stop failed manager=systemd-user detail={error}");
+                failures.push(format!("systemd-user: {error}"));
             }
             DaemonRestartStatus::Skipped => {}
         }
@@ -546,6 +550,7 @@ pub fn stop_managed_daemon(install_path: &Path) {
             }
             DaemonRestartStatus::Failed(error) => {
                 println!("warn: daemon stop failed manager=background detail={error}");
+                failures.push(format!("background: {error}"));
             }
             DaemonRestartStatus::Skipped => {}
         }
@@ -554,6 +559,15 @@ pub fn stop_managed_daemon(install_path: &Path) {
     if !stopped {
         println!("daemon=stop_skipped reason=no_managed_daemon_detected");
     }
+
+    if !failures.is_empty() {
+        anyhow::bail!(
+            "managed daemon stop incomplete; uninstall aborted before removing files: {}",
+            failures.join("; ")
+        );
+    }
+
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -645,7 +659,17 @@ fn restart_launchd_daemon() -> DaemonRestartStatus {
 #[cfg(target_os = "linux")]
 fn stop_systemd_user_daemon() -> DaemonRestartStatus {
     let unit_path = home_dir().join(".config/systemd/user/rustory.service");
-    if !unit_path.exists() {
+    let service_active = process_status(ProcessCommand::new("systemctl").args([
+        "--user",
+        "is-active",
+        "rustory.service",
+    ]));
+    let service_enabled = process_status(ProcessCommand::new("systemctl").args([
+        "--user",
+        "is-enabled",
+        "rustory.service",
+    ]));
+    if !unit_path.exists() && !service_active && !service_enabled {
         return DaemonRestartStatus::Skipped;
     }
 
@@ -721,7 +745,7 @@ fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
             println!("daemon=stale_processes_stopped manager=background count={count}");
         }
         Err(err) => {
-            println!("warn: daemon stale process cleanup failed manager=background detail={err}")
+            return DaemonRestartStatus::Failed(format!("stale process cleanup failed: {err}"));
         }
     }
 

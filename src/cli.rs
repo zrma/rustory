@@ -22,8 +22,9 @@ use crate::runtime_tasks::{
     compute_prune_cutoff_unix, load_async_upload_runtime_settings,
     load_auto_prune_runtime_settings, load_auto_tombstone_gc_runtime_settings,
     maybe_run_auto_prune, maybe_run_auto_tombstone_gc, maybe_spawn_async_upload, parse_env_bool,
-    summarize_async_upload_runtime, summarize_auto_prune_runtime,
-    summarize_auto_tombstone_gc_runtime,
+    resolve_async_upload_marker_path, resolve_auto_prune_marker_path,
+    resolve_auto_tombstone_gc_marker_path, summarize_async_upload_runtime,
+    summarize_auto_prune_runtime, summarize_auto_tombstone_gc_runtime,
 };
 use crate::sync_status::{
     SyncStatusTrackerReport, build_sync_status_report_for_cli, build_tracker_status_report,
@@ -570,7 +571,7 @@ enum Command {
         #[arg(
             long,
             default_value_t = false,
-            help = "Keep daemon state and log files"
+            help = "Keep runtime markers, daemon state, and log files"
         )]
         keep_state: bool,
 
@@ -580,6 +581,12 @@ enum Command {
             help = "Also remove the current rr binary"
         )]
         remove_binary: bool,
+
+        #[arg(
+            long,
+            help = "Also clean a non-default shell rc file used by the installer"
+        )]
+        rc_file: Option<String>,
     },
     #[command(about = "Print a bash or zsh shell hook")]
     Hook {
@@ -1308,6 +1315,7 @@ pub fn run() -> Result<()> {
             let peer = normalize_opt_string(peer);
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
+            let local_user_id = resolve_user_id(&cfg);
             let local_peer_id = resolve_local_p2p_peer_id(&cfg);
             let trackers = if with_tracker {
                 Some(resolve_trackers(Vec::new(), &cfg)?)
@@ -1328,7 +1336,7 @@ pub fn run() -> Result<()> {
                         peer_filter: peer.as_deref(),
                         trackers: trackers.as_deref(),
                         tracker_token: tracker_token.as_deref(),
-                        user_id: cfg.user_id.as_deref(),
+                        user_id: Some(&local_user_id),
                         interval_sec: interval_sec.max(1),
                     },
                 )?;
@@ -1342,7 +1350,7 @@ pub fn run() -> Result<()> {
                 peer.as_deref(),
                 trackers.as_deref(),
                 tracker_token.as_deref(),
-                cfg.user_id.as_deref(),
+                Some(&local_user_id),
             )?;
 
             if json {
@@ -1427,6 +1435,7 @@ pub fn run() -> Result<()> {
         } => {
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
+            let local_user_id = resolve_user_id(&cfg);
             let local_peer_id = resolve_local_p2p_peer_id(&cfg);
             let trackers = if no_tracker {
                 None
@@ -1446,7 +1455,7 @@ pub fn run() -> Result<()> {
                     local_peer_id.as_deref(),
                     trackers.as_deref(),
                     tracker_token.as_deref(),
-                    cfg.user_id.as_deref(),
+                    Some(&local_user_id),
                     interval_sec.max(1),
                 )?;
                 return Ok(());
@@ -1459,7 +1468,7 @@ pub fn run() -> Result<()> {
                 None,
                 trackers.as_deref(),
                 tracker_token.as_deref(),
-                cfg.user_id.as_deref(),
+                Some(&local_user_id),
             )?;
             let mut state = SyncStatusWatchState::default();
             let (width, height) =
@@ -1510,6 +1519,7 @@ pub fn run() -> Result<()> {
             keep_config,
             keep_state,
             remove_binary,
+            rc_file,
         } => {
             let install_path = std::env::current_exe().context("resolve current rr executable")?;
             let config_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
@@ -1517,6 +1527,27 @@ pub fn run() -> Result<()> {
             let trackers = resolve_trackers(Vec::new(), &cfg)?;
             let tracker_token = resolve_tracker_token(None, &cfg)?;
             let local_peer_id = resolve_local_p2p_peer_id(&cfg);
+            let config_key_paths = [
+                resolve_swarm_key_path(None, &cfg),
+                resolve_p2p_identity_key_path(None, &cfg),
+                resolve_relay_identity_key_path(None, &cfg),
+            ]
+            .into_iter()
+            .map(|path| config::expand_home_path(&path))
+            .collect::<Result<Vec<_>>>()?;
+            let state_marker_paths = [
+                resolve_async_upload_marker_path(&cfg),
+                resolve_auto_prune_marker_path(&cfg),
+                resolve_auto_tombstone_gc_marker_path(&cfg),
+            ]
+            .into_iter()
+            .map(|path| config::expand_home_path(&path))
+            .collect::<Result<Vec<_>>>()?;
+            let extra_rc_files = normalize_opt_string(rc_file)
+                .map(|path| config::expand_home_path(&path))
+                .transpose()?
+                .into_iter()
+                .collect();
             uninstall::run_uninstall(uninstall::UninstallRequest {
                 apply: yes && !dry_run,
                 dry_run,
@@ -1527,9 +1558,13 @@ pub fn run() -> Result<()> {
                 install_path,
                 config_path,
                 db_path,
+                config_key_paths,
+                state_marker_paths,
+                extra_rc_files,
                 trackers,
                 tracker_token,
                 local_peer_id,
+                config_load_error,
             })?;
         }
         Command::Hook { shell } => {
@@ -1722,7 +1757,8 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
         Command::Doctor { .. }
             | Command::Version { .. }
             | Command::Update { .. }
-            | Command::Uninstall { .. }
+            | Command::Uninstall { dry_run: true, .. }
+            | Command::Uninstall { yes: false, .. }
             | Command::CleanupHishtory { .. }
             | Command::Init { force: true, .. }
     )
@@ -4140,7 +4176,7 @@ mod tests {
     }
 
     #[test]
-    fn uninstall_command_parses_and_ignores_config_load_errors() {
+    fn uninstall_dry_run_parses_and_can_report_config_load_errors() {
         let app = App::parse_from([
             "rr",
             "uninstall",
@@ -4150,6 +4186,8 @@ mod tests {
             "--keep-config",
             "--keep-state",
             "--remove-binary",
+            "--rc-file",
+            "~/.config/custom-shell.rc",
         ]);
 
         match &app.cmd {
@@ -4160,6 +4198,7 @@ mod tests {
                 keep_config,
                 keep_state,
                 remove_binary,
+                rc_file,
             } => {
                 assert!(*dry_run);
                 assert!(*yes);
@@ -4167,10 +4206,18 @@ mod tests {
                 assert!(*keep_config);
                 assert!(*keep_state);
                 assert!(*remove_binary);
+                assert_eq!(rc_file.as_deref(), Some("~/.config/custom-shell.rc"));
             }
             _ => panic!("expected uninstall"),
         }
         assert!(can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn uninstall_apply_requires_valid_config() {
+        let app = App::parse_from(["rr", "uninstall", "--yes"]);
+
+        assert!(!can_continue_after_config_load_error(&app.cmd));
     }
 
     #[test]
