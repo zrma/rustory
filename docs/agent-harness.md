@@ -4,7 +4,7 @@
 
 - Structure ID: `agent-harness-v1`.
 - Baseline ID: `openai-gpt-5.6-2026-07-10`.
-- Convergence stage: `normalized`.
+- Convergence stage: `canonical`.
 - Target stage: `canonical`.
 - Canonical check: `scripts/check-agent-harness-interface.sh`.
 
@@ -64,7 +64,7 @@ Rustory를 local-first 셸 히스토리 daily driver로 유지한다. 기록은 
 
 - `bridge`: 이 문서가 공통 인터페이스를 제공하고 기존 상세 문서를 연결한다.
 - `normalized`: 중복된 autonomy, execution, verification, escalation, VCS 정책을 이 문서의 동일 섹션으로 이동한다.
-- `canonical`: 프로젝트별 차이는 `Project Overlay`에만 두고 기존 정책 문서는 domain runbook 또는 호환 링크로 축소한다.
+- `canonical`: 프로젝트 목적, source, command, domain invariant는 같은 섹션 계약 안의 local content로 유지하고 공통 baseline, 제목 순서, 검사 골격은 동일하게 잠근다.
 - 단계 전환은 현재 저장소의 Structure ID, 섹션 순서, canonical check 결과로 검증하며 다른 저장소의 이름·개수·로컬 경로·공개 여부를 전제하지 않는다.
 
 ## Project Overlay
