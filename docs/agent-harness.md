@@ -4,7 +4,7 @@
 
 - Structure ID: `agent-harness-v1`.
 - Baseline ID: `openai-gpt-5.6-2026-07-10`.
-- Convergence stage: `bridge`.
+- Convergence stage: `normalized`.
 - Target stage: `canonical`.
 - Canonical check: `scripts/check-agent-harness-interface.sh`.
 
