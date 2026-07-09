@@ -229,7 +229,16 @@ pub(crate) fn supervise_daemon_children(
 }
 
 pub(crate) fn sleep_with_stop(duration: Duration, stop: &AtomicBool) {
-    let deadline = Instant::now() + duration;
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let Some(deadline) = Instant::now().checked_add(duration) else {
+        while !stop.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        return;
+    };
     while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -285,5 +294,16 @@ fn send_child_terminate(child: &mut Child) -> std::io::Result<()> {
     #[cfg(not(unix))]
     {
         child.kill()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sleep_with_stop_handles_unrepresentable_duration_when_already_stopped() {
+        let stop = AtomicBool::new(true);
+        sleep_with_stop(Duration::MAX, &stop);
     }
 }

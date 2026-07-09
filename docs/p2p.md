@@ -156,6 +156,11 @@ rr --db-path "/tmp/rustory-b.db" p2p-sync --peers "/ip4/127.0.0.1/tcp/8845/p2p/<
 - 동기화 커서는 `peer_state.last_cursor`에 저장한다.
 - key(`peer_state.peer_id`)는 **상대 피어의 `PeerId` 문자열**을 사용한다.
   - 단계 1에서 저장한 multiaddr 키는, 수동 `--peers` 동기화 시 1회 마이그레이션된다.
+- 이 노드가 상대에게 보낸 entry/delete의 전달 커서는 `peer_push_state`와 `peer_delete_push_state`에 저장한다.
+  - outbound push는 원격이 batch를 수락한 응답을 받은 뒤에만 전진한다.
+  - inbound pull은 libp2p가 응답 frame을 보냈다는 transport event만으로 전진하지 않는다. 상대가 다음 pull 요청에 이전 응답의 cursor를 실어 보냈을 때 그 cursor까지 로컬 DB에 반영했다는 애플리케이션 확인으로 간주한다.
+  - 최초 push/pull 시도부터 peer별 전달 상태를 `0`으로 등록하므로, 실패하거나 아직 확인되지 않은 row와 deletion tombstone은 prune/GC floor를 통과하지 않는다.
+- pull 요청의 확인 cursor는 로컬 SQLite가 지금까지 할당한 sequence high-water mark를 넘을 수 없고 뒤로 이동하지 않는다. 이미 안전하게 prune/GC된 row의 cursor 확인은 허용된다.
 
 ## 설정 파일(config.toml)
 - `~/.config/rustory/config.toml`로 runtime 설정을 지속화할 수 있다. 현재 fallback 순서와 default는 `rr doctor`, CLI help, config resolver 코드를 확인한다.

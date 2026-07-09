@@ -5,10 +5,11 @@ usage() {
 	cat <<'EOF'
 Usage: scripts/check.sh [--fast|--no-smoke] [--acceptance] [--secret-scan]
 
-Runs the same Rust checks as CI:
+Runs the repository checks mirrored by CI:
   - cargo fmt --all --check
   - cargo test --workspace
   - cargo clippy --workspace --all-targets -- -D warnings
+  - python3 install/test_rustory.py
   - scripts/smoke_p2p_local.sh
 
 Optional heavy check:
@@ -60,6 +61,7 @@ rustory_require_cargo
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+python3 install/test_rustory.py
 
 if [[ "$secret_scan" -eq 1 ]]; then
 	bash scripts/secret_scan.sh

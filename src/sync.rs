@@ -101,6 +101,8 @@ where
             break;
         }
 
+        validate_pull_batch_cursors(&batch, cursor, delete_cursor)?;
+
         let stats = local.insert_entries_with_stats(&batch.entries)?;
         let deletion_stats = local.apply_entry_deletions_with_stats(&batch.deletions)?;
         received_total += batch.entries.len();
@@ -206,6 +208,8 @@ where
             break;
         }
 
+        validate_pull_batch_cursors(&batch, cursor, delete_cursor)?;
+
         let stats = local.insert_entries_with_stats(&batch.entries)?;
         let deletion_stats = local.apply_entry_deletions_with_stats(&batch.deletions)?;
         received_total += batch.entries.len();
@@ -270,6 +274,7 @@ where
         return Ok(0);
     }
 
+    local.ensure_peer_push_state(peer_id)?;
     let mut cursor = local.get_last_pushed_seq(peer_id)?;
     let mut delete_cursor = local.get_last_pushed_delete_seq(peer_id)?;
     let mut pushed_total = 0usize;
@@ -349,6 +354,7 @@ where
         return Ok(0);
     }
 
+    local.ensure_peer_push_state(peer_id)?;
     let mut cursor = local.get_last_pushed_seq(peer_id)?;
     let mut delete_cursor = local.get_last_pushed_delete_seq(peer_id)?;
     let mut pushed_total = 0usize;
@@ -412,6 +418,29 @@ where
     }
 
     Ok(pushed_total)
+}
+
+fn validate_pull_batch_cursors(batch: &PullBatch, cursor: i64, delete_cursor: i64) -> Result<()> {
+    if !batch.entries.is_empty() {
+        let Some(next_cursor) = batch.next_cursor else {
+            anyhow::bail!("invalid pull batch: entries is non-empty but next_cursor is None");
+        };
+        if next_cursor <= cursor {
+            anyhow::bail!("invalid pull batch: next_cursor did not advance");
+        }
+    }
+
+    if !batch.deletions.is_empty() {
+        let Some(next_delete_cursor) = batch.next_delete_cursor else {
+            anyhow::bail!(
+                "invalid pull batch: deletions is non-empty but next_delete_cursor is None"
+            );
+        };
+        if next_delete_cursor <= delete_cursor {
+            anyhow::bail!("invalid pull batch: next_delete_cursor did not advance");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn is_payload_too_large_error(err: &anyhow::Error) -> bool {
@@ -658,6 +687,35 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("network error"));
         assert_eq!(local.get_last_pushed_seq("peer-1").unwrap(), 0);
+        assert_eq!(
+            local.get_last_pushed_seq_opt("peer-1").unwrap(),
+            Some(0),
+            "a failed first push must still register a zero cursor so prune cannot skip the peer"
+        );
+        assert_eq!(
+            local.get_last_pushed_delete_seq_opt("peer-1").unwrap(),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn pull_rejects_missing_cursor_before_mutating_local_store() {
+        let local = LocalStore::open(":memory:").unwrap();
+        let incoming = entry("id-1", 1, "echo should-not-commit");
+
+        let err = sync_pull_from_peer(&local, "peer-1", 100, |_cursor, _delete_cursor, _limit| {
+            Ok(PullBatch {
+                entries: vec![incoming.clone()],
+                next_cursor: None,
+                deletions: Vec::new(),
+                next_delete_cursor: None,
+            })
+        })
+        .unwrap_err();
+
+        assert!(err.to_string().contains("next_cursor is None"));
+        assert!(local.list_recent(10).unwrap().is_empty());
+        assert_eq!(local.get_last_cursor("peer-1").unwrap(), 0);
     }
 
     #[test]

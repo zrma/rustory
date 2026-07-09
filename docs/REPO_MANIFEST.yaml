@@ -55,6 +55,7 @@ repositories:
       - cargo fmt --all --check
       - cargo test --workspace
       - cargo clippy --workspace --all-targets -- -D warnings
+      - python3 install/test_rustory.py
       - scripts/smoke_p2p_local.sh
       - ci:.github/workflows/ci.yml
       - ci:.github/workflows/docs-integrity.yml

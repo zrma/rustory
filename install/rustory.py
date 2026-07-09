@@ -1081,12 +1081,17 @@ def cleanup_hishtory_file(path: Path) -> bool:
     if not path.exists() or not path.is_file():
         return False
 
-    lines = path.read_text().splitlines()
+    original = path.read_text()
+    lines = original.splitlines()
     cleaned = remove_hishtory_lines(lines)
     if cleaned == lines:
         return False
+    if path.is_symlink():
+        raise SystemExit(
+            f"refusing to rewrite symlinked startup file {path}; edit its target manually"
+        )
 
-    had_final_newline = path.read_text().endswith("\n")
+    had_final_newline = original.endswith("\n")
     text = "\n".join(cleaned)
     if text and had_final_newline:
         text += "\n"
@@ -1099,69 +1104,42 @@ def remove_hishtory_lines(lines: list[str]) -> list[str]:
     index = 0
     while index < len(lines):
         line = lines[index]
-        if is_hishtory_line(line):
+        if is_hishtory_config_header(line) or is_hishtory_line(line):
             index += 1
-            continue
-        if is_hishtory_config_header(line):
-            index = skip_following_hishtory_block(lines, index + 1)
             continue
         cleaned.append(line)
         index += 1
-    return trim_repeated_blank_lines(cleaned)
+    return cleaned
 
 
 def is_hishtory_config_header(line: str) -> bool:
-    return "hishtory config" in line.casefold()
-
-
-def skip_following_hishtory_block(lines: list[str], index: int) -> int:
-    while index < len(lines):
-        line = lines[index]
-        stripped = line.strip()
-        if not stripped:
-            index += 1
-            break
-        if is_hishtory_line(line) or "hishtory" in line.casefold():
-            index += 1
-            continue
-        break
-    return index
+    return line.strip().casefold().rstrip(":") == "# hishtory config"
 
 
 def is_hishtory_line(line: str) -> bool:
-    folded = line.casefold()
     stripped = line.strip()
-    if "hishtory" not in folded:
+    folded = stripped.casefold()
+    if not folded or folded.startswith("#"):
         return False
-    markers = (
-        ".hishtory",
-        "hishtory/config",
-        "hishtory config",
-        "hishtory init",
-        "hishtory enable",
-        "hishtory shell",
-        "hishtory daemon",
-        "source ",
-        "export path",
-        "eval ",
+
+    references_hishtory_path = any(
+        marker in folded
+        for marker in (".hishtory", "hishtory/config", "hishtory config")
     )
-    return stripped.startswith("#") or any(marker in folded for marker in markers)
-
-
-def trim_repeated_blank_lines(lines: list[str]) -> list[str]:
-    result: list[str] = []
-    blank = False
-    for line in lines:
-        is_blank = not line.strip()
-        if is_blank and blank:
-            continue
-        result.append(line)
-        blank = is_blank
-    while result and not result[0].strip():
-        result.pop(0)
-    while result and not result[-1].strip():
-        result.pop()
-    return result
+    is_source = folded.startswith("source ") or folded.startswith(". ")
+    is_path_assignment = folded.startswith("export path=") or folded.startswith("path=")
+    is_eval_hook = folded.startswith("eval ") and (
+        "$(hishtory " in folded or "`hishtory " in folded
+    )
+    words = folded.split()
+    is_direct_hook = (
+        len(words) >= 2
+        and words[0] == "hishtory"
+        and words[1] in {"init", "enable", "shell", "daemon"}
+    )
+    return (
+        references_hishtory_path and (is_source or is_path_assignment)
+    ) or is_eval_hook or is_direct_hook
 
 
 def install_shell_hook(install_path: Path, args: argparse.Namespace) -> None:

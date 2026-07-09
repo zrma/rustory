@@ -1880,9 +1880,8 @@ fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<(
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create dir: {}", parent.display()))?;
         }
-        std::fs::write(&cfg_path, rendered)
+        config::write_private_file(&cfg_path, rendered.as_bytes(), args.force)
             .with_context(|| format!("write config: {}", cfg_path.display()))?;
-        restrict_permissions_0600(&cfg_path)?;
         println!("wrote config: {}", cfg_path.display());
     }
 
@@ -2035,18 +2034,6 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     );
 
     Ok(out)
-}
-
-fn restrict_permissions_0600(path: &std::path::Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o600);
-        std::fs::set_permissions(path, perms)
-            .with_context(|| format!("chmod 0600: {}", path.display()))?;
-    }
-
-    Ok(())
 }
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
@@ -2996,9 +2983,8 @@ fn fix_default_record_ignore_regex(
     content.push_str(&format!(
         "record_ignore_regex = {DEFAULT_RECORD_IGNORE_REGEX:?}\n"
     ));
-    std::fs::write(cfg_path, content)
+    config::write_private_file(cfg_path, content.as_bytes(), true)
         .with_context(|| format!("write config: {}", cfg_path.display()))?;
-    set_path_mode(cfg_path, 0o600).with_context(|| format!("chmod 600: {}", cfg_path.display()))?;
     report.actions.push(DoctorAutoFixAction {
         target: "record_ignore_regex".to_string(),
         status: DoctorAutoFixStatus::Fixed,

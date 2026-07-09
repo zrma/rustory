@@ -578,6 +578,58 @@ ON CONFLICT(peer_id) DO UPDATE SET
         Ok(())
     }
 
+    pub fn ensure_peer_push_state(&self, peer_id: &str) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin ensure peer push state tx")?;
+        tx.execute(
+            "INSERT OR IGNORE INTO peer_push_state(peer_id, last_pushed_seq) VALUES (?, 0)",
+            params![peer_id],
+        )
+        .context("initialize peer_push_state")?;
+        tx.execute(
+            "INSERT OR IGNORE INTO peer_delete_push_state(peer_id, last_pushed_delete_seq) VALUES (?, 0)",
+            params![peer_id],
+        )
+        .context("initialize peer_delete_push_state")?;
+        tx.commit().context("commit ensure peer push state tx")?;
+        Ok(())
+    }
+
+    pub fn acknowledge_peer_pull_cursors(
+        &self,
+        peer_id: &str,
+        cursor: i64,
+        delete_cursor: i64,
+    ) -> Result<()> {
+        anyhow::ensure!(cursor >= 0, "peer pull cursor must not be negative");
+        anyhow::ensure!(
+            delete_cursor >= 0,
+            "peer pull delete cursor must not be negative"
+        );
+
+        let entry_ceiling = self
+            .latest_ingest_seq_high_water()?
+            .max(self.get_last_pushed_seq(peer_id)?);
+        let delete_ceiling = self
+            .latest_delete_seq_high_water()?
+            .max(self.get_last_pushed_delete_seq(peer_id)?);
+        anyhow::ensure!(
+            cursor <= entry_ceiling,
+            "peer pull cursor {cursor} exceeds local entry ceiling {entry_ceiling}"
+        );
+        anyhow::ensure!(
+            delete_cursor <= delete_ceiling,
+            "peer pull delete cursor {delete_cursor} exceeds local deletion ceiling {delete_ceiling}"
+        );
+
+        self.ensure_peer_push_state(peer_id)?;
+        self.advance_last_pushed_seq(peer_id, cursor)?;
+        self.advance_last_pushed_delete_seq(peer_id, delete_cursor)?;
+        Ok(())
+    }
+
     pub fn latest_ingest_seq(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -586,6 +638,26 @@ ON CONFLICT(peer_id) DO UPDATE SET
                 |row| row.get(0),
             )
             .context("query latest ingest_seq")
+    }
+
+    fn latest_ingest_seq_high_water(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'entries'), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .context("query ingest_seq high water mark")
+    }
+
+    fn latest_delete_seq_high_water(&self) -> Result<i64> {
+        self.conn
+            .query_row(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'entry_deletions'), 0)",
+                [],
+                |row| row.get(0),
+            )
+            .context("query delete_seq high water mark")
     }
 
     pub fn list_peer_sync_status(&self) -> Result<Vec<PeerSyncStatus>> {
@@ -2091,6 +2163,21 @@ mod tests {
     fn latest_ingest_seq_returns_zero_for_empty_store() {
         let store = LocalStore::open(":memory:").unwrap();
         assert_eq!(store.latest_ingest_seq().unwrap(), 0);
+    }
+
+    #[test]
+    fn peer_pull_ack_accepts_assigned_cursor_after_entries_are_pruned() {
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .insert_entries(&[entry("id-1", 10, "echo 1")])
+            .unwrap();
+
+        let pruned = store.prune_entries_older_than(11, 0, false).unwrap();
+        assert_eq!(pruned.deleted, 1);
+        assert_eq!(store.latest_ingest_seq().unwrap(), 0);
+
+        store.acknowledge_peer_pull_cursors("peer-a", 1, 0).unwrap();
+        assert_eq!(store.get_last_pushed_seq("peer-a").unwrap(), 1);
     }
 
     #[test]

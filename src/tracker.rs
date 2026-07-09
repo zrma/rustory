@@ -303,10 +303,10 @@ fn prune_expired(state: &mut TrackerState, now: OffsetDateTime, ttl_sec: u64) {
     }
 
     let now_ts = now.unix_timestamp();
-    let ttl = ttl_sec as i64;
+    let ttl = i64::try_from(ttl_sec).unwrap_or(i64::MAX);
     state
         .peers
-        .retain(|_, rec| now_ts - rec.last_seen_unix <= ttl);
+        .retain(|_, rec| now_ts.saturating_sub(rec.last_seen_unix) <= ttl);
 }
 
 fn query_get<'a>(query: &'a str, key: &str) -> Option<&'a str> {
@@ -700,6 +700,27 @@ mod tests {
         assert!(token_matches(" secret ", "secret"));
         assert!(!token_matches("secret1", "secret"));
         assert!(!token_matches("secret", "secret1"));
+    }
+
+    #[test]
+    fn tracker_huge_ttl_does_not_wrap_and_expire_fresh_peers() {
+        let mut state = TrackerState::default();
+        state.peers.insert(
+            PeerId::random().to_string(),
+            PeerRecord {
+                addrs: Vec::new(),
+                meta: None,
+                last_seen_unix: -1,
+            },
+        );
+
+        prune_expired(
+            &mut state,
+            OffsetDateTime::from_unix_timestamp(0).unwrap(),
+            u64::MAX,
+        );
+
+        assert_eq!(state.peers.len(), 1);
     }
 
     #[test]

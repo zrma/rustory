@@ -1,6 +1,8 @@
 use crate::libp2p;
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const DEFAULT_CONFIG_PATH: &str = "~/.config/rustory/config.toml";
@@ -89,11 +91,16 @@ pub fn load_or_generate_swarm_key(path: &str) -> Result<libp2p::pnet::PreSharedK
                 .try_fill_bytes(&mut raw)
                 .context("generate swarm key")?;
             let key = PreSharedKey::new(raw);
+            if install_private_file(&path, key.to_string().as_bytes(), false)? {
+                return Ok(key);
+            }
 
-            std::fs::write(&path, key.to_string())
-                .with_context(|| format!("write swarm key: {}", path.display()))?;
-            restrict_permissions(&path)?;
-            Ok(key)
+            let existing = std::fs::read_to_string(&path).with_context(|| {
+                format!("read concurrently created swarm key: {}", path.display())
+            })?;
+            existing
+                .parse()
+                .context("parse concurrently created swarm key")
         }
         Err(err) => Err(err).with_context(|| format!("read swarm key: {}", path.display())),
     }
@@ -133,10 +140,18 @@ pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity:
             let bytes = keypair
                 .to_protobuf_encoding()
                 .context("encode identity keypair")?;
-            std::fs::write(&path, bytes)
-                .with_context(|| format!("write identity keypair: {}", path.display()))?;
-            restrict_permissions(&path)?;
-            Ok(keypair)
+            if install_private_file(&path, &bytes, false)? {
+                return Ok(keypair);
+            }
+
+            let existing = std::fs::read(&path).with_context(|| {
+                format!(
+                    "read concurrently created identity keypair: {}",
+                    path.display()
+                )
+            })?;
+            libp2p::identity::Keypair::from_protobuf_encoding(&existing)
+                .context("parse concurrently created identity keypair")
         }
         Err(err) => Err(err).with_context(|| format!("read identity keypair: {}", path.display())),
     }
@@ -165,6 +180,79 @@ pub fn expand_home_path(path: &str) -> Result<PathBuf> {
         return Ok(Path::new(&home).join(rest));
     }
     Ok(PathBuf::from(path))
+}
+
+pub fn write_private_file(path: &Path, contents: &[u8], replace_existing: bool) -> Result<()> {
+    if install_private_file(path, contents, replace_existing)? {
+        return Ok(());
+    }
+    anyhow::bail!("private file already exists: {}", path.display())
+}
+
+fn install_private_file(path: &Path, contents: &[u8], replace_existing: bool) -> Result<bool> {
+    ensure_parent_dir(path)?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rustory-private");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+
+    let write_result = (|| -> Result<()> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&tmp_path)
+            .with_context(|| format!("create private temp file: {}", tmp_path.display()))?;
+        file.write_all(contents)
+            .with_context(|| format!("write private temp file: {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync private temp file: {}", tmp_path.display()))?;
+        restrict_permissions(&tmp_path)?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+
+    let install_result = if replace_existing {
+        std::fs::rename(&tmp_path, path)
+            .map(|()| true)
+            .with_context(|| {
+                format!(
+                    "atomically replace private file: {} -> {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            })
+    } else {
+        match std::fs::hard_link(&tmp_path, path) {
+            Ok(()) => Ok(true),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(err) => Err(err).with_context(|| {
+                format!(
+                    "atomically install private file: {} -> {}",
+                    tmp_path.display(),
+                    path.display()
+                )
+            }),
+        }
+    };
+    let _ = std::fs::remove_file(&tmp_path);
+    install_result
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -271,6 +359,52 @@ auto_tombstone_gc_marker_path = "~/.config/rustory/auto-tombstone-gc.custom.last
             cfg.auto_tombstone_gc_marker_path.as_deref(),
             Some("~/.config/rustory/auto-tombstone-gc.custom.last")
         );
+    }
+
+    #[test]
+    fn private_file_write_is_noclobber_by_default_and_supports_atomic_replace() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        write_private_file(&path, b"secret=one\n", false).unwrap();
+        let err = write_private_file(&path, b"secret=two\n", false).unwrap_err();
+        assert!(format!("{err:#}").contains("already exists"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret=one\n");
+
+        write_private_file(&path, b"secret=two\n", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"secret=two\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_replace_does_not_follow_existing_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("target");
+        let path = dir.path().join("config.toml");
+        std::fs::write(&target, b"keep-target\n").unwrap();
+        symlink(&target, &path).unwrap();
+
+        write_private_file(&path, b"new-config\n", true).unwrap();
+
+        assert!(
+            !std::fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"new-config\n");
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep-target\n");
     }
 
     #[test]

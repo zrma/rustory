@@ -454,7 +454,6 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
         .collect::<Vec<_>>();
 
     let mut known_addrs: HashSet<String> = HashSet::new();
-    let mut pending_pull_responses = HashMap::new();
     let mut next_register = tokio::time::interval(Duration::from_secs(30));
 
     loop {
@@ -529,10 +528,17 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             libp2p_request_response::Message::Request {
                                 request,
                                 channel,
-                                request_id,
+                                ..
                             } => {
-                                if let Err(err) =
-                                    authorize_inbound_peer(&store, peer, &meta, &trackers)
+                                if let Err(err) = authorize_inbound_peer(
+                                    &store,
+                                    peer,
+                                    &meta,
+                                    &trackers,
+                                )
+                                .and_then(|_| {
+                                    acknowledge_inbound_pull_request(&store, peer, &request)
+                                })
                                 {
                                     eprintln!("warn: p2p pull rejected: peer={peer} error={err:#}");
                                     continue;
@@ -549,60 +555,13 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                     deletions: batch.deletions,
                                     next_delete_cursor: batch.next_delete_cursor,
                                 };
-                                if resp.next_cursor.is_some() || resp.next_delete_cursor.is_some() {
-                                    pending_pull_responses.insert(
-                                        (peer, request_id),
-                                        (resp.next_cursor, resp.next_delete_cursor),
-                                    );
-                                }
-                                if swarm
-                                    .behaviour_mut()
-                                    .sync
-                                    .send_response(channel, resp)
-                                    .is_err()
-                                {
-                                    pending_pull_responses.remove(&(peer, request_id));
-                                }
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
                             }
                             libp2p_request_response::Message::Response { .. } => {}
                         },
                         libp2p_request_response::Event::OutboundFailure { .. } => {}
-                        libp2p_request_response::Event::InboundFailure {
-                            peer,
-                            request_id,
-                            ..
-                        } => {
-                            pending_pull_responses.remove(&(peer, request_id));
-                        }
-                        libp2p_request_response::Event::ResponseSent {
-                            peer,
-                            request_id,
-                            ..
-                        } => {
-                            if let Some((next_cursor, next_delete_cursor)) =
-                                pending_pull_responses.remove(&(peer, request_id))
-                            {
-                                let peer_key = peer.to_string();
-                                if let Some(next_cursor) = next_cursor
-                                    && let Err(err) =
-                                        store.advance_last_pushed_seq(&peer_key, next_cursor)
-                                {
-                                    eprintln!(
-                                        "warn: p2p pull response cursor update failed: peer={peer} cursor={next_cursor} error={err:#}"
-                                    );
-                                }
-                                if let Some(next_delete_cursor) = next_delete_cursor
-                                    && let Err(err) = store.advance_last_pushed_delete_seq(
-                                        &peer_key,
-                                        next_delete_cursor,
-                                    )
-                                {
-                                    eprintln!(
-                                        "warn: p2p pull response delete cursor update failed: peer={peer} cursor={next_delete_cursor} error={err:#}"
-                                    );
-                                }
-                            }
-                        }
+                        libp2p_request_response::Event::InboundFailure { .. } => {}
+                        libp2p_request_response::Event::ResponseSent { .. } => {}
                     },
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
                         libp2p_request_response::Event::Message { peer, message, .. } => match message {
@@ -827,6 +786,14 @@ fn authorize_inbound_peer(
     }
 
     anyhow::bail!("peer is not present in peer_book or tracker: {peer_id}");
+}
+
+fn acknowledge_inbound_pull_request(
+    store: &LocalStore,
+    peer: PeerId,
+    request: &SyncPull,
+) -> Result<()> {
+    store.acknowledge_peer_pull_cursors(&peer.to_string(), request.cursor, request.delete_cursor)
 }
 
 fn refresh_peer_book_peer_from_trackers(
@@ -2878,6 +2845,65 @@ mod tests {
         assert_eq!(
             clamp_remote_pull_limit(usize::MAX),
             crate::sync::SERVER_SYNC_PULL_LIMIT_MAX
+        );
+    }
+
+    #[test]
+    fn inbound_pull_advances_delivery_only_from_the_next_acknowledged_request() {
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .insert_entries(&[entry("id-1", 1, "echo 1"), entry("id-2", 2, "echo 2")])
+            .unwrap();
+        let peer = PeerId::random();
+
+        acknowledge_inbound_pull_request(
+            &store,
+            peer,
+            &SyncPull {
+                cursor: 0,
+                delete_cursor: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        let batch = store.pull_sync_batch(0, 0, 10).unwrap();
+        assert_eq!(batch.next_cursor, Some(2));
+        assert_eq!(store.get_last_pushed_seq(&peer.to_string()).unwrap(), 0);
+
+        acknowledge_inbound_pull_request(
+            &store,
+            peer,
+            &SyncPull {
+                cursor: 2,
+                delete_cursor: 0,
+                limit: 10,
+            },
+        )
+        .unwrap();
+        assert_eq!(store.get_last_pushed_seq(&peer.to_string()).unwrap(), 2);
+    }
+
+    #[test]
+    fn inbound_pull_rejects_cursor_beyond_local_high_water_mark() {
+        let store = LocalStore::open(":memory:").unwrap();
+        store.insert_entries(&[entry("id-1", 1, "echo 1")]).unwrap();
+        let peer = PeerId::random();
+
+        let err = acknowledge_inbound_pull_request(
+            &store,
+            peer,
+            &SyncPull {
+                cursor: 99,
+                delete_cursor: 0,
+                limit: 10,
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("exceeds local entry ceiling"));
+        assert_eq!(
+            store.get_last_pushed_seq_opt(&peer.to_string()).unwrap(),
+            None
         );
     }
 

@@ -165,7 +165,7 @@ curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.p
     --install-hook --install-daemon --import-hishtory
 ```
 
-이 경로는 Hishtory DB/디렉터리는 삭제하지 않고, import 성공 후 user startup files의 Hishtory hook 라인만 제거한다.
+이 경로는 Hishtory DB/디렉터리는 삭제하지 않고, import 성공 후 user startup files의 알려진 Hishtory `source`/hook/PATH 설정 라인만 제거한다. 단순 문자열 언급과 unmanaged 공백은 보존하고, 변경이 필요한 startup file이 symlink면 외부 target을 따라 쓰지 않고 중단한다.
 Hishtory hook을 임시 유지해야 하는 디버깅 상황에서는 `--keep-hishtory-hooks`를 추가한다.
 
 ## 안정화 후 Hishtory 찌꺼기 정리
@@ -193,7 +193,10 @@ rr cleanup-hishtory --apply --archive-dir ~/SynologyDrive/rustory/hishtory-backu
 ```
 
 `--archive-dir`를 쓰면 삭제 전에 영향을 받는 Hishtory 디렉터리와 startup file을 `hishtory-backup-<unix>` 디렉터리 아래에 복사한다.
-startup file은 Hishtory 관련 라인만 제거하고, 제거 후 공백만 남는 파일은 삭제한다.
+archive 경로는 삭제 대상과 같거나 그 내부여서는 안 되며, 삭제 대상의 상위 경로를 archive로 지정하는 것도 거부한다. 이 검사는 archive 안으로 자기 자신을 재귀 복사하거나 archive까지 함께 삭제하는 구성을 막는다.
+startup file은 알려진 Hishtory `source`/hook/PATH 설정 라인만 제거한다. 주석이나 일반 명령처럼 단순히 `hishtory` 문자열만 언급한 라인은 보존한다.
+startup file이 symlink이고 제거 대상 라인이 있으면 링크 밖의 실제 파일을 우발적으로 수정하지 않도록 적용을 거부한다. 실제 파일을 직접 검토·수정한 뒤 다시 실행한다.
+제거 후 공백만 남는 일반 파일은 삭제한다.
 따라서 bash만 쓰는 Linux host에 Hishtory 때문에 생긴 `~/.zshrc` 같은 파일은 backup 후 사라진다.
 
 외부 백업을 이미 확보했고 로컬 archive를 만들지 않으려면 아래처럼 명시한다.

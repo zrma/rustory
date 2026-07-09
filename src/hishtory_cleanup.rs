@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const HISHTORY_DIRS_AND_FILES: &[&str] = &[".hishtory", ".config/hishtory", ".local/bin/hishtory"];
@@ -108,6 +109,7 @@ pub fn cleanup_hishtory(opts: CleanupOptions) -> Result<CleanupReport> {
                     opts.backup_name
                         .unwrap_or_else(|| format!("hishtory-backup-{}", unix_now())),
                 );
+                validate_archive_root(&planned, &root)?;
                 archive_planned_paths(&planned, &home_dir, &root, &mut actions)?;
                 Some(root)
             }
@@ -222,6 +224,8 @@ fn plan_cleanup(home_dir: &Path) -> Result<Vec<PlannedAction>> {
 }
 
 fn plan_startup_file_cleanup(path: PathBuf) -> Result<Option<PlannedAction>> {
+    let metadata = fs::symlink_metadata(&path)
+        .with_context(|| format!("inspect startup file: {}", path.display()))?;
     let content = fs::read_to_string(&path)
         .with_context(|| format!("read startup file: {}", path.display()))?;
     let had_trailing_newline = content.ends_with('\n');
@@ -238,6 +242,13 @@ fn plan_startup_file_cleanup(path: PathBuf) -> Result<Option<PlannedAction>> {
 
     if removed_lines == 0 {
         return Ok(None);
+    }
+
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!(
+            "refusing to rewrite symlinked startup file {}; edit its target manually",
+            path.display()
+        );
     }
 
     if kept.iter().all(|line| line.trim().is_empty()) {
@@ -260,7 +271,101 @@ fn plan_startup_file_cleanup(path: PathBuf) -> Result<Option<PlannedAction>> {
 }
 
 fn is_hishtory_startup_line(line: &str) -> bool {
-    line.to_ascii_lowercase().contains("hishtory")
+    let stripped = line.trim();
+    let folded = stripped.to_ascii_lowercase();
+    if folded.trim_end_matches(':') == "# hishtory config" {
+        return true;
+    }
+    if folded.is_empty() || folded.starts_with('#') {
+        return false;
+    }
+
+    let references_hishtory_path = folded.contains(".hishtory")
+        || folded.contains("hishtory/config")
+        || folded.contains("hishtory config");
+    let is_source = folded.starts_with("source ") || folded.starts_with(". ");
+    let is_path_assignment = folded.starts_with("export path=") || folded.starts_with("path=");
+    let is_eval_hook = folded.starts_with("eval ")
+        && (folded.contains("$(hishtory ") || folded.contains("`hishtory "));
+    let mut words = folded.split_whitespace();
+    let is_direct_hook = words.next() == Some("hishtory")
+        && matches!(words.next(), Some("init" | "enable" | "shell" | "daemon"));
+
+    (references_hishtory_path && (is_source || is_path_assignment))
+        || is_eval_hook
+        || is_direct_hook
+}
+
+fn validate_archive_root(planned: &[PlannedAction], archive_root: &Path) -> Result<()> {
+    let archive_root = normalize_boundary_path(archive_root)?;
+    for source in planned.iter().map(PlannedAction::affected_path) {
+        let source = normalize_boundary_path(source)?;
+        if archive_root == source
+            || archive_root.starts_with(&source)
+            || source.starts_with(&archive_root)
+        {
+            anyhow::bail!(
+                "archive path overlaps cleanup source: archive={} source={}",
+                archive_root.display(),
+                source.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn normalize_boundary_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for cleanup path")?
+            .join(path)
+    };
+    let lexical = normalize_lexical_path(&absolute)?;
+    let mut cursor = lexical.clone();
+    let mut missing: Vec<OsString> = Vec::new();
+    loop {
+        match fs::canonicalize(&cursor) {
+            Ok(mut resolved) => {
+                for part in missing.iter().rev() {
+                    resolved.push(part);
+                }
+                return Ok(resolved);
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                let name = cursor.file_name().with_context(|| {
+                    format!("cleanup path has no existing ancestor: {}", path.display())
+                })?;
+                missing.push(name.to_os_string());
+                if !cursor.pop() {
+                    anyhow::bail!("cleanup path has no existing ancestor: {}", path.display());
+                }
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("canonicalize cleanup path: {}", path.display()));
+            }
+        }
+    }
+}
+
+fn normalize_lexical_path(path: &Path) -> Result<PathBuf> {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    anyhow::bail!("cleanup path escapes filesystem root: {}", path.display());
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    Ok(normalized)
 }
 
 fn archive_planned_paths(
@@ -495,5 +600,79 @@ mod tests {
                 }
             )
         }));
+    }
+
+    #[test]
+    fn cleanup_hishtory_preserves_unrelated_mentions_in_startup_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        fs::write(
+            home.join(".bashrc"),
+            "# hishtory was retired\nexport MIGRATION_NOTE='hishtory was retired'\necho hishtory\neval \"echo hishtory init was old\"\nsource $HOME/.hishtory/config.sh\neval \"$(hishtory init bash)\"\n",
+        )
+        .unwrap();
+
+        cleanup_hishtory(CleanupOptions {
+            home_dir: home.clone(),
+            apply: true,
+            archive_dir: None,
+            no_archive: true,
+            backup_name: None,
+        })
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(home.join(".bashrc")).unwrap(),
+            "# hishtory was retired\nexport MIGRATION_NOTE='hishtory was retired'\necho hishtory\neval \"echo hishtory init was old\"\n"
+        );
+    }
+
+    #[test]
+    fn cleanup_hishtory_rejects_archive_inside_removal_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let hishtory_dir = home.join(".hishtory");
+        fs::create_dir_all(&hishtory_dir).unwrap();
+        fs::write(hishtory_dir.join(".hishtory.db"), "sqlite").unwrap();
+
+        let err = cleanup_hishtory(CleanupOptions {
+            home_dir: home,
+            apply: true,
+            archive_dir: Some(hishtory_dir.join("backups")),
+            no_archive: false,
+            backup_name: Some("backup".to_string()),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("archive path overlaps cleanup source"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_hishtory_refuses_to_rewrite_symlinked_startup_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let target = dir.path().join("shared-zshrc");
+        fs::write(&target, "source $HOME/.hishtory/config.zsh\n").unwrap();
+        symlink(&target, home.join(".zshrc")).unwrap();
+
+        let err = cleanup_hishtory(CleanupOptions {
+            home_dir: home,
+            apply: true,
+            archive_dir: None,
+            no_archive: true,
+            backup_name: None,
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("symlinked startup file"));
+        assert_eq!(
+            fs::read_to_string(target).unwrap(),
+            "source $HOME/.hishtory/config.zsh\n"
+        );
     }
 }
