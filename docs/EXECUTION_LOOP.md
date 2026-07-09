@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-28
+- Last Verified: 2026-07-09
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -31,13 +31,13 @@
 - 문서는 새 진입점, 안전 불변조건, 소유 경계, 결정 근거, 검증 증거처럼 코드만으로 드러나지 않는 판단 재료를 남긴다.
 - 에이전트는 문서가 현재 구현을 요약하길 기다리지 않고 관련 코드/스크립트/CLI help를 직접 확인한다.
 
-## OpenAI GPT-5.5 적용 기준
+## GPT-5.6 project overlay
 
-OpenAI 모델/API/프롬프트/에이전트 운영 기준을 다루는 작업은 `openai-docs` 스킬과 공식 OpenAI developer docs를 먼저 확인한다. 최신 OpenAI 기준을 요구받으면 `gpt-5.5`를 기준으로 삼되, 변경 범위는 활성 model string과 직접 연결된 prompt/harness 문구로 제한한다.
+공통 모델, 프롬프트 예산, 권한, 지속 실행, 검증, 출력, Pro/PTC, 평가 기준은 루트 `AGENTS.md`의 `Agent Harness Baseline (GPT-5.6)`을 단일 기준으로 사용한다. 이 문서는 Rustory의 실행 순서와 증거 게이트만 소유하며 공통 기준을 복제하지 않는다.
 
-GPT-5.5용 지침은 절차를 길게 늘리기보다 outcome-first로 작성한다. 목표, 성공 기준, 허용되는 부작용, 검증 증거, 중단/에스컬레이션 조건, 최종 출력 형태를 명확히 둔다. 기존 historical docs, examples, tests, eval baseline, provider 비교, fallback 경로는 명시 요청이 없으면 그대로 둔다.
-
-reasoning effort, verbosity, Responses API state, tool definitions, structured output contract는 현재 코드가 안전한 설정 지점을 제공할 때만 조정한다. SDK/API surface 변경, tool handler rewiring, schema 변경이 필요하면 이번 범위에 억지로 포함하지 말고 blocker 또는 별도 follow-up으로 기록한다.
+- Rustory 작업은 `docs/todo-*/spec.md`의 목표와 수용 기준, 실제 코드/스크립트/CLI help, `docs/REPO_MANIFEST.yaml`의 검증 명령으로 범위를 좁힌다.
+- 활성 OpenAI 통합 지점이 확인되지 않으면 runtime model, reasoning, Responses API, Pro mode, PTC, tool handler, schema를 추정해 추가하지 않는다.
+- historical docs, examples, tests, eval baseline, provider 비교, fallback 경로는 명시 요청이 없으면 그대로 둔다.
 
 ## 표준 사이클
 
@@ -62,8 +62,9 @@ reasoning effort, verbosity, Responses API state, tool definitions, structured o
 - 피처 규모와 변경 위험도에 맞는 독립 리뷰를 수행하고 교차 검증한다.
 - 지적 사항을 반영한 뒤 관련 테스트를 재실행한다.
 
-3. 커밋 정리 + 푸시
-- 구현 요청 턴의 완료 정의는 `원격 푸시 + 원격 SHA 검증`까지이며, 기본 경로는 `scripts/finalize-and-push.sh --message "<type>: <summary>" [--work-id <work-id>]`를 사용한다.
+3. 로컬 change 정리 + 승인된 푸시
+- 사용자가 commit/push까지 명시적으로 요청한 턴의 완료 정의는 `원격 푸시 + 원격 SHA 검증`까지이며, 기본 경로는 `scripts/finalize-and-push.sh --message "<type>: <summary>" [--work-id <work-id>]`를 사용한다.
+- 원격 쓰기 권한이 없는 구현 요청은 `jj st`/`jj diff`, 관련 검증, 문서 동기화, 필요한 로컬 change description까지 닫고 bookmark 이동이나 push 없이 보고한다.
 - `scripts/finalize-and-push.sh`는 기본적으로 `@` non-empty를 요구한다. 빈 작업트리에서 점검이 필요하면 디버그 환경에서만 `DEBUG_GATES_OVERRIDE=1` + `--allow-empty-at` 조합을 사용한다.
 - `jj st`/`jj diff`로 변경 상태를 확인하고, Codex-authored change description은 `scripts/finalize-and-push.sh` 또는 `~/.codex/skills/vcs-jj/scripts/describe_with_attribution.sh`로 trailer까지 함께 정리한다.
 - strict 게이트/푸시 안전 경로/디버그 우회의 허용 경계와 마감 커밋 예외 정책은 `docs/CHANGE_CONTROL.md`를 따른다. `--work-id` 자동 감지, 옵션/default, 실제 분기는 runner 스크립트와 CLI help를 직접 확인한다.

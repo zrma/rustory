@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-28
+- Last Verified: 2026-07-09
 
 이 문서는 반복 개발에서 누락/회귀를 줄이기 위한 경량 운영 루프를 정의한다.
 
@@ -64,7 +64,7 @@
 - 질문 해소 여부를 `open-questions.md`에 닫지 않은 채 다른 주제로 이동하는 방식
 - `open-questions.md`에 `Resolved`/결정 이력을 남겨 질문 문서와 스펙 문서의 책임을 섞는 방식
 - 완료된 `docs/todo-*`를 `docs/archive-*` 루트 폴더로 옮겨 장기 보관하는 방식 (완료 `todo`는 삭제하고 `docs/LESSONS_LOG.md` 또는 `docs/LESSONS_ARCHIVE.md`에만 식별자를 남긴다)
-- 구현 요청 턴에서 `원하면 진행` 형태로 커밋/푸시를 다음 턴으로 미루는 방식
+- 사용자가 commit/push까지 명시적으로 요청했는데 `원하면 진행` 형태로 승인된 원격 마감을 다음 턴으로 미루는 방식
 
 ## 산출물
 

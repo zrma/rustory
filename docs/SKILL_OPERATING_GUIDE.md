@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-28
+- Last Verified: 2026-07-09
 
 이 문서는 전역 스킬과 레포 문서의 책임 경계를 분리해, 전역 오염 없이 재사용 가능한 스킬만 유지하기 위한 기준이다.
 
@@ -33,7 +33,7 @@
 - 언어/도메인별 검증 세트와 실패 보고 규약
 
 3. OpenAI 문서 계층: `openai-docs`
-- OpenAI 모델/API/프롬프트/에이전트 기준과 GPT-5.5 migration guidance 확인
+- OpenAI 모델/API/프롬프트/에이전트 기준과 GPT-5.6 migration/prompting guidance 확인
 
 4. VCS 계층: `vcs-jj`
 - `jj` 우선 버전관리 규칙
@@ -85,5 +85,5 @@
 ## 참고
 
 - OpenAI Harness Engineering: <https://openai.com/index/harness-engineering/>
-- OpenAI GPT-5.5 guidance는 `openai-docs` 스킬과 공식 OpenAI developer docs를 우선한다.
+- OpenAI GPT-5.6 guidance는 `openai-docs` 스킬, 공식 [latest model guide](https://developers.openai.com/api/docs/guides/latest-model), [prompting best practices](https://developers.openai.com/api/docs/guides/latest-model#prompting-best-practices)를 우선한다.
 - Anthropic Skills Guide: <https://resources.anthropic.com/hubfs/The-Complete-Guide-to-Building-Skill-for-Claude.pdf?hsLang=en>
