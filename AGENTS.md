@@ -54,6 +54,7 @@ Baseline ID: `openai-gpt-5.6-2026-07-10`.
 
 ## Module-specific guidance
 
+- 공통 하네스 인터페이스와 Rustory overlay의 첫 진입점은 `docs/agent-harness.md`다.
 - 저장소 단일 네비 진입점은 `docs/HANDOFF.md`를 사용한다.
 - 운영/문서 경계의 단일 기준은 `docs/README_OPERATING_POLICY.md`를 따른다. (운영 제약: `docs/OPERATING_MODEL.md`, 스킬 경계: `docs/SKILL_OPERATING_GUIDE.md`)
 - 저장소 메타/진입점/검증 명령 선언의 단일 기준은 `docs/REPO_MANIFEST.yaml`이며, 게이트 실행 방식과 예외 경계는 `docs/CHANGE_CONTROL.md`를 따른다.
@@ -63,4 +64,4 @@ Baseline ID: `openai-gpt-5.6-2026-07-10`.
 
 ## 무컨텍스트 다음 순서
 
-- 문서 탐색이 필요한 작업은 `docs/HANDOFF.md` -> `docs/EXECUTION_LOOP.md` -> `docs/CHANGE_CONTROL.md` -> `docs/REPO_MANIFEST.yaml` 순서로 진행한다.
+- 문서 탐색이 필요한 작업은 `docs/agent-harness.md` -> `docs/HANDOFF.md` -> `docs/EXECUTION_LOOP.md` -> `docs/CHANGE_CONTROL.md` -> `docs/REPO_MANIFEST.yaml` 순서로 진행한다.

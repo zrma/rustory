@@ -42,10 +42,11 @@ self-update, daemon, Hishtory import 절차는 `docs/quickstart.md`, `docs/distr
 
 ## Agent Navigation
 
-AI agent에게 이 repo를 맡길 때 첫 진입점은 `docs/HANDOFF.md`다. README는 방향을 잡는
-landing page이고, 실제 실행 규칙은 아래 문서들이 소유한다.
+AI agent에게 이 repo를 맡길 때 하네스 계약은 `docs/agent-harness.md`, 제품/운영 탐색은
+`docs/HANDOFF.md`에서 시작한다. README는 방향을 잡는 landing page이고, 실제 실행 규칙은 아래 문서들이 소유한다.
 
 - 에이전트 규칙: `AGENTS.md`
+- 공통 하네스 인터페이스: `docs/agent-harness.md`
 - 운영 모델: `docs/OPERATING_MODEL.md`
 - 문서 책임 경계: `docs/README_OPERATING_POLICY.md`
 - 구현 루프: `docs/EXECUTION_LOOP.md`

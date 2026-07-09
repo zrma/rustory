@@ -6,6 +6,7 @@
 
 ### 1) 코어 네비게이션
 
+- [공통 에이전트 하네스 인터페이스](agent-harness.md)
 - [Rustory 작업 네비게이션](HANDOFF.md)
 - [실행 루프](EXECUTION_LOOP.md)
 - [출고 절차](CHANGE_CONTROL.md)

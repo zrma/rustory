@@ -1,5 +1,6 @@
 schema_version: 1
 entrypoint: docs/HANDOFF.md
+agent_harness: docs/agent-harness.md
 operating_model: docs/OPERATING_MODEL.md
 change_control: docs/CHANGE_CONTROL.md
 improvement_loop: docs/IMPROVEMENT_LOOP.md
@@ -13,6 +14,7 @@ repositories:
     entrypoints:
       - README.md
       - AGENTS.md
+      - docs/agent-harness.md
       - docs/HANDOFF.md
       - docs/README.md
       - docs/EXECUTION_LOOP.md
@@ -35,6 +37,7 @@ repositories:
       - docs/dev-playbook.md
       - docs/mvp.md
     checks:
+      - scripts/check-agent-harness-interface.sh
       - scripts/check-todo-readiness.sh docs/todo-<work-id>
       - scripts/check-open-questions-schema.sh --require-closed
       - scripts/check-todo-closure.sh
