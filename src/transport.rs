@@ -13,6 +13,7 @@ pub struct ServeConfig {
 
 pub struct SyncConfig {
     pub token: Option<String>,
+    pub allow_insecure_http: bool,
 }
 
 pub fn serve(bind: &str, db_path: &str, cfg: ServeConfig) -> Result<()> {
@@ -33,6 +34,10 @@ pub fn sync(
     }
     if push && local_device_id.is_none() {
         anyhow::bail!("local_device_id required for push");
+    }
+
+    for peer in peers {
+        validate_http_sync_peer_url(peer, cfg.allow_insecure_http)?;
     }
 
     let token = normalize_configured_token(cfg.token, "HTTP sync token")?;
@@ -171,6 +176,40 @@ fn normalize_peer_base_url(value: &str) -> Result<String> {
         anyhow::bail!("peer url is empty");
     }
     Ok(v.to_string())
+}
+
+fn validate_http_sync_peer_url(value: &str, allow_insecure_http: bool) -> Result<()> {
+    let value = value.trim();
+    let uri: ureq::http::Uri = value.parse().context("parse HTTP sync peer URL")?;
+    let scheme = uri
+        .scheme_str()
+        .context("HTTP sync peer URL must include http:// or https://")?;
+    let host = uri
+        .host()
+        .context("HTTP sync peer URL must include a host")?;
+
+    if scheme.eq_ignore_ascii_case("https") {
+        return Ok(());
+    }
+    if !scheme.eq_ignore_ascii_case("http") {
+        anyhow::bail!("unsupported HTTP sync peer URL scheme: {scheme}");
+    }
+    if http_host_is_loopback(host) || allow_insecure_http {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "refusing plaintext HTTP sync peer outside loopback: {host}; use HTTPS or pass --allow-insecure-http"
+    )
+}
+
+fn http_host_is_loopback(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback())
 }
 
 fn normalize_configured_token(token: Option<String>, label: &str) -> Result<Option<String>> {
@@ -493,6 +532,52 @@ mod tests {
         assert_eq!(limit, 1);
     }
 
+    #[test]
+    fn http_sync_transport_guard_allows_https_and_loopback_only_by_default() {
+        for allowed in [
+            "https://history.example.test",
+            "http://localhost:8844",
+            "http://localhost.:8844",
+            "http://127.0.0.1:8844",
+            "http://[::1]:8844",
+        ] {
+            validate_http_sync_peer_url(allowed, false).unwrap();
+        }
+
+        for rejected in [
+            "http://192.168.1.10:8844",
+            "http://history.example.test",
+            "ftp://history.example.test",
+            "history.example.test",
+        ] {
+            assert!(validate_http_sync_peer_url(rejected, false).is_err());
+        }
+
+        validate_http_sync_peer_url("http://192.168.1.10:8844", true).unwrap();
+    }
+
+    #[test]
+    fn http_sync_rejects_remote_plaintext_before_opening_database() {
+        let dir = tempdir().unwrap();
+        let local_db = dir.path().join("local.db");
+        let peers = vec!["http://192.168.1.10:8844".to_string()];
+
+        let err = sync(
+            &peers,
+            local_db.to_str().unwrap(),
+            false,
+            None,
+            SyncConfig {
+                token: None,
+                allow_insecure_http: false,
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("refusing plaintext HTTP sync peer"));
+        assert!(!local_db.exists());
+    }
+
     fn entry(entry_id: &str, ts: i64, cmd: &str) -> Entry {
         Entry {
             entry_id: entry_id.to_string(),
@@ -639,6 +724,7 @@ mod tests {
             None,
             SyncConfig {
                 token: Some("   ".into()),
+                allow_insecure_http: false,
             },
         )
         .unwrap_err();
@@ -735,7 +821,10 @@ mod tests {
             local_db.to_str().unwrap(),
             true,
             Some("dev-local"),
-            SyncConfig { token: None },
+            SyncConfig {
+                token: None,
+                allow_insecure_http: false,
+            },
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("push peer"));

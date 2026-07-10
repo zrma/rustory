@@ -55,6 +55,7 @@ AI agent에게 이 repo를 맡길 때 하네스 계약은 `docs/agent-harness.md
 - 에스컬레이션 기준: `docs/ESCALATION_POLICY.md`
 - 반복 교훈: `docs/LESSONS_LOG.md`
 - 장기 유지보수 축: `docs/MAINTENANCE_PILLARS.md`
+- 보안/프라이버시 신뢰 경계: `docs/security.md`
 - 진입점/검증 명령 선언: `docs/REPO_MANIFEST.yaml`
 
 무컨텍스트 시작은 보통 `jj status`, `find docs -maxdepth 1 -type d -name 'todo-*' | sort`,
@@ -67,6 +68,7 @@ AI agent에게 이 repo를 맡길 때 하네스 계약은 `docs/agent-harness.md
 - P2P tracker/relay/sync: `docs/p2p.md`
 - daemon과 service manager: `docs/daemon.md`
 - shell hook: `docs/hook.md`
+- 보안과 프라이버시 모델: `docs/security.md`
 - Hishtory migration: `docs/hishtory-migration.md`
 - acceptance guide: `docs/acceptance/README.md`
 - 전체 문서 인덱스: `docs/README.md`

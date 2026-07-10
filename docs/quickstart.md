@@ -160,6 +160,8 @@ source <(rr hook --shell zsh)
 bash/zsh 훅 상세는 `docs/hook.md` 참고.
 
 ### 2-5) (선택) 민감 커맨드 기록 제외
+원문 첫 문자가 공백인 command는 bash/zsh hook이 기록하지 않는다. 일회성 민감 command에는 앞 공백 opt-out을 사용할 수 있지만, shell 자체 history와 audit/logging 정책은 별도이므로 secret manager를 우선한다.
+
 예:
 ```sh
 export RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|bearer )'

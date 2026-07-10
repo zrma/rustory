@@ -346,7 +346,7 @@ fn render_bash_hook() -> String {
 __RUSTORY_HOOK_INSTALLED=1
 export RUSTORY_HOOK_INSTALLED=1
 
-__rustory_last_histnum=""
+__rustory_last_histnum="$(HISTTIMEFORMAT= builtin history 1 | sed -e 's/^ *//' -e 's/ .*//')"
 __rustory_last_start_histnum=""
 __rustory_last_start_ms=""
 __rustory_last_start_sec=""
@@ -409,7 +409,23 @@ __rustory_precmd() {
   line="$(HISTTIMEFORMAT= builtin history 1 | sed -e 's/^ *//')"
 
   local histnum="${line%% *}"
-  local cmd="${line#* }"
+  local raw_cmd="${line#"$histnum"}"
+  # `history`는 line number와 command 사이에 두 칸을 둔다. 그 두 칸만
+  # 제거해야 사용자가 입력한 privacy opt-out 앞 공백을 보존할 수 있다.
+  if [[ "$raw_cmd" != "  "* ]]; then
+    __rustory_in_hook=""
+    return 0
+  fi
+  raw_cmd="${raw_cmd#  }"
+  if [[ "$raw_cmd" == " "* ]]; then
+    __rustory_last_histnum="$histnum"
+    __rustory_last_start_ms=""
+    __rustory_last_start_sec=""
+    __rustory_in_hook=""
+    return 0
+  fi
+
+  local cmd="$raw_cmd"
   cmd="${cmd#"${cmd%%[![:space:]]*}"}"
 
   if [[ -z "$histnum" || -z "$cmd" ]]; then
@@ -509,6 +525,12 @@ __rustory_epoch_ms() {
 }
 
 __rustory_preexec() {
+  if [[ "$1" == " "* ]]; then
+    __rustory_last_cmd=""
+    __rustory_last_start_ms=""
+    return 0
+  fi
+
   __rustory_last_cmd="$1"
   if [[ -n "${EPOCHREALTIME:-}" ]]; then
     __rustory_last_start_ms="$(__rustory_epoch_ms 2>/dev/null || true)"
@@ -595,6 +617,8 @@ mod tests {
         assert!(!got.contains("READLINE_LINE=\"${READLINE_LINE:0:$READLINE_POINT}$selected"));
         assert!(got.contains("bind -x '\"\\C-r\":__rustory_ctrl_r'"));
         assert!(got.contains("trap '__rustory_preexec' DEBUG"));
+        assert!(got.contains("local raw_cmd=\"${line#\"$histnum\"}\""));
+        assert!(got.contains("if [[ \"$raw_cmd\" == \" \"* ]]; then"));
         assert!(got.contains("__rustory_epoch_ms()"));
         assert!(got.contains("--duration-ms"));
         assert!(got.contains("disown \"$!\""));
@@ -612,6 +636,7 @@ mod tests {
         assert!(!got.contains("${__RUSTORY_HOOK_INSTALLED:-}"));
         assert!(got.contains("add-zsh-hook -d preexec __rustory_preexec"));
         assert!(got.contains("add-zsh-hook -d precmd __rustory_precmd"));
+        assert!(got.contains("if [[ \"$1\" == \" \"* ]]; then"));
         assert!(got.contains("RUSTORY_SEARCH_LIMIT"));
         assert!(got.contains("selected=\"$(rr search)\""));
         assert!(!got.contains("rr search --limit"));
@@ -629,6 +654,50 @@ mod tests {
         assert!(got.contains("frac=\"${frac[1,3]}\""));
 
         assert!(!got.contains("rr|rr\\ *)"));
+    }
+
+    #[test]
+    fn bash_hook_skips_space_prefixed_command_and_records_normal_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("recorded-commands.txt");
+        let hook = render_hook(Shell::Bash);
+        let script = format!(
+            r#"
+history -c
+rr() {{
+  [[ "$1" == "record" ]] || return 0
+  shift
+  while (( $# > 0 )); do
+    if [[ "$1" == "--cmd" ]]; then
+      printf '%s\n' "$2" >> "$RUSTORY_TEST_RECORD_LOG"
+      return 0
+    fi
+    shift
+  done
+}}
+{hook}
+history -s ' echo private'
+__rustory_precmd
+wait
+history -s 'echo public'
+__rustory_precmd
+wait
+"#
+        );
+
+        let output = std::process::Command::new("bash")
+            .args(["--noprofile", "--norc", "-c", &script])
+            .env("RUSTORY_TEST_RECORD_LOG", &log_path)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "bash hook smoke failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(std::fs::read_to_string(log_path).unwrap(), "echo public\n");
     }
 
     #[test]

@@ -79,9 +79,15 @@ enum Command {
 
         #[arg(
             long,
-            help = "Allow serving the HTTP sync API without a token on non-loopback bind addresses"
+            help = "Allow unauthenticated non-loopback debug HTTP; also explicitly opts into plaintext transport"
         )]
         allow_unauthenticated: bool,
+
+        #[arg(
+            long,
+            help = "Allow plaintext debug HTTP on a non-loopback bind address; requires a token unless --allow-unauthenticated is set"
+        )]
+        allow_insecure_http: bool,
     },
     #[command(about = "Sync with HTTP peers")]
     Sync {
@@ -97,6 +103,12 @@ enum Command {
 
         #[arg(long, help = "Bearer token sent to HTTP sync peers")]
         token: Option<String>,
+
+        #[arg(
+            long,
+            help = "Allow syncing with non-loopback plaintext HTTP peers; loopback HTTP and HTTPS do not require this flag"
+        )]
+        allow_insecure_http: bool,
     },
     #[command(about = "Serve this device as a P2P peer")]
     P2pServe {
@@ -840,12 +852,23 @@ pub fn run() -> Result<()> {
             bind,
             token,
             allow_unauthenticated,
+            allow_insecure_http,
         } => {
             let token = resolve_http_sync_token(token);
-            validate_http_sync_serve_auth(&bind, token.as_deref(), allow_unauthenticated)?;
+            validate_http_sync_serve_security(
+                &bind,
+                token.as_deref(),
+                allow_unauthenticated,
+                allow_insecure_http,
+            )?;
             transport::serve(&bind, &db_path, transport::ServeConfig { token })?;
         }
-        Command::Sync { peers, push, token } => {
+        Command::Sync {
+            peers,
+            push,
+            token,
+            allow_insecure_http,
+        } => {
             let device_id = resolve_device_id(&cfg);
             let token = resolve_http_sync_token(token);
             transport::sync(
@@ -853,7 +876,10 @@ pub fn run() -> Result<()> {
                 &db_path,
                 push,
                 Some(&device_id),
-                transport::SyncConfig { token },
+                transport::SyncConfig {
+                    token,
+                    allow_insecure_http,
+                },
             )?;
         }
         Command::P2pServe {
@@ -3785,18 +3811,31 @@ fn resolve_http_sync_token(cli: Option<String>) -> Option<String> {
     normalize_opt_string(cli).or_else(|| env_nonempty("RUSTORY_HTTP_SYNC_TOKEN"))
 }
 
-fn validate_http_sync_serve_auth(
+fn validate_http_sync_serve_security(
     bind: &str,
     token: Option<&str>,
     allow_unauthenticated: bool,
+    allow_insecure_http: bool,
 ) -> Result<()> {
-    if token.is_some() || allow_unauthenticated || is_loopback_bind(bind) {
+    if is_loopback_bind(bind) {
         return Ok(());
     }
 
-    anyhow::bail!(
-        "refusing to serve unauthenticated HTTP sync API on non-loopback bind address {bind}; pass --token or --allow-unauthenticated"
-    );
+    // `--allow-unauthenticated` was already the legacy explicit unsafe opt-in.
+    // Keep it working while requiring the new transport-specific opt-in for
+    // token-authenticated non-loopback plaintext HTTP.
+    if !allow_insecure_http && !allow_unauthenticated {
+        anyhow::bail!(
+            "refusing to serve plaintext debug HTTP sync API on non-loopback bind address {bind}; bind to loopback behind TLS or pass --allow-insecure-http"
+        );
+    }
+    if token.is_none() && !allow_unauthenticated {
+        anyhow::bail!(
+            "refusing to serve unauthenticated HTTP sync API on non-loopback bind address {bind}; pass --token or --allow-unauthenticated"
+        );
+    }
+
+    Ok(())
 }
 
 fn validate_tracker_serve_auth(
@@ -3918,6 +3957,61 @@ mod tests {
         let relay_serve_help = relay_serve.render_help().to_string();
         assert!(relay_serve_help.contains("Maximum active relay circuits"));
         assert!(relay_serve_help.contains("Maximum bytes transferred by a relay circuit"));
+    }
+
+    #[test]
+    fn debug_http_security_flags_parse() {
+        let serve = App::parse_from([
+            "rr",
+            "serve",
+            "--bind",
+            "0.0.0.0:8844",
+            "--token",
+            "secret",
+            "--allow-insecure-http",
+        ]);
+        match serve.cmd {
+            Command::Serve {
+                allow_insecure_http,
+                allow_unauthenticated,
+                ..
+            } => {
+                assert!(allow_insecure_http);
+                assert!(!allow_unauthenticated);
+            }
+            _ => panic!("expected serve"),
+        }
+
+        let sync = App::parse_from([
+            "rr",
+            "sync",
+            "--peers",
+            "http://192.168.1.10:8844",
+            "--allow-insecure-http",
+        ]);
+        match sync.cmd {
+            Command::Sync {
+                allow_insecure_http,
+                ..
+            } => assert!(allow_insecure_http),
+            _ => panic!("expected sync"),
+        }
+    }
+
+    #[test]
+    fn debug_http_server_guard_preserves_safe_and_explicit_legacy_paths() {
+        validate_http_sync_serve_security("127.0.0.1:8844", None, false, false).unwrap();
+        validate_http_sync_serve_security("0.0.0.0:8844", Some("secret"), false, true).unwrap();
+        validate_http_sync_serve_security("0.0.0.0:8844", None, true, false).unwrap();
+
+        let plaintext =
+            validate_http_sync_serve_security("0.0.0.0:8844", Some("secret"), false, false)
+                .unwrap_err();
+        assert!(format!("{plaintext:#}").contains("--allow-insecure-http"));
+
+        let unauthenticated =
+            validate_http_sync_serve_security("0.0.0.0:8844", None, false, true).unwrap_err();
+        assert!(format!("{unauthenticated:#}").contains("--token"));
     }
 
     #[test]

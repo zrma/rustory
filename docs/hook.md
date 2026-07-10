@@ -30,6 +30,7 @@ hook runtime 설정은 `~/.config/rustory/config.toml`에도 둘 수 있다. 같
 - `RUSTORY_RECORD_IGNORE_REGEX="<regex>"`: 정규식에 매칭되는 커맨드는 기록하지 않는다.
   - 예: `RUSTORY_RECORD_IGNORE_REGEX='(?i)(password|token|secret|authorization:|bearer )'`
   - env가 있으면 config.toml의 `record_ignore_regex`보다 우선한다.
+- 원문 첫 문자가 공백인 command는 shell history 설정과 무관하게 privacy opt-out으로 보고 기록하지 않는다. 이미 열린 shell은 새 `rr` 설치 후 managed hook을 다시 source하거나 shell을 다시 열어야 새 동작을 사용한다.
   - 정규식이 잘못된 경우는 안전을 위해 기록을 스킵한다(`rr doctor`에서 상태 확인).
   - `rr doctor`, `rr sync-status`, `rr version` 같은 Rustory 운영 명령도 일반 명령처럼 기록된다. 특정 `rr ...` 명령을 제외하려면 이 regex에 명시적으로 추가한다.
 - `RUSTORY_ASYNC_UPLOAD=1`: `rr record` 성공 후 백그라운드 `rr p2p-sync --push` 트리거를 활성화한다.
