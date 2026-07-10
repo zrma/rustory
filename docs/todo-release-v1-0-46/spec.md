@@ -17,8 +17,8 @@
 | ID | 상태 | Owner | Verify command | 작업 항목 |
 | --- | --- | --- | --- | --- |
 | C1 | done | codex | `scripts/check-release-gates.sh --manifest-mode full --work-id release-v1-0-46` | peer-version 변경 재검토와 strict/full 회귀 검증 |
-| C2 | in_progress | codex | `git ls-remote --heads origin main` | feature change를 attribution 포함 `main`에 push하고 SHA 확인 |
-| C3 | todo | codex | `rr version` | Cargo version 1.0.46 bump를 검증하고 `main`에 push |
+| C2 | done | codex | `git ls-remote --heads origin main` | feature change를 attribution 포함 `main`에 push하고 SHA 확인 |
+| C3 | in_progress | codex | `rr version` | Cargo version 1.0.46 bump를 검증하고 `main`에 push |
 | C4 | todo | codex | `gh release view v1.0.46 --repo zrma/rustory` | daily-driver asset/checksum/GLIBC baseline을 검증하고 GitHub Release 게시 |
 | C5 | todo | codex | `rr version && rr doctor && rr sync-status --json --with-tracker` | 로컬 MacBook을 v1.0.46으로 업데이트하고 user-facing 상태 확인 |
 | C6 | todo | codex | `ssh ts-miniN '~/.local/bin/rr version'` | `node0..3` worker 4개를 순차 업데이트하고 각 노드 상태 확인 |
@@ -27,7 +27,7 @@
 
 ## 완료/미완료/다음 액션
 
-- 완료: C1. peer version 전달/저장/표시 경로를 재검토했고, 실사용 점검에서 `hostname=unknown`이 중복 호스트로 오탐되던 결함을 발견해 OS hostname fallback과 unknown sentinel 제외 처리를 추가했다.
-- 미완료: C2-C8.
-- 다음 액션: 검증된 feature change를 attribution 포함 `main`에 push한다.
-- 검증 증거: full release gate 통과(워크스페이스 304 tests, clippy, installer, local P2P smoke), 새 debug binary의 `sync-status --json --with-tracker`에서 peer version과 빈 warnings 확인, `mesh --watch` Flow Lanes에서 `[1.0.45]` badge 확인, 배포 전 Kubernetes 5개 노드 Ready 및 ArgoCD 19개 앱 Synced/Healthy 확인.
+- 완료: C1-C2. peer version/hostname 결함을 보완한 feature change를 `origin/main` `d5956e0fb0751c343f787392985b2c87c2c61d67`에 push했다.
+- 미완료: C3-C8.
+- 다음 액션: Cargo version을 1.0.46으로 변경해 검증하고 `main`에 push한다.
+- 검증 증거: full release gate 통과(워크스페이스 304 tests, clippy, installer, local P2P smoke), 새 debug binary의 `sync-status --json --with-tracker`에서 peer version과 빈 warnings 확인, `mesh --watch` Flow Lanes에서 `[1.0.45]` badge 확인, 배포 전 Kubernetes 5개 노드 Ready 및 ArgoCD 19개 앱 Synced/Healthy 확인, `jj-git-push-safe.sh` remote SHA 검증.
