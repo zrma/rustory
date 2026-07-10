@@ -821,6 +821,7 @@ fn refresh_peer_book_peer_from_trackers(
                 addrs: peer.addrs,
                 user_id: peer.meta.as_ref().and_then(|m| m.user_id.clone()),
                 device_id: peer.meta.as_ref().and_then(|m| m.device_id.clone()),
+                rr_version: peer.meta.as_ref().and_then(|m| m.version.clone()),
                 last_seen_unix: peer.last_seen_unix,
             };
             store.upsert_peer_book(&peer_book)?;
@@ -1168,6 +1169,7 @@ fn build_manual_targets(
             addrs: vec![peer_key_old.clone()],
             user_id: None,
             device_id: None,
+            rr_version: None,
             last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
         })?;
 
@@ -1242,6 +1244,7 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
                         addrs: p.addrs.clone(),
                         user_id: p.meta.as_ref().and_then(|m| m.user_id.clone()),
                         device_id: p.meta.as_ref().and_then(|m| m.device_id.clone()),
+                        rr_version: p.meta.as_ref().and_then(|m| m.version.clone()),
                         last_seen_unix: p.last_seen_unix,
                     })?;
 
@@ -2604,6 +2607,7 @@ mod tests {
                 addrs: vec![format!("{relay_addr}/p2p-circuit/p2p/{peer_id}")],
                 user_id: Some("u1".to_string()),
                 device_id: Some("dev-remote".to_string()),
+                rr_version: None,
                 last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
             })
             .unwrap();
@@ -2681,6 +2685,7 @@ mod tests {
                     addrs,
                     user_id: Some("u1".to_string()),
                     device_id: Some(device_id.to_string()),
+                    rr_version: None,
                     last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
                 })
                 .unwrap();
@@ -2790,6 +2795,7 @@ mod tests {
                 addrs: vec![],
                 user_id: Some("other-user".to_string()),
                 device_id: Some("dev-remote".to_string()),
+                rr_version: None,
                 last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
             })
             .unwrap();
@@ -2929,6 +2935,7 @@ mod tests {
                     addrs,
                     user_id: Some(user_id),
                     device_id: Some("dev-remote".to_string()),
+                    rr_version: None,
                     last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
                 })
                 .unwrap();

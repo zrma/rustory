@@ -95,6 +95,7 @@ pub struct PeerBookPeer {
     pub addrs: Vec<String>,
     pub user_id: Option<String>,
     pub device_id: Option<String>,
+    pub rr_version: Option<String>,
     pub last_seen_unix: i64,
 }
 
@@ -1372,8 +1373,8 @@ FROM (
         self.conn
             .execute(
                 r#"
-INSERT INTO peer_book(peer_id, addrs_json, user_id, device_id, last_seen)
-VALUES (?, ?, ?, ?, ?)
+INSERT INTO peer_book(peer_id, addrs_json, user_id, device_id, rr_version, last_seen)
+VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(peer_id) DO UPDATE SET
   addrs_json = CASE
     WHEN excluded.last_seen >= peer_book.last_seen THEN excluded.addrs_json
@@ -1387,6 +1388,10 @@ ON CONFLICT(peer_id) DO UPDATE SET
     WHEN excluded.last_seen >= peer_book.last_seen AND excluded.device_id IS NOT NULL THEN excluded.device_id
     ELSE peer_book.device_id
   END,
+  rr_version = CASE
+    WHEN excluded.last_seen >= peer_book.last_seen AND excluded.rr_version IS NOT NULL THEN excluded.rr_version
+    ELSE peer_book.rr_version
+  END,
   last_seen = MAX(peer_book.last_seen, excluded.last_seen)
 "#,
                 params![
@@ -1394,6 +1399,7 @@ ON CONFLICT(peer_id) DO UPDATE SET
                     addrs_json,
                     peer.user_id,
                     peer.device_id,
+                    peer.rr_version,
                     peer.last_seen_unix,
                 ],
             )
@@ -1411,7 +1417,7 @@ ON CONFLICT(peer_id) DO UPDATE SET
 
         let sql = if user_id.is_some() {
             r#"
-SELECT peer_id, addrs_json, user_id, device_id, last_seen
+SELECT peer_id, addrs_json, user_id, device_id, last_seen, rr_version
 FROM peer_book
 WHERE user_id = ?1
   AND last_seen >= ?2
@@ -1420,7 +1426,7 @@ LIMIT ?3
 "#
         } else {
             r#"
-SELECT peer_id, addrs_json, user_id, device_id, last_seen
+SELECT peer_id, addrs_json, user_id, device_id, last_seen, rr_version
 FROM peer_book
 WHERE last_seen >= ?1
 ORDER BY last_seen DESC, peer_id ASC
@@ -1455,7 +1461,7 @@ LIMIT ?2
             .conn
             .prepare(
                 r#"
-SELECT peer_id, addrs_json, user_id, device_id, last_seen
+SELECT peer_id, addrs_json, user_id, device_id, last_seen, rr_version
 FROM peer_book
 WHERE peer_id = ?1
 "#,
@@ -1644,6 +1650,7 @@ fn row_to_peer_book_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerBookPe
     let user_id: Option<String> = row.get(2)?;
     let device_id: Option<String> = row.get(3)?;
     let last_seen_unix: i64 = row.get(4)?;
+    let rr_version: Option<String> = row.get(5)?;
     let addrs: Vec<String> = serde_json::from_str(&addrs_json).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, Box::new(e))
     })?;
@@ -1652,6 +1659,7 @@ fn row_to_peer_book_peer(row: &rusqlite::Row<'_>) -> rusqlite::Result<PeerBookPe
         addrs,
         user_id,
         device_id,
+        rr_version,
         last_seen_unix,
     })
 }
@@ -1836,6 +1844,7 @@ CREATE TABLE IF NOT EXISTS peer_book (
   addrs_json TEXT NOT NULL,
   user_id TEXT,
   device_id TEXT,
+  rr_version TEXT,
   last_seen INTEGER NOT NULL
 );
 
@@ -1843,7 +1852,31 @@ CREATE INDEX IF NOT EXISTS idx_peer_book_last_seen ON peer_book(last_seen);
 "#,
     )
     .context("execute schema batch")?;
+    ensure_peer_book_rr_version_column(conn)?;
     Ok(())
+}
+
+fn ensure_peer_book_rr_version_column(conn: &Connection) -> Result<()> {
+    if peer_book_has_rr_version_column(conn)? {
+        return Ok(());
+    }
+
+    match conn.execute("ALTER TABLE peer_book ADD COLUMN rr_version TEXT", []) {
+        Ok(_) => Ok(()),
+        Err(_) if peer_book_has_rr_version_column(conn)? => Ok(()),
+        Err(err) => Err(err).context("add peer_book rr_version column"),
+    }
+}
+
+fn peer_book_has_rr_version_column(conn: &Connection) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(peer_book)")
+        .context("prepare peer_book schema inspection")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("query peer_book schema")?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|column| column == "rr_version"))
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<Entry> {
@@ -2006,6 +2039,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("dev2".to_string()),
+                rr_version: None,
                 last_seen_unix: 99,
             })
             .unwrap();
@@ -2194,6 +2228,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("d1".to_string()),
+                rr_version: None,
                 last_seen_unix: 111,
             })
             .unwrap();
@@ -2203,6 +2238,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/4/p2p/peer-d".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("d4".to_string()),
+                rr_version: None,
                 last_seen_unix: 222,
             })
             .unwrap();
@@ -2246,6 +2282,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("d1".to_string()),
+                rr_version: None,
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -2255,6 +2292,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/2/p2p/peer-b".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("d2".to_string()),
+                rr_version: None,
                 last_seen_unix: 200,
             })
             .unwrap();
@@ -2384,6 +2422,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("dev-a".to_string()),
+                rr_version: None,
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -2393,6 +2432,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/2/p2p/peer-b".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("dev-b".to_string()),
+                rr_version: None,
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -2812,6 +2852,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1/p2p/peer-a".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("d1".to_string()),
+                rr_version: None,
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -2822,6 +2863,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/2/p2p/peer-b".to_string()],
                 user_id: Some("u2".to_string()),
                 device_id: Some("d2".to_string()),
+                rr_version: None,
                 last_seen_unix: 200,
             })
             .unwrap();
@@ -2832,6 +2874,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/3/p2p/peer-c".to_string()],
                 user_id: None,
                 device_id: Some("d3".to_string()),
+                rr_version: None,
                 last_seen_unix: 300,
             })
             .unwrap();
@@ -2856,6 +2899,7 @@ mod tests {
                 addrs: vec!["/ip4/198.51.100.1/tcp/1/p2p/peer-a".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("node1".to_string()),
+                rr_version: Some("1.0.44".to_string()),
                 last_seen_unix: 200,
             })
             .unwrap();
@@ -2866,6 +2910,7 @@ mod tests {
                 addrs: vec!["/ip4/198.51.100.2/tcp/2/p2p/peer-a".to_string()],
                 user_id: None,
                 device_id: Some("stale-name".to_string()),
+                rr_version: Some("1.0.43".to_string()),
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -2874,6 +2919,7 @@ mod tests {
         assert_eq!(got.addrs, vec!["/ip4/198.51.100.1/tcp/1/p2p/peer-a"]);
         assert_eq!(got.user_id.as_deref(), Some("u1"));
         assert_eq!(got.device_id.as_deref(), Some("node1"));
+        assert_eq!(got.rr_version.as_deref(), Some("1.0.44"));
         assert_eq!(got.last_seen_unix, 200);
 
         store
@@ -2882,6 +2928,7 @@ mod tests {
                 addrs: vec!["/ip4/198.51.100.3/tcp/3/p2p/peer-a".to_string()],
                 user_id: Some("u1".to_string()),
                 device_id: Some("node1-x86_64".to_string()),
+                rr_version: Some("1.0.45".to_string()),
                 last_seen_unix: 300,
             })
             .unwrap();
@@ -2890,6 +2937,59 @@ mod tests {
         assert_eq!(got.addrs, vec!["/ip4/198.51.100.3/tcp/3/p2p/peer-a"]);
         assert_eq!(got.user_id.as_deref(), Some("u1"));
         assert_eq!(got.device_id.as_deref(), Some("node1-x86_64"));
+        assert_eq!(got.rr_version.as_deref(), Some("1.0.45"));
         assert_eq!(got.last_seen_unix, 300);
+    }
+
+    #[test]
+    fn peer_book_open_migrates_existing_database_for_rr_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                r#"
+CREATE TABLE peer_book (
+  peer_id TEXT PRIMARY KEY,
+  addrs_json TEXT NOT NULL,
+  user_id TEXT,
+  device_id TEXT,
+  last_seen INTEGER NOT NULL
+);
+INSERT INTO peer_book(peer_id, addrs_json, user_id, device_id, last_seen)
+VALUES ('peer-a', '[]', 'u1', 'node1', 100);
+"#,
+            )
+            .unwrap();
+        }
+
+        let store = LocalStore::open(db_path.to_str().unwrap()).unwrap();
+        let existing = store.get_peer_book_peer("peer-a").unwrap().unwrap();
+        assert_eq!(existing.rr_version, None);
+
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: Vec::new(),
+                user_id: Some("u1".to_string()),
+                device_id: Some("node1".to_string()),
+                rr_version: Some("1.0.45".to_string()),
+                last_seen_unix: 200,
+            })
+            .unwrap();
+        let migrated = store.get_peer_book_peer("peer-a").unwrap().unwrap();
+        assert_eq!(migrated.rr_version.as_deref(), Some("1.0.45"));
+
+        drop(store);
+        let reopened = LocalStore::open(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            reopened
+                .get_peer_book_peer("peer-a")
+                .unwrap()
+                .unwrap()
+                .rr_version
+                .as_deref(),
+            Some("1.0.45")
+        );
     }
 }

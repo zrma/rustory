@@ -1384,7 +1384,7 @@ pub fn run() -> Result<()> {
                         .map(|age| age.to_string())
                         .unwrap_or_else(|| "-".to_string());
                     println!(
-                        "peer={} device={} hostname={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={}",
+                        "peer={} device={} hostname={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={} rr_version={}",
                         status.peer_id,
                         status.peer_device_id.as_deref().unwrap_or("-"),
                         status.peer_hostname.as_deref().unwrap_or("-"),
@@ -1399,7 +1399,8 @@ pub fn run() -> Result<()> {
                         status.pending_push_entries,
                         status.pending_push_deletions,
                         last_seen,
-                        last_seen_age
+                        last_seen_age,
+                        status.peer_rr_version.as_deref().unwrap_or("-")
                     );
                 }
             }
@@ -3720,13 +3721,12 @@ fn resolve_tracker_token(cli: Option<String>, cfg: &config::FileConfig) -> Resul
 }
 
 fn resolve_peer_meta(cfg: &config::FileConfig) -> crate::tracker::PeerMeta {
-    let hostname = env_nonempty("HOSTNAME").unwrap_or_else(|| "unknown".to_string());
     let user_id = resolve_user_id(cfg);
     let device_id = resolve_device_id(cfg);
 
     crate::tracker::PeerMeta {
         device_id: Some(device_id),
-        hostname: Some(hostname),
+        hostname: resolve_hostname(),
         user_id: Some(user_id),
         version: Some(crate::build_info::VERSION.to_string()),
         build_revision: Some(crate::build_info::BUILD_REVISION.to_string()),
@@ -3744,11 +3744,36 @@ fn resolve_user_id(cfg: &config::FileConfig) -> String {
 fn resolve_device_id(cfg: &config::FileConfig) -> String {
     env_nonempty("RUSTORY_DEVICE_ID")
         .or_else(|| normalize_opt_string(cfg.device_id.clone()))
-        .unwrap_or_else(|| {
-            env_nonempty("HOSTNAME")
-                .or_else(|| env_nonempty("HOST"))
-                .unwrap_or_else(|| "unknown".to_string())
-        })
+        .or_else(resolve_hostname)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn resolve_hostname() -> Option<String> {
+    normalize_hostname_candidate(env_nonempty("HOSTNAME"))
+        .or_else(|| normalize_hostname_candidate(env_nonempty("HOST")))
+        .or_else(system_hostname)
+}
+
+fn normalize_hostname_candidate(value: Option<String>) -> Option<String> {
+    normalize_opt_string(value).filter(|value| !value.eq_ignore_ascii_case("unknown"))
+}
+
+#[cfg(unix)]
+fn system_hostname() -> Option<String> {
+    let mut buffer = [0_u8; 256];
+    if unsafe { libc::gethostname(buffer.as_mut_ptr().cast(), buffer.len()) } != 0 {
+        return None;
+    }
+    let len = buffer
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(buffer.len());
+    normalize_hostname_candidate(Some(String::from_utf8_lossy(&buffer[..len]).into_owned()))
+}
+
+#[cfg(not(unix))]
+fn system_hostname() -> Option<String> {
+    None
 }
 
 fn resolve_record_ignore_regex(cfg: &config::FileConfig) -> Option<String> {
@@ -4371,6 +4396,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("dev2".to_string()),
+                rr_version: None,
                 last_seen_unix: 99,
             })
             .unwrap();
@@ -5047,6 +5073,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("dev-remote".to_string()),
+                rr_version: Some("1.0.44".to_string()),
                 last_seen_unix: 99,
             })
             .unwrap();
@@ -5056,6 +5083,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/2222/p2p/peer-self".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("dev-local".to_string()),
+                rr_version: None,
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -5065,6 +5093,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/3333/p2p/peer-self-spaced".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some(" dev-local ".to_string()),
+                rr_version: None,
                 last_seen_unix: 101,
             })
             .unwrap();
@@ -5098,6 +5127,7 @@ mod tests {
         assert_eq!(peer_a.pull_cursor, 2);
         assert_eq!(peer_a.push_cursor, 1);
         assert_eq!(peer_a.peer_device_id.as_deref(), Some("dev-remote"));
+        assert_eq!(peer_a.peer_rr_version.as_deref(), Some("1.0.44"));
         assert_eq!(peer_a.outbound_push_pending, 2);
         assert_eq!(peer_a.outbound_push_pending_entries, 1);
         assert_eq!(peer_a.outbound_push_pending_deletions, 1);
@@ -5140,6 +5170,7 @@ mod tests {
         assert!(json.contains("\"local_head\""));
         assert!(json.contains("\"local_device_id\""));
         assert!(json.contains("\"peer_device_id\""));
+        assert!(json.contains("\"peer_rr_version\":\"1.0.44\""));
         assert!(json.contains("\"outbound_push_pending\""));
         assert!(json.contains("\"outbound_push_pending_entries\""));
         assert!(json.contains("\"outbound_push_pending_deletions\""));
@@ -5177,6 +5208,21 @@ mod tests {
         assert!(!parse_env_bool("false", "X").unwrap());
         assert!(!parse_env_bool("no", "X").unwrap());
         assert!(!parse_env_bool("off", "X").unwrap());
+    }
+
+    #[test]
+    fn hostname_resolution_rejects_unknown_placeholder() {
+        assert_eq!(normalize_hostname_candidate(None), None);
+        assert_eq!(
+            normalize_hostname_candidate(Some(" unknown ".to_string())),
+            None
+        );
+        assert_eq!(
+            normalize_hostname_candidate(Some("node0".to_string())).as_deref(),
+            Some("node0")
+        );
+        #[cfg(unix)]
+        assert!(system_hostname().is_some());
     }
 
     #[test]

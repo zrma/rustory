@@ -869,7 +869,7 @@ fn render_mesh_lanes_panel(
         body.push("no local mesh edges yet".to_string());
     }
 
-    box_watch_panel("Flow Lanes", panel_width, body)
+    box_watch_panel("Flow Lanes  rr: !old +new ?unknown", panel_width, body)
 }
 
 fn render_mesh_lanes_wide(
@@ -900,7 +900,7 @@ fn render_mesh_lanes_wide(
     let mut body = Vec::new();
     body.push(format!(
         "{} {} {} {} {} {} {} {} {}",
-        fit_cell("peer", peer_col),
+        fit_cell("peer [rr]", peer_col),
         fit_cell("state", STATE_COL),
         right_cell("seen", SEEN_COL),
         right_cell("direct", DIRECT_COL),
@@ -915,7 +915,7 @@ fn render_mesh_lanes_wide(
     for view in peer_views.iter().take(max_rows) {
         body.push(format!(
             "{} {} {} {} {} {} {} {} {}",
-            fit_cell(&view.peer_name, peer_col),
+            fit_peer_rr_version_cell(view, peer_col),
             fit_cell(sync_status_watch_peer_status(view), STATE_COL),
             right_cell(&format_age_opt(view.peer.last_seen_age_sec), SEEN_COL),
             right_cell(&format_count_i64(view.peer.pull_cursor), DIRECT_COL),
@@ -950,7 +950,7 @@ fn render_mesh_lanes_compact(
     let mut body = Vec::new();
     body.push(format!(
         "{} {} {} {} {} {}",
-        fit_cell("peer", peer_col),
+        fit_cell("peer [rr]", peer_col),
         fit_cell("state", state_col),
         right_cell("seen", seen_col),
         fit_cell("direct/sent", cursor_col),
@@ -967,7 +967,7 @@ fn render_mesh_lanes_compact(
         );
         body.push(format!(
             "{} {} {} {} {} {}",
-            fit_cell(&view.peer_name, peer_col),
+            fit_peer_rr_version_cell(view, peer_col),
             fit_cell(sync_status_watch_peer_status(view), state_col),
             right_cell(&format_age_opt(view.peer.last_seen_age_sec), seen_col),
             fit_cell(&cursor, cursor_col),
@@ -1330,7 +1330,7 @@ fn render_link_panel(
         body.push("no peers known yet; run rr daemon or p2p-serve + p2p-sync --push".to_string());
     }
 
-    box_watch_panel("Links", panel_width, body)
+    box_watch_panel("Links  rr: !old +new ?unknown", panel_width, body)
 }
 
 fn render_link_panel_wide(
@@ -1361,7 +1361,7 @@ fn render_link_panel_wide(
     let mut body = Vec::new();
     body.push(format!(
         "{} {} {} {} {} {} {} {} {}",
-        fit_cell("peer", peer_col),
+        fit_cell("peer [rr]", peer_col),
         fit_cell("state", STATE_COL),
         right_cell("seen", SEEN_COL),
         right_cell("direct", PULL_CURSOR_COL),
@@ -1381,7 +1381,7 @@ fn render_link_panel_wide(
             .unwrap_or_else(|| "-".to_string());
         body.push(format!(
             "{} {} {} {} {} {} {} {} {}",
-            fit_cell(&view.peer_name, peer_col),
+            fit_peer_rr_version_cell(view, peer_col),
             fit_cell(sync_status_watch_peer_status(view), STATE_COL),
             right_cell(&last_seen, SEEN_COL),
             right_cell(&format_count_i64(peer.pull_cursor), PULL_CURSOR_COL),
@@ -1413,7 +1413,7 @@ fn render_link_panel_compact(
     let mut body = Vec::new();
     body.push(format!(
         "{} {} {} {} {}",
-        fit_cell("peer", peer_col),
+        fit_cell("peer [rr]", peer_col),
         fit_cell("state", state_col),
         right_cell("seen", seen_col),
         fit_cell("direct_pull", pull_col),
@@ -1440,7 +1440,7 @@ fn render_link_panel_compact(
         );
         body.push(format!(
             "{} {} {} {} {}",
-            fit_cell(&view.peer_name, peer_col),
+            fit_peer_rr_version_cell(view, peer_col),
             fit_cell(sync_status_watch_peer_status(view), state_col),
             right_cell(&last_seen, seen_col),
             fit_cell(&pull, pull_col),
@@ -1612,6 +1612,78 @@ fn sync_status_peer_display_name(peer: &SyncStatusPeerReport) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PeerRrVersionRelation {
+    Older,
+    Same,
+    Newer,
+    Unknown,
+}
+
+fn peer_rr_version_relation(
+    peer_version: Option<&str>,
+    local_version: &str,
+) -> PeerRrVersionRelation {
+    let Some(peer_version) = peer_version.and_then(parse_rr_semver) else {
+        return PeerRrVersionRelation::Unknown;
+    };
+    let Some(local_version) = parse_rr_semver(local_version) else {
+        return PeerRrVersionRelation::Unknown;
+    };
+
+    match peer_version.cmp_precedence(&local_version) {
+        std::cmp::Ordering::Less => PeerRrVersionRelation::Older,
+        std::cmp::Ordering::Equal => PeerRrVersionRelation::Same,
+        std::cmp::Ordering::Greater => PeerRrVersionRelation::Newer,
+    }
+}
+
+fn parse_rr_semver(value: &str) -> Option<semver::Version> {
+    let value = value.trim();
+    let value = value
+        .strip_prefix('v')
+        .or_else(|| value.strip_prefix('V'))
+        .unwrap_or(value);
+    semver::Version::parse(value).ok()
+}
+
+fn peer_rr_version_badge(peer: &SyncStatusPeerReport) -> String {
+    let Some(version) = peer
+        .peer_rr_version
+        .as_deref()
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+    else {
+        return "[?]".to_string();
+    };
+    let version = version
+        .strip_prefix('v')
+        .or_else(|| version.strip_prefix('V'))
+        .unwrap_or(version);
+    let version = truncate_display(version, 12);
+    let suffix =
+        match peer_rr_version_relation(peer.peer_rr_version.as_deref(), crate::build_info::VERSION)
+        {
+            PeerRrVersionRelation::Older => "!",
+            PeerRrVersionRelation::Same => "",
+            PeerRrVersionRelation::Newer => "+",
+            PeerRrVersionRelation::Unknown => "?",
+        };
+    format!("[{version}{suffix}]")
+}
+
+fn fit_peer_rr_version_cell(view: &SyncStatusWatchPeerView<'_>, width: usize) -> String {
+    let badge = peer_rr_version_badge(view.peer);
+    let badge_width = display_width(&badge);
+    if width <= badge_width {
+        return fit_cell(&badge, width);
+    }
+
+    let name_width = width.saturating_sub(badge_width + 1);
+    let name = truncate_display(&view.peer_name, name_width);
+    fit_cell(&format!("{name} {badge}"), width)
+}
+
 fn short_peer_id(peer_id: &str) -> String {
     let prefix = peer_id.chars().take(10).collect::<String>();
     if peer_id.chars().count() <= 10 {
@@ -1748,6 +1820,7 @@ mod tests {
             peer_id: peer_id.to_string(),
             peer_device_id: Some(device.to_string()),
             peer_hostname: None,
+            peer_rr_version: Some(crate::build_info::VERSION.to_string()),
             pull_cursor: 100,
             pull_delete_cursor: 0,
             push_cursor: 200,
@@ -1804,6 +1877,47 @@ mod tests {
 
         assert_eq!(format_rate(42.4), "42");
         assert_eq!(format_rate(1200.0), "1.2k");
+    }
+
+    #[test]
+    fn peer_rr_version_badge_marks_relative_versions_and_preserves_badge() {
+        assert_eq!(
+            peer_rr_version_relation(Some("v1.0.44"), "1.0.45"),
+            PeerRrVersionRelation::Older
+        );
+        assert_eq!(
+            peer_rr_version_relation(Some("1.0.45"), "1.0.45"),
+            PeerRrVersionRelation::Same
+        );
+        assert_eq!(
+            peer_rr_version_relation(Some("1.0.45+peer"), "1.0.45+local"),
+            PeerRrVersionRelation::Same
+        );
+        assert_eq!(
+            peer_rr_version_relation(Some("1.0.46"), "1.0.45"),
+            PeerRrVersionRelation::Newer
+        );
+        assert_eq!(
+            peer_rr_version_relation(Some("not-semver"), "1.0.45"),
+            PeerRrVersionRelation::Unknown
+        );
+
+        let mut state = SyncStatusWatchState::default();
+        let mut report = unsorted_watch_report();
+        report.peers[0].peer_rr_version = Some("0.0.1".to_string());
+        let views = build_sync_status_watch_peer_views(
+            &mut state,
+            &report,
+            Instant::now(),
+            SyncStatusWatchPeerOrder::StableName,
+        );
+        let view = views
+            .iter()
+            .find(|view| view.peer.peer_device_id.as_deref() == Some("zulu"))
+            .unwrap();
+        let cell = fit_peer_rr_version_cell(view, 16);
+        assert_eq!(unicode_width::UnicodeWidthStr::width(cell.as_str()), 16);
+        assert!(cell.ends_with("[0.0.1!]"), "{cell}");
     }
 
     #[test]
@@ -2049,6 +2163,7 @@ mod tests {
                         "sample-node-x86_64-with-a-very-long-device-name".to_string(),
                     ),
                     peer_hostname: None,
+                    peer_rr_version: Some("0.0.1".to_string()),
                     pull_cursor: 1_526_049,
                     pull_delete_cursor: 0,
                     push_cursor: 1_968_089,
@@ -2066,6 +2181,7 @@ mod tests {
                     peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
                     peer_device_id: Some("node3".to_string()),
                     peer_hostname: None,
+                    peer_rr_version: None,
                     pull_cursor: 1_818_365,
                     pull_delete_cursor: 0,
                     push_cursor: 2_122_722,
@@ -2102,12 +2218,23 @@ mod tests {
         assert!(frame.contains("drain/s"));
         assert!(frame.contains("2.3k"));
         assert!(frame.contains("2.0M"));
+        assert!(frame.contains("rr: !old +new ?unknown"));
+        assert!(frame.contains("[0.0.1!]"));
+        assert!(frame.contains("[?]"));
         assert!(frame.contains("to_send R=row D=delete"));
         assert!(frame.contains("direct_pull is only"));
         assert!(!frame.contains("Mesh Map"));
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
             assert!(width <= 160, "line width {width}: {line}");
+        }
+
+        let narrow = render_sync_status_watch_frame(&mut state, &report, Instant::now(), 80);
+        assert!(narrow.contains("[0.0.1!]"));
+        assert!(narrow.contains("[?]"));
+        for line in narrow.lines() {
+            let width = unicode_width::UnicodeWidthStr::width(line);
+            assert!(width <= 80, "line width {width}: {line}");
         }
     }
 
@@ -2122,6 +2249,7 @@ mod tests {
                     peer_id: "12D3KooWE3u4VEsbCGR7w53rbBYi1mZ3kADAgAhDYTj8ACiPBC1M".to_string(),
                     peer_device_id: Some("sample-node-x86_64".to_string()),
                     peer_hostname: None,
+                    peer_rr_version: Some(crate::build_info::VERSION.to_string()),
                     pull_cursor: 4_400_747,
                     pull_delete_cursor: 0,
                     push_cursor: 4_494_530,
@@ -2139,6 +2267,7 @@ mod tests {
                     peer_id: "12D3KooWJSi7WKtoW8wp2MnxhheB3Y62fAN9FRHGMspc5fQZfZnH".to_string(),
                     peer_device_id: Some("samplex-x86_64-with-long-name".to_string()),
                     peer_hostname: None,
+                    peer_rr_version: Some("0.0.1".to_string()),
                     pull_cursor: 0,
                     pull_delete_cursor: 0,
                     push_cursor: 3_678_638,
@@ -2156,6 +2285,7 @@ mod tests {
                     peer_id: "12D3KooWKvNkdisp13vqjrzZtPkDUz1aB2uVYpWBQCDVT3ihPcJU".to_string(),
                     peer_device_id: Some("node3-x86_64".to_string()),
                     peer_hostname: None,
+                    peer_rr_version: Some("9999.0.0".to_string()),
                     pull_cursor: 4_345_857,
                     pull_delete_cursor: 0,
                     push_cursor: 4_494_530,
@@ -2193,6 +2323,10 @@ mod tests {
         assert!(frame.contains("coverage"));
         assert!(frame.contains("queue"));
         assert!(frame.contains("158.5k"));
+        assert!(frame.contains("rr: !old +new ?unknown"));
+        assert!(frame.contains(&format!("[{}]", crate::build_info::VERSION)));
+        assert!(frame.contains("[0.0.1!]"));
+        assert!(frame.contains("[9999.0.0+]"));
         assert!(!frame.contains("Mesh Map"));
         assert!(!frame.contains("Peer Ring"));
         assert!(
@@ -2204,6 +2338,14 @@ mod tests {
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
             assert!(width <= 160, "line width {width}: {line}");
+        }
+
+        let narrow = render_mesh_watch_frame(&mut state, &report, Instant::now(), 92, 24);
+        assert!(narrow.contains("[0.0.1!]"));
+        assert!(narrow.contains("[9999.0.0+]"));
+        for line in narrow.lines() {
+            let width = unicode_width::UnicodeWidthStr::width(line);
+            assert!(width <= 92, "line width {width}: {line}");
         }
     }
 

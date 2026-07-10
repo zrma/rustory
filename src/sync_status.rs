@@ -15,6 +15,8 @@ pub(crate) struct SyncStatusPeerReport {
     pub(crate) peer_device_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) peer_hostname: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_rr_version: Option<String>,
     pub(crate) pull_cursor: i64,
     pub(crate) pull_delete_cursor: i64,
     pub(crate) push_cursor: i64,
@@ -46,6 +48,7 @@ pub(crate) struct SyncStatusPeerMetadata {
     pub(crate) peer_id: String,
     pub(crate) device_id: Option<String>,
     pub(crate) hostname: Option<String>,
+    pub(crate) rr_version: Option<String>,
     pub(crate) last_seen_unix: i64,
 }
 
@@ -53,6 +56,7 @@ pub(crate) struct SyncStatusPeerMetadata {
 struct PeerMetadata {
     device_id: Option<String>,
     hostname: Option<String>,
+    rr_version: Option<String>,
     last_seen_unix: i64,
 }
 
@@ -105,25 +109,35 @@ pub(crate) fn build_sync_status_report(
                 PeerMetadata {
                     device_id: peer.device_id,
                     hostname: None,
+                    rr_version: peer.rr_version,
                     last_seen_unix: peer.last_seen_unix,
                 },
             )
         })
         .collect::<HashMap<_, _>>();
     for peer in tracker_peers {
-        match peer_metadata.get(&peer.peer_id) {
-            Some(existing) if existing.last_seen_unix > peer.last_seen_unix => {}
-            _ => {
-                peer_metadata.insert(
-                    peer.peer_id.clone(),
-                    PeerMetadata {
-                        device_id: peer.device_id.clone(),
-                        hostname: peer.hostname.clone(),
-                        last_seen_unix: peer.last_seen_unix,
-                    },
-                );
+        if let Some(existing) = peer_metadata.get_mut(&peer.peer_id)
+            && existing.last_seen_unix > peer.last_seen_unix
+        {
+            if existing.rr_version.is_none() {
+                existing.rr_version = peer.rr_version.clone();
             }
+            continue;
         }
+        let rr_version = peer.rr_version.clone().or_else(|| {
+            peer_metadata
+                .get(&peer.peer_id)
+                .and_then(|existing| existing.rr_version.clone())
+        });
+        peer_metadata.insert(
+            peer.peer_id.clone(),
+            PeerMetadata {
+                device_id: peer.device_id.clone(),
+                hostname: peer.hostname.clone(),
+                rr_version,
+                last_seen_unix: peer.last_seen_unix,
+            },
+        );
     }
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
     let membership_peers = build_membership_peers(&peer_metadata, now_unix);
@@ -141,6 +155,7 @@ pub(crate) fn build_sync_status_report(
         let metadata = peer_metadata.get(&peer_id);
         let peer_device_id = metadata.and_then(|metadata| metadata.device_id.clone());
         let peer_hostname = metadata.and_then(|metadata| metadata.hostname.clone());
+        let peer_rr_version = metadata.and_then(|metadata| metadata.rr_version.clone());
         let last_seen_unix = metadata.map(|metadata| metadata.last_seen_unix);
         if sync_device_id_matches(peer_device_id.as_deref(), local_device_id) {
             continue;
@@ -156,6 +171,7 @@ pub(crate) fn build_sync_status_report(
         peers.push(SyncStatusPeerReport {
             peer_device_id,
             peer_hostname,
+            peer_rr_version,
             peer_id,
             pull_cursor: status.last_cursor,
             pull_delete_cursor,
@@ -228,6 +244,7 @@ pub(crate) fn list_tracker_peers_for_status(
             peer_id: peer.peer_id,
             device_id: peer.meta.as_ref().and_then(|meta| meta.device_id.clone()),
             hostname: peer.meta.as_ref().and_then(|meta| meta.hostname.clone()),
+            rr_version: peer.meta.as_ref().and_then(|meta| meta.version.clone()),
             last_seen_unix: peer.last_seen_unix,
         }));
     }
@@ -328,7 +345,7 @@ where
 
 fn normalize_membership_key(value: &str) -> Option<String> {
     let normalized = value.trim().to_ascii_lowercase();
-    (!normalized.is_empty()).then_some(normalized)
+    (!normalized.is_empty() && normalized != "unknown").then_some(normalized)
 }
 
 fn is_active_membership_peer(peer: &MembershipPeer) -> bool {
@@ -415,6 +432,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("old-device".to_string()),
+                rr_version: Some("1.0.43".to_string()),
                 last_seen_unix: 100,
             })
             .unwrap();
@@ -423,6 +441,7 @@ mod tests {
             peer_id: "peer-a".to_string(),
             device_id: Some("new-device".to_string()),
             hostname: Some("new-host".to_string()),
+            rr_version: Some("1.0.45".to_string()),
             last_seen_unix: 200,
         }];
 
@@ -436,6 +455,7 @@ mod tests {
             .unwrap();
         assert_eq!(peer.peer_device_id.as_deref(), Some("new-device"));
         assert_eq!(peer.peer_hostname.as_deref(), Some("new-host"));
+        assert_eq!(peer.peer_rr_version.as_deref(), Some("1.0.45"));
         assert_eq!(peer.last_seen_unix, Some(200));
     }
 
@@ -449,6 +469,7 @@ mod tests {
                 addrs: vec!["/ip4/127.0.0.1/tcp/1111/p2p/peer-a".to_string()],
                 user_id: Some("user1".to_string()),
                 device_id: Some("local-newer-device".to_string()),
+                rr_version: None,
                 last_seen_unix: 300,
             })
             .unwrap();
@@ -457,6 +478,7 @@ mod tests {
             peer_id: "peer-a".to_string(),
             device_id: Some("tracker-older-device".to_string()),
             hostname: Some("tracker-older-host".to_string()),
+            rr_version: Some("1.0.44".to_string()),
             last_seen_unix: 200,
         }];
 
@@ -470,6 +492,7 @@ mod tests {
             .unwrap();
         assert_eq!(peer.peer_device_id.as_deref(), Some("local-newer-device"));
         assert_eq!(peer.peer_hostname.as_deref(), None);
+        assert_eq!(peer.peer_rr_version.as_deref(), Some("1.0.44"));
         assert_eq!(peer.last_seen_unix, Some(300));
     }
 
@@ -484,12 +507,14 @@ mod tests {
                 peer_id: "peer-a".to_string(),
                 device_id: Some("host-a-old".to_string()),
                 hostname: Some("workstation".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 30,
             },
             SyncStatusPeerMetadata {
                 peer_id: "peer-b".to_string(),
                 device_id: Some("host-a-new".to_string()),
                 hostname: Some("WORKSTATION ".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 40,
             },
         ];
@@ -518,13 +543,45 @@ mod tests {
                 peer_id: "peer-a".to_string(),
                 device_id: Some("host-a-old".to_string()),
                 hostname: Some("workstation".to_string()),
+                rr_version: None,
                 last_seen_unix: now - ACTIVE_DUPLICATE_LAST_SEEN_MAX_AGE_SEC - 1,
             },
             SyncStatusPeerMetadata {
                 peer_id: "peer-b".to_string(),
                 device_id: Some("host-a-new".to_string()),
                 hostname: Some("workstation".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 30,
+            },
+        ];
+
+        let report =
+            build_sync_status_report(&store, "local-device", None, None, None, &tracker_peers)
+                .unwrap();
+
+        assert!(report.warnings.is_empty());
+    }
+
+    #[test]
+    fn sync_status_report_ignores_unknown_duplicate_hostnames() {
+        let store = storage::LocalStore::open(":memory:").unwrap();
+        store.set_last_cursor("peer-a", 10).unwrap();
+        store.set_last_cursor("peer-b", 20).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let tracker_peers = vec![
+            SyncStatusPeerMetadata {
+                peer_id: "peer-a".to_string(),
+                device_id: Some("host-a".to_string()),
+                hostname: Some("unknown".to_string()),
+                rr_version: None,
+                last_seen_unix: now - 30,
+            },
+            SyncStatusPeerMetadata {
+                peer_id: "peer-b".to_string(),
+                device_id: Some("host-b".to_string()),
+                hostname: Some(" UNKNOWN ".to_string()),
+                rr_version: None,
+                last_seen_unix: now - 40,
             },
         ];
 
@@ -546,12 +603,14 @@ mod tests {
                 peer_id: "peer-a".to_string(),
                 device_id: Some("same-device".to_string()),
                 hostname: Some("host-a".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 30,
             },
             SyncStatusPeerMetadata {
                 peer_id: "peer-b".to_string(),
                 device_id: Some(" same-device ".to_string()),
                 hostname: Some("host-b".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 40,
             },
         ];
@@ -576,12 +635,14 @@ mod tests {
                 peer_id: "current-peer".to_string(),
                 device_id: Some("local-device".to_string()),
                 hostname: Some("workstation".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 10,
             },
             SyncStatusPeerMetadata {
                 peer_id: "old-peer".to_string(),
                 device_id: Some("local-device".to_string()),
                 hostname: Some("workstation".to_string()),
+                rr_version: None,
                 last_seen_unix: now - 20,
             },
         ];

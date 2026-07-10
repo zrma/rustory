@@ -193,19 +193,21 @@ p2p_watch_start_jitter_sec = 10
   - 텍스트/JSON 출력 필드와 오류 표시는 `rr doctor --help`, `rr doctor --json`, 관련 코드가 소유한다.
 - `rr sync-status [--peer <peer_id>] [--json] [--with-tracker]`: 로컬/피어별 동기화 상태와 tracker 접근성을 점검하는 시작점이다.
   - `outbound_push_pending`은 이 디바이스에서 해당 peer로 아직 push/delete 커서가 전진하지 않은 로컬 엔트리와 deletion tombstone의 합계다. 기존 스크립트 호환을 위해 `pending_push`도 같은 값을 유지한다.
+  - JSON/text 출력의 `peer_rr_version`/`rr_version`은 peer가 tracker에 마지막으로 보고한 `rr` 버전이다. `p2p-sync`의 tracker discovery가 받은 값은 `peer_book`에 캐시되므로 이후 tracker를 조회하지 않는 상태 화면에서도 마지막 보고 값을 재사용하며, 아직 버전을 보고하지 않은 구버전/수동 peer는 unknown으로 남는다.
   - JSON/text 출력의 `outbound_push_pending_entries`, `outbound_push_pending_deletions`, `pending_push_entries`, `pending_push_deletions`, `pull_delete_cursor`, `push_delete_cursor`는 row backlog와 삭제 tombstone backlog를 분리해 보여준다.
   - deletion tombstone backlog가 0으로 안정된 뒤에만 오래된 tombstone을 `rr tombstone-gc`로 정리한다. GC는 알려진 peer의 delete push cursor floor를 넘지 않는 tombstone만 삭제한다.
-  - `--watch`는 alternate screen TUI로 tracker 상태, 로컬 outbox 요약, 큐가 남은 peer, peer별 `direct`/`sent`/`to_send`/`drain/s`를 계속 갱신한다.
+  - `--watch`는 alternate screen TUI로 tracker 상태, 로컬 outbox 요약, 큐가 남은 peer, peer별 `direct`/`sent`/`to_send`/`drain/s`를 계속 갱신한다. peer 이름 옆의 `[1.0.45]`는 마지막 보고 버전이고, `!`는 현재 로컬 `rr`보다 낮음, `+`는 높음, `?`는 unknown 또는 semantic version으로 해석할 수 없음을 뜻한다. 이는 GitHub의 최신 release를 실시간 조회한 표식이 아니라 현재 실행 중인 로컬 버전과의 상대 비교다.
   - watch 화면의 `direct`는 이 노드가 해당 peer에서 직접 pull 완료한 cursor다. 이 값이 `0`이어도 inbound push나 다른 peer 경유 전파로 데이터가 들어올 수 있으므로 단독으로 데이터 유실 신호로 보지 않는다.
   - watch 화면의 `sent`는 이 노드의 로컬 엔트리를 해당 peer가 받아들인 push cursor이고, `to_send`는 아직 해당 peer에 수락되지 않은 로컬 엔트리와 deletion tombstone 수다.
   - watch/mesh 화면의 `idle`은 tracker heartbeat가 오래됐지만 이 노드에서 해당 peer로 보낼 row/delete backlog가 없다는 뜻이다. `stale`은 오래된 heartbeat와 남은 `to_send`가 동시에 있을 때만 표시한다.
+  - tracker 등록 hostname은 `HOSTNAME`/`HOST`가 없으면 OS hostname으로 보완한다. 값을 얻지 못한 peer의 `unknown` sentinel은 실제 공유 hostname이 아니므로 active duplicate warning 대상에서 제외한다.
   - 다른 peer끼리 실제로 주고받는 global active flow는 아직 원격 daemon telemetry가 없으므로 fake mesh graph로 추정하지 않는다.
   - 현재 출력 필드, JSON 스키마, tracker ping 방식, peer cache fallback 표시는 `rr sync-status --help`와 관련 코드가 소유한다.
 - `rr mesh [--watch] [--no-tracker]`: `sync-status`와 같은 로컬 cursor 데이터를 사람이 보기 쉬운 mesh dashboard로 렌더링한다.
   - 기본값은 configured tracker를 ping해서 `Outbox` 패널에 tracker health를 포함한다. 네트워크 조회를 피하려면 `--no-tracker`를 사용한다.
   - `Mesh Topology`는 braille canvas로 이 노드(local hub)와 각 peer 사이의 관측 가능한 edge, peer 상태, queue/active packet marker를 표시한다. peer 위치는 device/peer display name 오름차순으로 고정해 watch tick마다 노드가 뒤섞이지 않게 한다. peer끼리 직접 주고받는 global graph는 아직 daemon telemetry가 없으므로 그리지 않는다.
   - `Outbox`는 전체 `to_send`, queue trend sparkline, pull/push/drain rate, hot peer를 보여준다.
-  - `Flow Lanes`는 topology와 같은 stable name order로 peer별 `direct`, `sent`, `to_send`, coverage를 보여준다. 상태 기반 attention sorting이 필요하면 `rr sync-status --watch --with-tracker`를 사용하고, 정밀 자동화나 JSON이 필요하면 `rr sync-status --json --with-tracker`를 사용한다.
+  - `Flow Lanes`는 topology와 같은 stable name order로 peer별 마지막 보고 `rr` 버전, `direct`, `sent`, `to_send`, coverage를 보여준다. 버전 배지의 `!`/`+`/`?` 의미는 `sync-status --watch`와 같다. 상태 기반 attention sorting이 필요하면 `rr sync-status --watch --with-tracker`를 사용하고, 정밀 자동화나 JSON이 필요하면 `rr sync-status --json --with-tracker`를 사용한다.
   - 예시:
     - `rr sync-status`
     - `rr sync-status --peer 12D3KooW...`
