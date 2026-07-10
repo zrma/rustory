@@ -558,6 +558,7 @@ run_cmd "bash -n scripts/finalize-and-push.sh"
 run_cmd "bash -n scripts/jj-git-push-safe.sh"
 run_cmd "bash -n scripts/start-work.sh"
 run_cmd "bash -n scripts/check.sh"
+run_cmd "bash -n scripts/build-release-assets.sh"
 run_cmd "bash -n scripts/release-version.sh"
 run_cmd "bash -n scripts/smoke_p2p_local.sh"
 run_cmd "bash -n scripts/acceptance_docker_macos_linux.sh"
@@ -593,6 +594,15 @@ expect_fail_cmd "scripts/check-jj-conflicts.sh --bookmark"
 expect_fail_cmd "scripts/run-manifest-checks.sh --repo-key"
 expect_fail_cmd "scripts/start-work.sh --work-id"
 expect_fail_cmd "scripts/finalize-and-push.sh --message"
+
+ensure_tmp_root
+glibc_ok_fixture="$tmp_root/glibc-ok.bin"
+glibc_new_fixture="$tmp_root/glibc-new.bin"
+printf 'ELF fixture GLIBC_2.17\n' > "$glibc_ok_fixture"
+printf 'ELF fixture GLIBC_2.39\n' > "$glibc_new_fixture"
+run_cmd "scripts/check-linux-glibc-baseline.sh $glibc_ok_fixture 2.17"
+expect_fail_cmd "scripts/check-linux-glibc-baseline.sh $glibc_new_fixture 2.17"
+expect_fail_cmd "scripts/check-linux-glibc-baseline.sh $glibc_ok_fixture invalid"
 
 setup_multi_todo_workspaces
 run_cmd "scripts/check-push-gates.sh --mode strict --dry-run"

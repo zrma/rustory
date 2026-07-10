@@ -12,6 +12,11 @@ use std::time::Instant;
 
 pub const DEFAULT_RELEASE_REPO: &str = "zrma/rustory";
 
+#[cfg(target_os = "linux")]
+const SYSTEMD_USER_UNIT: &str = "rustory.service";
+#[cfg(target_os = "linux")]
+const LEGACY_SYSTEMD_USER_UNITS: &[&str] = &["rustory-daemon.service"];
+
 const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 
@@ -658,57 +663,119 @@ fn restart_launchd_daemon() -> DaemonRestartStatus {
 
 #[cfg(target_os = "linux")]
 fn stop_systemd_user_daemon() -> DaemonRestartStatus {
-    let unit_path = home_dir().join(".config/systemd/user/rustory.service");
-    let service_active = process_status(ProcessCommand::new("systemctl").args([
-        "--user",
-        "is-active",
-        "rustory.service",
-    ]));
-    let service_enabled = process_status(ProcessCommand::new("systemctl").args([
-        "--user",
-        "is-enabled",
-        "rustory.service",
-    ]));
-    if !unit_path.exists() && !service_active && !service_enabled {
+    let units = std::iter::once(SYSTEMD_USER_UNIT)
+        .chain(LEGACY_SYSTEMD_USER_UNITS.iter().copied())
+        .filter(|unit| systemd_user_unit_present(unit))
+        .collect::<Vec<_>>();
+    if units.is_empty() {
         return DaemonRestartStatus::Skipped;
     }
 
-    for args in [
-        &["--user", "stop", "rustory.service"][..],
-        &["--user", "disable", "rustory.service"][..],
-        &["--user", "daemon-reload"][..],
-    ] {
-        let output = ProcessCommand::new("systemctl").args(args).output();
-        match output {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => return DaemonRestartStatus::Failed(one_line_output(&output)),
-            Err(err) => return DaemonRestartStatus::Failed(err.to_string()),
+    for unit in &units {
+        if let Err(error) = stop_disable_systemd_user_unit(unit) {
+            return DaemonRestartStatus::Failed(error);
+        }
+        let path = systemd_user_unit_path(unit);
+        if path.exists()
+            && let Err(error) = std::fs::remove_file(&path)
+        {
+            return DaemonRestartStatus::Failed(format!(
+                "remove systemd unit {}: {error}",
+                path.display()
+            ));
         }
     }
-    println!("daemon=stopped manager=systemd-user unit=rustory.service");
+    if let Err(error) = run_systemctl_user(&["daemon-reload"]) {
+        return DaemonRestartStatus::Failed(error);
+    }
+    println!(
+        "daemon=stopped manager=systemd-user units_removed={}",
+        units.join(",")
+    );
     DaemonRestartStatus::Restarted
 }
 
 #[cfg(target_os = "linux")]
 fn restart_systemd_user_daemon() -> DaemonRestartStatus {
-    let unit_path = home_dir().join(".config/systemd/user/rustory.service");
+    let unit_path = systemd_user_unit_path(SYSTEMD_USER_UNIT);
     if !unit_path.exists() {
         return DaemonRestartStatus::Skipped;
     }
 
+    match remove_legacy_systemd_user_units() {
+        Ok(0) => {}
+        Ok(count) => println!("daemon=legacy_units_removed manager=systemd-user count={count}"),
+        Err(error) => return DaemonRestartStatus::Failed(error),
+    }
+
     for args in [
         &["--user", "daemon-reload"][..],
-        &["--user", "restart", "rustory.service"][..],
+        &["--user", "restart", SYSTEMD_USER_UNIT][..],
     ] {
-        let output = ProcessCommand::new("systemctl").args(args).output();
-        match output {
-            Ok(output) if output.status.success() => {}
-            Ok(output) => return DaemonRestartStatus::Failed(one_line_output(&output)),
-            Err(err) => return DaemonRestartStatus::Failed(err.to_string()),
+        if let Err(error) = run_systemctl_user(args) {
+            return DaemonRestartStatus::Failed(error);
         }
     }
-    println!("daemon=restarted manager=systemd-user unit=rustory.service");
+    println!("daemon=restarted manager=systemd-user unit={SYSTEMD_USER_UNIT}");
     DaemonRestartStatus::Restarted
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_unit_path(unit: &str) -> PathBuf {
+    systemd_user_unit_path_for_home(&home_dir(), unit)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_unit_path_for_home(home: &Path, unit: &str) -> PathBuf {
+    home.join(".config/systemd/user").join(unit)
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_user_unit_present(unit: &str) -> bool {
+    systemd_user_unit_path(unit).exists()
+        || process_status(ProcessCommand::new("systemctl").args(["--user", "is-active", unit]))
+        || process_status(ProcessCommand::new("systemctl").args(["--user", "is-enabled", unit]))
+}
+
+#[cfg(target_os = "linux")]
+fn run_systemctl_user(args: &[&str]) -> std::result::Result<(), String> {
+    match ProcessCommand::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .output()
+    {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(one_line_output(&output)),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_disable_systemd_user_unit(unit: &str) -> std::result::Result<(), String> {
+    run_systemctl_user(&["stop", unit])?;
+    run_systemctl_user(&["disable", unit])
+}
+
+#[cfg(target_os = "linux")]
+fn remove_legacy_systemd_user_units() -> std::result::Result<usize, String> {
+    let mut removed = 0usize;
+    for unit in LEGACY_SYSTEMD_USER_UNITS {
+        if !systemd_user_unit_present(unit) {
+            continue;
+        }
+        stop_disable_systemd_user_unit(unit)?;
+        let path = systemd_user_unit_path(unit);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|error| {
+                format!("remove legacy systemd unit {}: {error}", path.display())
+            })?;
+        }
+        removed += 1;
+    }
+    if removed > 0 {
+        run_systemctl_user(&["daemon-reload"])?;
+    }
+    Ok(removed)
 }
 
 #[cfg(target_os = "linux")]
@@ -1464,5 +1531,21 @@ mod tests {
         assert!(!systemd_user_bus_unavailable_text(
             "Unit rustory.service not found"
         ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_user_unit_paths_include_legacy_daemon_unit() {
+        let home = Path::new("/home/user");
+
+        assert_eq!(
+            systemd_user_unit_path_for_home(home, SYSTEMD_USER_UNIT),
+            home.join(".config/systemd/user/rustory.service")
+        );
+        assert_eq!(LEGACY_SYSTEMD_USER_UNITS, &["rustory-daemon.service"]);
+        assert_eq!(
+            systemd_user_unit_path_for_home(home, LEGACY_SYSTEMD_USER_UNITS[0]),
+            home.join(".config/systemd/user/rustory-daemon.service")
+        );
     }
 }

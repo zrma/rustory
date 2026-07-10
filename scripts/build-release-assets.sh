@@ -403,6 +403,12 @@ fi
 
 install -m 755 "$binary_path" "$dist_path/$asset_name"
 
+if [[ -n "$linux_platform" ]]; then
+  max_glibc="${RUSTORY_RELEASE_MAX_GLIBC:-${RUSTORY_RELEASE_ZIG_GLIBC:-2.17}}"
+  "$repo_root/scripts/check-linux-glibc-baseline.sh" \
+    "$dist_path/$asset_name" "$max_glibc"
+fi
+
 checksum_file="$dist_path/$asset_name.sha256"
 checksums_file="$dist_path/checksums.txt"
 touch "$checksums_file"

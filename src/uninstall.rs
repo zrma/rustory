@@ -284,10 +284,15 @@ fn remove_daemon_service_files() -> Result<()> {
 
 fn daemon_service_files() -> Result<Vec<PathBuf>> {
     let home = home_dir()?;
-    Ok(vec![
+    Ok(daemon_service_files_for_home(&home))
+}
+
+fn daemon_service_files_for_home(home: &Path) -> Vec<PathBuf> {
+    vec![
         home.join("Library/LaunchAgents/com.rustory.daemon.plist"),
         home.join(".config/systemd/user/rustory.service"),
-    ])
+        home.join(".config/systemd/user/rustory-daemon.service"),
+    ]
 }
 
 fn remove_db_path_family(db_path: &Path) -> Result<()> {
@@ -693,6 +698,15 @@ mod tests {
         assert!(!xdg.join("rustory/daemon.log").exists());
         assert!(unknown.exists());
         assert!(xdg.join("rustory").exists());
+    }
+
+    #[test]
+    fn daemon_service_cleanup_includes_legacy_systemd_unit() {
+        let home = Path::new("/home/user");
+        let paths = daemon_service_files_for_home(home);
+
+        assert!(paths.contains(&home.join(".config/systemd/user/rustory.service")));
+        assert!(paths.contains(&home.join(".config/systemd/user/rustory-daemon.service")));
     }
 
     #[test]

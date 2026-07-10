@@ -66,6 +66,9 @@ Zig가 없고 `RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`가 설정되어 있으�
 마지막 fallback은 Docker buildx다. 빌더를 고정해야 하면 `RUSTORY_RELEASE_LINUX_BUILDER=zig|ssh|docker|host`
 또는 `--linux-builder zig|ssh|docker|host`를 명시한다. 실제 옵션/default는
 `scripts/build-release-assets.sh --help`와 스크립트 본문을 기준으로 한다.
+Linux asset은 빌더 종류와 무관하게 기본 최대 `GLIBC_2.17` 요구사항을 검사하며, 이를 넘으면 checksum
+생성 전에 실패한다. 지원 baseline을 의도적으로 바꾸는 경우에만
+`RUSTORY_RELEASE_MAX_GLIBC=<glibc-version>`을 명시하고 호환 대상 실행 환경을 별도로 검증한다.
 
 `--skip-upload`은 asset/checksum만 만들고 GitHub Release는 건드리지 않는다.
 `--dry-run`은 release plan과 실행할 명령만 출력한다.
