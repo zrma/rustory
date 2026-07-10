@@ -1089,7 +1089,7 @@ fn wait_pid_stopped(pid: u32, timeout: Duration) -> bool {
     !pid_is_running(pid)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn process_status(command: &mut ProcessCommand) -> bool {
     command
         .stdout(Stdio::null())
