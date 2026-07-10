@@ -3,12 +3,16 @@
 ## Interface
 
 - Structure ID: `agent-harness-v1`.
-- Baseline ID: `openai-gpt-5.6-2026-07-10`.
+- Baseline ID: `openai-gpt-5.6-2026-07-11`.
 - Convergence stage: `canonical`.
 - Target stage: `canonical`.
 - Canonical check: `scripts/check-agent-harness-interface.sh`.
+- Publication class: `public`.
+- Publication boundary check: `scripts/check-publication-boundary.py`.
 
 `AGENTS.md`가 공통 GPT-5.6 계약을 소유하고, 이 문서는 Rustory overlay와 기존 운영 문서로 가는 canonical 진입점이다.
+
+Publication class는 현재 저장소 자체의 공개 경계만 선언한다. public gate는 다른 저장소의 inventory를 기록하지 않고 직접 식별자, checkout 경로, 외부 revision, local draft 상태를 차단하며 식별 불가능한 책임 경계는 허용한다.
 
 ## Project Objective
 
@@ -39,6 +43,7 @@ Rustory를 local-first 셸 히스토리 daily driver로 유지한다. 기록은 
 
 ## Verification And Evidence
 
+- Publication boundary: `scripts/check-publication-boundary.py`; 공개 출고 전에는 권한 있는 local private-inventory guard도 실행한다.
 - Harness interface: `scripts/check-agent-harness-interface.sh`.
 - 빠른 기본 게이트: `scripts/check.sh --fast`.
 - 문서 변경: `docs/CHANGE_CONTROL.md`가 지정한 Last Verified, 링크, 인덱스, README, manifest 게이트.

@@ -11,7 +11,7 @@
 <!-- agent-harness-baseline:start -->
 ## Agent Harness Baseline (GPT-5.6)
 
-Baseline ID: `openai-gpt-5.6-2026-07-10`.
+Baseline ID: `openai-gpt-5.6-2026-07-11`.
 
 - Source of truth: use the `openai-docs` skill and the official [latest model guide](https://developers.openai.com/api/docs/guides/latest-model) plus [prompting best practices](https://developers.openai.com/api/docs/guides/latest-model#prompting-best-practices) before changing OpenAI model, API, prompt, or agent guidance.
 - Model target: when the task asks for the current or latest OpenAI baseline, use `gpt-5.6`. This is harness guidance, not proof that the application calls OpenAI; change runtime model strings only at an existing OpenAI integration point.
@@ -20,6 +20,7 @@ Baseline ID: `openai-gpt-5.6-2026-07-10`.
 - Permissions: reading, searching, editing in-scope files, and running non-destructive checks are pre-authorized for change tasks. Require confirmation for external writes not explicitly requested, destructive or irreversible actions, purchases or cost, secrets, or material scope expansion.
 - Persistence: continue until the requested outcome is complete; do not stop after only analysis, a partial patch, or an intermediate tool success. Stop and escalate only at a real permission, product-decision, or external-state boundary.
 - Verification: treat tool and patch success as provisional. Re-read the diff and verify the user-visible or runtime outcome with the narrowest meaningful checks, then broaden only when risk warrants it.
+- Publication boundary: before a public push, tag/release, visibility change, or published-history rewrite, run the repository boundary check and any authorized local private-inventory check. Keep private inventory outside published repositories and CI configuration; retain only non-identifying responsibility boundaries and operational contracts.
 - Output: lead with the conclusion. Include required evidence, material caveats, and the next action; trim introductions, repetition, generic reassurance, and optional background before trimming required content.
 - Structure: use a lightweight task-specific plan or output shape. Do not impose a global template or long process narration when the repository already supplies the necessary workflow.
 - Modes and orchestration: configure Pro mode in the API or runtime rather than asking the model to “think harder.” Use Programmatic Tool Calling only for bounded reduction stages with explicit schemas, limits, and no approval-sensitive side effects; keep semantic decisions and final validation direct.
@@ -32,4 +33,3 @@ Baseline ID: `openai-gpt-5.6-2026-07-10`.
 - local-first/P2P 경계와 relay acceptance는 `docs/agent-harness.md`와 제품 source를 따른다.
 - 기본 검증은 `scripts/check.sh --fast`; 출고 경계는 `docs/CHANGE_CONTROL.md`를 따른다.
 - 로컬 VCS는 `jj`를 사용하고 push는 명시적 권한이 있을 때만 수행한다.
-
