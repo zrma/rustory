@@ -645,6 +645,10 @@ ON CONFLICT(peer_id) DO UPDATE SET
             .context("query latest ingest_seq")
     }
 
+    pub fn entry_count(&self) -> Result<usize> {
+        query_count(&self.conn, "SELECT COUNT(*) FROM entries", "entry count")
+    }
+
     fn latest_ingest_seq_high_water(&self) -> Result<i64> {
         self.conn
             .query_row(
@@ -2156,6 +2160,19 @@ mod tests {
     fn latest_ingest_seq_returns_zero_for_empty_store() {
         let store = LocalStore::open(":memory:").unwrap();
         assert_eq!(store.latest_ingest_seq().unwrap(), 0);
+        assert_eq!(store.entry_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn entry_count_is_distinct_from_gapped_ingest_cursor() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let first = entry("id-1", 1, "echo 1");
+        store.insert_entries(std::slice::from_ref(&first)).unwrap();
+        store.insert_entries(std::slice::from_ref(&first)).unwrap();
+        store.insert_entries(&[entry("id-2", 2, "echo 2")]).unwrap();
+
+        assert_eq!(store.latest_ingest_seq().unwrap(), 3);
+        assert_eq!(store.entry_count().unwrap(), 2);
     }
 
     #[test]

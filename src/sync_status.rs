@@ -78,7 +78,9 @@ pub(crate) struct SyncStatusTrackerReport {
 
 #[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
 pub(crate) struct SyncStatusReport {
+    /// Backward-compatible entry sequence cursor. This is not a row count.
     pub(crate) local_head: i64,
+    pub(crate) local_row_count: usize,
     pub(crate) local_device_id: String,
     pub(crate) peers: Vec<SyncStatusPeerReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -100,6 +102,7 @@ pub(crate) fn build_sync_status_report(
     tracker_peers: &[SyncStatusPeerMetadata],
 ) -> Result<SyncStatusReport> {
     let local_head = store.latest_ingest_seq()?;
+    let local_row_count = store.entry_count()?;
     let mut peer_metadata = store
         .list_peer_book(None, 0, 1000)?
         .into_iter()
@@ -191,6 +194,7 @@ pub(crate) fn build_sync_status_report(
 
     Ok(SyncStatusReport {
         local_head,
+        local_row_count,
         local_device_id: local_device_id.to_string(),
         peers,
         warnings,

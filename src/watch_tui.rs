@@ -452,9 +452,10 @@ pub(crate) fn render_sync_status_watch_frame(
         &mut out,
         width,
         &format!(
-            "{spinner} rustory sync watch  local={}  head={}  peers={}  to_send={}",
+            "{spinner} rustory sync watch  local={}  cursor={}  rows={}  peers={}  to_send={}",
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
+            format_count_usize(report.local_row_count),
             report.peers.len(),
             totals.pending.compact()
         ),
@@ -477,7 +478,7 @@ pub(crate) fn render_sync_status_watch_frame(
     push_watch_line(
         &mut out,
         width,
-        "ctrl+c to exit  •  to_send R=row D=delete  •  direct_pull is only this node's pull cursor; inbound pushes can still keep data current",
+        "ctrl+c to exit  •  cursor values are sequence positions, not row counts  •  to_send R=row D=delete",
     );
     out
 }
@@ -555,9 +556,10 @@ pub(crate) fn render_mesh_watch_frame(
         &mut out,
         width,
         &format!(
-            "{spinner} rustory mesh watch  local={}  head={}  peers={}  to_send={}",
+            "{spinner} rustory mesh watch  local={}  cursor={}  rows={}  peers={}  to_send={}",
             truncate_display(&report.local_device_id, 24),
             format_count_i64(report.local_head),
+            format_count_usize(report.local_row_count),
             report.peers.len(),
             totals.pending.compact(),
         ),
@@ -565,7 +567,7 @@ pub(crate) fn render_mesh_watch_frame(
     push_watch_line(
         &mut out,
         width,
-        "local view: peer→local is direct pull; local→peer is accepted push coverage",
+        "local view: pull_cur peer→local  •  push_cur local→peer  •  cursors are sequence positions",
     );
 
     out.push('\n');
@@ -773,12 +775,17 @@ fn render_mesh_outbox_panel(
         tracker_summary_line(trackers),
         traffic_kv_line("local", &report.local_device_id, inner_width),
         traffic_kv_line(
-            "head",
+            "stored",
             &format!(
                 "{} rows   {} peers",
-                format_count_i64(report.local_head),
+                format_count_usize(report.local_row_count),
                 report.peers.len()
             ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "cursor",
+            &format!("{} ingest_seq", format_count_i64(report.local_head)),
             inner_width,
         ),
         traffic_kv_line("seen", &oldest_seen, inner_width),
@@ -880,9 +887,9 @@ fn render_mesh_lanes_wide(
 ) -> Vec<String> {
     const STATE_COL: usize = 8;
     const SEEN_COL: usize = 8;
-    const DIRECT_COL: usize = 11;
+    const PULL_CURSOR_COL: usize = 11;
     const PULL_RATE_COL: usize = 8;
-    const SENT_COL: usize = 11;
+    const PUSH_CURSOR_COL: usize = 11;
     const PENDING_COL: usize = 9;
     const DRAIN_COL: usize = 8;
     const PROGRESS_COL: usize = 24;
@@ -890,9 +897,9 @@ fn render_mesh_lanes_wide(
 
     let fixed_width = STATE_COL
         + SEEN_COL
-        + DIRECT_COL
+        + PULL_CURSOR_COL
         + PULL_RATE_COL
-        + SENT_COL
+        + PUSH_CURSOR_COL
         + PENDING_COL
         + DRAIN_COL
         + PROGRESS_COL
@@ -904,9 +911,9 @@ fn render_mesh_lanes_wide(
         fit_cell("peer [rr]", peer_col),
         fit_cell("state", STATE_COL),
         right_cell("seen", SEEN_COL),
-        right_cell("direct", DIRECT_COL),
+        right_cell("pull_cur", PULL_CURSOR_COL),
         right_cell("pull/s", PULL_RATE_COL),
-        right_cell("sent", SENT_COL),
+        right_cell("push_cur", PUSH_CURSOR_COL),
         right_cell("to_send", PENDING_COL),
         right_cell("drain/s", DRAIN_COL),
         fit_cell("coverage", PROGRESS_COL),
@@ -919,9 +926,9 @@ fn render_mesh_lanes_wide(
             fit_peer_rr_version_cell(view, peer_col),
             fit_cell(sync_status_watch_peer_status(view), STATE_COL),
             right_cell(&format_age_opt(view.peer.last_seen_age_sec), SEEN_COL),
-            right_cell(&format_count_i64(view.peer.pull_cursor), DIRECT_COL),
+            right_cell(&format_count_i64(view.peer.pull_cursor), PULL_CURSOR_COL),
             right_cell(&format_rate(view.rates.pull_per_sec), PULL_RATE_COL),
-            right_cell(&format_count_i64(view.peer.push_cursor), SENT_COL),
+            right_cell(&format_count_i64(view.peer.push_cursor), PUSH_CURSOR_COL),
             right_cell(&compact_peer_pending_breakdown(view.peer), PENDING_COL),
             right_cell(
                 &format_rate(view.rates.pending_drain_per_sec.max(0.0)),
@@ -954,7 +961,7 @@ fn render_mesh_lanes_compact(
         fit_cell("peer [rr]", peer_col),
         fit_cell("state", state_col),
         right_cell("seen", seen_col),
-        fit_cell("direct/sent", cursor_col),
+        fit_cell("pull_cur/push_cur", cursor_col),
         right_cell("to_send", pending_col),
         fit_cell("coverage", progress_col),
     ));
@@ -962,7 +969,7 @@ fn render_mesh_lanes_compact(
 
     for view in peer_views.iter().take(max_rows) {
         let cursor = format!(
-            "direct {}  sent {}",
+            "pull {}  push {}",
             format_count_i64(view.peer.pull_cursor),
             format_count_i64(view.peer.push_cursor),
         );
@@ -1094,12 +1101,17 @@ fn render_overview_panel(
         tracker_summary_line(trackers),
         traffic_kv_line("local", &report.local_device_id, inner_width),
         traffic_kv_line(
-            "head",
+            "stored",
             &format!(
                 "{} rows   {} peers",
-                format_count_i64(report.local_head),
+                format_count_usize(report.local_row_count),
                 report.peers.len()
             ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "cursor",
+            &format!("{} ingest_seq", format_count_i64(report.local_head)),
             inner_width,
         ),
         traffic_kv_line(
@@ -1130,7 +1142,7 @@ fn render_overview_panel(
         traffic_kv_line(
             "health",
             &format!(
-                "{} stale   {} idle   {} direct_pull=0{}",
+                "{} stale   {} idle   {} pull_cur=0{}",
                 totals.stale,
                 totals.idle,
                 totals.direct_pull_zero,
@@ -1144,7 +1156,7 @@ fn render_overview_panel(
             inner_width,
         ),
         truncate_display(
-            "read: direct_pull is only this node's completed pull cursor",
+            "read: pull_cur/push_cur are sequence positions, not row counts",
             inner_width,
         ),
     ];
@@ -1169,12 +1181,17 @@ fn render_traffic_panel(
 
     let mut body = vec![
         traffic_kv_line(
-            "head",
+            "stored",
             &format!(
                 "{} rows   {} peers",
-                format_count_i64(report.local_head),
+                format_count_usize(report.local_row_count),
                 report.peers.len()
             ),
+            inner_width,
+        ),
+        traffic_kv_line(
+            "cursor",
+            &format!("{} ingest_seq", format_count_i64(report.local_head)),
             inner_width,
         ),
         traffic_kv_line("seen", &seen, inner_width),
@@ -1268,7 +1285,7 @@ fn traffic_progress_line_with_text(
 
 fn traffic_hot_line(peer_name: &str, peer: &SyncStatusPeerReport, inner_width: usize) -> String {
     let right = format!(
-        "direct {}  sent {}  {} left",
+        "pull_cur {}  push_cur {}  {} left",
         right_cell(&format_count_i64(peer.pull_cursor), 7),
         right_cell(&format_count_i64(peer.push_cursor), 7),
         compact_peer_pending_breakdown(peer)
@@ -1289,7 +1306,7 @@ fn traffic_hot_line(peer_name: &str, peer: &SyncStatusPeerReport, inner_width: u
 fn traffic_peer_queue_line(view: &SyncStatusWatchPeerView<'_>, inner_width: usize) -> String {
     let peer = view.peer;
     let right = format!(
-        "sent {}  {} left",
+        "push_cur {}  {} left",
         right_cell(&format_count_i64(peer.push_cursor), 7),
         compact_peer_pending_breakdown(peer)
     );
@@ -1365,9 +1382,9 @@ fn render_link_panel_wide(
         fit_cell("peer [rr]", peer_col),
         fit_cell("state", STATE_COL),
         right_cell("seen", SEEN_COL),
-        right_cell("direct", PULL_CURSOR_COL),
+        right_cell("pull_cur", PULL_CURSOR_COL),
         right_cell("pull/s", PULL_RATE_COL),
-        right_cell("sent", PUSH_CURSOR_COL),
+        right_cell("push_cur", PUSH_CURSOR_COL),
         right_cell("to_send", PENDING_COL),
         right_cell("drain/s", DRAIN_COL),
         fit_cell("progress", PROGRESS_COL),
@@ -1417,8 +1434,8 @@ fn render_link_panel_compact(
         fit_cell("peer [rr]", peer_col),
         fit_cell("state", state_col),
         right_cell("seen", seen_col),
-        fit_cell("direct_pull", pull_col),
-        fit_cell("local_to_peer", push_col)
+        fit_cell("pull_cursor", pull_col),
+        fit_cell("push_cursor/to_send", push_col)
     ));
     body.push("─".repeat(inner_width));
 
@@ -1434,7 +1451,7 @@ fn render_link_panel_compact(
             format_rate(view.rates.pull_per_sec)
         );
         let push = format!(
-            "sent {} to_send {} {}",
+            "cur {} to_send {} {}",
             format_count_i64(peer.push_cursor),
             compact_peer_pending_breakdown(peer),
             link_push_progress_line(view.progress, 12),
@@ -1841,6 +1858,7 @@ mod tests {
     fn unsorted_watch_report() -> SyncStatusReport {
         SyncStatusReport {
             local_head: 300,
+            local_row_count: 42,
             local_device_id: "local".to_string(),
             peers: vec![
                 sample_watch_peer(
@@ -1988,6 +2006,7 @@ mod tests {
         let mut state = SyncStatusWatchState::default();
         let report = SyncStatusReport {
             local_head: 300,
+            local_row_count: 42,
             local_device_id: "local".to_string(),
             peers: vec![
                 sample_watch_peer(
@@ -2180,6 +2199,7 @@ mod tests {
         let mut state = SyncStatusWatchState::default();
         let report = SyncStatusReport {
             local_head: 2_129_846,
+            local_row_count: 269_524,
             local_device_id: "user-arm64-with-an-extra-long-local-device-id".to_string(),
             peers: vec![
                 SyncStatusPeerReport {
@@ -2236,9 +2256,13 @@ mod tests {
         assert!(frame.contains("Overview"));
         assert!(frame.contains("Attention"));
         assert!(frame.contains("Links"));
-        assert!(frame.contains("direct"));
+        assert!(frame.contains("cursor=2.1M"));
+        assert!(frame.contains("rows=269.5k"));
+        assert!(frame.contains("stored"));
+        assert!(frame.contains("ingest_seq"));
+        assert!(frame.contains("pull_cur"));
         assert!(frame.contains("pull/s"));
-        assert!(frame.contains("sent"));
+        assert!(frame.contains("push_cur"));
         assert!(frame.contains("to_send"));
         assert!(frame.contains("drain/s"));
         assert!(frame.contains("2.3k"));
@@ -2247,7 +2271,7 @@ mod tests {
         assert!(frame.contains("[0.0.1!]"));
         assert!(frame.contains("[?]"));
         assert!(frame.contains("to_send R=row D=delete"));
-        assert!(frame.contains("direct_pull is only"));
+        assert!(frame.contains("sequence positions, not row counts"));
         assert!(!frame.contains("Mesh Map"));
         for line in frame.lines() {
             let width = unicode_width::UnicodeWidthStr::width(line);
@@ -2268,6 +2292,7 @@ mod tests {
         let mut state = SyncStatusWatchState::default();
         let report = SyncStatusReport {
             local_head: 4_494_530,
+            local_row_count: 269_524,
             local_device_id: "user-arm64-with-an-extra-long-local-device-id".to_string(),
             peers: vec![
                 SyncStatusPeerReport {
@@ -2337,10 +2362,12 @@ mod tests {
         let frame = render_mesh_watch_frame(&mut state, &report, Instant::now(), 160, 36);
 
         assert!(frame.contains("rustory mesh watch"));
+        assert!(frame.contains("cursor=4.5M"));
+        assert!(frame.contains("rows=269.5k"));
         assert!(frame.contains("Mesh Topology"));
         assert!(frame.contains("Outbox"));
         assert!(frame.contains("Flow Lanes"));
-        assert!(frame.contains("local view: peer"));
+        assert!(frame.contains("local view: pull_cur peer"));
         assert!(frame.contains("global peer"));
         assert!(frame.contains("peer ↔ peer"));
         assert!(frame.contains("to_send R=row D=delete"));
@@ -2387,8 +2414,8 @@ mod tests {
         assert_eq!(unicode_width::UnicodeWidthStr::width(hot.as_str()), 52);
         assert_eq!(unicode_width::UnicodeWidthStr::width(progress.as_str()), 24);
         assert!(backlog.ends_with("   5% 16 left"));
-        assert!(hot.contains("direct"));
-        assert!(hot.contains("sent"));
+        assert!(hot.contains("pull_cur"));
+        assert!(hot.contains("push_cur"));
         assert!(hot.ends_with("13 left"));
         assert!(progress.ends_with("  66%"));
     }

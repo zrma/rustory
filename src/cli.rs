@@ -1721,7 +1721,8 @@ fn print_sync_status_text(
     peer_filter: Option<&str>,
     mut out: impl Write,
 ) -> Result<()> {
-    writeln!(out, "local ingest head: {}", report.local_head)?;
+    writeln!(out, "local ingest cursor: {}", report.local_head)?;
+    writeln!(out, "local stored rows: {}", report.local_row_count)?;
     writeln!(
         out,
         "local device id: {}",
@@ -5334,6 +5335,7 @@ mod tests {
             build_sync_status_report(&store, "dev-local", Some("peer-local-id"), None, None, &[])
                 .unwrap();
         assert_eq!(report.local_head, 4);
+        assert_eq!(report.local_row_count, 3);
         assert_eq!(report.local_device_id, "dev-local");
         assert_eq!(report.peers.len(), 2);
         assert!(report.tracker_status.is_none());
@@ -5400,6 +5402,7 @@ mod tests {
 
         let json = serde_json::to_string(&filtered).unwrap();
         assert!(json.contains("\"local_head\""));
+        assert!(json.contains("\"local_row_count\":3"));
         assert!(json.contains("\"local_device_id\""));
         assert!(json.contains("\"peer_device_id\""));
         assert!(json.contains("\"peer_rr_version\":\"1.0.44\""));
@@ -5419,6 +5422,7 @@ mod tests {
     fn sync_status_text_escapes_controls_without_mutating_report_values() {
         let report = SyncStatusReport {
             local_head: 7,
+            local_row_count: 3,
             local_device_id: "local\x1b]52;c;LOCAL\x07".to_string(),
             peers: vec![crate::sync_status::SyncStatusPeerReport {
                 peer_id: "peer-a".to_string(),
@@ -5456,6 +5460,9 @@ mod tests {
         let mut output = Vec::new();
         print_sync_status_text(&report, None, &mut output).unwrap();
         let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("local ingest cursor: 7"), "{output}");
+        assert!(output.contains("local stored rows: 3"), "{output}");
+        assert!(!output.contains("local ingest head"), "{output}");
         assert!(!output.contains('\x1b'), "{output:?}");
         assert!(!output.contains('\x07'), "{output:?}");
         assert!(!output.contains('\u{7f}'), "{output:?}");
