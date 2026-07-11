@@ -7,6 +7,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 
+#[cfg(test)]
+const HTTP_PULL_RESPONSE_MAX_BYTES: u64 = 8 * 1024;
+#[cfg(not(test))]
+const HTTP_PULL_RESPONSE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const HTTP_PUSH_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
+
 pub struct ServeConfig {
     pub token: Option<String>,
 }
@@ -252,8 +258,10 @@ fn http_pull_batch(
     let mut resp = resp;
     let body = resp
         .body_mut()
+        .with_config()
+        .limit(HTTP_PULL_RESPONSE_MAX_BYTES)
         .read_to_string()
-        .context("read response body")?;
+        .context("read pull response body")?;
     let parsed: EntriesResponse =
         serde_json::from_str(&body).context("parse entries response json")?;
 
@@ -289,8 +297,10 @@ fn http_push_batch(
     let mut resp = resp;
     let _ = resp
         .body_mut()
+        .with_config()
+        .limit(HTTP_PUSH_RESPONSE_MAX_BYTES)
         .read_to_string()
-        .context("read response body")?;
+        .context("read push response body")?;
     Ok(())
 }
 
@@ -630,6 +640,30 @@ mod tests {
         assert_eq!(got.len(), 3);
         assert!(got.iter().any(|e| e.entry_id == "id-3"));
 
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_pull_adapts_when_response_exceeds_body_limit() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let local_db = dir.path().join("local.db");
+
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+        let mut first = entry("id-large-1", 1, &"a".repeat(5 * 1024));
+        first.device_id = "dev-remote".to_string();
+        let mut second = entry("id-large-2", 2, &"b".repeat(5 * 1024));
+        second.device_id = "dev-remote".to_string();
+        remote.insert_entries(&[first, second]).unwrap();
+
+        let server = start_test_server(remote_db.to_str().unwrap().to_string());
+        let local = LocalStore::open(local_db.to_str().unwrap()).unwrap();
+
+        let pulled = sync_pull_http_peer(&local, &server.base_url, 2, None).unwrap();
+
+        assert_eq!(pulled.received, 2);
+        assert_eq!(pulled.inserted, 2);
+        assert_eq!(local.list_recent(10).unwrap().len(), 2);
         server.shutdown();
     }
 

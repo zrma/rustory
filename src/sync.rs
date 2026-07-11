@@ -446,7 +446,10 @@ fn validate_pull_batch_cursors(batch: &PullBatch, cursor: i64, delete_cursor: i6
 pub(crate) fn is_payload_too_large_error(err: &anyhow::Error) -> bool {
     err.chain().any(|cause| {
         if let Some(e) = cause.downcast_ref::<ureq::Error>() {
-            return matches!(e, ureq::Error::StatusCode(413));
+            return matches!(
+                e,
+                ureq::Error::StatusCode(413) | ureq::Error::BodyExceedsLimit(_)
+            );
         }
 
         if let Some(libp2p_request_response::OutboundFailure::Io(ioe)) =
