@@ -113,6 +113,51 @@ current_target() {
   esac
 }
 
+sha256_file() {
+  local path="$1"
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print tolower($1)}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$path" | awk '{print tolower($1)}'
+  else
+    fail "required command not found: sha256sum or shasum"
+  fi
+}
+
+checksum_entry_for_asset() {
+  local checksum_file="$1"
+  local asset_name="$2"
+  awk -v expected="$asset_name" '
+    {
+      digest = tolower($1)
+      name = $2
+      sub(/^\*/, "", name)
+      sub(/^\.\//, "", name)
+      if (name == expected) print digest
+    }
+  ' "$checksum_file"
+}
+
+verify_asset_checksum_entry() {
+  local asset="$1"
+  local checksum_file="$2"
+  local asset_name=""
+  local actual=""
+  local entries=""
+  local entry_count=""
+
+  asset_name="$(basename "$asset")"
+  actual="$(sha256_file "$asset")"
+  entries="$(checksum_entry_for_asset "$checksum_file" "$asset_name")"
+  entry_count="$(printf '%s\n' "$entries" | awk 'NF { count += 1 } END { print count + 0 }')"
+  [[ "$entry_count" -eq 1 ]] || fail \
+    "expected exactly one checksum for $asset_name in $checksum_file (found $entry_count)"
+  [[ "$entries" =~ ^[0-9a-f]{64}$ ]] || fail \
+    "invalid SHA-256 for $asset_name in $checksum_file"
+  [[ "$entries" == "$actual" ]] || fail \
+    "checksum mismatch for $asset_name in $checksum_file: expected $actual, found $entries"
+}
+
 resolve_targets_from_profile() {
   case "$PROFILE" in
     current)
@@ -253,6 +298,7 @@ build_or_collect_assets() {
   local resolved_target=""
   local asset=""
   local checksum=""
+  local -a release_assets=()
   ASSETS=()
 
   for target in "${TARGETS[@]}"; do
@@ -277,12 +323,17 @@ build_or_collect_assets() {
       [[ -x "$asset" ]] || fail "missing release asset: $asset"
       [[ -f "$checksum" ]] || fail "missing release checksum: $checksum"
     fi
+    release_assets+=("$asset")
     ASSETS+=("$asset" "$checksum")
   done
 
   local checksums="$DIST_PATH/checksums.txt"
   if [[ "$DRY_RUN" -eq 0 ]]; then
     [[ -f "$checksums" ]] || fail "missing release checksums file: $checksums"
+    for asset in "${release_assets[@]}"; do
+      verify_asset_checksum_entry "$asset" "$asset.sha256"
+      verify_asset_checksum_entry "$asset" "$checksums"
+    done
   fi
   ASSETS+=("$checksums")
 }

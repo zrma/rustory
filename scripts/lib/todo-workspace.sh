@@ -154,6 +154,9 @@ todo_workspace_collect_deleted_work_ids() {
   fi
 
   {
+    if command -v jj >/dev/null 2>&1 && (cd "$root" && jj root >/dev/null 2>&1); then
+      (cd "$root" && jj diff --summary 2>/dev/null) || true
+    fi
     git -C "$root" diff --name-status -- "$TODO_WORKSPACE_PARENT_REL"
     git -C "$root" diff --cached --name-status -- "$TODO_WORKSPACE_PARENT_REL"
     if (( run_head_range == 1 )) && git -C "$root" rev-parse --verify --quiet HEAD^ >/dev/null; then

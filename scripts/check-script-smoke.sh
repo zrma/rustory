@@ -143,7 +143,13 @@ EOF
   fi
   printf '#!/usr/bin/env sh\nexit 0\n' > "$asset"
   chmod +x "$asset"
-  printf '%064d  %s\n' 0 "$(basename "$asset")" > "$asset.sha256"
+  local digest=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum "$asset" | awk '{print $1}')"
+  else
+    digest="$(shasum -a 256 "$asset" | awk '{print $1}')"
+  fi
+  printf '%s  %s\n' "$digest" "$(basename "$asset")" > "$asset.sha256"
   cp "$asset.sha256" "$release_tree_repo_dir/dist/release-v1.2.3/checksums.txt"
 }
 
@@ -604,6 +610,17 @@ expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --targ
 git -C "$release_tree_repo_dir" checkout -qb same-tree main
 git -C "$release_tree_repo_dir" commit --allow-empty -qm "chore: empty child"
 run_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+release_fixture_asset="$(find "$release_tree_repo_dir/dist/release-v1.2.3" -type f -name 'rr-*' ! -name '*.sha256' -print -quit)"
+release_fixture_checksum="$release_fixture_asset.sha256"
+release_fixture_checksums="$release_tree_repo_dir/dist/release-v1.2.3/checksums.txt"
+cp "$release_fixture_checksum" "$release_fixture_checksum.good"
+printf '%064d  %s\n' 0 "$(basename "$release_fixture_asset")" > "$release_fixture_checksum"
+expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+mv "$release_fixture_checksum.good" "$release_fixture_checksum"
+cp "$release_fixture_checksums" "$release_fixture_checksums.good"
+printf '%064d  %s\n' 0 "$(basename "$release_fixture_asset")" > "$release_fixture_checksums"
+expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+mv "$release_fixture_checksums.good" "$release_fixture_checksums"
 run_cmd "scripts/check-push-gates.sh --mode quick --dry-run"
 run_cmd "$push_strict_cmd"
 run_debug_override_cmd "ALLOW_MISSING_WORK_ID_IN_CI=0 DEBUG_GATES_OVERRIDE=1 scripts/check-push-gates.sh --mode strict --allow-missing-work-id --dry-run"
