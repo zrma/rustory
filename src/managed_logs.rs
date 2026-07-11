@@ -256,6 +256,7 @@ fn managed_daemon_log_paths_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     #[test]
     fn oversized_regular_log_is_truncated() {
@@ -268,6 +269,26 @@ mod tests {
         assert_eq!(result.status, ManagedLogCleanupStatus::Cleaned);
         assert_eq!(result.previous_bytes, Some(10));
         assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn existing_append_writer_continues_from_truncated_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("daemon.log");
+        let mut writer = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writer.write_all(b"0123456789").unwrap();
+        writer.flush().unwrap();
+
+        let result = cleanup_log_file(&path, 4);
+        writer.write_all(b"next").unwrap();
+        writer.flush().unwrap();
+
+        assert_eq!(result.status, ManagedLogCleanupStatus::Cleaned);
+        assert_eq!(fs::read(path).unwrap(), b"next");
     }
 
     #[test]
