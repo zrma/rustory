@@ -64,6 +64,125 @@ rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --allow-unauthenticated
 운영 서비스에서는 토큰이 process args에 남지 않도록 `RUSTORY_TRACKER_TOKEN` 또는
 `config.toml`의 `tracker_token`을 우선한다. `--token`은 임시 실행/테스트용으로만 쓴다.
 
+#### Device enrollment와 revoke 제어면
+
+기본 tracker API와 config default는 기존 peer와 호환된다. durable revoke를 활성화할 때는 fleet
+token과 분리된 admin token, absolute private state path를 먼저 추가한다. admin token은 peer에
+배포하지 않는다.
+
+```sh
+export RUSTORY_TRACKER_TOKEN='<fleet-token>'
+export RUSTORY_TRACKER_ADMIN_TOKEN="$(openssl rand -hex 32)"
+export RUSTORY_TRACKER_SECURITY_STATE_PATH='/var/lib/rustory/tracker-security.json'
+rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
+```
+
+안전한 전환 순서는 다음과 같다.
+
+1. 새 버전을 모든 정상 node에 먼저 배포한다. 이 단계에서는 `require_device_membership=false`,
+   `allow_remote_retirement=false`를 유지하고 각 node의 signed registration을 기다린다.
+2. admin 환경에서 `rr device list`로 observed PeerId를 확인하고, 정확한 대상마다
+   `rr device enroll --peer-id '<peer-id>'`를 실행한다.
+3. tracker를 같은 state path와 `--require-device-enrollment`로 재시작한다. 이후 unsigned/unknown
+   identity의 register/unregister는 shared fleet token을 알아도 거부된다.
+4. 정상 node config를 `require_device_membership=true`로 바꾸고 daemon을 재시작한다. 이 모드는
+   authoritative tracker가 정확히 하나이고 HTTPS여야 하며(loopback test HTTP 예외), tracker 장애
+   중에는 history sync를 fail-closed한다.
+5. `rr device list`에서 남을 모든 enrolled node가 현재 membership protocol과
+   `membership_enforced=true`를 보고하는지 확인한다. offline인 strict-enrolled node는 준비된 것으로
+   취급하지만, 현재 active인데 미등록인 legacy peer는 fleet-wide enforcement 미완료 신호다.
+
+strict mode 전환 뒤 새 장비를 추가할 때 tracker를 non-strict로 되돌릴 필요는 없다. 새 장비의 첫 signed
+registration은 sync membership에는 403으로 거부되지만 `rr device list`에는
+`enrolled=false active=false` pending observation으로 최대 15분 표시된다. 관리자가 정확한 PeerId를
+확인해 `rr device enroll`한 뒤 다음 registration부터 활성화된다. 이미 revoke된 `user_id + device_id`는
+새 identity로 우회할 수 없으므로 교체 장비는 의도적으로 새 `device_id`를 부여해 이 절차를 따른다.
+
+incident revoke가 다른 node의 offline 상태 때문에 막히지 않도록 tracker는 대상 membership을 즉시
+durable하게 revoke한다. 다만 남을 enrolled node 중 protocol/enforcement가 부족하거나 현재 active인
+미등록 legacy peer가 있으면 응답의 `membership_enforcement_complete=false`와 CLI warning으로
+"tracker revoke 기록"과 "fleet 전체 강제 확인"을 분리한다. 이 warning이 나오면 legacy peer를
+업데이트/enroll하고, 대상이 신뢰되지 않는 경우 shared tracker token과 `swarm.key`도 rotation한다.
+`true`도 마지막으로 수락된 signed registration capability의 advisory snapshot이지 live attestation은
+아니다. node가 이후 offline rollback되었는지 증명하지 않으므로 rollout/incident 때 각 node의 현재
+binary version과 fresh registration 시각을 별도로 확인한다.
+대상 자체는 offline이어도 revoke할 수 있으며, full-uninstall capability를 광고했던 cooperative 대상은
+재접속 때 ticket을 처리한다. 동일 PeerId에 다른 cleanup 정책을 덮어쓰는 것은 거부한다. scheduling
+실패나 대상의 명시적 거부는 같은 admin retire 명령으로 안전 precondition을 다시 확인한 뒤
+`Pending`으로 재큐잉할 수 있다. 먼저 revoke-only로 격리한 대상은 이후 precondition이 충족되면
+`rr device retire`로 새 full-uninstall ticket을 발급하는 단방향 승격이 가능하다. full-uninstall을
+revoke-only로 낮추거나 이미 실행 중인 ticket의 cleanup 정책을 바꾸는 것은 거부한다.
+
+```sh
+# 한 번 생성해 tracker와 관리 CLI가 같은 secret-manager 값을 사용한다.
+export RUSTORY_TRACKER_ADMIN_TOKEN="$(openssl rand -hex 32)"
+rr device list
+rr device enroll --peer-id '<exact-peer-id>'
+rr device revoke --peer-id '<exact-peer-id>' --yes
+rr device retire --peer-id '<exact-peer-id>' --yes
+rr device status --peer-id '<exact-peer-id>'
+```
+
+admin 요청은 일반 tracker bearer token에 더해 admin token을 요구하고 production에서는 HTTPS로만
+전송된다. loopback HTTP 허용은 repository test build에만 존재하며 운영 우회 수단이 아니다.
+admin token은 fleet token과 다른 최소 32-byte random 값이어야 한다(`openssl rand -hex 32` 권장).
+TLS reverse proxy에서 admin endpoint, `/api/v1/peers/register`, signed
+`/api/v1/peers/unregister`, `/api/v1/devices/retirement/{poll,ack,complete}`에 peer/IP별 rate
+limit을 적용한다. 정상 poll 30초와 completion retry 5~60초 cadence보다 충분히 여유 있게 두고
+request/response read/write timeout을 설정하며,
+backend port는 loopback/private network policy로 직접 접근을 막는다.
+CLI 인자의 `--admin-token`보다 `RUSTORY_TRACKER_ADMIN_TOKEN`을 권장한다. tracker security state는
+재시작 후 enrollment, revocation, cleanup ACK와 ticket-scoped completion capability hash를 복원하며
+group/world-readable 파일이나 symlink를 거부한다. state file에는 process-lifetime exclusive lock을
+잡으므로 같은 path를 공유하는 tracker replica는 하나만 실행한다.
+대상 helper의 retirement `poll`/`ack`는 enrolled identity의 timestamp/nonce/signature proof로 인증하므로
+fleet bearer token rotation 뒤에도 복구된다. 이 두 endpoint는 자신의 ticket만 조회/전이할 수 있고,
+admin/list/register API의 bearer-token 요구를 완화하지 않는다.
+자발적 uninstall의 signed unregister도 같은 identity proof로 자기 enrollment만 제거할 수 있어 stale
+fleet token 때문에 탈퇴가 막히지 않는다. proof가 없는 legacy unregister는 기존처럼 bearer token을
+요구한다.
+
+tracker ingress는 proof/capability 요청을 bounded header에서 먼저 검증하고, 인증되지 않은 요청은 body를
+읽지 않는다. legacy JSON body는 유효한 fleet bearer가 있을 때만 허용한다. 전체 body read에는 10초
+deadline과 64개 동시 요청 상한을 두므로 느린 unauthenticated body 하나가 register/admin/sync 요청 전체를
+멈추지 않는다. TLS reverse proxy에도 request-body/header size와 read/write timeout을 같은 수준 이하로 둔다.
+`X-Rustory-Device-Request`와 해당 request body에는 signed proof 및 completion capability가 포함될 수
+있으므로 access log에서 header/body를 반드시 redact하거나 기록하지 않는다. tracker 응답은
+`Cache-Control: no-store, private`이므로 proxy에서 cache하지 않는다.
+
+### Strict mode rollback 경계
+
+wire JSON 필드는 additive라 새 client가 구 tracker의 `revocations` 없는 list 응답을 읽고 구 client가 새
+list의 추가 필드를 무시하는 것은 가능하다. 그러나 strict membership을 활성화한 뒤 tracker를 이 기능
+이전 버전으로 내리는 것은 보안상 호환되지 않는다. 구 tracker는 durable enrollment/revocation/ticket
+state를 읽거나 강제하지 못한다.
+
+rollback이 불가피하면 다음 순서를 지킨다.
+
+1. device enroll/revoke/retire mutation을 중지하고 private tracker security-state 파일과 lock 경로를
+   보존한다. 이 파일을 구 tracker가 이해하지 못한다고 삭제하거나 빈 파일로 대체하지 않는다.
+2. 모든 full-uninstall ticket이 terminal인지, 대상 helper/receipt가 `Running` 또는 ACK retry 중이 아닌지
+   확인한다. 실행 중 helper가 있으면 새 tracker/client를 유지해 완료 ACK까지 수렴시킨다.
+3. 아직 current binary인 모든 정상 node에서 먼저 `allow_remote_retirement=false`, 그 다음
+   `require_device_membership=false`를 config에 저장하고 daemon을 재시작한다. 새 tracker를 유지한 채
+   모든 node가 non-strict registration을 다시 보고하고 더 이상 helper가 없는지 확인한다. 이 단계부터
+   durable revoke의 fleet 강제를 의도적으로 포기한 상태이므로 접근을 별도 network policy로 제한한다.
+4. revoke된 대상이나 credential 노출 가능성이 있으면 정상 node의 tracker token과 `swarm.key`를 먼저
+   rotation한다. rollback은 이미 유출된 shared credential을 폐기하지 않는다.
+5. strict enforcement를 포기한다는 운영 결정을 기록하고 current client의 strict flag가 모두 내려간
+   뒤에만 tracker binary를 구 버전으로 내린다. 마지막으로 client binary를 coordinated downgrade한다.
+   strict flag를 둔 채 tracker부터 내리면 current client가 membership API 404로 fail-closed하고, 구
+   client를 먼저 내리면 strict tracker가 registration을 거부하므로 어느 쪽도 단독 binary downgrade로
+   시작하지 않는다.
+6. 재전진할 때 보존한 security state로 새 tracker를 먼저 복구하고 enrollment/enforcement coverage를
+   다시 확인한 뒤 client를 올린다.
+
+실제 fleet에서 full uninstall을 허용하기 전에는 disposable macOS/Linux node에서 별도 launchd label,
+systemd-user cgroup과 reboot recovery, offline 재접속, cleanup 후 completion ACK 재시도를 각각 통과시킨다.
+unit/integration gate만 통과한 build는 membership revoke에는 쓸 수 있지만 live full-uninstall enablement의
+최종 증거로 간주하지 않는다.
+재현 경계와 최신 acceptance evidence는 `docs/acceptance/device-retirement-vms.md`가 소유한다.
+
 #### 3) Peer A (서버 역할)
 ```sh
 rr --db-path "/tmp/rustory-a.db" p2p-serve \
@@ -177,7 +296,17 @@ p2p_identity_key_path = "~/.config/rustory/identity.key"
 relay_identity_key_path = "~/.config/rustory/relay.key"
 tracker_token = "secret"
 p2p_watch_start_jitter_sec = 10
+require_device_membership = true
+# allow_remote_retirement = false # target-side destructive opt-in
 ```
+
+일반 실행에서는 `require_device_membership`과 `allow_remote_retirement`를 각각
+`RUSTORY_REQUIRE_DEVICE_MEMBERSHIP`, `RUSTORY_ALLOW_REMOTE_RETIREMENT`로 override할 수 있다. 하지만
+remote retirement capability는 recovery helper가 재구성할 수 있도록 두 opt-in과 `user_id`,
+`device_id`, tracker/DB/key 경로가 `config.toml`에도 일치하게 저장된 경우에만 광고한다.
+remote retirement를 켠 node는 두 값을 모두 true로 두고 launchd 또는 systemd-user가 관리하는
+`rr daemon`으로 실행해야 capability를 광고한다. standalone `rr p2p-serve`와 Linux background
+fallback은 파일 삭제 capability를 광고하지 않고 revoke-only로 남는다.
 
 ## peerbook 캐시(tracker fallback)
 - `rr p2p-sync`는 tracker 조회가 성공하면, 받은 peer 목록을 로컬 DB에 캐시한다(`peer_book`).

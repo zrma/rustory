@@ -114,6 +114,82 @@ rr daemon --preflight
 - `rr daemon` foreground 실행 후 tracker에 peer가 등록되고 relay reservation이 발생한다.
 - `rr daemon`의 sync watch 1주기에서 pull/push summary가 출력된다.
 
+## Cooperative remote retirement
+
+remote full uninstall은 기본적으로 꺼져 있다. strict enrollment 전환을 끝낸 뒤 대상별로 다음 두
+설정을 함께 켜고 managed daemon을 재시작해야 한다.
+
+```toml
+require_device_membership = true
+allow_remote_retirement = true
+```
+
+installer 자동화에서는 HTTPS tracker를 정확히 하나 지정하고 다음 flag를 함께 쓴다.
+
+```sh
+python3 install/rustory.py \
+  --tracker 'https://tracker.example' \
+  --require-device-membership \
+  --allow-remote-retirement \
+  --install-daemon
+```
+
+기존 `config.toml`이 있으면 installer는 이를 `--force`로 재생성하지 않는다. 대신 두 security key만
+atomic하게 `true`로 병합하고 주석, plugin table, 기타 설정을 그대로 보존한다. 이때 authoritative HTTPS
+tracker가 이미 config에 정확히 하나 저장되어 있지 않으면 성공처럼 보이는 partial activation 대신
+실패한다. 먼저 config를 명시적으로 수정한 뒤 재시도한다.
+
+`rr p2p-serve` child는 managed daemon marker, strict membership, target opt-in이 모두 있을 때만
+retirement protocol을 signed registration에 광고한다. opt-in, user/device id, tracker와 cleanup 관련
+DB/key/marker 경로는 helper가 재구성할 수 있게 `config.toml`에 저장되어 effective runtime과 일치해야
+한다. env-only opt-in 또는 CLI/env path override가 config와 다르면 parent는 capability와 monitor를 모두
+끄고 revoke-only로 남는다. daemon parent가 fixed ticket을 poll하고 다음 별도 execution context로
+internal helper를 넘긴다.
+
+- macOS: `com.rustory.retire.<ticket>` one-shot launchd agent. 기존
+  `com.rustory.daemon`을 `bootout`해도 helper는 별도 label이라 생존한다.
+- Linux systemd-user: ticket별 `rustory-retire-<ticket>.service` recovery unit을 private file로 만들고
+  enable한 뒤 기존 `rustory.service`와 다른 cgroup에서 실행한다. `Restart=on-failure`와 boot enable로
+  crash/reboot를 복구하며 handoff 실패 시 background로 우회하지 않고 파일 삭제 전에 실패한다.
+- Linux background fallback: membership revoke는 지원하지만 full-uninstall capability는 광고하지 않는다.
+  shell-start process만으로는 cleanup 중 crash/reboot 뒤 recovery helper를 확실히 다시 실행할 수 없기
+  때문이다. full uninstall이 필요하면 systemd-user와 linger를 정상 구성한다.
+
+installer가 service를 만들 때 resolved absolute `XDG_STATE_HOME`을 launchd/systemd environment에 고정해
+daemon과 recovery helper가 install 시점과 같은 receipt/log state를 사용한다. fixed private
+`managed-state-home` metadata로 이후 `rr update`/uninstall에도 같은 값을 복원한다. bounded
+`managed-state-homes.json`은 이전 값까지 보존해 state home 변경 뒤 남은 Rustory state도 uninstall에서
+정리한다. immediate/background
+rc child에도 raw `~/...`나 빈 env 대신 resolved absolute 값을 고정한다. systemd-user parent는 모든
+config/key/cleanup preflight를 통과한 뒤 exact managed signature가 일치하는 기존 background
+parent/child를 먼저 정리하고, rc block도 active unit을 확인한다. 따라서 manual takeover 직후나 이후
+interactive shell에서 duplicate daemon이 생기지 않는다.
+
+helper argument는 canonical ticket UUID 하나뿐이고 remote ticket에는 실행 command나 local path가
+없다. daemon은 시작 시 effective DB/config/key/state/managed-rc 경로를 검증해 exact cleanup plan을
+만들고, scheduler는 현재 `rr`를 private helper로 복사하면서 이 plan과 identity key의 경로를 0600
+receipt에 먼저 고정한다. helper는 Pending ticket에서 local config/identity/user/device/tracker와 opt-in을
+다시 대조하고 ticket별 256-bit completion capability를 receipt에 내구성 있게 기록한 뒤 tracker가
+hash-bound `Running` ACK를 확인해야만 기존 uninstall executor를 호출한다. config가 그 사이 바뀌어도
+삭제 경로는 startup-pinned plan에서 늘어나거나 바뀌지 않는다. receipt에는 fleet token이나 identity
+private key가 들어가지 않는다.
+manager stop이 불완전하면 기존 uninstall과 같이 DB/config/binary 삭제 전에 중단한다.
+
+cleanup이 성공하면 receipt에 먼저 완료를 기록한 뒤, 이미 config/identity/binary가 없어도 completion
+capability만으로 `Completed` ACK를 확인할 때까지 재시도한다. tracker는 capability hash만 보관하고 이
+경로는 해당 ticket의 `Running → Completed` 외 상태를 바꿀 수 없다. ACK 확인 후 helper copy, manager
+artifact/enable link, receipt를 삭제한다. helper crash/reboot는 launchd의 persistent agent 또는
+systemd의 enabled recovery unit이 같은 receipt에서 재개한다. device proof로 인증하는 poll/Running ACK는
+fleet bearer token을 receipt에 넣지 않으므로 token rotation에도 복구된다. scheduling 실패는 Pending에서
+`Failed`, 실행 직전 target preflight가 실패하면 `Refused`로 남고 같은 admin retire 명령으로
+precondition을 재검증해 재큐잉할 수 있다. `Running → Failed`는 허용하지 않아 늦게 도착한 scheduler
+오류가 이미 승인된 cleanup을 덮어쓰지 못한다. cleanup 도중
+오류는 destructive step을 idempotent하게 재시도하기 위해 `Running`을 유지한다.
+
+이 기능은 협조적인 정상 대상의 정리를 자동화한다. offline 대상은 ticket을 보관했다가 재접속 때
+처리하고, 침해된 대상이나 root/MDM 수준 파일 삭제를 강제하지 않는다. membership revoke는 cleanup
+성공 여부와 무관하게 유지된다.
+
 실사용 readiness에서는 direct-only 성공을 합격 증거로 보지 않는다.
 서로 다른 NAT/WiFi/router 뒤 peer를 대상으로 tracker + relay circuit 경로가 실제로 쓰였는지 확인한 뒤 daemon으로 전환한다.
 

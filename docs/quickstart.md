@@ -308,8 +308,9 @@ rr uninstall --dry-run --keep-db --keep-config
 rr uninstall --yes --keep-db --keep-config
 ```
 
-installer에서 `--rc-file <path>`로 비표준 shell 시작 파일을 지정했다면 uninstall에도 같은 경로를
-전달해 그 파일의 Rustory hook/daemon autostart 관리 블록까지 제거한다.
+현재 installer는 `--rc-file <path>`로 지정한 비표준 shell 시작 파일을 private managed-state에 먼저
+기록하므로 이후 local/remote uninstall이 자동으로 해당 관리 블록을 제거한다. 이 기록 기능 도입 전
+설치된 legacy node이거나 상태 파일을 별도로 삭제했다면 uninstall에 같은 경로를 명시한다.
 
 ```sh
 rr uninstall --dry-run --rc-file "~/.config/custom-shell.rc"
@@ -320,16 +321,51 @@ uninstall은 현재 머신의 membership 정리일 뿐이다. 이미 다른 peer
 다른 머신 DB에 남은 과거 hostname/device metadata를 삭제하지 않는다. 따라서 같은 hostname의 과거
 history row가 검색되는 것은 정상이다.
 
-재가입은 새 설치와 같은 절차를 따른다. `identity.key`를 보존하지 않고 다시 설치하면 새 PeerId로
-grid에 들어오며, historical row의 과거 `device_id`/hostname과 새 peer identity가 함께 보일 수 있다.
-이 자체는 데이터 손상이 아니다. 다만 `rr sync-status --json --with-tracker`나 watch UI에서 같은
+자발적 self-uninstall 뒤 재가입은 새 설치와 같은 절차를 따른다. `identity.key`를 보존하지 않고 다시
+설치하면 새 PeerId가 생긴다. strict tracker에서는 첫 signed registration이 pending observation으로만
+보이므로 관리자가 `rr device enroll`해야 활성화된다. remote revoke된 `user_id + device_id`는 identity
+재생성으로 우회할 수 없으므로 교체 장비에는 새 `device_id`를 명시한다. historical row의 과거
+`device_id`/hostname과 새 peer identity가 함께 보일 수 있으며 이 자체는 데이터 손상이 아니다. 다만
+`rr sync-status --json --with-tracker`나 watch UI에서 같은
 hostname 또는 같은 `device_id`가 동시에 active duplicate warning으로 나오면 이전 daemon이 아직
 살아 있거나 같은 config/key를 다른 환경에 복제한 상태일 수 있으므로 대상 노드의 process/config를
 먼저 정리한다.
 
-원격 노드 강제 uninstall은 현재 지원하지 않는다. 인증된 원격 제어면과 대상 사용자 확인 없이 다른
-머신의 hook/DB/config를 지우는 기능은 grid 안정성과 보안 경계를 동시에 깨뜨릴 수 있으므로, 운영
-절차는 대상 노드에서 직접 `rr uninstall --yes`를 실행하는 방식으로 제한한다.
+strict membership node의 `rr uninstall --yes`는 local 파일이나 daemon을 건드리기 전에 authoritative
+HTTPS tracker가 signed unregister를 확인해야 한다. tracker가 닿지 않거나 identity/config가 깨졌으면
+반쯤 제거된 node를 만들지 않고 fail-closed한다. non-strict legacy node만 기존 best-effort unregister 뒤
+local cleanup을 계속한다.
+
+관리 머신에서 다른 노드를 퇴역시키는 기능은 strict device enrollment를 먼저 구성한 fleet에서만 쓴다.
+`rr device revoke`는 membership만 즉시 박탈하고, `rr device retire`는 revoke와 cooperative local
+uninstall ticket을 함께 만든다. 두 명령 모두 `--yes`가 없으면 plan만 출력한다.
+incident 중 먼저 revoke-only로 격리한 node도 나중에 precondition이 충족되면 `rr device retire --yes`로
+새 full-uninstall ticket을 발급할 수 있다. 반대 방향 downgrade나 실행 중 ticket 정책 변경은 허용하지
+않는다.
+
+```sh
+# 한 번 생성해 tracker와 관리 CLI가 같은 secret-manager 값을 사용한다.
+export RUSTORY_TRACKER_ADMIN_TOKEN="$(openssl rand -hex 32)"
+rr device list
+rr device revoke --peer-id '<exact-peer-id>'
+rr device revoke --peer-id '<exact-peer-id>' --yes
+rr device retire --peer-id '<exact-peer-id>'
+rr device retire --peer-id '<exact-peer-id>' --yes
+rr device status --peer-id '<exact-peer-id>'
+```
+
+remote full uninstall은 대상 config의 `require_device_membership=true`와
+`allow_remote_retirement=true`, HTTPS authoritative tracker, launchd/systemd-user managed `rr daemon`이
+모두 필요하다. `user_id`, `device_id`, tracker와 DB/key 경로도 config에 저장되어 실제 daemon 입력과
+일치해야 한다. 대상은 fixed ticket만 받고, daemon 시작 시 검증해 receipt에 고정한 cleanup plan을 별도
+recovery helper에서 기존 uninstall 경계로 실행한다. 이후 config가 바뀌어도 삭제 대상 경로는 바뀌지 않는다.
+Linux background fallback은 crash/reboot recovery를 보장할 수 없어 full uninstall을 광고하지 않고
+revoke-only로 남는다. 오프라인 대상은 membership부터 revoke되고, 다시 온라인이 되어 cooperative
+helper를 실행할 때 cleanup이 완료된다. cleanup 후 ACK가 일시적으로 실패하면 fleet credential이 아닌
+ticket-scoped completion receipt로 재시도하고, 확인 뒤 helper와 receipt를 자동 삭제한다. root/MDM처럼
+대상 OS를 강제 제어하는 기능은 아니며, `swarm.key`나
+tracker token 유출 시에는 정상 node의 fleet credential rotation도 별도로 수행한다. 단계별 strict
+전환과 tracker 실행 예시는 `docs/p2p.md`, helper 경계는 `docs/daemon.md`를 따른다.
 
 ## 다음 문서
 - 배포/installer/self-update: `docs/distribution.md`

@@ -69,6 +69,11 @@ Zig가 없고 `RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`가 설정되어 있으�
 Linux asset은 빌더 종류와 무관하게 기본 최대 `GLIBC_2.17` 요구사항을 검사하며, 이를 넘으면 checksum
 생성 전에 실패한다. 지원 baseline을 의도적으로 바꾸는 경우에만
 `RUSTORY_RELEASE_MAX_GLIBC=<glibc-version>`을 명시하고 호환 대상 실행 환경을 별도로 검증한다.
+Zig build는 `target/zig-<target>-glibc-<baseline>/`처럼 baseline별 별도 Cargo target dir를 사용한 뒤
+검증 대상 binary만 표준 staging 경로로 복사한다. host build나 다른 baseline의 Cargo fingerprint가
+같은 `target/<triple>/release/rr`를 재사용해 높은 GLIBC 요구 binary를 잘못 게시하는 것을 막는다.
+cache root를 바꿀 때는 `RUSTORY_RELEASE_ZIG_CARGO_TARGET_DIR`을 쓴다. 스크립트가 그 아래에
+target과 glibc baseline을 포함한 디렉터리를 별도로 만들어 교차 오염을 막는다.
 
 `--skip-upload`은 asset/checksum만 만들고 GitHub Release는 건드리지 않는다.
 `--dry-run`은 release plan과 실행할 명령만 출력한다.
@@ -99,12 +104,31 @@ token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증�
 대상 머신에 다른 swarm key가 이미 있으면 installer는 기본적으로 실패하고, `--force`를 지정했을 때만 백업 후 교체한다.
 `--install-hook`은 현재 shell을 자동 감지해 `~/.zshrc` 또는 `~/.bashrc`에 Rustory managed block을 추가/교체한다.
 비표준 시작 파일을 쓰면 `--hook-shell bash|zsh --rc-file <path>`로 명시한다.
+installer는 이 rc 경로를 hook 쓰기 전에 `~/.config/rustory/managed-rc-files.json` private registry에
+기록해 local/remote uninstall에서 자동 정리한다. resolved daemon state home도 같은 fixed config dir의
+0600 `managed-state-home`에 보존한다. 변경 이력은 별도 private bounded
+`managed-state-homes.json`에도 누적해 state home을 바꾼 뒤 uninstall해도 과거 Rustory-owned
+pid/log/receipt 디렉터리를 자동 정리한다. 따라서 one-shot install 이후 일반 shell의 `rr update`/uninstall도
+custom state를 다시 찾는다. `XDG_STATE_HOME`을 지정하면 absolute path로 resolve되어야
+하고, 그 값은 managed daemon service/background child와 updater restart에도 명시적으로 전달된다.
 `--install-daemon`은 macOS에서는 `~/Library/LaunchAgents/com.rustory.daemon.plist`, Linux에서는
 `~/.config/systemd/user/rustory.service`를 설치하고 기본적으로 즉시 시작한다. Linux에서
 user systemd bus가 없으면 unit 파일은 보존하고 `manager=background` fallback으로 `rr daemon`을
 즉시 시작하며, 같은 shell rc 파일에 background daemon autostart block을 설치해 컨테이너 재시작 뒤
 첫 interactive shell에서 다시 띄운다. 설치만 하고 시작을 미루려면 `--no-start-daemon`을 함께
 넘긴다. rc autostart가 싫으면 `--no-daemon-shell-autostart`를 함께 넘긴다.
+`--require-device-membership`은 config에 strict authoritative membership을 켠다. cooperative remote
+uninstall 대상은 HTTPS tracker를 정확히 하나 지정하고 `--allow-remote-retirement`를 함께 넘겨야 한다.
+후자는 전자를 요구하며 launchd/systemd-user managed daemon만 retirement capability를 광고한다.
+user systemd bus가 없어 background fallback으로 실행된 Linux node는 revoke-only이고, remote full
+uninstall이 필요하면 systemd-user/linger를 먼저 정상화한다. fleet 전체 enrollment와 tracker
+strict-mode 전환을 끝내기 전에는 이 flag들을 한 번에 켜지 않는다. 단계별 순서는 `docs/p2p.md`의
+device enrollment 절차를 따른다.
+remote retirement opt-in과 user/device/tracker/cleanup 경로는 config에 저장되어야 하며 env-only 값이나
+config와 다른 CLI/env path override는 안전상 capability를 끈다.
+기존 config가 있으면 installer는 전체 파일을 `--force` 재생성하지 않고 요청한 device-security boolean만
+atomic update한다. 주석과 기타 설정은 보존하며, authoritative HTTPS tracker가 config에 이미 정확히
+하나 없으면 partial activation을 거부한다.
 `--import-hishtory`는 기본 Hishtory DB(`~/.hishtory/.hishtory.db`)가 있으면 import하고,
 성공 후 user startup files에서 Hishtory hook/PATH/source 라인을 삭제한다.
 Hishtory hook을 유지해야 하면 `--keep-hishtory-hooks`를 함께 넘긴다.
@@ -118,7 +142,8 @@ installer는 다음 순서로 동작한다.
 3. checksum을 검증한 뒤 `~/.local/bin/rr`에 설치한다.
 4. `--swarm-key-b64` 또는 `--swarm-key-source`가 있으면 공유 swarm key를
    `~/.config/rustory/swarm.key`로 쓰고 fingerprint만 출력한다.
-5. `--token`, `--tracker`, `--relay`, `--user-id`, `--device-id` 중 지정된 값이 있으면 `rr init`을 실행한다.
+5. `--token`, `--tracker`, `--relay`, `--user-id`, `--device-id`, device membership/retirement flag 중
+   지정된 값이 있으면 `rr init`을 실행한다.
 6. `--install-hook`이 있으면 shell rc 파일에 Rustory hook block을 설치한다.
 7. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
 8. `--install-daemon`이 있으면 user service를 설치하고, `--no-start-daemon`이 없으면 즉시 시작한다.
@@ -200,6 +225,13 @@ systemctl --user daemon-reload
 systemctl --user enable --now rustory.service
 systemctl --user status rustory.service
 ```
+
+managed shell block은 `rustory.service`가 active인지 먼저 확인하므로 이 전환 뒤 interactive shell이
+duplicate background daemon을 시작하지 않는다. 새 systemd-user parent도 시작 시 현재 binary와 exact
+installer daemon signature가 일치하는 기존 background parent/child만 정리한 뒤 takeover하므로 manual
+`enable --now` 전환 직후의 중복도 남기지 않는다. unrelated process나 다른 binary는 signal하지 않는다.
+installer를 다시 실행하면 service template에도 같은 resolved `XDG_STATE_HOME`이 유지되는지 함께
+확인한다.
 
 로그아웃 뒤에도 계속 실행해야 하는 서버라면 운영 정책에 맞게
 `loginctl enable-linger <user>`를 별도로 적용한다. shell autostart fallback은 interactive

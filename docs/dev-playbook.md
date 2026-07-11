@@ -35,7 +35,7 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 
 ### 노드 이탈/재가입은 membership 변경으로 취급한다
 - `rr uninstall --yes`는 현재 머신의 로컬 이탈이다. 관리 중인 daemon/hook/autostart/service, 로컬 DB/config/state, tracker 등록을 정리하지만 이미 다른 peer에 전파된 history row를 되돌리지는 않는다.
-- 원격 노드 강제 uninstall은 인증된 원격 제어면과 대상 사용자 확인이 없으면 구현하지 않는다. 현재 운영 절차는 대상 머신에서 직접 `rr uninstall --yes`를 실행하는 것이다.
+- 다른 노드의 membership은 strict enrollment fleet에서 `rr device revoke`로 박탈할 수 있다. 로컬 파일 정리는 대상이 사전 opt-in한 managed daemon만 fixed `rr device retire` ticket을 cooperative helper로 실행하며, 임의 command/path 또는 offline/침해 대상의 강제 삭제로 확장하지 않는다. 상세 rollout과 한계는 `docs/security.md`, `docs/p2p.md`, `docs/daemon.md`를 따른다.
 - 이미 전파된 row는 원래 `hostname`, `device_id`, command metadata를 유지한다. 따라서 같은 hostname의 과거 row가 남는 것은 정상이다.
 - 비정상 신호는 같은 hostname 또는 같은 `device_id`를 가진 peer가 동시에 active로 보이는 경우다. `rr sync-status --with-tracker`와 watch UI는 5분 이내에 보인 active duplicate를 warning으로 표시해야 한다.
 - uninstall 뒤 완전히 새로 join하면 새 `identity.key`와 새 PeerId가 생긴다. 같은 머신을 동일 identity로 이어가려면 uninstall 전에 config/key를 보존하는 운영 절차를 명시적으로 선택해야 한다.

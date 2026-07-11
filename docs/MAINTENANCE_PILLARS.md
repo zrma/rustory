@@ -13,7 +13,7 @@ Rustory의 다음 단계는 기능을 계속 붙이는 것보다, 오래 써도 
 | 축 | 왜 중요한가 | 소유 위치 | 확인 증거 |
 | --- | --- | --- | --- |
 | Agent handoff and gates | 사람이 모든 컨텍스트를 기억하지 않아도 후속 agent가 이어받아야 한다. | `AGENTS.md`, `docs/HANDOFF.md`, `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`, `docs/REPO_MANIFEST.yaml`, `scripts/start-work.sh`, `scripts/check.sh`, `scripts/finalize-and-push.sh` | `scripts/run-manifest-checks.sh`, `scripts/check-release-gates.sh`, `scripts/finalize-and-push.sh` |
-| Node lifecycle and identity hygiene | `uninstall`, 재가입, 중복 hostname/device identity가 grid membership을 흔들 수 있다. | `docs/dev-playbook.md`, `docs/p2p.md`, `src/uninstall.rs`, `src/cli.rs` | `rr uninstall --dry-run`, `rr uninstall --yes`, `rr doctor`, `rr sync-status --with-tracker`, duplicate active peer warning |
+| Node lifecycle and identity hygiene | self-uninstall, admin revoke/retire, 재가입, 중복 hostname/device identity가 grid membership을 흔들 수 있다. | `docs/dev-playbook.md`, `docs/security.md`, `docs/p2p.md`, `docs/daemon.md`, `src/uninstall.rs`, `src/device_retirement.rs`, `src/tracker.rs`, `src/cli.rs` | `rr uninstall --dry-run`, `rr device list`, `rr device revoke`, `rr device retire`, `rr doctor`, `rr sync-status --with-tracker`, duplicate active peer warning |
 | Sync observability | pending row/delete가 실제 stuck인지, 단순 대기인지 구분해야 한다. | `docs/p2p.md`, `docs/acceptance/README.md`, `src/cli.rs`, `src/sync.rs`, `src/storage.rs` | `rr sync-status --json --with-tracker`, `rr mesh --watch`, acceptance canary |
 | Log signal vs noise | relay/NAT retry, DCUtR 실패, stale daemon이 정상 동기화를 장애처럼 보이게 만들 수 있다. | `docs/p2p.md`, `docs/LESSONS_LOG.md`, `src/p2p.rs`, `src/cli.rs` | `~/.local/state/rustory/daemon.log`, `RUSTORY_P2P_LOG=verbose`, p2p log tests |
 | Data hygiene and GC | dedupe/delete/tombstone/prune이 peer cursor보다 앞서가면 삭제 동기화나 복구 판단이 깨진다. | `docs/p2p.md`, `src/sync.rs`, `src/storage.rs`, `src/cli.rs` | `rr dedupe --dry-run`, `rr delete --dry-run`, `rr tombstone-gc --dry-run`, `rr sync-status --json --with-tracker` |
@@ -25,7 +25,7 @@ Rustory의 다음 단계는 기능을 계속 붙이는 것보다, 오래 써도 
 - 새 기능은 위 축 중 하나 이상의 책임을 더 명확하게 만들 때만 추가한다.
 - 같은 종류의 실패가 두 번 반복되면 설명만 남기지 말고 gate, smoke, acceptance, 또는 lessons entry로 만든다.
 - `rr mesh --watch`와 `rr sync-status`는 local observation이다. 전역 peer-to-peer flow처럼 보이게 꾸미지 않는다.
-- node lifecycle 변경은 membership 변경이다. data deletion과 identity retirement를 섞지 않는다.
+- node lifecycle 변경은 membership 변경이다. revoke는 즉시 적용하고 cooperative data deletion은 별도 ticket/ACK로 추적한다.
 - tombstone GC와 dedupe는 dry-run evidence, peer cursor evidence, rollback 경계를 먼저 확인한다.
 - installer/update 변경은 파일 교체뿐 아니라 이미 떠 있는 daemon 재시작, fallback autostart, stale process 제거까지 검증한다.
 - release/deploy 후에는 적어도 `rr version`, `rr doctor`, `rr sync-status --json --with-tracker` 중 관련 evidence를 남긴다.

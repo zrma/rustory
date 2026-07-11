@@ -1,6 +1,6 @@
 # Security and Privacy Model
 
-Last Verified: 2026-07-11
+Last Verified: 2026-07-12
 
 이 문서는 Rustory가 보호하는 경계와 보호하지 않는 경계를 명시한다. 암호화 구현의 source of truth는 `src/p2p.rs`, `src/transport.rs`, `src/storage.rs`, `src/tracker.rs`, `src/config.rs`다.
 
@@ -53,8 +53,16 @@ Rustory daily-driver grid는 **같은 grid에 가입한 모든 peer를 신뢰하
 ## 키 유출과 노드 이탈
 
 - authorized peer는 정상 기능상 history 원문을 복호화해 검색해야 하므로 같은 grid의 peer compromise를 transport 암호화로 막을 수 없다.
-- 노드를 분실하거나 `swarm.key`/tracker token이 유출되면 해당 노드 uninstall만으로 충분하다고 가정하지 않는다.
-- device revoke와 fleet key rotation은 후속 보완 대상이다. 그 전까지는 영향받은 credential을 전체 fleet에서 교체하고 신뢰 수준이 다른 grid를 분리한다.
+- `rr device revoke`는 tracker의 durable enrollment에서 정확한 PeerId membership을 박탈한다. strict-ready peer는 inbound/outbound 모두 authoritative tracker를 확인하고, 로컬 revocation cache를 stale `peer_book`보다 먼저 평가한다.
+- `rr device retire`는 revoke와 함께 대상 daemon에 fixed `full_uninstall` ticket을 남긴다. 대상이 `allow_remote_retirement=true`로 명시적으로 허용했고 launchd/systemd-user 관리 daemon으로 실행 중일 때만 별도 recovery helper가 로컬 uninstall을 수행한다. ticket에는 shell command나 경로가 들어가지 않으며 Linux background fallback은 crash/reboot 복구를 보장할 수 없어 revoke-only로 동작한다.
+- admin API는 fleet tracker token과 별도 admin token을 모두 요구하고, production admin/retirement 제어면은 HTTPS에서만 동작한다. loopback HTTP는 test build 전용이다. tracker security-state 파일은 absolute path의 private regular file이어야 한다.
+- proof/capability endpoint는 bounded authenticated header를 body보다 먼저 처리한다. 인증되지 않은 legacy body는 읽지 않고, body가 필요한 요청도 async ingress의 10초 deadline과 64-request 동시 상한 안에서만 읽는다. TLS reverse proxy의 read/write/body/header limit도 이보다 느슨하게 두지 않고 admin, register, signed unregister, retirement poll/ack/complete endpoint를 정상 poll/retry cadence보다 여유 있는 peer/IP별 한도로 rate-limit한다. `X-Rustory-Device-Request`와 request body는 access log에서 redact/미기록하고 tracker 응답은 cache하지 않는다.
+- tracker security state는 process-lifetime exclusive lock으로 단일 writer만 허용한다. transactional shared store가 도입되기 전에는 같은 state path를 공유하는 여러 replica로 tracker를 실행하지 않는다.
+- destructive cleanup을 시작하기 전에 daemon 시작 시 검증한 exact cleanup path plan과 ticket별 256-bit completion capability를 private receipt에 저장하고 tracker에는 capability의 SHA-256 hash만 보낸다. helper는 이후 config path가 바뀌어도 receipt의 불변 plan만 사용한다. receipt에는 fleet token이나 identity private key를 복제하지 않는다. config/identity/binary 삭제 뒤에는 이 capability가 `Running → Completed` 전이에만 쓰이고, 응답이 유실되면 독립 helper가 확인될 때까지 재시도한 뒤 receipt와 helper copy를 삭제한다.
+- tracker revoke record는 incident 대응을 위해 즉시 생성된다. 응답의 `membership_enforcement_complete=true`는 tracker가 마지막으로 수락한 signed registration capability와 현재 active peer를 기준으로 한 advisory snapshot이다. live attestation이 아니며 node의 offline rollback까지 증명하지 않는다. false warning은 revoke 실패가 아니라 active legacy/미준비 peer 때문에 fleet 전체 강제가 아직 확인되지 않았다는 뜻이다. 기본값은 꺼져 있어 기존 fleet 동작을 유지하지만 strict mode를 켜면 미등록/구버전 peer는 의도적으로 거부된다.
+- 노드를 분실하거나 `swarm.key`/tracker token이 유출되면 device revoke만으로 충분하다고 가정하지 않는다. revoke는 Rustory history pull/push membership을 막지만 유출된 shared credential 자체를 폐기하지 않는다.
+- transport-level grid 접근까지 폐기하려면 정상 node에서 tracker token과 `swarm.key`를 rotation하고, 필요하면 relay allowlist도 갱신한다. 이미 다른 peer/backup에 복제된 history는 revoke나 remote uninstall로 secure erase되지 않는다.
+- 오프라인 대상에도 revoke와 ticket은 즉시 durable하게 남지만 로컬 파일 삭제는 대상이 다시 온라인이 되어 정상 helper를 실행해야 완료된다. 침해된 대상, root 권한 대상, 전원이 꺼진 대상의 파일을 Rustory만으로 강제 삭제한다고 간주하지 않는다.
 
 ## Application-level E2EE 도입 기준
 
@@ -72,4 +80,5 @@ Rustory daily-driver grid는 **같은 grid에 가입한 모든 peer를 신뢰하
 - `rr doctor`: DB/config/key permission과 tracker HTTPS/reachability를 확인한다.
 - `rr sync-status --json --with-tracker`: peer membership, warnings, deletion/push pending을 확인한다.
 - `rr mesh --watch`: active peer와 상대 version을 확인한다.
+- `rr device list|status`: enrollment, strict membership enforcement, retirement capability와 cleanup ACK를 확인한다.
 - `rr hook --shell bash|zsh`: 현재 generated hook의 privacy 동작을 확인한다.
