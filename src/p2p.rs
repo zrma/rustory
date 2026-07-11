@@ -46,6 +46,8 @@ pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
 // 사용자가 `--req-timeout-cap-sec` 등을 크게 잡았을 때 내부 Timeout이 먼저 터질 수 있다.
 // 따라서 "충분히 큰 값"으로 두고, 실제 attempt timeout은 클라이언트 로직에서 결정한다.
 const REQUEST_RESPONSE_INTERNAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const RELAY_RELISTEN_MIN_DELAY: Duration = Duration::from_secs(5);
+const RELAY_RELISTEN_MAX_DELAY: Duration = Duration::from_secs(60);
 static NEXT_TARGET_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -440,6 +442,8 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
     swarm.listen_on(listen).context("listen_on")?;
 
     let mut relay_listener_id = None;
+    let mut relay_relisten_deadline = None;
+    let mut next_relay_relisten_delay = RELAY_RELISTEN_MIN_DELAY;
     if let Some(relay_addr) = relay_addr.clone() {
         let relay_listen = relay_circuit_listen_addr(&relay_addr)?;
         if verbose_event_logs {
@@ -460,6 +464,45 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
     loop {
         tokio::select! {
+            _ = wait_for_relay_relisten(relay_relisten_deadline) => {
+                relay_relisten_deadline = None;
+                if relay_listener_id.is_none()
+                    && let Some(relay_addr) = relay_addr.clone()
+                {
+                    match relay_circuit_listen_addr(&relay_addr) {
+                        Ok(relay_listen) => match swarm.listen_on(relay_listen.clone()) {
+                            Ok(new_listener_id) => {
+                                relay_listener_id = Some(new_listener_id);
+                                if verbose_event_logs {
+                                    eprintln!("p2p relay re-listen requested: {relay_listen}");
+                                }
+                            }
+                            Err(err) => {
+                                let delay = schedule_relay_relisten(
+                                    &mut relay_relisten_deadline,
+                                    &mut next_relay_relisten_delay,
+                                )
+                                .expect("relay retry timer is clear after firing");
+                                eprintln!(
+                                    "warn: p2p relay re-listen failed: {err:#}; retry_in_sec={}",
+                                    delay.as_secs()
+                                );
+                            }
+                        },
+                        Err(err) => {
+                            let delay = schedule_relay_relisten(
+                                &mut relay_relisten_deadline,
+                                &mut next_relay_relisten_delay,
+                            )
+                            .expect("relay retry timer is clear after firing");
+                            eprintln!(
+                                "warn: p2p relay re-listen addr resolve failed: {err:#}; retry_in_sec={}",
+                                delay.as_secs()
+                            );
+                        }
+                    }
+                }
+            }
             _ = next_register.tick() => {
                 if !trackers.is_empty() && !known_addrs.is_empty() {
                     spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), meta.clone());
@@ -624,6 +667,8 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             renewal,
                             ..
                         } => {
+                            relay_relisten_deadline = None;
+                            next_relay_relisten_delay = RELAY_RELISTEN_MIN_DELAY;
                             if verbose_event_logs {
                                 eprintln!(
                                     "p2p relay reservation accepted: relay={relay_peer_id} renewal={renewal}"
@@ -680,9 +725,6 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         reason,
                         ..
                     } => {
-                        eprintln!(
-                            "warn: p2p listener closed: addresses={addresses:?} reason={reason:?}"
-                        );
                         let is_tracked_relay_listener =
                             relay_listener_id.as_ref() == Some(&listener_id);
                         if is_tracked_relay_listener {
@@ -700,29 +742,20 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                 meta.clone(),
                             );
                         }
-                        if had_relay_listener
-                            && let Some(relay_addr) = relay_addr.clone()
-                        {
-                            match relay_circuit_listen_addr(&relay_addr) {
-                                Ok(relay_listen) => {
-                                    eprintln!(
-                                        "p2p relay listener closed; re-listen requested: {relay_listen}"
-                                    );
-                                    match swarm.listen_on(relay_listen) {
-                                        Ok(new_listener_id) => {
-                                            relay_listener_id = Some(new_listener_id);
-                                        }
-                                        Err(err) => {
-                                            eprintln!("warn: p2p relay re-listen failed: {err:#}");
-                                        }
-                                    }
-                                }
-                                Err(err) => {
-                                    eprintln!(
-                                        "warn: p2p relay re-listen addr resolve failed: {err:#}"
-                                    );
-                                }
+                        if had_relay_listener && relay_addr.is_some() {
+                            if let Some(delay) = schedule_relay_relisten(
+                                &mut relay_relisten_deadline,
+                                &mut next_relay_relisten_delay,
+                            ) {
+                                eprintln!(
+                                    "warn: p2p relay listener closed: addresses={addresses:?} reason={reason:?}; retry_in_sec={}",
+                                    delay.as_secs()
+                                );
                             }
+                        } else {
+                            eprintln!(
+                                "warn: p2p listener closed: addresses={addresses:?} reason={reason:?}"
+                            );
                         }
                     }
                     SwarmEvent::ListenerError { error, .. } => {
@@ -744,6 +777,27 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
             }
         }
     }
+}
+
+async fn wait_for_relay_relisten(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
+fn schedule_relay_relisten(
+    deadline: &mut Option<tokio::time::Instant>,
+    next_delay: &mut Duration,
+) -> Option<Duration> {
+    if deadline.is_some() {
+        return None;
+    }
+
+    let delay = *next_delay;
+    *deadline = Some(tokio::time::Instant::now() + delay);
+    *next_delay = next_delay.saturating_mul(2).min(RELAY_RELISTEN_MAX_DELAY);
+    Some(delay)
 }
 
 fn spawn_register_all(
@@ -3434,6 +3488,33 @@ mod tests {
         assert!(!is_routine_outgoing_connection_noise(
             "Failed to negotiate transport protocol(s): [(/dns4/rustory-relay.example/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooW: : Multistream select failed: Protocol negotiation failed.)]"
         ));
+    }
+
+    #[test]
+    fn relay_relisten_schedule_backs_off_and_caps_without_duplicate_timer() {
+        let mut deadline = None;
+        let mut next_delay = RELAY_RELISTEN_MIN_DELAY;
+
+        assert_eq!(
+            schedule_relay_relisten(&mut deadline, &mut next_delay),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(next_delay, Duration::from_secs(10));
+        assert_eq!(
+            schedule_relay_relisten(&mut deadline, &mut next_delay),
+            None
+        );
+        assert_eq!(next_delay, Duration::from_secs(10));
+
+        let expected = [10, 20, 40, 60, 60];
+        for seconds in expected {
+            deadline = None;
+            assert_eq!(
+                schedule_relay_relisten(&mut deadline, &mut next_delay),
+                Some(Duration::from_secs(seconds))
+            );
+        }
+        assert_eq!(next_delay, RELAY_RELISTEN_MAX_DELAY);
     }
 
     #[test]
