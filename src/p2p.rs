@@ -2143,7 +2143,10 @@ fn is_loopback_direct_dial_noise(message: &str) -> bool {
     let has_loopback = msg.contains("/ip4/127.")
         || msg.contains("/ip6/::1")
         || msg.contains("/ip6/0:0:0:0:0:0:0:1");
-    has_loopback && msg.contains("connection refused")
+    has_loopback
+        && (msg.contains("connection refused")
+            || msg.contains("operation timed out")
+            || msg.contains("connection timed out"))
 }
 
 fn is_routine_outgoing_connection_noise(message: &str) -> bool {
@@ -3409,8 +3412,16 @@ mod tests {
 
         assert!(is_loopback_direct_dial_noise(err));
         assert!(is_routine_outgoing_connection_noise(err));
+
+        let timeout = "Failed to negotiate transport protocol(s): [(/ip4/127.0.0.6/tcp/38531/p2p/12D3KooW: : Operation timed out (os error 60))]";
+        assert!(is_loopback_direct_dial_noise(timeout));
+        assert!(is_routine_outgoing_connection_noise(timeout));
+
         assert!(!is_loopback_direct_dial_noise(
             "Failed to negotiate transport protocol(s): [(/dns4/rustory-relay.example/tcp/4001/p2p/12D3KooRelay/p2p-circuit/p2p/12D3KooW: relay rejected)]"
+        ));
+        assert!(!is_loopback_direct_dial_noise(
+            "Failed to negotiate transport protocol(s): [(/ip4/198.51.100.10/tcp/4001/p2p/12D3KooW: : Operation timed out (os error 60))]"
         ));
     }
 
