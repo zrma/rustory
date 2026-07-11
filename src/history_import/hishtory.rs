@@ -148,14 +148,12 @@ ORDER BY start_ts ASC, source_rowid ASC
 
     let mut out = Vec::new();
     if let Some(limit) = limit {
+        let limit = i64::try_from(limit).context("hishtory import limit exceeds SQLite range")?;
         let mut stmt = conn
             .prepare(sql_limited)
             .context("prepare hishtory limited import query")?;
         let rows = stmt
-            .query_map(
-                params![fallback_hostname, limit as i64],
-                row_to_hishtory_record,
-            )
+            .query_map(params![fallback_hostname, limit], row_to_hishtory_record)
             .context("query hishtory limited records")?;
         for row in rows {
             out.push(row?);

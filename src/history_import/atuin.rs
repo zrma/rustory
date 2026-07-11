@@ -178,8 +178,9 @@ ORDER BY timestamp ASC, source_rowid ASC
     let mut stmt = conn.prepare(&sql).context("prepare atuin import query")?;
     let mut out = Vec::new();
     if let Some(limit) = limit {
+        let limit = i64::try_from(limit).context("atuin import limit exceeds SQLite range")?;
         let rows = stmt
-            .query_map(params![limit as i64], row_to_atuin_record)
+            .query_map(params![limit], row_to_atuin_record)
             .context("query limited atuin records")?;
         for row in rows {
             out.push(row?);
@@ -391,10 +392,119 @@ VALUES (?1, ?2, 0, 0, ?3, '/work', 'session', 'host', NULL)
         assert!(format!("{error:#}").contains("missing columns"));
     }
 
+    #[test]
+    fn atuin_import_reads_committed_wal_snapshot_without_mutating_source() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let writer = Connection::open(db.path()).unwrap();
+        writer
+            .execute_batch(
+                r#"
+PRAGMA journal_mode = WAL;
+PRAGMA wal_autocheckpoint = 0;
+CREATE TABLE history (
+  id TEXT PRIMARY KEY,
+  timestamp INTEGER NOT NULL,
+  duration INTEGER NOT NULL,
+  exit INTEGER NOT NULL,
+  command TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  session TEXT NOT NULL,
+  hostname TEXT NOT NULL,
+  deleted_at INTEGER
+);
+INSERT INTO history VALUES (
+  'wal-1', 1700000000000000000, 0, 0, 'echo wal', '/work', 'session', 'host', NULL
+);
+"#,
+            )
+            .unwrap();
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let stats = run_import(&store, db.path(), None).unwrap();
+        assert_eq!(stats.inserted, 1);
+        assert_eq!(store.list_recent(10).unwrap()[0].cmd, "echo wal");
+        assert_eq!(
+            writer
+                .query_row("SELECT COUNT(*) FROM history", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'entries'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn atuin_blank_id_is_stable_across_databases_and_import_devices() {
+        let first_db = atuin_db(true, false);
+        let second_db = atuin_db(true, false);
+        insert_row(
+            second_db.path(),
+            "deleted-padding",
+            1_699_999_999 * SECOND,
+            0,
+            0,
+            "echo padding",
+            "/padding",
+            "padding-session",
+            "padding-host",
+            Some(1_700_000_000 * SECOND),
+        );
+        for path in [first_db.path(), second_db.path()] {
+            insert_row(
+                path,
+                "",
+                1_700_000_001 * SECOND,
+                SECOND,
+                0,
+                "echo stable",
+                "/work",
+                "session",
+                "source-host",
+                None,
+            );
+        }
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let first = run_import_with_device(&store, first_db.path(), None, "device-a").unwrap();
+        let second = run_import_with_device(&store, second_db.path(), None, "device-b").unwrap();
+        assert_eq!(first.inserted, 1);
+        assert_eq!(second.inserted, 0);
+        assert_eq!(second.ignored, 1);
+        assert_eq!(store.list_recent(10).unwrap().len(), 1);
+        assert_eq!(store.list_recent(10).unwrap()[0].device_id, "device-a");
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn atuin_import_rejects_limit_outside_sqlite_range() {
+        let db = atuin_db(true, false);
+        let store = LocalStore::open(":memory:").unwrap();
+        let error = run_import(&store, db.path(), Some(usize::MAX)).unwrap_err();
+        assert!(format!("{error:#}").contains("limit exceeds SQLite range"));
+    }
+
     fn run_import(
         store: &LocalStore,
         path: &std::path::Path,
         limit: Option<usize>,
+    ) -> Result<ImportStats> {
+        run_import_with_device(store, path, limit, "rustory-device")
+    }
+
+    fn run_import_with_device(
+        store: &LocalStore,
+        path: &std::path::Path,
+        limit: Option<usize>,
+        device_id: &str,
     ) -> Result<ImportStats> {
         import_path_into_store(
             store,
@@ -403,7 +513,7 @@ VALUES (?1, ?2, 0, 0, ?3, '/work', 'session', 'host', NULL)
                 path,
                 limit,
                 user_id: "rustory-user",
-                device_id: "rustory-device",
+                device_id,
                 hostname: "fallback-host",
                 ignore_regex: None,
             },

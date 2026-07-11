@@ -897,6 +897,26 @@ INSERT INTO history_entries (
         assert_eq!(commands, vec!["echo three", "echo two"]);
     }
 
+    #[cfg(all(feature = "import-hishtory", target_pointer_width = "64"))]
+    #[test]
+    fn import_hishtory_sqlite_rejects_limit_outside_sqlite_range() {
+        let hishtory_db = synthetic_hishtory_db(&[]);
+        let store = LocalStore::open(":memory:").unwrap();
+        let error = import_hishtory_sqlite_into_store(
+            &store,
+            HishtoryImportRequest {
+                path: hishtory_db.path(),
+                limit: Some(usize::MAX),
+                user_id: "u1",
+                device_id: "d1",
+                hostname: "host",
+                ignore_regex: None,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("limit exceeds SQLite range"));
+    }
+
     #[cfg(feature = "import-hishtory")]
     #[test]
     fn import_hishtory_sqlite_entries_are_pushable_for_import_device() {
