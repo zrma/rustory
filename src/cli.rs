@@ -37,8 +37,8 @@ use crate::watch_tui::{
     SyncStatusWatchState, render_mesh_watch_frame, render_sync_status_watch_frame,
 };
 use crate::{
-    config, hishtory_cleanup, history_import, hook, p2p, search, storage, tracker, transport,
-    uninstall,
+    config, hishtory_cleanup, history_import, hook, managed_logs, p2p, search, storage, tracker,
+    transport, uninstall,
 };
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, RawFd};
@@ -744,6 +744,11 @@ enum Command {
         )]
         auto_fix: bool,
     },
+    #[command(about = "Inspect or clean Rustory-managed daemon logs")]
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
     #[command(about = "Import existing shell history into the local store")]
     Import {
         #[arg(
@@ -801,6 +806,12 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum LogsCommand {
+    #[command(about = "Truncate Rustory-managed daemon logs that exceed the safe size limit")]
+    Cleanup,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum DedupeKeepArg {
     Newest,
@@ -833,6 +844,11 @@ impl From<DedupeKeepArg> for storage::DedupeKeep {
 
 pub fn run() -> Result<()> {
     let app = App::parse();
+    // launchd/background redirection happens before rr starts. Clean managed logs before
+    // config loading so a broken config and restart loop cannot bypass the size guard.
+    if matches!(&app.cmd, Command::Daemon { .. }) {
+        managed_logs::cleanup_managed_daemon_logs_with_warnings();
+    }
     let mut config_load_error = None;
     let cfg = match config::load_default() {
         Ok(cfg) => cfg,
@@ -1604,6 +1620,9 @@ pub fn run() -> Result<()> {
         Command::Doctor { json, auto_fix } => {
             run_doctor(&cfg, &db_path, json, auto_fix, config_load_error.as_deref())?;
         }
+        Command::Logs { command } => match command {
+            LogsCommand::Cleanup => run_logs_cleanup()?,
+        },
         Command::Import {
             shell,
             path,
@@ -1798,6 +1817,7 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
     matches!(
         cmd,
         Command::Doctor { .. }
+            | Command::Logs { .. }
             | Command::Version { .. }
             | Command::Update { .. }
             | Command::Uninstall { dry_run: true, .. }
@@ -1861,6 +1881,8 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         .context("set Ctrl-C/SIGTERM handler")?;
     }
 
+    managed_logs::spawn_managed_daemon_log_monitor(stop.clone());
+
     eprintln!(
         "daemon: starting p2p-serve and p2p-sync watch (push={})",
         !args.pull_only
@@ -1896,6 +1918,44 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
     )?;
 
     supervise_daemon_children(serve.child_mut(), sync.child_mut(), stop.as_ref())
+}
+
+fn run_logs_cleanup() -> Result<()> {
+    let results = managed_logs::cleanup_managed_daemon_logs()?;
+    let mut unsafe_or_failed = false;
+    for result in results {
+        let status = match result.status {
+            managed_logs::ManagedLogCleanupStatus::Cleaned => "cleaned",
+            managed_logs::ManagedLogCleanupStatus::Ok => "ok",
+            managed_logs::ManagedLogCleanupStatus::Missing => "missing",
+            managed_logs::ManagedLogCleanupStatus::SkippedUnsafe => {
+                unsafe_or_failed = true;
+                "skipped_unsafe"
+            }
+            managed_logs::ManagedLogCleanupStatus::Failed => {
+                unsafe_or_failed = true;
+                "failed"
+            }
+        };
+        println!(
+            "logs cleanup: status={status} path={} previous_bytes={} max_bytes={}{}",
+            result.path.display(),
+            result
+                .previous_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            managed_logs::MANAGED_DAEMON_LOG_MAX_BYTES,
+            result
+                .detail
+                .as_deref()
+                .map(|detail| format!(" detail={}", sanitize_one_line(detail)))
+                .unwrap_or_default()
+        );
+    }
+    if unsafe_or_failed {
+        anyhow::bail!("one or more managed daemon logs could not be cleaned safely");
+    }
+    Ok(())
 }
 
 fn run_daemon_preflight_if_requested(
@@ -2896,8 +2956,53 @@ fn run_doctor_auto_fix(
     }
 
     fix_managed_hook_blocks(&mut report)?;
+    fix_managed_daemon_logs(&mut report)?;
 
     Ok(report)
+}
+
+fn fix_managed_daemon_logs(report: &mut DoctorAutoFixReport) -> Result<()> {
+    for result in managed_logs::cleanup_managed_daemon_logs()? {
+        let (status, detail) = match result.status {
+            managed_logs::ManagedLogCleanupStatus::Cleaned => (
+                DoctorAutoFixStatus::Fixed,
+                format!(
+                    "path={} previous_bytes={} max_bytes={}",
+                    result.path.display(),
+                    result.previous_bytes.unwrap_or(0),
+                    managed_logs::MANAGED_DAEMON_LOG_MAX_BYTES
+                ),
+            ),
+            managed_logs::ManagedLogCleanupStatus::Ok => (
+                DoctorAutoFixStatus::Ok,
+                format!(
+                    "path={} bytes={} max_bytes={}",
+                    result.path.display(),
+                    result.previous_bytes.unwrap_or(0),
+                    managed_logs::MANAGED_DAEMON_LOG_MAX_BYTES
+                ),
+            ),
+            managed_logs::ManagedLogCleanupStatus::Missing => (
+                DoctorAutoFixStatus::Skipped,
+                format!("missing path={}", result.path.display()),
+            ),
+            managed_logs::ManagedLogCleanupStatus::SkippedUnsafe
+            | managed_logs::ManagedLogCleanupStatus::Failed => (
+                DoctorAutoFixStatus::Skipped,
+                format!(
+                    "path={} detail={}",
+                    result.path.display(),
+                    result.detail.as_deref().unwrap_or("unknown")
+                ),
+            ),
+        };
+        report.actions.push(DoctorAutoFixAction {
+            target: "daemon log".to_string(),
+            status,
+            detail,
+        });
+    }
+    Ok(())
 }
 
 fn expand_db_path_for_auto_fix(path: &str) -> Result<PathBuf> {
@@ -4238,6 +4343,19 @@ mod tests {
             }
             _ => panic!("expected doctor"),
         }
+    }
+
+    #[test]
+    fn logs_cleanup_parses_and_ignores_config_load_errors() {
+        let app = App::parse_from(["rr", "logs", "cleanup"]);
+
+        match app.cmd {
+            Command::Logs {
+                command: LogsCommand::Cleanup,
+            } => {}
+            _ => panic!("expected logs cleanup"),
+        }
+        assert!(can_continue_after_config_load_error(&app.cmd));
     }
 
     #[test]

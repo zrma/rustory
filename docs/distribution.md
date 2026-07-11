@@ -190,6 +190,9 @@ installer는 `daemon=start_deferred`를 출력하고 `manager=background` fallba
 `rr daemon`을 시작한다. fallback 로그와 pid는 `~/.local/state/rustory/daemon.log`,
 `~/.local/state/rustory/daemon.pid`에 둔다. 또한 같은 shell rc 파일에 managed autostart
 block을 설치해 컨테이너 재시작 뒤 첫 interactive shell에서 죽은 daemon을 다시 띄운다.
+이 fallback 로그와 macOS launchd의 Rustory 관리 로그는 64 MiB를 초과하면 `rr daemon`이
+시작 시점과 실행 중 60초 주기로 자동 정리한다. fleet에서 즉시 같은 정책을 적용할 때는
+`rr logs cleanup`을 실행한다. systemd-user의 journald 로그는 이 명령의 대상이 아니다.
 장기 운영 서버에서는 같은 사용자 로그인 세션에서 다음을 실행해 systemd-user 관리로 전환한다.
 
 ```sh

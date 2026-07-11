@@ -42,6 +42,28 @@ systemctl --user status rustory.service
 lifetime 동안 grid presence를 유지하고, 재시작 뒤에는 다음 interactive shell startup에서
 자동 복구된다. shell이 한 번도 열리지 않으면 daemon도 자동으로 떠 있지 않다.
 
+## 관리 로그 상한과 자동 정리
+
+Rustory가 직접 소유하는 daemon 로그는 64 MiB를 초과하면 파일을 제자리에서 비운다. `rr daemon`은
+시작 직후 한 번 확인하고 실행 중에는 60초마다 다시 확인하므로, launchd나 background fallback에서
+반복 오류가 발생해도 로그가 무제한으로 자라지 않는다. 정리 대상은 다음 경로로 제한된다.
+
+- macOS launchd: `~/Library/Logs/rustory-daemon.out.log`,
+  `~/Library/Logs/rustory-daemon.err.log`
+- Linux background fallback: `${XDG_STATE_HOME:-$HOME/.local/state}/rustory/daemon.log`
+
+systemd-user가 journald에 기록한 로그는 Rustory가 삭제하지 않는다. journald 보존 정책은 시스템
+운영 정책으로 관리한다. 정리 코드는 현재 사용자 소유의 단일-link 일반 파일만 열며 symbolic link,
+hard link, 디렉터리는 거부한다.
+
+데몬 재시작을 기다리지 않고 여러 머신에서 같은 정책을 적용하려면 각 노드에서 다음 명령을 실행한다.
+상한 이하는 보존하고, 상한을 초과한 Rustory 관리 로그만 비운다. `rr doctor --auto-fix`도 같은 정리를
+수행한다.
+
+```sh
+rr logs cleanup
+```
+
 `rr update`는 기본적으로 관리 중인 daemon을 재시작한다. 새 release asset이 현재 설치
 파일과 byte-identical이어도 restart를 시도하므로, 오래 떠 있던 daemon child가 이전
 인자/default로 남아 있을 때 `rr update`를 다시 실행하는 것이 안전한 복구 경로가 된다.

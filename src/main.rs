@@ -8,6 +8,7 @@ mod history_import;
 mod hook;
 mod http_retry;
 mod libp2p;
+mod managed_logs;
 mod p2p;
 mod p2p_codec;
 mod runtime_tasks;
