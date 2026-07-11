@@ -5,3 +5,4 @@
 
 - [Docker macOS/Linux 수용 테스트](docker-macos-linux.md)
 - [Docker two-peer relay-only 수용 테스트](docker-two-peer-relay.md)
+- [Disposable device-retirement VM 수용 테스트](device-retirement-vms.md)

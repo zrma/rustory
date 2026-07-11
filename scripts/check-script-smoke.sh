@@ -600,6 +600,7 @@ run_cmd "bash -n scripts/build-release-assets.sh"
 run_cmd "bash -n scripts/release-version.sh"
 run_cmd "bash -n scripts/smoke_p2p_local.sh"
 run_cmd "bash -n scripts/acceptance_docker_macos_linux.sh"
+run_cmd "bash -n scripts/acceptance_device_retirement_vms.sh"
 run_cmd "scripts/release-version.sh --profile current --skip-upload --dry-run"
 setup_release_tree_fixture
 git -C "$release_tree_repo_dir" checkout -qb divergent

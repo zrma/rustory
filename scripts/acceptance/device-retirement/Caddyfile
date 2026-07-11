@@ -1,0 +1,10 @@
+{
+	admin off
+	auto_https disable_redirects
+}
+
+https://{$RUSTORY_ACCEPTANCE_TLS_NAME}:9443 {
+	bind 192.168.64.1
+	tls {$RUSTORY_ACCEPTANCE_CERT_FILE} {$RUSTORY_ACCEPTANCE_KEY_FILE}
+	reverse_proxy 127.0.0.1:8860
+}
