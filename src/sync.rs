@@ -20,38 +20,28 @@ pub struct PullStats {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SyncRunProgress {
-    pull_ok: bool,
-    push_requested: bool,
-    push_needed: bool,
-    push_ok: bool,
+    successful_pulls: usize,
+    required_action_failed: bool,
 }
 
 impl SyncRunProgress {
-    pub(crate) fn new(push_requested: bool) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            pull_ok: false,
-            push_requested,
-            push_needed: false,
-            push_ok: false,
+            successful_pulls: 0,
+            required_action_failed: false,
         }
     }
 
     pub(crate) fn mark_pull_ok(&mut self) {
-        self.pull_ok = true;
+        self.successful_pulls = self.successful_pulls.saturating_add(1);
     }
 
-    pub(crate) fn note_push_needed(&mut self, needed: bool) {
-        self.push_needed |= needed;
-    }
-
-    pub(crate) fn mark_push_ok(&mut self, needed: bool) {
-        if needed {
-            self.push_ok = true;
-        }
+    pub(crate) fn mark_required_action_failed(&mut self) {
+        self.required_action_failed = true;
     }
 
     pub(crate) fn is_success(self) -> bool {
-        self.pull_ok && (!self.push_requested || !self.push_needed || self.push_ok)
+        self.successful_pulls > 0 && !self.required_action_failed
     }
 }
 
@@ -516,31 +506,28 @@ mod tests {
 
     #[test]
     fn sync_run_progress_requires_pull_success() {
-        let mut progress = SyncRunProgress::new(true);
-        progress.note_push_needed(true);
-        progress.mark_push_ok(true);
+        let progress = SyncRunProgress::new();
 
         assert!(!progress.is_success());
     }
 
     #[test]
-    fn sync_run_progress_allows_push_when_no_pending_work() {
-        let mut progress = SyncRunProgress::new(true);
+    fn sync_run_progress_accepts_all_successful_peers() {
+        let mut progress = SyncRunProgress::new();
         progress.mark_pull_ok();
-        progress.note_push_needed(false);
+        progress.mark_pull_ok();
 
         assert!(progress.is_success());
     }
 
     #[test]
-    fn sync_run_progress_requires_push_success_when_pending_work_exists() {
-        let mut progress = SyncRunProgress::new(true);
+    fn sync_run_progress_rejects_partial_multi_peer_success() {
+        let mut progress = SyncRunProgress::new();
         progress.mark_pull_ok();
-        progress.note_push_needed(true);
-        assert!(!progress.is_success());
+        progress.mark_required_action_failed();
+        progress.mark_pull_ok();
 
-        progress.mark_push_ok(true);
-        assert!(progress.is_success());
+        assert!(!progress.is_success());
     }
 
     #[test]
@@ -850,13 +837,12 @@ mod tests {
             .tombstone_entries_by_ids(&["id-1".to_string()], "user1", "dev1", false)
             .unwrap();
 
-        let pushed =
-            sync_push_to_peer(&source, "relay", 100, Some("dev1"), |entries, deletions| {
-                relay.insert_entries(&entries)?;
-                relay.apply_entry_deletions_with_stats(&deletions)?;
-                Ok(())
-            })
-            .unwrap();
+        let pushed = sync_push_to_peer(&source, "relay", 1, Some("dev1"), |entries, deletions| {
+            relay.insert_entries(&entries)?;
+            relay.apply_entry_deletions_with_stats(&deletions)?;
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(pushed, 2);
         assert_eq!(relay.list_recent(10).unwrap().len(), 1);
 

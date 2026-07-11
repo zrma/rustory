@@ -161,6 +161,32 @@ check_clean_worktree() {
   fi
 }
 
+check_build_tree_matches_target() {
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    return 0
+  fi
+
+  if [[ -d "$ROOT/.jj" ]] && command -v jj >/dev/null 2>&1; then
+    local diff_summary=""
+    diff_summary="$(cd "$ROOT" && jj diff --from "$TARGET_REF" --to @ --summary)"
+    if [[ -n "$diff_summary" ]]; then
+      echo "$diff_summary" >&2
+      fail "build working tree does not match release target $TARGET_REF ($COMMIT_SHA)"
+    fi
+    ok "build working tree matches release target tree: $TARGET_REF"
+    return 0
+  fi
+
+  need_cmd git
+  local untracked=""
+  untracked="$(cd "$ROOT" && git ls-files --others --exclude-standard)"
+  if ! (cd "$ROOT" && git diff --quiet "$COMMIT_SHA" --) || [[ -n "$untracked" ]]; then
+    (cd "$ROOT" && git status --short) >&2
+    fail "build working tree does not match release target $TARGET_REF ($COMMIT_SHA)"
+  fi
+  ok "build working tree matches release target tree: $TARGET_REF"
+}
+
 check_remote_main() {
   if [[ "$REMOTE_CHECK" -eq 0 || "$DRY_RUN" -eq 1 || "$SKIP_UPLOAD" -eq 1 ]]; then
     return 0
@@ -467,6 +493,7 @@ echo "release plan: tag=$TAG version=$VERSION target_ref=$TARGET_REF commit=$COM
 echo "profile=$PROFILE targets=${TARGETS[*]} dist_dir=$DIST_DIR repo=$REPO gate=$GATE"
 
 check_clean_worktree
+check_build_tree_matches_target
 run_gate
 check_remote_main
 check_remote_tag_target

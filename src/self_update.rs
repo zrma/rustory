@@ -1,14 +1,11 @@
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
-#[cfg(target_os = "linux")]
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::time::Duration;
-#[cfg(target_os = "linux")]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_RELEASE_REPO: &str = "zrma/rustory";
 
@@ -19,6 +16,7 @@ const LEGACY_SYSTEMD_USER_UNITS: &[&str] = &["rustory-daemon.service"];
 
 const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
+const DOWNLOADED_BINARY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateRequest {
@@ -74,6 +72,8 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
     verify_sha256(&bytes, &expected)?;
 
     if installed_binary_matches(&plan.install_path, &bytes)? {
+        make_executable(&plan.install_path)?;
+        verify_downloaded_binary(&plan.install_path, &plan.version)?;
         println!(
             "update: installed binary already matches downloaded asset; no replacement performed"
         );
@@ -82,7 +82,7 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
         return Ok(());
     }
 
-    install_binary(&bytes, &plan.install_path)?;
+    install_binary(&bytes, &plan.install_path, &plan.version)?;
 
     println!("updated rr: {}", plan.install_path.display());
     auto_fix_managed_hook_blocks(&plan.install_path);
@@ -392,7 +392,7 @@ fn installed_binary_matches(install_path: &Path, bytes: &[u8]) -> Result<bool> {
     }
 }
 
-fn install_binary(bytes: &[u8], install_path: &Path) -> Result<()> {
+fn install_binary(bytes: &[u8], install_path: &Path, requested_version: &str) -> Result<()> {
     let parent = install_path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -414,7 +414,7 @@ fn install_binary(bytes: &[u8], install_path: &Path) -> Result<()> {
             .with_context(|| format!("sync temporary binary: {}", tmp_path.display()))?;
     }
     make_executable(&tmp_path)?;
-    let result = verify_downloaded_binary(&tmp_path).and_then(|()| {
+    let result = verify_downloaded_binary(&tmp_path, requested_version).and_then(|()| {
         std::fs::rename(&tmp_path, install_path).with_context(|| {
             format!(
                 "replace {} with downloaded binary {}",
@@ -782,8 +782,20 @@ fn remove_legacy_systemd_user_units() -> std::result::Result<usize, String> {
 fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
     let state_dir = rustory_state_dir();
     let pid_path = state_dir.join("daemon.pid");
-    let pid = read_pid_file(&pid_path);
+    let mut pid = read_pid_file(&pid_path);
     let mut stopped = false;
+
+    if let Some(candidate) = pid
+        && pid_is_running(candidate)
+        && !background_pid_matches_install(candidate, install_path)
+    {
+        println!(
+            "warn: daemon pid file is stale; refusing to signal unrelated pid={candidate} path={}",
+            pid_path.display()
+        );
+        let _ = std::fs::remove_file(&pid_path);
+        pid = None;
+    }
 
     if let Some(pid) = pid
         && pid_is_running(pid)
@@ -794,9 +806,9 @@ fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
                 "terminate background process {pid}: {err}"
             ));
         }
-        if !wait_pid_stopped(pid, Duration::from_secs(5)) {
+        if !wait_managed_pid_stopped(pid, install_path, Duration::from_secs(5)) {
             let _ = terminate_background_process(pid, libc::SIGKILL);
-            if !wait_pid_stopped(pid, Duration::from_secs(2)) {
+            if !wait_managed_pid_stopped(pid, install_path, Duration::from_secs(2)) {
                 return DaemonRestartStatus::Failed(format!(
                     "pid {pid} did not stop after SIGTERM/SIGKILL"
                 ));
@@ -831,7 +843,19 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
     let state_dir = rustory_state_dir();
     let pid_path = state_dir.join("daemon.pid");
     let log_path = state_dir.join("daemon.log");
-    let pid = read_pid_file(&pid_path);
+    let mut pid = read_pid_file(&pid_path);
+
+    if let Some(candidate) = pid
+        && pid_is_running(candidate)
+        && !background_pid_matches_install(candidate, install_path)
+    {
+        println!(
+            "warn: daemon pid file is stale; refusing to signal unrelated pid={candidate} path={}",
+            pid_path.display()
+        );
+        let _ = std::fs::remove_file(&pid_path);
+        pid = None;
+    }
 
     if !force_start && pid.is_none() {
         return DaemonRestartStatus::Skipped;
@@ -846,9 +870,9 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
                 "terminate background process {pid}: {err}"
             ));
         }
-        if !wait_pid_stopped(pid, Duration::from_secs(5)) {
+        if !wait_managed_pid_stopped(pid, install_path, Duration::from_secs(5)) {
             let _ = terminate_background_process(pid, libc::SIGKILL);
-            if !wait_pid_stopped(pid, Duration::from_secs(2)) {
+            if !wait_managed_pid_stopped(pid, install_path, Duration::from_secs(2)) {
                 return DaemonRestartStatus::Failed(format!(
                     "pid {pid} did not stop after SIGTERM/SIGKILL"
                 ));
@@ -996,7 +1020,8 @@ fn terminate_background_process(pid: u32, signal: libc::c_int) -> std::io::Resul
 #[cfg(target_os = "linux")]
 fn stop_stale_background_rr_processes(install_path: &Path) -> std::io::Result<usize> {
     let current_pid = std::process::id();
-    let mut targets = Vec::new();
+    let mut child_targets = Vec::new();
+    let mut daemon_targets = Vec::new();
     for entry in std::fs::read_dir("/proc")? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1012,29 +1037,36 @@ fn stop_stale_background_rr_processes(install_path: &Path) -> std::io::Result<us
         let Some(cmdline) = read_proc_cmdline(pid) else {
             continue;
         };
-        if !is_managed_background_rr_cmdline(&cmdline) {
+        if !(process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path))
+        {
             continue;
         }
-        if process_exe_matches(pid, install_path)
-            || cmdline_exe_matches(&cmdline, install_path)
-            || cmdline_looks_like_default_rustory_background(&cmdline)
-        {
-            targets.push(pid);
+        match managed_background_cmdline_kind(&cmdline) {
+            Some(ManagedBackgroundCmdlineKind::Daemon) => daemon_targets.push(pid),
+            Some(ManagedBackgroundCmdlineKind::Child)
+                if process_has_managed_daemon_ancestor(pid, install_path) =>
+            {
+                child_targets.push(pid);
+            }
+            _ => {}
         }
     }
 
-    targets.sort_unstable();
+    child_targets.sort_unstable();
+    daemon_targets.sort_unstable();
+    let mut targets = child_targets;
+    targets.extend(daemon_targets);
     targets.dedup();
 
     let mut stopped = 0;
     for pid in targets {
-        if !pid_is_running(pid) {
+        if !managed_process_is_running(pid, install_path) {
             continue;
         }
         terminate_background_process(pid, libc::SIGTERM)?;
-        if !wait_pid_stopped(pid, Duration::from_secs(2)) {
+        if !wait_managed_process_stopped(pid, install_path, Duration::from_secs(2)) {
             let _ = terminate_background_process(pid, libc::SIGKILL);
-            let _ = wait_pid_stopped(pid, Duration::from_secs(1));
+            let _ = wait_managed_process_stopped(pid, install_path, Duration::from_secs(1));
         }
         stopped += 1;
     }
@@ -1074,6 +1106,69 @@ fn process_exe_matches(pid: u32, install_path: &Path) -> bool {
     paths_match_after_deleted_suffix(&exe, install_path)
 }
 
+#[cfg(target_os = "linux")]
+fn background_pid_matches_install(pid: u32, install_path: &Path) -> bool {
+    if !process_is_current_user(pid) {
+        return false;
+    }
+    let Some(cmdline) = read_proc_cmdline(pid) else {
+        return false;
+    };
+    managed_background_cmdline_kind(&cmdline) == Some(ManagedBackgroundCmdlineKind::Daemon)
+        && (process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path))
+}
+
+#[cfg(target_os = "linux")]
+fn managed_process_matches_install(pid: u32, install_path: &Path) -> bool {
+    if !process_is_current_user(pid) {
+        return false;
+    }
+    let Some(cmdline) = read_proc_cmdline(pid) else {
+        return false;
+    };
+    if !(process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path)) {
+        return false;
+    }
+    match managed_background_cmdline_kind(&cmdline) {
+        Some(ManagedBackgroundCmdlineKind::Daemon) => true,
+        Some(ManagedBackgroundCmdlineKind::Child) => {
+            process_has_managed_daemon_ancestor(pid, install_path)
+        }
+        None => false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_has_managed_daemon_ancestor(mut pid: u32, install_path: &Path) -> bool {
+    for _ in 0..64 {
+        let Some(parent_pid) = read_proc_parent_pid(pid) else {
+            return false;
+        };
+        if parent_pid <= 1 || parent_pid == pid {
+            return false;
+        }
+        let Some(parent_cmdline) = read_proc_cmdline(parent_pid) else {
+            return false;
+        };
+        if managed_background_cmdline_kind(&parent_cmdline)
+            == Some(ManagedBackgroundCmdlineKind::Daemon)
+            && (process_exe_matches(parent_pid, install_path)
+                || cmdline_exe_matches(&parent_cmdline, install_path))
+        {
+            return true;
+        }
+        pid = parent_pid;
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_parent_pid(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(") ")?.1;
+    after_comm.split_whitespace().nth(1)?.parse().ok()
+}
+
 #[cfg(any(target_os = "linux", test))]
 fn cmdline_exe_matches(cmdline: &[String], install_path: &Path) -> bool {
     cmdline
@@ -1083,31 +1178,39 @@ fn cmdline_exe_matches(cmdline: &[String], install_path: &Path) -> bool {
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn cmdline_looks_like_default_rustory_background(cmdline: &[String]) -> bool {
-    if !cmdline_rr_basename_is_rr(cmdline) || !is_managed_background_rr_cmdline(cmdline) {
-        return false;
-    }
-
-    if cmdline.iter().any(|arg| arg == "daemon") {
-        return cmdline
-            .iter()
-            .any(|arg| matches!(arg.as_str(), "--interval-sec" | "--start-jitter-sec"));
-    }
-
-    let has_watch_child = cmdline
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "p2p-serve" | "p2p-sync"))
-        && cmdline.iter().any(|arg| arg == "--watch");
-    has_watch_child && cmdline_has_default_rustory_db_path(cmdline)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedBackgroundCmdlineKind {
+    Daemon,
+    Child,
 }
 
 #[cfg(any(target_os = "linux", test))]
-fn cmdline_rr_basename_is_rr(cmdline: &[String]) -> bool {
-    cmdline
-        .first()
-        .and_then(|arg| Path::new(arg).file_name())
-        .map(|name| name == "rr")
-        .unwrap_or(false)
+fn managed_background_cmdline_kind(cmdline: &[String]) -> Option<ManagedBackgroundCmdlineKind> {
+    if cmdline.iter().any(|arg| arg == "daemon") {
+        return (cmdline.iter().any(|arg| arg == "--interval-sec")
+            && cmdline.iter().any(|arg| arg == "--start-jitter-sec"))
+        .then_some(ManagedBackgroundCmdlineKind::Daemon);
+    }
+
+    if cmdline.iter().any(|arg| arg == "p2p-sync") {
+        return (cmdline.iter().any(|arg| arg == "--watch")
+            && cmdline_has_default_rustory_db_path(cmdline))
+        .then_some(ManagedBackgroundCmdlineKind::Child);
+    }
+    if cmdline.iter().any(|arg| arg == "p2p-serve") {
+        return cmdline_has_default_rustory_db_path(cmdline)
+            .then_some(ManagedBackgroundCmdlineKind::Child);
+    }
+    None
+}
+
+#[cfg(test)]
+fn is_managed_background_rr_cmdline(cmdline: &[String], has_managed_daemon_ancestor: bool) -> bool {
+    match managed_background_cmdline_kind(cmdline) {
+        Some(ManagedBackgroundCmdlineKind::Daemon) => true,
+        Some(ManagedBackgroundCmdlineKind::Child) => has_managed_daemon_ancestor,
+        None => false,
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1137,23 +1240,38 @@ fn normalize_deleted_exe_path(path: &Path) -> String {
         .to_string()
 }
 
-#[cfg(any(target_os = "linux", test))]
-fn is_managed_background_rr_cmdline(cmdline: &[String]) -> bool {
-    cmdline
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "daemon" | "p2p-serve" | "p2p-sync"))
+#[cfg(target_os = "linux")]
+fn managed_pid_is_running(pid: u32, install_path: &Path) -> bool {
+    pid_is_running(pid) && background_pid_matches_install(pid, install_path)
 }
 
 #[cfg(target_os = "linux")]
-fn wait_pid_stopped(pid: u32, timeout: Duration) -> bool {
+fn managed_process_is_running(pid: u32, install_path: &Path) -> bool {
+    pid_is_running(pid) && managed_process_matches_install(pid, install_path)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_managed_pid_stopped(pid: u32, install_path: &Path, timeout: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if !pid_is_running(pid) {
+        if !managed_pid_is_running(pid, install_path) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    !pid_is_running(pid)
+    !managed_pid_is_running(pid, install_path)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_managed_process_stopped(pid: u32, install_path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !managed_process_is_running(pid, install_path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !managed_process_is_running(pid, install_path)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1201,22 +1319,138 @@ fn make_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verify_downloaded_binary(path: &Path) -> Result<()> {
-    let output = ProcessCommand::new(path)
-        .arg("version")
-        .output()
-        .with_context(|| format!("run downloaded binary: {}", path.display()))?;
+fn verify_downloaded_binary(path: &Path, requested_version: &str) -> Result<()> {
+    verify_downloaded_binary_with_timeout(path, requested_version, DOWNLOADED_BINARY_CHECK_TIMEOUT)
+}
+
+fn verify_downloaded_binary_with_timeout(
+    path: &Path,
+    requested_version: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let output = run_downloaded_version_with_timeout(path, timeout)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("downloaded binary failed `version`: {stderr}");
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(expected) = pinned_release_version(requested_version) {
+        let actual = parse_rr_version_output(&stdout).with_context(|| {
+            format!(
+                "downloaded binary did not report a version for pinned release {requested_version}"
+            )
+        })?;
+        if actual != expected {
+            anyhow::bail!(
+                "downloaded binary version mismatch: requested {expected}, reported {actual}"
+            );
+        }
+    }
     let first_line = stdout
         .lines()
         .next()
         .unwrap_or("version output unavailable");
     println!("downloaded binary check: {first_line}");
     Ok(())
+}
+
+fn run_downloaded_version_with_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("downloaded binary check timeout is too large")?;
+    let nonce = uuid::Uuid::new_v4();
+    let output_dir = std::env::temp_dir();
+    let stdout_path = output_dir.join(format!("rustory-version-{nonce}.stdout"));
+    let stderr_path = output_dir.join(format!("rustory-version-{nonce}.stderr"));
+    let stdout_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stdout_path)
+        .with_context(|| format!("create version stdout file: {}", stdout_path.display()))?;
+    let stderr_file = match OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&stderr_path)
+    {
+        Ok(file) => file,
+        Err(err) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            return Err(err)
+                .with_context(|| format!("create version stderr file: {}", stderr_path.display()));
+        }
+    };
+
+    let mut child = match ProcessCommand::new(path)
+        .arg("version")
+        .stdout(Stdio::from(stdout_file))
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            return Err(err).with_context(|| format!("run downloaded binary: {}", path.display()));
+        }
+    };
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(err) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = std::fs::remove_file(&stdout_path);
+                let _ = std::fs::remove_file(&stderr_path);
+                return Err(err)
+                    .with_context(|| format!("wait downloaded binary: {}", path.display()));
+            }
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&stdout_path);
+            let _ = std::fs::remove_file(&stderr_path);
+            anyhow::bail!(
+                "downloaded binary timed out running `version` after {:.1}s: {}",
+                timeout.as_secs_f64(),
+                path.display()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+
+    let stdout = std::fs::read(&stdout_path)
+        .with_context(|| format!("read version stdout file: {}", stdout_path.display()));
+    let stderr = std::fs::read(&stderr_path)
+        .with_context(|| format!("read version stderr file: {}", stderr_path.display()));
+    let _ = std::fs::remove_file(&stdout_path);
+    let _ = std::fs::remove_file(&stderr_path);
+    Ok(std::process::Output {
+        status,
+        stdout: stdout?,
+        stderr: stderr?,
+    })
+}
+
+fn pinned_release_version(requested_version: &str) -> Option<semver::Version> {
+    let requested = requested_version.trim();
+    if requested == "latest" {
+        return None;
+    }
+    let normalized = requested.strip_prefix('v').unwrap_or(requested);
+    semver::Version::parse(normalized).ok()
+}
+
+fn parse_rr_version_output(output: &str) -> Option<semver::Version> {
+    output.lines().find_map(|line| {
+        line.strip_prefix("version:")
+            .and_then(|value| semver::Version::parse(value.trim()).ok())
+    })
 }
 
 #[cfg(test)]
@@ -1410,6 +1644,57 @@ mod tests {
     }
 
     #[test]
+    fn pinned_release_version_accepts_semver_and_preserves_custom_tags() {
+        assert_eq!(
+            pinned_release_version("v1.2.3"),
+            Some(semver::Version::new(1, 2, 3))
+        );
+        assert_eq!(
+            pinned_release_version("1.2.3-beta.1"),
+            Some(semver::Version::parse("1.2.3-beta.1").unwrap())
+        );
+        assert_eq!(pinned_release_version("latest"), None);
+        assert_eq!(pinned_release_version("nightly-main"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_binary_must_match_pinned_version_but_not_custom_tag() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rr");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\nprintf 'version: 9.9.9\\nrevision: test\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(verify_downloaded_binary(&binary, "v9.9.9").is_ok());
+        let err = verify_downloaded_binary(&binary, "v1.2.3").unwrap_err();
+        assert!(format!("{err:#}").contains("version mismatch"));
+        assert!(verify_downloaded_binary(&binary, "latest").is_ok());
+        assert!(verify_downloaded_binary(&binary, "nightly-main").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn downloaded_binary_version_check_times_out() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("rr");
+        std::fs::write(&binary, "#!/bin/sh\nwhile :; do :; done\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err =
+            verify_downloaded_binary_with_timeout(&binary, "latest", Duration::from_millis(50))
+                .unwrap_err();
+        assert!(format!("{err:#}").contains("timed out running `version`"));
+    }
+
+    #[test]
     fn installed_binary_match_detects_identical_bytes() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(temp.path(), b"rr-binary").unwrap();
@@ -1450,60 +1735,137 @@ mod tests {
 
     #[test]
     fn managed_background_cmdline_matches_only_daemon_children() {
-        assert!(is_managed_background_rr_cmdline(&[
-            "/home/user/.local/bin/rr".to_string(),
-            "daemon".to_string(),
-        ]));
-        assert!(is_managed_background_rr_cmdline(&[
-            "/home/user/.local/bin/rr".to_string(),
-            "p2p-sync".to_string(),
-            "--watch".to_string(),
-        ]));
-        assert!(!is_managed_background_rr_cmdline(&[
-            "/home/user/.local/bin/rr".to_string(),
-            "sync-status".to_string(),
-            "--with-tracker".to_string(),
-        ]));
+        assert!(is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "daemon".to_string(),
+                "--interval-sec".to_string(),
+                "60".to_string(),
+                "--start-jitter-sec".to_string(),
+                "10".to_string(),
+            ],
+            false
+        ));
+        assert!(is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "--db-path".to_string(),
+                "/home/user/.rustory/history.db".to_string(),
+                "p2p-sync".to_string(),
+                "--watch".to_string(),
+            ],
+            true
+        ));
+        assert!(is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "--db-path".to_string(),
+                "/home/user/.rustory/history.db".to_string(),
+                "p2p-serve".to_string(),
+            ],
+            true
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "--db-path".to_string(),
+                "/home/user/.rustory/history.db".to_string(),
+                "p2p-serve".to_string(),
+            ],
+            false
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "p2p-serve".to_string(),
+            ],
+            false
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "p2p-sync".to_string(),
+            ],
+            false
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "sync-status".to_string(),
+                "--with-tracker".to_string(),
+            ],
+            false
+        ));
     }
 
     #[test]
-    fn default_rustory_background_cmdline_matches_stale_children_without_full_path() {
-        assert!(cmdline_looks_like_default_rustory_background(&[
-            "rr".to_string(),
-            "--db-path".to_string(),
-            "~/.rustory/history.db".to_string(),
-            "p2p-sync".to_string(),
-            "--watch".to_string(),
-            "--max-peers-per-tick".to_string(),
-            "1".to_string(),
-        ]));
-        assert!(cmdline_looks_like_default_rustory_background(&[
-            "/home/user/.local/bin/rr".to_string(),
-            "daemon".to_string(),
-            "--interval-sec".to_string(),
-            "60".to_string(),
-        ]));
-        assert!(cmdline_looks_like_default_rustory_background(&[
-            "rr".to_string(),
-            "daemon".to_string(),
-            "--preflight".to_string(),
-            "--interval-sec".to_string(),
-            "60".to_string(),
-            "--start-jitter-sec".to_string(),
-            "10".to_string(),
-        ]));
-        assert!(!cmdline_looks_like_default_rustory_background(&[
-            "rr".to_string(),
-            "sync-status".to_string(),
-            "--watch".to_string(),
-        ]));
-        assert!(!cmdline_looks_like_default_rustory_background(&[
-            "rr".to_string(),
-            "--db-path".to_string(),
-            "/tmp/other.db".to_string(),
-            "p2p-sync".to_string(),
-            "--watch".to_string(),
-        ]));
+    fn managed_background_cmdline_requires_installer_daemon_signature() {
+        assert!(is_managed_background_rr_cmdline(
+            &[
+                "rr".to_string(),
+                "--db-path".to_string(),
+                "~/.rustory/history.db".to_string(),
+                "p2p-sync".to_string(),
+                "--watch".to_string(),
+                "--max-peers-per-tick".to_string(),
+                "1".to_string(),
+            ],
+            true
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "/home/user/.local/bin/rr".to_string(),
+                "daemon".to_string(),
+                "--interval-sec".to_string(),
+                "60".to_string(),
+            ],
+            false
+        ));
+        assert!(is_managed_background_rr_cmdline(
+            &[
+                "rr".to_string(),
+                "daemon".to_string(),
+                "--preflight".to_string(),
+                "--interval-sec".to_string(),
+                "60".to_string(),
+                "--start-jitter-sec".to_string(),
+                "10".to_string(),
+            ],
+            false
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "rr".to_string(),
+                "sync-status".to_string(),
+                "--watch".to_string(),
+            ],
+            false
+        ));
+        assert!(!is_managed_background_rr_cmdline(
+            &[
+                "rr".to_string(),
+                "--db-path".to_string(),
+                "/tmp/other.db".to_string(),
+                "p2p-sync".to_string(),
+                "--watch".to_string(),
+            ],
+            true
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unrelated_running_pid_never_matches_managed_background_daemon() {
+        let mut child = ProcessCommand::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        let install_path = std::env::current_exe().unwrap();
+
+        assert!(pid_is_running(pid));
+        assert!(!background_pid_matches_install(pid, &install_path));
+        assert!(pid_is_running(pid));
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     #[test]

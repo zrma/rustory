@@ -11,6 +11,7 @@ use libp2p_request_response::ProtocolSupport;
 use multiaddr::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -45,6 +46,7 @@ pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
 // 사용자가 `--req-timeout-cap-sec` 등을 크게 잡았을 때 내부 Timeout이 먼저 터질 수 있다.
 // 따라서 "충분히 큰 값"으로 두고, 실제 attempt timeout은 클라이언트 로직에서 결정한다.
 const REQUEST_RESPONSE_INTERNAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+static NEXT_TARGET_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
 pub struct ServeConfig {
@@ -990,6 +992,7 @@ async fn sync_async(
     cfg: SyncConfig,
     push: bool,
 ) -> Result<()> {
+    validate_local_sync_limit(limit)?;
     if limit == 0 {
         return Ok(());
     }
@@ -1017,7 +1020,7 @@ async fn sync_async(
         None
     };
 
-    let mut progress = crate::sync::SyncRunProgress::new(push);
+    let mut progress = crate::sync::SyncRunProgress::new();
     let mut last_err: Option<anyhow::Error> = None;
     for t in targets {
         let mut client = match P2pClient::new(
@@ -1030,6 +1033,7 @@ async fn sync_async(
         ) {
             Ok(v) => v,
             Err(err) => {
+                progress.mark_required_action_failed();
                 eprintln!("warn: p2p client init failed: {}: {err:#}", t.peer_key);
                 last_err = Some(err);
                 continue;
@@ -1061,23 +1065,22 @@ async fn sync_async(
                 }
             }
             Err(err) => {
+                progress.mark_required_action_failed();
                 log_p2p_sync_failure("pull", &t.peer_key, &err);
                 last_err = Some(err);
             }
         }
 
         if push {
-            let pending_push = match store.count_pending_push_items(&t.peer_key, push_device_id) {
+            let _pending_push = match store.count_pending_push_items(&t.peer_key, push_device_id) {
                 Ok(count) => count,
                 Err(err) => {
+                    progress.mark_required_action_failed();
                     eprintln!("warn: p2p push preflight failed: {}: {err:#}", t.peer_key);
                     last_err = Some(err);
                     continue;
                 }
             };
-            let push_needed = pending_push > 0;
-            progress.note_push_needed(push_needed);
-
             client.reset_push_ack_stats();
 
             let push_res = crate::sync::sync_push_to_peer_async(
@@ -1092,7 +1095,6 @@ async fn sync_async(
 
             match push_res {
                 Ok(pushed) => {
-                    progress.mark_push_ok(push_needed);
                     if let Some(stats) = client.take_push_ack_stats() {
                         eprintln!(
                             "p2p push summary: {}: sent={pushed} inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
@@ -1108,6 +1110,7 @@ async fn sync_async(
                     }
                 }
                 Err(err) => {
+                    progress.mark_required_action_failed();
                     if let Some(stats) = client.take_push_ack_stats() {
                         eprintln!(
                             "warn: p2p push partial: {}: inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
@@ -1133,6 +1136,15 @@ async fn sync_async(
     } else {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p sync failed")))
     }
+}
+
+fn validate_local_sync_limit(limit: usize) -> Result<()> {
+    anyhow::ensure!(
+        limit <= crate::sync::SERVER_SYNC_PULL_LIMIT_MAX,
+        "sync limit must be <= {}",
+        crate::sync::SERVER_SYNC_PULL_LIMIT_MAX
+    );
+    Ok(())
 }
 
 fn build_manual_targets(
@@ -1183,17 +1195,22 @@ fn build_manual_targets(
     Ok(out)
 }
 
-fn limit_targets_per_tick(
-    mut targets: Vec<SyncTarget>,
-    max_peers_per_tick: usize,
-) -> Vec<SyncTarget> {
+fn limit_targets_per_tick(targets: Vec<SyncTarget>, max_peers_per_tick: usize) -> Vec<SyncTarget> {
     if max_peers_per_tick == 0 || targets.len() <= max_peers_per_tick {
         return targets;
     }
 
+    let offset = NEXT_TARGET_OFFSET.fetch_add(max_peers_per_tick, Ordering::Relaxed);
+    limit_targets_per_tick_from_offset(targets, max_peers_per_tick, offset)
+}
+
+fn limit_targets_per_tick_from_offset(
+    mut targets: Vec<SyncTarget>,
+    max_peers_per_tick: usize,
+    offset: usize,
+) -> Vec<SyncTarget> {
     targets.sort_by(|a, b| a.peer_key.cmp(&b.peer_key));
-    let tick = OffsetDateTime::now_utc().unix_timestamp().max(0) as usize / 60;
-    let offset = tick % targets.len();
+    let offset = offset % targets.len();
     let mut selected = Vec::with_capacity(max_peers_per_tick);
     for idx in 0..max_peers_per_tick {
         selected.push(targets[(offset + idx) % targets.len()].clone());
@@ -2769,6 +2786,26 @@ mod tests {
     }
 
     #[test]
+    fn limit_targets_per_tick_round_robin_covers_every_peer() {
+        let targets = (0..5)
+            .map(|idx| SyncTarget {
+                peer_id: PeerId::random(),
+                peer_key: format!("peer-{idx}"),
+                dial_addrs: Vec::new(),
+                relay_addr: None,
+            })
+            .collect::<Vec<_>>();
+        let mut selected = HashSet::new();
+
+        for offset in 0..5 {
+            let tick = limit_targets_per_tick_from_offset(targets.clone(), 1, offset);
+            selected.insert(tick[0].peer_key.clone());
+        }
+
+        assert_eq!(selected.len(), targets.len());
+    }
+
+    #[test]
     fn inbound_peer_authorization_rejects_unknown_peer() {
         let store = LocalStore::open(":memory:").unwrap();
         let peer = PeerId::random();
@@ -2852,6 +2889,14 @@ mod tests {
             clamp_remote_pull_limit(usize::MAX),
             crate::sync::SERVER_SYNC_PULL_LIMIT_MAX
         );
+    }
+
+    #[test]
+    fn local_sync_limit_rejects_values_above_server_batch_contract() {
+        validate_local_sync_limit(crate::sync::SERVER_SYNC_PULL_LIMIT_MAX).unwrap();
+        let err =
+            validate_local_sync_limit(crate::sync::SERVER_SYNC_PULL_LIMIT_MAX + 1).unwrap_err();
+        assert!(err.to_string().contains("sync limit must be <= 1000"));
     }
 
     #[test]

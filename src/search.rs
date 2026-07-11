@@ -1,4 +1,5 @@
 use crate::core::Entry;
+use crate::terminal::sanitize_one_line;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -528,9 +529,26 @@ impl Tty {
         let byte = self.read_byte_blocking()?;
         if byte == 0x1b {
             self.read_escape_sequence()
-        } else {
+        } else if byte.is_ascii() {
             Ok(parse_plain_key(byte))
+        } else {
+            self.read_utf8_key(byte)
         }
+    }
+
+    fn read_utf8_key(&mut self, first: u8) -> std::io::Result<Key> {
+        let Some(expected_len) = utf8_scalar_len(first) else {
+            return Ok(Key::Unknown);
+        };
+        let mut bytes = Vec::with_capacity(expected_len);
+        bytes.push(first);
+        while bytes.len() < expected_len {
+            let Some(byte) = self.read_byte_with_timeout(Duration::from_millis(30))? else {
+                return Ok(Key::Unknown);
+            };
+            bytes.push(byte);
+        }
+        Ok(parse_utf8_key(&bytes))
     }
 
     fn read_escape_sequence(&mut self) -> std::io::Result<Key> {
@@ -643,6 +661,30 @@ fn parse_plain_key(byte: u8) -> Key {
         0x7f => Key::Backspace,
         byte if byte.is_ascii_graphic() || byte == b' ' => Key::Char(byte as char),
         _ => Key::Unknown,
+    }
+}
+
+fn utf8_scalar_len(first: u8) -> Option<usize> {
+    match first {
+        0xc2..=0xdf => Some(2),
+        0xe0..=0xef => Some(3),
+        0xf0..=0xf4 => Some(4),
+        _ => None,
+    }
+}
+
+fn parse_utf8_key(bytes: &[u8]) -> Key {
+    let Ok(value) = std::str::from_utf8(bytes) else {
+        return Key::Unknown;
+    };
+    let mut chars = value.chars();
+    let Some(ch) = chars.next() else {
+        return Key::Unknown;
+    };
+    if chars.next().is_some() || ch.is_control() {
+        Key::Unknown
+    } else {
+        Key::Char(ch)
     }
 }
 
@@ -1263,24 +1305,6 @@ fn is_word_break(ch: char) -> bool {
     ch == ' ' || ch == '-'
 }
 
-fn sanitize_one_line(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
-        match ch {
-            '\n' | '\r' | '\t' => out.push(' '),
-            '\u{1b}' => out.push_str("\\x1b"),
-            '\u{00}'..='\u{1f}' | '\u{7f}' => {
-                out.push_str(&format!("\\x{:02x}", ch as u32));
-            }
-            '\u{80}'..='\u{9f}' => {
-                out.push_str(&format!("\\u{{{:02x}}}", ch as u32));
-            }
-            _ => out.push(ch),
-        }
-    }
-    out
-}
-
 fn compact_cwd(cwd: &str) -> String {
     let cwd = sanitize_one_line(cwd);
     if cwd.is_empty() {
@@ -1640,6 +1664,33 @@ mod tests {
     #[test]
     fn parse_plain_key_maps_ctrl_k_to_delete_selected() {
         assert_eq!(parse_plain_key(0x0b), Key::DeleteSelected);
+    }
+
+    #[test]
+    fn utf8_multibyte_keys_build_korean_and_emoji_query() {
+        let mut query = Vec::new();
+        for value in ["한", "글", "😀"] {
+            match parse_utf8_key(value.as_bytes()) {
+                Key::Char(ch) => query.push(ch),
+                key => panic!("expected character key for {value:?}, got {key:?}"),
+            }
+        }
+
+        let query = query.iter().collect::<String>();
+        assert_eq!(query, "한글😀");
+        let rows = build_search_rows(&[entry("host", "/tmp", "echo 한글😀")]);
+        assert_eq!(filter_rows(&rows, &query), vec![0]);
+        assert_eq!(utf8_scalar_len("한".as_bytes()[0]), Some(3));
+        assert_eq!(utf8_scalar_len("😀".as_bytes()[0]), Some(4));
+    }
+
+    #[test]
+    fn utf8_key_decoder_rejects_invalid_or_control_scalars() {
+        assert_eq!(parse_utf8_key(&[0xe3, 0x28, 0xa1]), Key::Unknown);
+        assert_eq!(parse_utf8_key("\u{85}".as_bytes()), Key::Unknown);
+        assert_eq!(utf8_scalar_len(0x80), None);
+        assert_eq!(utf8_scalar_len(0xc0), None);
+        assert_eq!(utf8_scalar_len(0xf5), None);
     }
 
     #[test]

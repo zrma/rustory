@@ -193,11 +193,11 @@ fn remove_daemon_autostart_blocks(extra_rc_files: &[PathBuf]) -> Result<()> {
             }
         };
         let (cleaned, removed_blocks) =
-            strip_marker_blocks(&existing, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END);
+            strip_marker_blocks(&existing, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END)?;
         if removed_blocks == 0 || cleaned == existing {
             continue;
         }
-        std::fs::write(&rc_file, cleaned)
+        hook::atomic_write_text_preserving_symlink(&rc_file, &cleaned)
             .with_context(|| format!("write rc file: {}", rc_file.display()))?;
         removed_files += 1;
         println!(
@@ -232,47 +232,12 @@ fn shell_profile_candidates(extra_rc_files: &[PathBuf]) -> Result<Vec<PathBuf>> 
     Ok(candidates)
 }
 
-fn strip_marker_blocks(content: &str, start_marker: &str, end_marker: &str) -> (String, usize) {
-    let mut rest = content;
-    let mut output = String::with_capacity(content.len());
-    let mut removed = 0usize;
-    while let Some(start) = find_line_marker(rest, start_marker) {
-        output.push_str(&rest[..start]);
-        let after_start_offset = marker_line_end(rest, start, start_marker);
-        let after_start = &rest[after_start_offset..];
-        let Some(end) = find_line_marker(after_start, end_marker) else {
-            output.push_str(&rest[start..]);
-            return (output, removed);
-        };
-        let skip = after_start_offset + marker_line_end(after_start, end, end_marker);
-        rest = &rest[skip..];
-        removed += 1;
-    }
-    output.push_str(rest);
-    (output, removed)
-}
-
-fn find_line_marker(content: &str, marker: &str) -> Option<usize> {
-    content.match_indices(marker).find_map(|(offset, _)| {
-        let starts_line = offset == 0 || content.as_bytes().get(offset - 1) == Some(&b'\n');
-        let after = offset + marker.len();
-        let ends_line = after == content.len()
-            || content.as_bytes().get(after) == Some(&b'\n')
-            || (content.as_bytes().get(after) == Some(&b'\r')
-                && content.as_bytes().get(after + 1) == Some(&b'\n'));
-        (starts_line && ends_line).then_some(offset)
-    })
-}
-
-fn marker_line_end(content: &str, offset: usize, marker: &str) -> usize {
-    let after = offset + marker.len();
-    if content[after..].starts_with("\r\n") {
-        after + 2
-    } else if content[after..].starts_with('\n') {
-        after + 1
-    } else {
-        after
-    }
+fn strip_marker_blocks(
+    content: &str,
+    start_marker: &str,
+    end_marker: &str,
+) -> Result<(String, usize)> {
+    hook::strip_managed_marker_blocks(content, &[(start_marker, end_marker)])
 }
 
 fn remove_daemon_service_files() -> Result<()> {
@@ -560,7 +525,7 @@ mod tests {
         .join("");
 
         let (cleaned, removed) =
-            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END);
+            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END).unwrap();
 
         assert_eq!(removed, 2);
         assert!(!cleaned.contains(DAEMON_AUTOSTART_START));
@@ -582,7 +547,7 @@ mod tests {
         let content = format!("{prefix}{managed}{suffix}");
 
         let (cleaned, removed_blocks) =
-            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END);
+            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END).unwrap();
 
         assert_eq!(removed_blocks, 1);
         assert_eq!(cleaned, format!("{prefix}{suffix}"));
@@ -594,10 +559,19 @@ mod tests {
             format!("echo '{DAEMON_AUTOSTART_START}'\nkeep=1\necho '{DAEMON_AUTOSTART_END}'\n");
 
         let (cleaned, removed_blocks) =
-            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END);
+            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END).unwrap();
 
         assert_eq!(removed_blocks, 0);
         assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn strip_marker_blocks_rejects_unmatched_marker() {
+        let content = format!("{DAEMON_AUTOSTART_START}\nexport KEEP=1\n");
+
+        assert!(
+            strip_marker_blocks(&content, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END).is_err()
+        );
     }
 
     #[test]

@@ -48,7 +48,7 @@ pub fn sync(
 
     let token = normalize_configured_token(cfg.token, "HTTP sync token")?;
     let store = LocalStore::open(db_path)?;
-    let mut progress = sync::SyncRunProgress::new(push);
+    let mut progress = sync::SyncRunProgress::new();
     let mut last_err: Option<anyhow::Error> = None;
     for peer in peers {
         // peer_id는 우선 URL 문자열을 그대로 사용한다.
@@ -57,29 +57,29 @@ pub fn sync(
         {
             Ok(_) => progress.mark_pull_ok(),
             Err(err) => {
+                progress.mark_required_action_failed();
                 eprintln!("warn: http pull failed: {peer}: {err:#}");
                 last_err = Some(err);
             }
         }
 
         if push {
-            let pending_push = match count_pending_http_push_entries(&store, peer, local_device_id)
+            let _pending_push = match count_pending_http_push_entries(&store, peer, local_device_id)
             {
                 Ok(count) => count,
                 Err(err) => {
+                    progress.mark_required_action_failed();
                     eprintln!("warn: http push preflight failed: {peer}: {err:#}");
                     last_err = Some(err);
                     continue;
                 }
             };
-            let push_needed = pending_push > 0;
-            progress.note_push_needed(push_needed);
-
             match sync_push_http_peer(&store, peer, 1000, local_device_id, token.as_deref())
                 .with_context(|| format!("push peer: {peer}"))
             {
-                Ok(_) => progress.mark_push_ok(push_needed),
+                Ok(_) => {}
                 Err(err) => {
+                    progress.mark_required_action_failed();
                     eprintln!("warn: http push failed: {peer}: {err:#}");
                     last_err = Some(err);
                 }
@@ -256,6 +256,7 @@ fn http_pull_batch(
     )
     .with_context(|| format!("GET {url}"))?;
     let mut resp = resp;
+    ensure_http_sync_success_status(&resp, &url)?;
     let body = resp
         .body_mut()
         .with_config()
@@ -295,12 +296,25 @@ fn http_push_batch(
     )
     .with_context(|| format!("POST {url}"))?;
     let mut resp = resp;
+    ensure_http_sync_success_status(&resp, &url)?;
     let _ = resp
         .body_mut()
         .with_config()
         .limit(HTTP_PUSH_RESPONSE_MAX_BYTES)
         .read_to_string()
         .context("read push response body")?;
+    Ok(())
+}
+
+fn ensure_http_sync_success_status(
+    resp: &ureq::http::Response<ureq::Body>,
+    url: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "HTTP sync endpoint returned redirect/non-success status {} for {url}",
+        resp.status()
+    );
     Ok(())
 }
 
@@ -530,6 +544,53 @@ mod tests {
         }
     }
 
+    fn start_redirect_server(location: String) -> TestServer {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let bind = format!("127.0.0.1:{}", addr.port());
+        let base_url = format!("http://{bind}");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown2 = shutdown.clone();
+
+        let join = thread::spawn(move || {
+            let server = tiny_http::Server::http(&bind).unwrap();
+            while !shutdown2.load(Ordering::SeqCst) {
+                match server.recv_timeout(Duration::from_millis(50)) {
+                    Ok(Some(req)) => {
+                        let path = req.url().split('?').next().unwrap_or(req.url());
+                        let res = if path == "/api/v1/ping" {
+                            respond_text(200, "ok\n")
+                        } else {
+                            respond_text(307, "redirect\n").with_header(
+                                tiny_http::Header::from_bytes("Location", location.as_bytes())
+                                    .unwrap(),
+                            )
+                        };
+                        let _ = req.respond(res);
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+        });
+
+        for _ in 0..50 {
+            let url = format!("{base_url}/api/v1/ping");
+            if ureq::get(&url).call().is_ok() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        TestServer {
+            base_url,
+            shutdown,
+            join: Some(join),
+        }
+    }
+
     #[test]
     fn parse_cursor_limit_clamps_remote_limit_before_storage() {
         let (cursor, delete_cursor, limit) =
@@ -588,6 +649,25 @@ mod tests {
         assert!(!local_db.exists());
     }
 
+    #[test]
+    fn http_sync_does_not_follow_redirects_to_plaintext_remote_hops() {
+        let server = start_redirect_server(
+            "http://192.0.2.1:8844/api/v1/entries?cursor=0&limit=1".to_string(),
+        );
+
+        let err = match http_pull_batch(&server.base_url, 0, 0, 1, None) {
+            Ok(_) => panic!("redirected pull must fail"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("redirect/non-success status 307"));
+
+        let push_err = http_push_batch(&server.base_url, Vec::new(), Vec::new(), None)
+            .expect_err("redirected push must not be acknowledged");
+        assert!(format!("{push_err:#}").contains("redirect/non-success status 307"));
+
+        server.shutdown();
+    }
+
     fn entry(entry_id: &str, ts: i64, cmd: &str) -> Entry {
         Entry {
             entry_id: entry_id.to_string(),
@@ -639,6 +719,47 @@ mod tests {
         let got = remote.list_recent(10).unwrap();
         assert_eq!(got.len(), 3);
         assert!(got.iter().any(|e| e.entry_id == "id-3"));
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_sync_reports_partial_multi_peer_failure() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let local_db = dir.path().join("local.db");
+        let remote = LocalStore::open(remote_db.to_str().unwrap()).unwrap();
+        remote
+            .insert_entries(&[entry("id-remote", 1, "echo remote")])
+            .unwrap();
+        let server = start_test_server(remote_db.to_str().unwrap().to_string());
+
+        let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+        let peers = vec![format!("http://{dead_addr}"), server.base_url.clone()];
+
+        let err = sync(
+            &peers,
+            local_db.to_str().unwrap(),
+            false,
+            None,
+            SyncConfig {
+                token: None,
+                allow_insecure_http: false,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("pull peer"));
+        assert_eq!(
+            LocalStore::open(local_db.to_str().unwrap())
+                .unwrap()
+                .list_recent(10)
+                .unwrap()
+                .len(),
+            1,
+            "successful peers should still make progress even though the run reports failure"
+        );
 
         server.shutdown();
     }

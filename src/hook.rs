@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,7 +98,7 @@ pub fn remove_existing_managed_hook_blocks(
             continue;
         }
 
-        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&existing);
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&existing)?;
         if cleaned == existing {
             reports.push(ManagedHookFixReport {
                 rc_file,
@@ -108,7 +109,7 @@ pub fn remove_existing_managed_hook_blocks(
             continue;
         }
 
-        std::fs::write(&rc_file, cleaned)
+        atomic_write_text_preserving_symlink(&rc_file, &cleaned)
             .with_context(|| format!("write rc file: {}", rc_file.display()))?;
         reports.push(ManagedHookFixReport {
             rc_file,
@@ -182,7 +183,7 @@ fn update_managed_hook_block(
         });
     }
 
-    let (cleaned, removed_blocks) = strip_managed_hook_blocks(&existing);
+    let (cleaned, removed_blocks) = strip_managed_hook_blocks(&existing)?;
     let updated = append_managed_block(&cleaned, block);
     if updated == existing {
         return Ok(ManagedHookFixReport {
@@ -199,7 +200,7 @@ fn update_managed_hook_block(
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create rc parent: {}", parent.display()))?;
     }
-    std::fs::write(rc_file, updated)
+    atomic_write_text_preserving_symlink(rc_file, &updated)
         .with_context(|| format!("write rc file: {}", rc_file.display()))?;
     Ok(ManagedHookFixReport {
         rc_file: rc_file.to_path_buf(),
@@ -214,33 +215,56 @@ fn contains_managed_hook_block(content: &str) -> bool {
         || find_line_marker(content, LEGACY_HOOK_START).is_some()
 }
 
-fn strip_managed_hook_blocks(content: &str) -> (String, usize) {
+fn strip_managed_hook_blocks(content: &str) -> Result<(String, usize)> {
+    strip_managed_marker_blocks(
+        content,
+        &[(HOOK_START, HOOK_END), (LEGACY_HOOK_START, LEGACY_HOOK_END)],
+    )
+}
+
+pub(crate) fn strip_managed_marker_blocks(
+    content: &str,
+    marker_pairs: &[(&str, &str)],
+) -> Result<(String, usize)> {
     let mut rest = content;
     let mut output = String::with_capacity(content.len());
     let mut removed = 0;
-    while let Some((start, start_marker, end_marker)) = find_next_managed_block_start(rest) {
+    while let Some((start, marker)) = find_next_line_marker(rest, marker_pairs) {
+        let Some((start_marker, end_marker)) = marker_pairs
+            .iter()
+            .find(|(start_marker, _)| *start_marker == marker)
+            .copied()
+        else {
+            bail!("managed block has unmatched end marker: {marker}");
+        };
         output.push_str(&rest[..start]);
         let after_start_offset = marker_line_end(rest, start, start_marker);
         let after_start = &rest[after_start_offset..];
-        let Some(end) = find_line_marker(after_start, end_marker) else {
-            output.push_str(&rest[start..]);
-            return (output, removed);
+        let Some((end, next_marker)) = find_next_line_marker(after_start, marker_pairs) else {
+            bail!("managed block is missing end marker {end_marker} after {start_marker}");
         };
+        if next_marker != end_marker {
+            bail!(
+                "managed block marker nesting is invalid: expected {end_marker}, found {next_marker}"
+            );
+        }
         let skip = after_start_offset + marker_line_end(after_start, end, end_marker);
         rest = &rest[skip..];
         removed += 1;
     }
     output.push_str(rest);
-    (output, removed)
+    Ok((output, removed))
 }
 
-fn find_next_managed_block_start(content: &str) -> Option<(usize, &'static str, &'static str)> {
-    [(HOOK_START, HOOK_END), (LEGACY_HOOK_START, LEGACY_HOOK_END)]
-        .into_iter()
-        .filter_map(|(start_marker, end_marker)| {
-            find_line_marker(content, start_marker).map(|offset| (offset, start_marker, end_marker))
-        })
-        .min_by_key(|(offset, _, _)| *offset)
+fn find_next_line_marker<'a>(
+    content: &str,
+    marker_pairs: &'a [(&'a str, &'a str)],
+) -> Option<(usize, &'a str)> {
+    marker_pairs
+        .iter()
+        .flat_map(|(start_marker, end_marker)| [*start_marker, *end_marker])
+        .filter_map(|marker| find_line_marker(content, marker).map(|offset| (offset, marker)))
+        .min_by_key(|(offset, _)| *offset)
 }
 
 fn find_line_marker(content: &str, marker: &str) -> Option<usize> {
@@ -271,6 +295,66 @@ fn append_managed_block(existing: &str, block: &str) -> String {
         return block.to_string();
     }
     format!("{}\n\n{}", existing.trim_end(), block)
+}
+
+pub(crate) fn atomic_write_text_preserving_symlink(path: &Path, content: &str) -> Result<()> {
+    let write_path = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => std::fs::canonicalize(path)
+            .with_context(|| format!("resolve symlinked file: {}", path.display()))?,
+        Ok(_) => path.to_path_buf(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => path.to_path_buf(),
+        Err(err) => return Err(err).with_context(|| format!("stat file: {}", path.display())),
+    };
+    let parent = write_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("create file parent: {}", parent.display()))?;
+    let existing_permissions = std::fs::metadata(&write_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let file_name = write_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("rustory-rc");
+    let tmp_path = parent.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
+
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o666);
+        }
+        let mut file = options
+            .open(&tmp_path)
+            .with_context(|| format!("create temporary file: {}", tmp_path.display()))?;
+        file.write_all(content.as_bytes())
+            .with_context(|| format!("write temporary file: {}", tmp_path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("sync temporary file: {}", tmp_path.display()))?;
+        if let Some(permissions) = existing_permissions {
+            std::fs::set_permissions(&tmp_path, permissions)
+                .with_context(|| format!("preserve file permissions: {}", write_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, &write_path).with_context(|| {
+            format!(
+                "atomically replace file: {} -> {}",
+                tmp_path.display(),
+                write_path.display()
+            )
+        })?;
+        if let Ok(parent_dir) = std::fs::File::open(parent) {
+            let _ = parent_dir.sync_all();
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+    result
 }
 
 fn render_managed_source_block(shell: Shell, bin_dir: &Path) -> String {
@@ -750,7 +834,7 @@ wait
         ]
         .join("");
 
-        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content);
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content).unwrap();
 
         assert_eq!(removed_blocks, 2);
         assert!(!cleaned.contains(LEGACY_HOOK_START));
@@ -772,7 +856,7 @@ wait
         let suffix = "\n\nexport KEEP_TOO=1\n\n\n";
         let content = format!("{prefix}{managed}{suffix}");
 
-        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content);
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content).unwrap();
 
         assert_eq!(removed_blocks, 1);
         assert_eq!(cleaned, format!("{prefix}{suffix}"));
@@ -782,10 +866,46 @@ wait
     fn strip_managed_hook_blocks_ignores_quoted_marker_text() {
         let content = format!("echo '{HOOK_START}'\nexport KEEP=1\necho '{HOOK_END}'\n");
 
-        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content);
+        let (cleaned, removed_blocks) = strip_managed_hook_blocks(&content).unwrap();
 
         assert_eq!(removed_blocks, 0);
         assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn strip_managed_hook_blocks_rejects_unmatched_and_nested_markers() {
+        let unmatched = format!("{HOOK_START}\nexport KEEP=1\n");
+        let nested = format!("{HOOK_START}\nexport KEEP=1\n{LEGACY_HOOK_START}\n");
+
+        assert!(strip_managed_hook_blocks(&unmatched).is_err());
+        assert!(strip_managed_hook_blocks(&nested).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_rc_write_preserves_symlink_and_target_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("shared-zshrc");
+        let link = dir.path().join(".zshrc");
+        std::fs::write(&target, "export KEEP=1\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        symlink(&target, &link).unwrap();
+
+        atomic_write_text_preserving_symlink(&link, "export KEEP=2\n").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "export KEEP=2\n");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 
     #[test]

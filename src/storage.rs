@@ -325,9 +325,12 @@ LIMIT ?
         delete_cursor: i64,
         limit: usize,
     ) -> Result<PullBatch> {
-        let entry_batch = self.pull_since_cursor(cursor, limit)?;
         let (deletions, next_delete_cursor) =
             self.pull_deletions_since_cursor(delete_cursor, limit)?;
+        // 삭제 전파를 우선하되 entries+deletions 합계가 transport batch limit을 넘지 않게 한다.
+        // 특히 limit=1에서도 tombstone 하나를 먼저 보낸 뒤 다음 batch에서 entry가 전진해야 한다.
+        let entry_limit = limit.saturating_sub(deletions.len());
+        let entry_batch = self.pull_since_cursor(cursor, entry_limit)?;
         Ok(PullBatch {
             entries: entry_batch.entries,
             next_cursor: entry_batch.next_cursor,
@@ -343,9 +346,10 @@ LIMIT ?
         limit: usize,
         device_id: &str,
     ) -> Result<PullBatch> {
-        let entry_batch = self.pull_since_cursor_for_device(cursor, limit, device_id)?;
         let (deletions, next_delete_cursor) =
             self.pull_deletions_since_cursor_for_device(delete_cursor, limit, device_id)?;
+        let entry_limit = limit.saturating_sub(deletions.len());
+        let entry_batch = self.pull_since_cursor_for_device(cursor, entry_limit, device_id)?;
         Ok(PullBatch {
             entries: entry_batch.entries,
             next_cursor: entry_batch.next_cursor,
@@ -858,65 +862,41 @@ WHERE delete_seq > ?
         keep_recent: usize,
         dry_run: bool,
     ) -> Result<PruneStats> {
-        let keep_floor_seq = self.prune_keep_floor_seq(keep_recent)?;
-        let pushed_floor_seq = self.prune_pushed_floor_seq()?;
+        let keep_recent = i64::try_from(keep_recent).context("keep_recent is too large")?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin prune entries tx")?;
+        let pushed_floor_seq = tx
+            .query_row(
+                "SELECT MIN(last_pushed_seq) FROM peer_push_state",
+                [],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .context("resolve prune pushed floor seq")?;
 
-        let matched: i64 = match (keep_floor_seq, pushed_floor_seq) {
-            (Some(keep_floor_seq), Some(pushed_floor_seq)) => self
-                .conn
-                .query_row(
-                    r#"
+        let matched: i64 = tx
+            .query_row(
+                r#"
+WITH protected AS (
+  SELECT entry_id
+  FROM entries
+  ORDER BY ts DESC, ingest_seq DESC
+  LIMIT ?2
+)
 SELECT COUNT(*)
 FROM entries
-WHERE ts < ?
-  AND ingest_seq < ?
-  AND ingest_seq <= ?
+WHERE ts < ?1
+  AND entry_id NOT IN (SELECT entry_id FROM protected)
+  AND (?3 IS NULL OR ingest_seq <= ?3)
 "#,
-                    params![cutoff_unix, keep_floor_seq, pushed_floor_seq],
-                    |row| row.get(0),
-                )
-                .context("count prune candidates with keep_recent and push floor")?,
-            (Some(keep_floor_seq), None) => self
-                .conn
-                .query_row(
-                    r#"
-SELECT COUNT(*)
-FROM entries
-WHERE ts < ?
-  AND ingest_seq < ?
-"#,
-                    params![cutoff_unix, keep_floor_seq],
-                    |row| row.get(0),
-                )
-                .context("count prune candidates with keep_recent")?,
-            (None, Some(pushed_floor_seq)) => self
-                .conn
-                .query_row(
-                    r#"
-SELECT COUNT(*)
-FROM entries
-WHERE ts < ?
-  AND ingest_seq <= ?
-"#,
-                    params![cutoff_unix, pushed_floor_seq],
-                    |row| row.get(0),
-                )
-                .context("count prune candidates with push floor")?,
-            (None, None) => self
-                .conn
-                .query_row(
-                    r#"
-SELECT COUNT(*)
-FROM entries
-WHERE ts < ?
-"#,
-                    params![cutoff_unix],
-                    |row| row.get(0),
-                )
-                .context("count prune candidates")?,
-        };
+                params![cutoff_unix, keep_recent, pushed_floor_seq],
+                |row| row.get(0),
+            )
+            .context("count prune candidates")?;
 
         if dry_run || matched <= 0 {
+            tx.commit().context("commit prune entries tx")?;
             return Ok(PruneStats {
                 matched: matched.max(0) as usize,
                 deleted: 0,
@@ -924,52 +904,24 @@ WHERE ts < ?
         }
 
         // push cursor가 남아 있는 peer가 있으면, 가장 느린 peer가 아직 못 받은 ingest_seq는 지우지 않는다.
-        let deleted = match (keep_floor_seq, pushed_floor_seq) {
-            (Some(keep_floor_seq), Some(pushed_floor_seq)) => self
-                .conn
-                .execute(
-                    r#"
+        let deleted = tx
+            .execute(
+                r#"
+WITH protected AS (
+  SELECT entry_id
+  FROM entries
+  ORDER BY ts DESC, ingest_seq DESC
+  LIMIT ?2
+)
 DELETE FROM entries
-WHERE ts < ?
-  AND ingest_seq < ?
-  AND ingest_seq <= ?
+WHERE ts < ?1
+  AND entry_id NOT IN (SELECT entry_id FROM protected)
+  AND (?3 IS NULL OR ingest_seq <= ?3)
 "#,
-                    params![cutoff_unix, keep_floor_seq, pushed_floor_seq],
-                )
-                .context("delete pruned entries with keep_recent and push floor")?,
-            (Some(keep_floor_seq), None) => self
-                .conn
-                .execute(
-                    r#"
-DELETE FROM entries
-WHERE ts < ?
-  AND ingest_seq < ?
-"#,
-                    params![cutoff_unix, keep_floor_seq],
-                )
-                .context("delete pruned entries with keep_recent")?,
-            (None, Some(pushed_floor_seq)) => self
-                .conn
-                .execute(
-                    r#"
-DELETE FROM entries
-WHERE ts < ?
-  AND ingest_seq <= ?
-"#,
-                    params![cutoff_unix, pushed_floor_seq],
-                )
-                .context("delete pruned entries with push floor")?,
-            (None, None) => self
-                .conn
-                .execute(
-                    r#"
-DELETE FROM entries
-WHERE ts < ?
-"#,
-                    params![cutoff_unix],
-                )
-                .context("delete pruned entries")?,
-        };
+                params![cutoff_unix, keep_recent, pushed_floor_seq],
+            )
+            .context("delete pruned entries")?;
+        tx.commit().context("commit prune entries tx")?;
 
         Ok(PruneStats {
             matched: matched as usize,
@@ -1334,28 +1286,6 @@ PRAGMA wal_checkpoint(TRUNCATE);
 "#,
             )
             .context("compact sqlite storage")
-    }
-
-    fn prune_keep_floor_seq(&self, keep_recent: usize) -> Result<Option<i64>> {
-        if keep_recent == 0 {
-            return Ok(None);
-        }
-
-        self.conn
-            .query_row(
-                r#"
-SELECT MIN(ingest_seq)
-FROM (
-  SELECT ingest_seq
-  FROM entries
-  ORDER BY ingest_seq DESC
-  LIMIT ?
-)
-"#,
-                params![keep_recent as i64],
-                |row| row.get::<_, Option<i64>>(0),
-            )
-            .context("resolve prune keep_recent floor seq")
     }
 
     fn prune_pushed_floor_seq(&self) -> Result<Option<i64>> {
@@ -2162,6 +2092,35 @@ mod tests {
     }
 
     #[test]
+    fn pull_sync_batch_applies_one_total_limit_and_prioritizes_deletions() {
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .insert_entries(&[
+                entry("id-delete", 1, "echo delete"),
+                entry("id-keep", 2, "echo keep"),
+            ])
+            .unwrap();
+        store
+            .tombstone_entries_by_ids(&["id-delete".to_string()], "user1", "dev1", false)
+            .unwrap();
+
+        let deletion_batch = store.pull_sync_batch(0, 0, 1).unwrap();
+        assert!(deletion_batch.entries.is_empty());
+        assert_eq!(deletion_batch.deletions.len(), 1);
+        assert_eq!(deletion_batch.next_cursor, None);
+        assert_eq!(deletion_batch.next_delete_cursor, Some(1));
+
+        let entry_batch = store
+            .pull_sync_batch(0, deletion_batch.next_delete_cursor.unwrap(), 1)
+            .unwrap();
+        assert_eq!(entry_batch.entries.len(), 1);
+        assert_eq!(entry_batch.entries[0].entry_id, "id-keep");
+        assert!(entry_batch.deletions.is_empty());
+        assert_eq!(entry_batch.next_cursor, Some(2));
+        assert_eq!(entry_batch.next_delete_cursor, None);
+    }
+
+    #[test]
     fn list_recent_orders_by_ts_desc() {
         let store = LocalStore::open(":memory:").unwrap();
 
@@ -2809,6 +2768,28 @@ mod tests {
                 deleted: 0
             }
         );
+    }
+
+    #[test]
+    fn prune_keep_recent_uses_command_time_when_old_history_is_imported_later() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let current = entry("current", 30, "echo current");
+        let imported_old = entry("imported-old", 10, "echo imported old");
+        store.insert_entries(&[current, imported_old]).unwrap();
+
+        let stats = store.prune_entries_older_than(40, 1, false).unwrap();
+        assert_eq!(
+            stats,
+            PruneStats {
+                matched: 1,
+                deleted: 1
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "current");
     }
 
     #[test]

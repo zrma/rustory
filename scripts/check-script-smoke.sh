@@ -23,6 +23,7 @@ closed_work_repo_dir=""
 CLOSED_WORK_FIXTURE_WORK_ID="script-smoke-closed"
 todo_closure_repo_dir=""
 TODO_CLOSURE_WORK_ID="script-smoke-closure"
+release_tree_repo_dir=""
 
 usage() {
   cat <<'USAGE'
@@ -113,6 +114,37 @@ ensure_tmp_root() {
     return 0
   fi
   tmp_root="$(mktemp -d "$ROOT/.tmp-script-smoke.XXXXXX")"
+}
+
+setup_release_tree_fixture() {
+  ensure_tmp_root
+  release_tree_repo_dir="$tmp_root/release-tree-repo"
+  mkdir -p "$release_tree_repo_dir/scripts" "$release_tree_repo_dir/dist/release-v1.2.3"
+  cp "$ROOT/scripts/release-version.sh" "$release_tree_repo_dir/scripts/release-version.sh"
+  chmod +x "$release_tree_repo_dir/scripts/release-version.sh"
+  cat > "$release_tree_repo_dir/Cargo.toml" <<'EOF'
+[package]
+name = "release-tree-fixture"
+version = "1.2.3"
+edition = "2024"
+EOF
+  printf 'dist/\n' > "$release_tree_repo_dir/.gitignore"
+  printf 'main source\n' > "$release_tree_repo_dir/source.txt"
+
+  git -C "$release_tree_repo_dir" init -q -b main
+  git -C "$release_tree_repo_dir" config user.name "script-smoke"
+  git -C "$release_tree_repo_dir" config user.email "script-smoke@example.com"
+  git -C "$release_tree_repo_dir" add .
+  git -C "$release_tree_repo_dir" commit -qm "feat: initialize release tree fixture"
+
+  local asset="$release_tree_repo_dir/dist/release-v1.2.3/rr-$(uname -m | sed 's/^arm64$/aarch64/')-apple-darwin"
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    asset="$release_tree_repo_dir/dist/release-v1.2.3/rr-$(uname -m | sed 's/^arm64$/aarch64/')-unknown-linux-gnu"
+  fi
+  printf '#!/usr/bin/env sh\nexit 0\n' > "$asset"
+  chmod +x "$asset"
+  printf '%064d  %s\n' 0 "$(basename "$asset")" > "$asset.sha256"
+  cp "$asset.sha256" "$release_tree_repo_dir/dist/release-v1.2.3/checksums.txt"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -563,6 +595,15 @@ run_cmd "bash -n scripts/release-version.sh"
 run_cmd "bash -n scripts/smoke_p2p_local.sh"
 run_cmd "bash -n scripts/acceptance_docker_macos_linux.sh"
 run_cmd "scripts/release-version.sh --profile current --skip-upload --dry-run"
+setup_release_tree_fixture
+git -C "$release_tree_repo_dir" checkout -qb divergent
+printf 'divergent source\n' > "$release_tree_repo_dir/source.txt"
+git -C "$release_tree_repo_dir" add source.txt
+git -C "$release_tree_repo_dir" commit -qm "fix: diverge release source"
+expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+git -C "$release_tree_repo_dir" checkout -qb same-tree main
+git -C "$release_tree_repo_dir" commit --allow-empty -qm "chore: empty child"
+run_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
 run_cmd "scripts/check-push-gates.sh --mode quick --dry-run"
 run_cmd "$push_strict_cmd"
 run_debug_override_cmd "ALLOW_MISSING_WORK_ID_IN_CI=0 DEBUG_GATES_OVERRIDE=1 scripts/check-push-gates.sh --mode strict --allow-missing-work-id --dry-run"

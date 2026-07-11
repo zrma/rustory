@@ -6,6 +6,8 @@ use std::io::Read;
 use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
+use crate::terminal::contains_terminal_control;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerMeta {
     pub device_id: Option<String>,
@@ -291,6 +293,9 @@ fn validate_register_meta(meta: &Option<PeerMeta>) -> std::result::Result<(), &'
     {
         if field.len() > MAX_TRACKER_META_FIELD_BYTES {
             return Err("meta field too large\n");
+        }
+        if contains_terminal_control(field) {
+            return Err("meta field must not contain control characters\n");
         }
     }
     Ok(())
@@ -768,6 +773,61 @@ mod tests {
         let err = client.register(&oversized_meta).unwrap_err();
         assert_ureq_status(&err, 400);
 
+        server.shutdown();
+    }
+
+    #[test]
+    fn tracker_rejects_control_characters_in_every_meta_string_field() {
+        let controls = [
+            "bad\x1bdevice",
+            "bad\u{7f}host",
+            "bad\u{85}user",
+            "bad\nversion",
+        ];
+        for field_index in 0..5 {
+            for control in controls {
+                let mut meta = PeerMeta {
+                    device_id: Some("device".to_string()),
+                    hostname: Some("host".to_string()),
+                    user_id: Some("user".to_string()),
+                    version: Some("1.2.3".to_string()),
+                    build_revision: Some("revision".to_string()),
+                    build_dirty: Some(false),
+                };
+                match field_index {
+                    0 => meta.device_id = Some(control.to_string()),
+                    1 => meta.hostname = Some(control.to_string()),
+                    2 => meta.user_id = Some(control.to_string()),
+                    3 => meta.version = Some(control.to_string()),
+                    4 => meta.build_revision = Some(control.to_string()),
+                    _ => unreachable!(),
+                }
+
+                let err = validate_register_meta(&Some(meta)).unwrap_err();
+                assert_eq!(err, "meta field must not contain control characters\n");
+            }
+        }
+    }
+
+    #[test]
+    fn tracker_http_ingress_rejects_terminal_escape_in_meta() {
+        let server = start_test_server(60, None);
+        let client = TrackerClient::new(server.base_url.clone(), None);
+        let req = RegisterRequest {
+            peer_id: PeerId::random().to_string(),
+            addrs: vec![],
+            meta: Some(PeerMeta {
+                device_id: Some("device\x1b]52;c;AAAA\x07".to_string()),
+                hostname: Some("host".to_string()),
+                user_id: Some("user".to_string()),
+                version: Some("1.2.3".to_string()),
+                build_revision: Some("revision".to_string()),
+                build_dirty: Some(false),
+            }),
+        };
+
+        let err = client.register(&req).unwrap_err();
+        assert_ureq_status(&err, 400);
         server.shutdown();
     }
 

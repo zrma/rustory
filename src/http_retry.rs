@@ -9,6 +9,7 @@ pub struct RetryPolicy {
     pub read_base: Duration,
     pub read_cap: Duration,
     pub backoff_base: Duration,
+    pub max_redirects: u32,
 }
 
 impl RetryPolicy {
@@ -21,6 +22,7 @@ impl RetryPolicy {
             read_base: Duration::from_secs(1),
             read_cap: Duration::from_secs(5),
             backoff_base: Duration::from_millis(100),
+            max_redirects: 10,
         }
     }
 
@@ -32,6 +34,9 @@ impl RetryPolicy {
             read_base: Duration::from_secs(3),
             read_cap: Duration::from_secs(30),
             backoff_base: Duration::from_millis(200),
+            // HTTP sync는 command payload를 운반하므로 redirect hop에서 transport
+            // security 검증이 우회되지 않게 base URL 자체만 요청한다.
+            max_redirects: 0,
         }
     }
 }
@@ -55,6 +60,7 @@ where
             .timeout_connect(Some(connect))
             .timeout_recv_response(Some(read))
             .timeout_recv_body(Some(read))
+            .max_redirects(policy.max_redirects)
             .build()
             .into();
 

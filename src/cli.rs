@@ -7,8 +7,8 @@ use rand::RngExt;
 #[cfg(test)]
 use crate::daemon::validate_daemon_preflight_statuses;
 use crate::daemon::{
-    DaemonArgs, build_daemon_child_specs, run_daemon_preflight, sleep_with_stop,
-    spawn_daemon_child, supervise_daemon_children, terminate_daemon_child,
+    DaemonArgs, DaemonChildGuard, build_daemon_child_specs, run_daemon_preflight, sleep_with_stop,
+    supervise_daemon_children,
 };
 #[cfg(test)]
 use crate::runtime_tasks::{
@@ -27,11 +27,12 @@ use crate::runtime_tasks::{
     summarize_auto_prune_runtime, summarize_auto_tombstone_gc_runtime,
 };
 use crate::sync_status::{
-    SyncStatusTrackerReport, build_sync_status_report_for_cli, build_tracker_status_report,
-    tracker_ping,
+    SyncStatusReport, SyncStatusTrackerReport, build_sync_status_report_for_cli,
+    build_tracker_status_report, tracker_ping,
 };
 #[cfg(test)]
 use crate::sync_status::{build_sync_status_report, compute_last_seen_age_sec};
+use crate::terminal::sanitize_one_line;
 use crate::watch_tui::{
     SyncStatusWatchState, render_mesh_watch_frame, render_sync_status_watch_frame,
 };
@@ -1387,73 +1388,7 @@ pub fn run() -> Result<()> {
                 return Ok(());
             }
 
-            println!("local ingest head: {}", report.local_head);
-            println!("local device id: {}", report.local_device_id);
-            for warning in &report.warnings {
-                println!("warning={} message={}", warning.code, warning.message);
-            }
-
-            if report.peers.is_empty() {
-                if let Some(peer_id) = peer.as_deref() {
-                    println!("peer sync state: no state for peer '{peer_id}'");
-                } else {
-                    println!("peer sync state: (empty)");
-                }
-            } else {
-                for status in &report.peers {
-                    let last_seen = status
-                        .last_seen_unix
-                        .map(|ts| ts.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    let last_seen_age = status
-                        .last_seen_age_sec
-                        .map(|age| age.to_string())
-                        .unwrap_or_else(|| "-".to_string());
-                    println!(
-                        "peer={} device={} hostname={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={} rr_version={}",
-                        status.peer_id,
-                        status.peer_device_id.as_deref().unwrap_or("-"),
-                        status.peer_hostname.as_deref().unwrap_or("-"),
-                        status.pull_cursor,
-                        status.pull_delete_cursor,
-                        status.push_cursor,
-                        status.push_delete_cursor,
-                        status.outbound_push_pending,
-                        status.outbound_push_pending_entries,
-                        status.outbound_push_pending_deletions,
-                        status.pending_push,
-                        status.pending_push_entries,
-                        status.pending_push_deletions,
-                        last_seen,
-                        last_seen_age,
-                        status.peer_rr_version.as_deref().unwrap_or("-")
-                    );
-                }
-            }
-
-            if let Some(trackers) = &report.tracker_status {
-                if trackers.is_empty() {
-                    println!("tracker status: (none)");
-                } else {
-                    for tracker in trackers {
-                        let latency = tracker
-                            .latency_ms
-                            .map(|ms| ms.to_string())
-                            .unwrap_or_else(|| "-".to_string());
-                        if let Some(error) = &tracker.error {
-                            println!(
-                                "tracker={} reachable={} latency_ms={} error={error}",
-                                tracker.base_url, tracker.reachable, latency
-                            );
-                        } else {
-                            println!(
-                                "tracker={} reachable={} latency_ms={}",
-                                tracker.base_url, tracker.reachable, latency
-                            );
-                        }
-                    }
-                }
-            }
+            print_sync_status_text(&report, peer.as_deref(), io::stdout())?;
         }
         Command::Mesh {
             watch,
@@ -1778,6 +1713,103 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn print_sync_status_text(
+    report: &SyncStatusReport,
+    peer_filter: Option<&str>,
+    mut out: impl Write,
+) -> Result<()> {
+    writeln!(out, "local ingest head: {}", report.local_head)?;
+    writeln!(
+        out,
+        "local device id: {}",
+        sanitize_one_line(&report.local_device_id)
+    )?;
+    for warning in &report.warnings {
+        writeln!(
+            out,
+            "warning={} message={}",
+            sanitize_one_line(&warning.code),
+            sanitize_one_line(&warning.message)
+        )?;
+    }
+
+    if report.peers.is_empty() {
+        if let Some(peer_id) = peer_filter {
+            writeln!(
+                out,
+                "peer sync state: no state for peer '{}'",
+                sanitize_one_line(peer_id)
+            )?;
+        } else {
+            writeln!(out, "peer sync state: (empty)")?;
+        }
+    } else {
+        for status in &report.peers {
+            let last_seen = status
+                .last_seen_unix
+                .map(|ts| ts.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            let last_seen_age = status
+                .last_seen_age_sec
+                .map(|age| age.to_string())
+                .unwrap_or_else(|| "-".to_string());
+            writeln!(
+                out,
+                "peer={} device={} hostname={} pull_cursor={} pull_delete_cursor={} push_cursor={} push_delete_cursor={} outbound_push_pending={} outbound_push_pending_entries={} outbound_push_pending_deletions={} pending_push={} pending_push_entries={} pending_push_deletions={} last_seen_unix={} last_seen_age_sec={} rr_version={}",
+                sanitize_one_line(&status.peer_id),
+                sanitize_one_line(status.peer_device_id.as_deref().unwrap_or("-")),
+                sanitize_one_line(status.peer_hostname.as_deref().unwrap_or("-")),
+                status.pull_cursor,
+                status.pull_delete_cursor,
+                status.push_cursor,
+                status.push_delete_cursor,
+                status.outbound_push_pending,
+                status.outbound_push_pending_entries,
+                status.outbound_push_pending_deletions,
+                status.pending_push,
+                status.pending_push_entries,
+                status.pending_push_deletions,
+                last_seen,
+                last_seen_age,
+                sanitize_one_line(status.peer_rr_version.as_deref().unwrap_or("-"))
+            )?;
+        }
+    }
+
+    if let Some(trackers) = &report.tracker_status {
+        if trackers.is_empty() {
+            writeln!(out, "tracker status: (none)")?;
+        } else {
+            for tracker in trackers {
+                let latency = tracker
+                    .latency_ms
+                    .map(|ms| ms.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                if let Some(error) = &tracker.error {
+                    writeln!(
+                        out,
+                        "tracker={} reachable={} latency_ms={} error={}",
+                        sanitize_one_line(&tracker.base_url),
+                        tracker.reachable,
+                        latency,
+                        sanitize_one_line(error)
+                    )?;
+                } else {
+                    writeln!(
+                        out,
+                        "tracker={} reachable={} latency_ms={}",
+                        sanitize_one_line(&tracker.base_url),
+                        tracker.reachable,
+                        latency
+                    )?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn can_continue_after_config_load_error(cmd: &Command) -> bool {
     matches!(
         cmd,
@@ -1849,7 +1881,7 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         "daemon: starting p2p-serve and p2p-sync watch (push={})",
         !args.pull_only
     );
-    let mut serve = spawn_daemon_child(
+    let mut serve = DaemonChildGuard::spawn(
         "p2p-serve",
         &exe,
         &specs.serve_args,
@@ -1861,21 +1893,25 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         stop.as_ref(),
     );
     if stop.load(Ordering::SeqCst) {
-        terminate_daemon_child("p2p-serve", &mut serve)?;
+        serve.terminate()?;
         return Ok(());
     }
-    if let Some(status) = serve.try_wait().context("poll p2p-serve child")? {
+    if let Some(status) = serve
+        .child_mut()
+        .try_wait()
+        .context("poll p2p-serve child")?
+    {
         anyhow::bail!("daemon child p2p-serve exited before sync start: {status}");
     }
 
-    let mut sync = spawn_daemon_child(
+    let mut sync = DaemonChildGuard::spawn(
         "p2p-sync",
         &exe,
         &specs.sync_args,
         specs.tracker_token_env.as_deref(),
     )?;
 
-    supervise_daemon_children(&mut serve, &mut sync, stop.as_ref())
+    supervise_daemon_children(serve.child_mut(), sync.child_mut(), stop.as_ref())
 }
 
 fn run_daemon_preflight_if_requested(
@@ -5275,6 +5311,66 @@ mod tests {
         assert!(json.contains("\"push_delete_cursor\""));
         assert!(json.contains("\"last_seen_unix\""));
         assert!(json.contains("\"last_seen_age_sec\""));
+    }
+
+    #[test]
+    fn sync_status_text_escapes_controls_without_mutating_report_values() {
+        let report = SyncStatusReport {
+            local_head: 7,
+            local_device_id: "local\x1b]52;c;LOCAL\x07".to_string(),
+            peers: vec![crate::sync_status::SyncStatusPeerReport {
+                peer_id: "peer-a".to_string(),
+                peer_device_id: Some("device\x1b[2J".to_string()),
+                peer_hostname: Some("host\nnext".to_string()),
+                peer_rr_version: Some("1.2.3\u{85}".to_string()),
+                pull_cursor: 1,
+                pull_delete_cursor: 2,
+                push_cursor: 3,
+                push_delete_cursor: 4,
+                outbound_push_pending: 5,
+                outbound_push_pending_entries: 3,
+                outbound_push_pending_deletions: 2,
+                pending_push: 5,
+                pending_push_entries: 3,
+                pending_push_deletions: 2,
+                last_seen_unix: Some(6),
+                last_seen_age_sec: Some(1),
+            }],
+            warnings: vec![crate::sync_status::SyncStatusWarning {
+                code: "warn\u{7f}".to_string(),
+                message: "first\rsecond".to_string(),
+                peer_ids: Vec::new(),
+                device_ids: Vec::new(),
+                hostnames: Vec::new(),
+            }],
+            tracker_status: Some(vec![SyncStatusTrackerReport {
+                base_url: "https://tracker\x1b[2J".to_string(),
+                reachable: false,
+                latency_ms: None,
+                error: Some("failure\nnext\x07".to_string()),
+            }]),
+        };
+
+        let mut output = Vec::new();
+        print_sync_status_text(&report, None, &mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert!(!output.contains('\x1b'), "{output:?}");
+        assert!(!output.contains('\x07'), "{output:?}");
+        assert!(!output.contains('\u{7f}'), "{output:?}");
+        assert!(!output.contains('\u{85}'), "{output:?}");
+        assert!(output.contains("local\\x1b]52;c;LOCAL\\x07"), "{output}");
+        assert!(output.contains("hostname=host next"), "{output}");
+        assert!(output.contains("rr_version=1.2.3\\u{85}"), "{output}");
+        assert!(output.contains("error=failure next\\x07"), "{output}");
+
+        assert!(report.local_device_id.contains('\x1b'));
+        assert!(
+            report.peers[0]
+                .peer_rr_version
+                .as_deref()
+                .unwrap()
+                .contains('\u{85}')
+        );
     }
 
     #[test]

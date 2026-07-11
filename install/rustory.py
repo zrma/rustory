@@ -19,6 +19,7 @@ import hashlib
 import ipaddress
 import os
 import platform
+import re
 import signal
 import stat
 import subprocess
@@ -80,8 +81,7 @@ def main() -> int:
         raise SystemExit(f"checksum mismatch: expected {expected}, actual {actual}")
     print(f"checksum=ok sha256={actual}")
 
-    install_binary(data, install_path)
-    verify_binary(install_path)
+    install_binary(data, install_path, requested_version=args.version)
 
     if args.swarm_key_source or args.swarm_key_b64:
         install_swarm_key(install_path, args)
@@ -354,10 +354,11 @@ def normalize_sha256(value: str) -> str:
     return value
 
 
-def install_binary(data: bytes, install_path: Path) -> None:
+def install_binary(data: bytes, install_path: Path, requested_version: str | None = None) -> None:
     install_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         if install_path.exists() and install_path.read_bytes() == data:
+            verify_binary(install_path, requested_version=requested_version)
             print(f"binary=unchanged path={install_path}")
             return
     except OSError:
@@ -371,14 +372,16 @@ def install_binary(data: bytes, install_path: Path) -> None:
             file.flush()
             os.fsync(file.fileno())
         tmp_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+        verify_binary(tmp_path, requested_version=requested_version)
         os.replace(tmp_path, install_path)
+        fsync_directory(install_path.parent)
         print(f"binary=updated path={install_path}")
     finally:
         if tmp_path.exists():
             tmp_path.unlink()
 
 
-def verify_binary(install_path: Path) -> None:
+def verify_binary(install_path: Path, requested_version: str | None = None) -> None:
     try:
         output = subprocess.run(
             [str(install_path), "version"],
@@ -386,7 +389,10 @@ def verify_binary(install_path: Path) -> None:
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=15,
         )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SystemExit(f"binary_check=failed path={install_path} detail={exc}") from exc
     except subprocess.CalledProcessError as exc:
         print(f"binary_check=failed exit_code={exc.returncode}", file=sys.stderr)
         if exc.stdout:
@@ -398,7 +404,46 @@ def verify_binary(install_path: Path) -> None:
         raise SystemExit(exc.returncode) from exc
 
     first_line = output.stdout.splitlines()[0] if output.stdout.splitlines() else "version output unavailable"
+    expected_version = pinned_semver(requested_version)
+    if expected_version is not None:
+        actual_version = parse_rr_version_output(output.stdout)
+        if actual_version != expected_version:
+            raise SystemExit(
+                "binary_check=failed reason=version_mismatch "
+                f"expected={expected_version} actual={actual_version or 'missing'}"
+            )
     print(f"binary_check={first_line}")
+
+
+def pinned_semver(value: str | None) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if value == "latest":
+        return None
+    normalized = value[1:] if value.startswith("v") else value
+    if re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?", normalized) is None:
+        return None
+    return normalized
+
+
+def parse_rr_version_output(output: str) -> str | None:
+    for line in output.splitlines():
+        if line.startswith("version:"):
+            version = line.removeprefix("version:").strip()
+            return version or None
+    return None
+
+
+def fsync_directory(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def install_swarm_key(install_path: Path, args: argparse.Namespace) -> None:
@@ -709,13 +754,13 @@ def start_background_daemon(daemon_args: list[str], restart: bool = False) -> No
     pid_path = state_dir / "daemon.pid"
     log_path = state_dir / "daemon.log"
 
-    existing_pid = read_pid_file(pid_path)
-    if existing_pid and pid_is_running(existing_pid):
+    existing_pid = validated_background_pid(pid_path, Path(daemon_args[0]))
+    if existing_pid is not None:
         if not restart:
             print(f"daemon=started manager=background status=already_running pid={existing_pid} log={log_path}")
             return
         print(f"daemon=stopping manager=background pid={existing_pid}")
-        stop_background_daemon(existing_pid)
+        stop_background_daemon(existing_pid, Path(daemon_args[0]))
     if restart:
         stopped = stop_stale_background_daemon_processes(Path(daemon_args[0]))
         if stopped:
@@ -751,19 +796,21 @@ def start_background_daemon(daemon_args: list[str], restart: bool = False) -> No
     print("daemon=start_note manager=background persistence=until_process_exit_or_reboot")
 
 
-def stop_background_daemon(pid: int) -> None:
+def stop_background_daemon(pid: int, install_path: Path) -> None:
     signal_background_process(pid, signal.SIGTERM)
 
     deadline = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if not pid_is_running(pid):
+        if not background_pid_matches_install(pid, install_path):
             return
         time.sleep(0.1)
 
+    if not background_pid_matches_install(pid, install_path):
+        return
     signal_background_process(pid, signal.SIGKILL)
     deadline = time.monotonic() + 2
     while time.monotonic() < deadline:
-        if not pid_is_running(pid):
+        if not background_pid_matches_install(pid, install_path):
             return
         time.sleep(0.1)
 
@@ -795,7 +842,8 @@ def stop_stale_background_daemon_processes(install_path: Path) -> int:
         return 0
 
     current_pid = os.getpid()
-    targets: list[int] = []
+    child_targets: list[int] = []
+    daemon_targets: list[int] = []
     for child in proc_dir.iterdir():
         if not child.name.isdigit():
             continue
@@ -803,24 +851,24 @@ def stop_stale_background_daemon_processes(install_path: Path) -> int:
         if pid == current_pid or not proc_is_current_user(pid):
             continue
         cmdline = read_proc_cmdline(pid)
-        if not is_managed_background_cmdline(cmdline):
+        if not (proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path)):
             continue
-        if (
-            proc_exe_matches(pid, install_path)
-            or cmdline_exe_matches(cmdline, install_path)
-            or cmdline_looks_like_default_rustory_background(cmdline)
-        ):
-            targets.append(pid)
+        kind = managed_background_cmdline_kind(cmdline)
+        if kind == "daemon":
+            daemon_targets.append(pid)
+        elif kind == "child" and process_has_managed_daemon_ancestor(pid, install_path):
+            child_targets.append(pid)
 
     stopped = 0
-    for pid in sorted(set(targets)):
-        if not pid_is_running(pid):
+    targets = sorted(set(child_targets)) + sorted(set(daemon_targets))
+    for pid in targets:
+        if not managed_process_matches_install(pid, install_path):
             continue
         signal_background_process(pid, signal.SIGTERM)
         deadline = time.monotonic() + 2
-        while time.monotonic() < deadline and pid_is_running(pid):
+        while time.monotonic() < deadline and managed_process_matches_install(pid, install_path):
             time.sleep(0.1)
-        if pid_is_running(pid):
+        if managed_process_matches_install(pid, install_path):
             try:
                 signal_background_process(pid, signal.SIGKILL)
             except SystemExit:
@@ -861,19 +909,6 @@ def cmdline_exe_matches(cmdline: list[str], install_path: Path) -> bool:
     return bool(cmdline) and paths_match_after_deleted_suffix(Path(cmdline[0]), install_path)
 
 
-def cmdline_looks_like_default_rustory_background(cmdline: list[str]) -> bool:
-    if not cmdline_rr_basename_is_rr(cmdline) or not is_managed_background_cmdline(cmdline):
-        return False
-    if "daemon" in cmdline:
-        return "--interval-sec" in cmdline or "--start-jitter-sec" in cmdline
-    has_watch_child = ("p2p-serve" in cmdline or "p2p-sync" in cmdline) and "--watch" in cmdline
-    return has_watch_child and cmdline_has_default_rustory_db_path(cmdline)
-
-
-def cmdline_rr_basename_is_rr(cmdline: list[str]) -> bool:
-    return bool(cmdline) and Path(cmdline[0]).name == "rr"
-
-
 def cmdline_has_default_rustory_db_path(cmdline: list[str]) -> bool:
     for idx, arg in enumerate(cmdline[:-1]):
         if arg == "--db-path" and is_default_rustory_db_path(cmdline[idx + 1]):
@@ -897,8 +932,27 @@ def strip_deleted_suffix(value: str) -> str:
     return value[:-10] if value.endswith(" (deleted)") else value
 
 
-def is_managed_background_cmdline(cmdline: list[str]) -> bool:
-    return any(arg in ("daemon", "p2p-serve", "p2p-sync") for arg in cmdline)
+def managed_background_cmdline_kind(cmdline: list[str]) -> str | None:
+    if "daemon" in cmdline:
+        if "--interval-sec" in cmdline and "--start-jitter-sec" in cmdline:
+            return "daemon"
+        return None
+    if "p2p-sync" in cmdline:
+        if "--watch" in cmdline and cmdline_has_default_rustory_db_path(cmdline):
+            return "child"
+        return None
+    if "p2p-serve" in cmdline:
+        if cmdline_has_default_rustory_db_path(cmdline):
+            return "child"
+        return None
+    return None
+
+
+def is_managed_background_cmdline(
+    cmdline: list[str], has_managed_daemon_ancestor: bool = False
+) -> bool:
+    kind = managed_background_cmdline_kind(cmdline)
+    return kind == "daemon" or (kind == "child" and has_managed_daemon_ancestor)
 
 
 def install_background_daemon_autostart(daemon_args: list[str], args: argparse.Namespace) -> None:
@@ -975,6 +1029,67 @@ def read_pid_file(path: Path) -> int | None:
     try:
         return int(raw)
     except ValueError:
+        return None
+
+
+def validated_background_pid(pid_path: Path, install_path: Path) -> int | None:
+    pid = read_pid_file(pid_path)
+    if pid is None or not pid_is_running(pid):
+        return None
+    if background_pid_matches_install(pid, install_path):
+        return pid
+    print(
+        f"warn: daemon pid file is stale; refusing to signal unrelated pid={pid} path={pid_path}"
+    )
+    try:
+        pid_path.unlink()
+    except FileNotFoundError:
+        pass
+    return None
+
+
+def background_pid_matches_install(pid: int, install_path: Path) -> bool:
+    if sys.platform != "linux" or not proc_is_current_user(pid):
+        return False
+    cmdline = read_proc_cmdline(pid)
+    if managed_background_cmdline_kind(cmdline) != "daemon":
+        return False
+    return proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path)
+
+
+def managed_process_matches_install(pid: int, install_path: Path) -> bool:
+    if sys.platform != "linux" or not proc_is_current_user(pid):
+        return False
+    cmdline = read_proc_cmdline(pid)
+    if not (proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path)):
+        return False
+    kind = managed_background_cmdline_kind(cmdline)
+    if kind == "daemon":
+        return True
+    return kind == "child" and process_has_managed_daemon_ancestor(pid, install_path)
+
+
+def process_has_managed_daemon_ancestor(pid: int, install_path: Path) -> bool:
+    for _ in range(64):
+        parent_pid = read_proc_parent_pid(pid)
+        if parent_pid is None or parent_pid <= 1 or parent_pid == pid:
+            return False
+        parent_cmdline = read_proc_cmdline(parent_pid)
+        if managed_background_cmdline_kind(parent_cmdline) == "daemon" and (
+            proc_exe_matches(parent_pid, install_path)
+            or cmdline_exe_matches(parent_cmdline, install_path)
+        ):
+            return True
+        pid = parent_pid
+    return False
+
+
+def read_proc_parent_pid(pid: int) -> int | None:
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        after_comm = stat_text.rsplit(") ", 1)[1]
+        return int(after_comm.split()[1])
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -1095,7 +1210,7 @@ def cleanup_hishtory_file(path: Path) -> bool:
     text = "\n".join(cleaned)
     if text and had_final_newline:
         text += "\n"
-    path.write_text(text)
+    atomic_write_text(path, text)
     return True
 
 
@@ -1223,30 +1338,42 @@ def update_managed_block(
     )
     prefix = cleaned.rstrip() + "\n\n" if cleaned.strip() else ""
     updated = prefix + block
-    rc_file.write_text(updated)
+    atomic_write_text(rc_file, updated)
     return removed_blocks
 
 
 def strip_managed_blocks(content: str, marker_pairs: tuple[tuple[str, str], ...]) -> tuple[str, int]:
+    lines = content.splitlines(keepends=True)
     output: list[str] = []
-    rest = content
+    index = 0
     removed_blocks = 0
-    while True:
-        found = find_next_managed_block_start(rest, marker_pairs)
-        if found is None:
-            output.append(rest)
-            break
-        start, start_marker, end_marker = found
-        output.append(rest[:start])
-        after_start = rest[start + len(start_marker) :]
-        end = after_start.find(end_marker)
-        if end == -1:
-            output.append(rest[start:])
-            break
-        skip = start + len(start_marker) + end + len(end_marker)
-        if rest[skip:].startswith("\n"):
-            skip += 1
-        rest = rest[skip:]
+    marker_by_start = dict(marker_pairs)
+    all_markers = {marker for pair in marker_pairs for marker in pair}
+
+    while index < len(lines):
+        line_value = lines[index].rstrip("\r\n")
+        end_marker = marker_by_start.get(line_value)
+        if end_marker is None:
+            output.append(lines[index])
+            index += 1
+            continue
+
+        end_index = index + 1
+        while end_index < len(lines):
+            candidate = lines[end_index].rstrip("\r\n")
+            if candidate == end_marker:
+                break
+            if candidate in all_markers:
+                raise SystemExit(
+                    "managed_block=failed reason=malformed_nested_marker "
+                    f"start={line_value} marker={candidate}"
+                )
+            end_index += 1
+        if end_index >= len(lines):
+            raise SystemExit(
+                f"managed_block=failed reason=missing_end_marker start={line_value} expected={end_marker}"
+            )
+        index = end_index + 1
         removed_blocks += 1
     return trim_repeated_blank_lines_text("".join(output)), removed_blocks
 
@@ -1263,6 +1390,36 @@ def find_next_managed_block_start(
         if found is None or start < found[0]:
             found = (start, start_marker, end_marker)
     return found
+
+
+def atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_path = path.resolve(strict=False) if path.is_symlink() else path
+    write_path.parent.mkdir(parents=True, exist_ok=True)
+    existing_mode: int | None = None
+    try:
+        existing_mode = stat.S_IMODE(write_path.stat().st_mode)
+    except FileNotFoundError:
+        pass
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{write_path.name}.", dir=str(write_path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as file:
+            file.write(content)
+            file.flush()
+            os.fsync(file.fileno())
+        if existing_mode is not None:
+            os.chmod(tmp_path, existing_mode)
+        else:
+            current_umask = os.umask(0)
+            os.umask(current_umask)
+            os.chmod(tmp_path, 0o666 & ~current_umask)
+        os.replace(tmp_path, write_path)
+        fsync_directory(write_path.parent)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def trim_repeated_blank_lines_text(content: str) -> str:

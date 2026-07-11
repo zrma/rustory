@@ -35,6 +35,53 @@ pub(crate) struct DaemonChildSpecs {
     pub(crate) tracker_token_env: Option<String>,
 }
 
+pub(crate) struct DaemonChildGuard {
+    label: String,
+    child: Child,
+}
+
+impl DaemonChildGuard {
+    pub(crate) fn spawn(
+        label: &str,
+        exe: &Path,
+        args: &[String],
+        tracker_token_env: Option<&str>,
+    ) -> Result<Self> {
+        let child = spawn_daemon_child(label, exe, args, tracker_token_env)?;
+        Ok(Self {
+            label: label.to_string(),
+            child,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_child(label: &str, child: Child) -> Self {
+        Self {
+            label: label.to_string(),
+            child,
+        }
+    }
+
+    pub(crate) fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    pub(crate) fn terminate(&mut self) -> Result<()> {
+        terminate_daemon_child(&self.label, &mut self.child)
+    }
+}
+
+impl Drop for DaemonChildGuard {
+    fn drop(&mut self) {
+        if let Err(err) = terminate_daemon_child(&self.label, &mut self.child) {
+            eprintln!(
+                "warn: failed to clean up daemon child {} during scope exit: {err:#}",
+                self.label
+            );
+        }
+    }
+}
+
 pub(crate) fn run_daemon_preflight(trackers: &[String], tracker_token: Option<&str>) -> Result<()> {
     eprintln!("daemon preflight: ping {} tracker(s)", trackers.len());
     let statuses = build_tracker_status_report(trackers, tracker_token);
@@ -305,5 +352,26 @@ mod tests {
     fn sleep_with_stop_handles_unrepresentable_duration_when_already_stopped() {
         let stop = AtomicBool::new(true);
         sleep_with_stop(Duration::MAX, &stop);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_child_guard_terminates_and_reaps_on_injected_error_return() {
+        fn fail_after_spawn(child: Child) -> Result<()> {
+            let _guard = DaemonChildGuard::from_child("failure-injection", child);
+            anyhow::bail!("injected startup failure")
+        }
+
+        let child = ProcessCommand::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        let err = fail_after_spawn(child).unwrap_err();
+        assert!(err.to_string().contains("injected startup failure"));
+
+        let rc = unsafe { libc::kill(pid, 0) };
+        assert_eq!(rc, -1, "child process {pid} is still alive");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
     }
 }

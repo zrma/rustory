@@ -16,6 +16,7 @@ mod self_update;
 mod storage;
 mod sync;
 mod sync_status;
+mod terminal;
 mod tracker;
 mod transport;
 mod uninstall;

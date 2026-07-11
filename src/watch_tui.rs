@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::sync_status::{SyncStatusPeerReport, SyncStatusReport, SyncStatusTrackerReport};
+use crate::terminal::sanitize_one_line;
 
 #[derive(Default)]
 pub(crate) struct SyncStatusWatchState {
@@ -1781,8 +1782,9 @@ fn right_cell(value: &str, width: usize) -> String {
 }
 
 fn truncate_display(value: &str, max_width: usize) -> String {
-    if unicode_width::UnicodeWidthStr::width(value) <= max_width {
-        return value.to_string();
+    let value = sanitize_one_line(value);
+    if unicode_width::UnicodeWidthStr::width(value.as_str()) <= max_width {
+        return value;
     }
     if max_width == 0 {
         return String::new();
@@ -1918,6 +1920,29 @@ mod tests {
         let cell = fit_peer_rr_version_cell(view, 16);
         assert_eq!(unicode_width::UnicodeWidthStr::width(cell.as_str()), 16);
         assert!(cell.ends_with("[0.0.1!]"), "{cell}");
+    }
+
+    #[test]
+    fn watch_frames_escape_cached_peer_and_tracker_control_characters() {
+        let mut state = SyncStatusWatchState::default();
+        let mut report = unsorted_watch_report();
+        report.local_device_id = "local\x1b]52;c;LOCAL\x07".to_string();
+        report.peers[0].peer_device_id = Some("peer\x1b[2J\u{85}".to_string());
+        report.peers[0].peer_rr_version = Some("1.2.3\x1b]52;c;PEER\x07".to_string());
+        report.tracker_status = Some(vec![SyncStatusTrackerReport {
+            base_url: "https://tracker\x1b[2J".to_string(),
+            reachable: false,
+            latency_ms: None,
+            error: Some("failed\nnext\u{7f}".to_string()),
+        }]);
+
+        let frame = render_sync_status_watch_frame(&mut state, &report, Instant::now(), 160);
+        assert!(!frame.contains('\x1b'), "{frame:?}");
+        assert!(!frame.contains('\x07'), "{frame:?}");
+        assert!(!frame.contains('\u{7f}'), "{frame:?}");
+        assert!(!frame.contains('\u{85}'), "{frame:?}");
+        assert!(frame.contains("\\x1b"), "{frame}");
+        assert!(frame.contains("failed next\\x7f"), "{frame}");
     }
 
     #[test]
