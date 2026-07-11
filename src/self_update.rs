@@ -576,6 +576,16 @@ pub fn stop_managed_daemon(install_path: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+pub fn stop_background_daemon_for_systemd_transition(install_path: &Path) -> Result<()> {
+    match stop_background_daemon(install_path) {
+        DaemonRestartStatus::Restarted | DaemonRestartStatus::Skipped => Ok(()),
+        DaemonRestartStatus::Failed(error) => anyhow::bail!(
+            "failed to stop installer-managed background daemon before systemd-user takeover: {error}"
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn stop_stale_managed_rr_processes_before_restart(install_path: &Path) {
     match stop_stale_background_rr_processes(install_path) {
         Ok(0) => {}
@@ -780,7 +790,10 @@ fn remove_legacy_systemd_user_units() -> std::result::Result<usize, String> {
 
 #[cfg(target_os = "linux")]
 fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
-    let state_dir = rustory_state_dir();
+    let state_dir = match rustory_state_dir() {
+        Ok(path) => path,
+        Err(error) => return DaemonRestartStatus::Failed(error),
+    };
     let pid_path = state_dir.join("daemon.pid");
     let mut pid = read_pid_file(&pid_path);
     let mut stopped = false;
@@ -840,7 +853,16 @@ fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
 
 #[cfg(target_os = "linux")]
 fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRestartStatus {
-    let state_dir = rustory_state_dir();
+    let state_dir = match rustory_state_dir() {
+        Ok(path) => path,
+        Err(error) => return DaemonRestartStatus::Failed(error),
+    };
+    let Some(state_home) = state_dir.parent() else {
+        return DaemonRestartStatus::Failed(format!(
+            "managed state dir has no parent: {}",
+            state_dir.display()
+        ));
+    };
     let pid_path = state_dir.join("daemon.pid");
     let log_path = state_dir.join("daemon.log");
     let mut pid = read_pid_file(&pid_path);
@@ -914,6 +936,8 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
         .arg("--start-jitter-sec")
         .arg("10")
         .current_dir(home_dir())
+        .env("XDG_STATE_HOME", state_home)
+        .env("RUSTORY_DAEMON_MANAGER", "background")
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr));
@@ -963,11 +987,22 @@ fn home_dir() -> PathBuf {
 }
 
 #[cfg(target_os = "linux")]
-fn rustory_state_dir() -> PathBuf {
-    std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".local/state"))
-        .join("rustory")
+fn rustory_state_dir() -> std::result::Result<PathBuf, String> {
+    let state_home = match crate::uninstall::load_managed_state_home() {
+        Ok(Some(path)) => path,
+        Ok(None) => std::env::var_os("XDG_STATE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".local/state")),
+        Err(error) => return Err(format!("load managed state home: {error:#}")),
+    };
+    if !state_home.is_absolute() {
+        return Err(format!(
+            "managed XDG_STATE_HOME must be absolute: {}",
+            state_home.display()
+        ));
+    }
+    Ok(state_home.join("rustory"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1037,8 +1072,7 @@ fn stop_stale_background_rr_processes(install_path: &Path) -> std::io::Result<us
         let Some(cmdline) = read_proc_cmdline(pid) else {
             continue;
         };
-        if !(process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path))
-        {
+        if !process_exe_matches(pid, install_path) || !process_has_background_manager_env(pid) {
             continue;
         }
         match managed_background_cmdline_kind(&cmdline) {
@@ -1107,6 +1141,16 @@ fn process_exe_matches(pid: u32, install_path: &Path) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn process_has_background_manager_env(pid: u32) -> bool {
+    let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ")) else {
+        return false;
+    };
+    environ
+        .split(|byte| *byte == 0)
+        .any(|entry| entry == b"RUSTORY_DAEMON_MANAGER=background")
+}
+
+#[cfg(target_os = "linux")]
 fn background_pid_matches_install(pid: u32, install_path: &Path) -> bool {
     if !process_is_current_user(pid) {
         return false;
@@ -1114,8 +1158,11 @@ fn background_pid_matches_install(pid: u32, install_path: &Path) -> bool {
     let Some(cmdline) = read_proc_cmdline(pid) else {
         return false;
     };
+    // The caller obtained this PID from the private installer-owned pid file.
+    // Accept that provenance for migration from older updater children that did
+    // not yet carry RUSTORY_DAEMON_MANAGER; broad /proc scans require the marker.
     managed_background_cmdline_kind(&cmdline) == Some(ManagedBackgroundCmdlineKind::Daemon)
-        && (process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path))
+        && process_exe_matches(pid, install_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -1126,7 +1173,7 @@ fn managed_process_matches_install(pid: u32, install_path: &Path) -> bool {
     let Some(cmdline) = read_proc_cmdline(pid) else {
         return false;
     };
-    if !(process_exe_matches(pid, install_path) || cmdline_exe_matches(&cmdline, install_path)) {
+    if !process_exe_matches(pid, install_path) || !process_has_background_manager_env(pid) {
         return false;
     }
     match managed_background_cmdline_kind(&cmdline) {
@@ -1152,8 +1199,8 @@ fn process_has_managed_daemon_ancestor(mut pid: u32, install_path: &Path) -> boo
         };
         if managed_background_cmdline_kind(&parent_cmdline)
             == Some(ManagedBackgroundCmdlineKind::Daemon)
-            && (process_exe_matches(parent_pid, install_path)
-                || cmdline_exe_matches(&parent_cmdline, install_path))
+            && process_exe_matches(parent_pid, install_path)
+            && process_has_background_manager_env(parent_pid)
         {
             return true;
         }
@@ -1167,14 +1214,6 @@ fn read_proc_parent_pid(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let after_comm = stat.rsplit_once(") ")?.1;
     after_comm.split_whitespace().nth(1)?.parse().ok()
-}
-
-#[cfg(any(target_os = "linux", test))]
-fn cmdline_exe_matches(cmdline: &[String], install_path: &Path) -> bool {
-    cmdline
-        .first()
-        .map(|exe| paths_match_after_deleted_suffix(Path::new(exe), install_path))
-        .unwrap_or(false)
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1722,13 +1761,6 @@ mod tests {
         ));
         assert!(!paths_match_after_deleted_suffix(
             Path::new("/home/user/.local/bin/other"),
-            Path::new("/home/user/.local/bin/rr")
-        ));
-        assert!(cmdline_exe_matches(
-            &[
-                "/home/user/.local/bin/rr (deleted)".to_string(),
-                "p2p-sync".to_string(),
-            ],
             Path::new("/home/user/.local/bin/rr")
         ));
     }

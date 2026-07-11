@@ -14,9 +14,11 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
+import fcntl
 import html
 import hashlib
 import ipaddress
+import json
 import os
 import platform
 import re
@@ -40,6 +42,11 @@ LEGACY_HOOK_START = "# >>> rustory >>>"
 LEGACY_HOOK_END = "# <<< rustory <<<"
 DAEMON_AUTOSTART_START = "# >>> rustory daemon autostart >>>"
 DAEMON_AUTOSTART_END = "# <<< rustory daemon autostart <<<"
+MANAGED_STATE_HOME_FILE = "managed-state-home"
+MANAGED_STATE_HOMES_FILE = "managed-state-homes.json"
+MANAGED_STATE_HOMES_LOCK_FILE = ".managed-state-homes.lock"
+MANAGED_RC_LOCK_FILE = ".managed-rc-files.lock"
+MAX_MANAGED_STATE_HOMES = 32
 SUPPORTED_HOOK_SHELLS = ("bash", "zsh")
 USER_STARTUP_FILES = (
     ".zshrc",
@@ -86,7 +93,7 @@ def main() -> int:
     if args.swarm_key_source or args.swarm_key_b64:
         install_swarm_key(install_path, args)
 
-    if args.token or args.trackers or args.relay:
+    if init_requested(args):
         run_init(install_path, args)
 
     if args.install_hook:
@@ -142,6 +149,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--user-id", help="Logical Rustory user id to write via rr init")
     parser.add_argument("--device-id", help="Device id to write via rr init")
+    parser.add_argument(
+        "--require-device-membership",
+        action="store_true",
+        help="Require authoritative enrolled-device membership for P2P sync",
+    )
+    parser.add_argument(
+        "--allow-remote-retirement",
+        action="store_true",
+        help="Opt this managed daemon into cooperative remote full uninstall",
+    )
     parser.add_argument(
         "--force",
         action="store_true",
@@ -204,6 +221,10 @@ def parse_args() -> argparse.Namespace:
             "--token appears to include literal quote characters; pass the raw token value, "
             'for example --token "$RUSTORY_TRACKER_TOKEN"'
         )
+    if args.allow_remote_retirement and not args.require_device_membership:
+        parser.error("--allow-remote-retirement requires --require-device-membership")
+    if args.allow_remote_retirement and len(split_tracker_values(args.trackers)) != 1:
+        parser.error("--allow-remote-retirement requires exactly one --tracker")
     return args
 
 
@@ -547,6 +568,20 @@ def split_tracker_values(values: list[str]) -> list[str]:
     return trackers
 
 
+def init_requested(args: argparse.Namespace) -> bool:
+    return any(
+        (
+            args.token,
+            args.trackers,
+            args.relay,
+            args.user_id,
+            args.device_id,
+            args.require_device_membership,
+            args.allow_remote_retirement,
+        )
+    )
+
+
 def run_init(install_path: Path, args: argparse.Namespace) -> None:
     cmd = [str(install_path), "init"]
     if args.force:
@@ -561,6 +596,12 @@ def run_init(install_path: Path, args: argparse.Namespace) -> None:
         cmd += ["--relay", args.relay]
     if args.token:
         cmd += ["--token", args.token]
+    if args.require_device_membership:
+        cmd.append("--require-device-membership")
+    if args.allow_remote_retirement:
+        cmd.append("--allow-remote-retirement")
+    if (args.require_device_membership or args.allow_remote_retirement) and not args.force:
+        cmd.append("--update-existing-security")
 
     if args.relay:
         warning = relay_addr_reachability_warning(args.relay)
@@ -597,6 +638,8 @@ def relay_addr_reachability_warning(relay: str) -> str | None:
 
 def install_daemon_service(install_path: Path, args: argparse.Namespace) -> None:
     system = platform.system().lower()
+    state_home = rustory_state_home()
+    record_managed_state_home(state_home)
     daemon_args = [
         str(install_path),
         "daemon",
@@ -606,21 +649,31 @@ def install_daemon_service(install_path: Path, args: argparse.Namespace) -> None
         str(args.daemon_start_jitter_sec),
     ]
     if system == "darwin":
-        install_launchd_daemon(daemon_args, not args.no_start_daemon)
+        install_launchd_daemon(daemon_args, state_home, not args.no_start_daemon)
         return
     if system == "linux":
-        install_systemd_user_daemon(daemon_args, not args.no_start_daemon, args)
+        install_systemd_user_daemon(
+            daemon_args,
+            state_home,
+            not args.no_start_daemon,
+            args,
+        )
         return
     raise SystemExit(f"daemon=failed reason=unsupported_platform platform={platform.system()}")
 
 
-def install_launchd_daemon(daemon_args: list[str], start: bool) -> None:
+def install_launchd_daemon(
+    daemon_args: list[str], state_home: Path, start: bool
+) -> None:
     label = "com.rustory.daemon"
     plist_path = Path.home() / "Library" / "LaunchAgents" / f"{label}.plist"
     log_dir = Path.home() / "Library" / "Logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     plist_path.parent.mkdir(parents=True, exist_ok=True)
-    plist_path.write_text(render_launchd_plist(label, daemon_args, log_dir), encoding="utf-8")
+    plist_path.write_text(
+        render_launchd_plist(label, daemon_args, log_dir, state_home),
+        encoding="utf-8",
+    )
     os.chmod(plist_path, 0o644)
     print(f"daemon=installed manager=launchd plist={plist_path}")
 
@@ -636,11 +689,14 @@ def install_launchd_daemon(daemon_args: list[str], start: bool) -> None:
     print(f"daemon=started manager=launchd label={label}")
 
 
-def render_launchd_plist(label: str, daemon_args: list[str], log_dir: Path) -> str:
+def render_launchd_plist(
+    label: str, daemon_args: list[str], log_dir: Path, state_home: Path
+) -> str:
     arg_lines = "\n".join(f"    <string>{html.escape(arg)}</string>" for arg in daemon_args)
     stdout_path = html.escape(str(log_dir / "rustory-daemon.out.log"))
     stderr_path = html.escape(str(log_dir / "rustory-daemon.err.log"))
     path_value = html.escape(os.environ.get("PATH", ""))
+    state_home_value = html.escape(str(state_home))
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -663,31 +719,41 @@ def render_launchd_plist(label: str, daemon_args: list[str], log_dir: Path) -> s
   <dict>
     <key>PATH</key>
     <string>{path_value}</string>
+    <key>RUSTORY_DAEMON_MANAGER</key>
+    <string>launchd</string>
+    <key>XDG_STATE_HOME</key>
+    <string>{state_home_value}</string>
   </dict>
 </dict>
 </plist>
 """
 
 
-def install_systemd_user_daemon(daemon_args: list[str], start: bool, args: argparse.Namespace) -> None:
+def install_systemd_user_daemon(
+    daemon_args: list[str],
+    state_home: Path,
+    start: bool,
+    args: argparse.Namespace,
+) -> None:
     unit_path = Path.home() / ".config" / "systemd" / "user" / "rustory.service"
     unit_path.parent.mkdir(parents=True, exist_ok=True)
-    unit_path.write_text(render_systemd_user_unit(daemon_args), encoding="utf-8")
+    unit_path.write_text(
+        render_systemd_user_unit(daemon_args, state_home), encoding="utf-8"
+    )
     os.chmod(unit_path, 0o644)
     print(f"daemon=installed manager=systemd-user unit={unit_path}")
 
     if start:
-        stopped = stop_stale_background_daemon_processes(Path(daemon_args[0]))
-        if stopped:
-            print(f"daemon=stale_processes_stopped manager=systemd-user count={stopped}")
         for step in (["daemon-reload"], ["enable", "rustory.service"], ["restart", "rustory.service"]):
             try:
                 run_systemd_user(step)
             except subprocess.CalledProcessError as exc:
                 if systemd_user_bus_unavailable(exc):
                     print_systemd_user_start_deferred(step[0], exc)
-                    start_background_daemon(daemon_args, restart=True)
-                    install_background_daemon_autostart(daemon_args, args)
+                    start_background_daemon(
+                        daemon_args, state_home, restart=True
+                    )
+                    install_background_daemon_autostart(daemon_args, state_home, args)
                     return
                 print_systemd_user_failure(step[0], exc)
                 raise SystemExit(exc.returncode) from exc
@@ -748,8 +814,10 @@ def one_line_process_output(exc: subprocess.CalledProcessError) -> str:
     return " ".join((exc.stderr or exc.stdout or str(exc)).split())
 
 
-def start_background_daemon(daemon_args: list[str], restart: bool = False) -> None:
-    state_dir = rustory_state_dir()
+def start_background_daemon(
+    daemon_args: list[str], state_home: Path, restart: bool = False
+) -> None:
+    state_dir = state_home / "rustory"
     state_dir.mkdir(parents=True, exist_ok=True)
     pid_path = state_dir / "daemon.pid"
     log_path = state_dir / "daemon.log"
@@ -775,6 +843,11 @@ def start_background_daemon(daemon_args: list[str], restart: bool = False) -> No
             stderr=subprocess.STDOUT,
             start_new_session=True,
             close_fds=True,
+            env={
+                **os.environ,
+                "XDG_STATE_HOME": str(state_home),
+                "RUSTORY_DAEMON_MANAGER": "background",
+            },
         )
 
     pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
@@ -851,7 +924,7 @@ def stop_stale_background_daemon_processes(install_path: Path) -> int:
         if pid == current_pid or not proc_is_current_user(pid):
             continue
         cmdline = read_proc_cmdline(pid)
-        if not (proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path)):
+        if not proc_exe_matches(pid, install_path) or not proc_has_background_manager(pid):
             continue
         kind = managed_background_cmdline_kind(cmdline)
         if kind == "daemon":
@@ -905,8 +978,12 @@ def proc_exe_matches(pid: int, install_path: Path) -> bool:
     return paths_match_after_deleted_suffix(exe, install_path)
 
 
-def cmdline_exe_matches(cmdline: list[str], install_path: Path) -> bool:
-    return bool(cmdline) and paths_match_after_deleted_suffix(Path(cmdline[0]), install_path)
+def proc_has_background_manager(pid: int) -> bool:
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return b"RUSTORY_DAEMON_MANAGER=background" in environ.split(b"\0")
 
 
 def cmdline_has_default_rustory_db_path(cmdline: list[str]) -> bool:
@@ -955,31 +1032,40 @@ def is_managed_background_cmdline(
     return kind == "daemon" or (kind == "child" and has_managed_daemon_ancestor)
 
 
-def install_background_daemon_autostart(daemon_args: list[str], args: argparse.Namespace) -> None:
+def install_background_daemon_autostart(
+    daemon_args: list[str], state_home: Path, args: argparse.Namespace
+) -> None:
     if args.no_daemon_shell_autostart:
         print("daemon=autostart_skipped manager=background reason=--no-daemon-shell-autostart")
         return
 
     shell = resolve_hook_shell(args.hook_shell)
     rc_file = Path(args.rc_file).expanduser() if args.rc_file else default_rc_file(shell)
-    block = render_daemon_autostart_block(daemon_args)
+    block = render_daemon_autostart_block(daemon_args, state_home)
+    record_managed_rc_file(rc_file)
     update_managed_block(rc_file, block, DAEMON_AUTOSTART_START, DAEMON_AUTOSTART_END)
     print(f"daemon=autostart_installed manager=background shell={shell} rc_file={rc_file}")
 
 
-def render_daemon_autostart_block(daemon_args: list[str]) -> str:
+def render_daemon_autostart_block(
+    daemon_args: list[str], state_home: Path
+) -> str:
     daemon_command = " ".join(shell_quote_arg(arg) for arg in daemon_args)
+    state_home_command = shell_quote_arg(str(state_home))
+    state_dir_command = shell_quote_arg(str(state_home / "rustory"))
     return "\n".join(
         [
             DAEMON_AUTOSTART_START,
             "# Managed by rustory installer. Re-run with --install-daemon to update.",
             "case $- in",
             "  *i*)",
-            '    __rustory_daemon_state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/rustory"',
+            f"    __rustory_daemon_state_dir={state_dir_command}",
             '    __rustory_daemon_pid_file="$__rustory_daemon_state_dir/daemon.pid"',
             '    __rustory_daemon_log_file="$__rustory_daemon_state_dir/daemon.log"',
             "    __rustory_daemon_running=0",
-            '    if [ -r "$__rustory_daemon_pid_file" ]; then',
+            "    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet rustory.service >/dev/null 2>&1; then",
+            "      __rustory_daemon_running=1",
+            '    elif [ -r "$__rustory_daemon_pid_file" ]; then',
             '      __rustory_daemon_pid="$(cat "$__rustory_daemon_pid_file" 2>/dev/null)"',
             '      case "$__rustory_daemon_pid" in',
             "        ''|*[!0-9]*) __rustory_daemon_running=0 ;;",
@@ -989,9 +1075,9 @@ def render_daemon_autostart_block(daemon_args: list[str]) -> str:
             '    if [ "$__rustory_daemon_running" != "1" ]; then',
             '      mkdir -p "$__rustory_daemon_state_dir"',
             "      if command -v setsid >/dev/null 2>&1; then",
-            f'        setsid {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
+            f'        XDG_STATE_HOME={state_home_command} RUSTORY_DAEMON_MANAGER=background setsid {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
             "      else",
-            f'        nohup {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
+            f'        XDG_STATE_HOME={state_home_command} RUSTORY_DAEMON_MANAGER=background nohup {daemon_command} >> "$__rustory_daemon_log_file" 2>&1 </dev/null &',
             "      fi",
             '      echo $! > "$__rustory_daemon_pid_file"',
             '      chmod 600 "$__rustory_daemon_pid_file" "$__rustory_daemon_log_file" 2>/dev/null || true',
@@ -1012,11 +1098,231 @@ def shell_quote_arg(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def rustory_state_dir() -> Path:
+def rustory_state_home() -> Path:
     base = os.environ.get("XDG_STATE_HOME")
     if base:
-        return Path(base).expanduser() / "rustory"
-    return Path.home() / ".local" / "state" / "rustory"
+        base_path = Path(base).expanduser()
+        if not base_path.is_absolute():
+            raise SystemExit("XDG_STATE_HOME must be absolute")
+        return base_path
+    return Path.home() / ".local" / "state"
+
+
+def rustory_state_dir() -> Path:
+    return rustory_state_home() / "rustory"
+
+
+def managed_rc_state_path() -> Path:
+    return Path.home() / ".config" / "rustory" / "managed-rc-files.json"
+
+
+def managed_state_home_path() -> Path:
+    return Path.home() / ".config" / "rustory" / MANAGED_STATE_HOME_FILE
+
+
+def managed_state_homes_path() -> Path:
+    return Path.home() / ".config" / "rustory" / MANAGED_STATE_HOMES_FILE
+
+
+def record_managed_state_home(state_home: Path) -> None:
+    if not state_home.is_absolute():
+        raise SystemExit(f"managed state home must be absolute: {state_home}")
+    state_home_text = str(state_home)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in state_home_text):
+        raise SystemExit("managed state home must not contain control characters")
+    if len(state_home_text.encode("utf-8")) > 4095:
+        raise SystemExit("managed state home path is too long")
+    state_path = managed_state_home_path()
+    state_dir = state_path.parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise SystemExit(f"managed state dir must be a regular directory: {state_dir}")
+    os.chmod(state_dir, 0o700)
+    try:
+        metadata = state_path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit(f"managed state home must be a regular non-symlink file: {state_path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SystemExit(f"managed state home permissions are too broad: {state_path}")
+        if metadata.st_size > 4096:
+            raise SystemExit(f"managed state home file is too large: {state_path}")
+
+    payload = f"{state_home_text}\n"
+    fd, tmp_name = tempfile.mkstemp(prefix=".managed-state-home.", dir=str(state_dir))
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, state_path)
+        os.chmod(state_path, 0o600)
+        fsync_directory(state_dir)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    record_managed_state_home_history(state_home)
+
+
+def record_managed_state_home_history(state_home: Path) -> None:
+    state_path = managed_state_homes_path()
+    state_dir = state_path.parent
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_path = state_dir / MANAGED_STATE_HOMES_LOCK_FILE
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise SystemExit(f"open managed state homes lock: {lock_path}: {exc}") from exc
+    try:
+        lock_metadata = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_metadata.st_mode):
+            raise SystemExit(f"managed state homes lock must be a regular file: {lock_path}")
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        record_managed_state_home_history_locked(state_home, state_path, state_dir)
+    finally:
+        os.close(lock_fd)
+
+
+def record_managed_state_home_history_locked(
+    state_home: Path, state_path: Path, state_dir: Path
+) -> None:
+    paths: list[str] = []
+    try:
+        metadata = state_path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit(f"managed state homes must be a regular non-symlink file: {state_path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SystemExit(f"managed state homes permissions are too broad: {state_path}")
+        if metadata.st_size > 64 * 1024:
+            raise SystemExit(f"managed state homes file is too large: {state_path}")
+        try:
+            existing = json.loads(state_path.read_text(encoding="utf-8"))
+            if existing.get("version") != 1 or not isinstance(existing.get("paths"), list):
+                raise ValueError("unsupported schema")
+            for value in existing["paths"]:
+                if (
+                    not isinstance(value, str)
+                    or not Path(value).is_absolute()
+                    or len(value.encode("utf-8")) > 4095
+                    or any(ord(ch) < 32 or ord(ch) == 127 for ch in value)
+                ):
+                    raise ValueError("managed state homes must be absolute safe strings")
+                if value not in paths:
+                    paths.append(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"invalid managed state homes: {state_path}: {exc}") from exc
+
+    value = str(state_home)
+    if value not in paths:
+        paths.append(value)
+    if len(paths) > MAX_MANAGED_STATE_HOMES:
+        raise SystemExit("too many managed state homes; uninstall old Rustory state before changing it again")
+    payload = json.dumps({"version": 1, "paths": paths}, indent=2) + "\n"
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise SystemExit("managed state homes payload is too large")
+    fd, tmp_name = tempfile.mkstemp(prefix=".managed-state-homes.", dir=str(state_dir))
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, state_path)
+        os.chmod(state_path, 0o600)
+        fsync_directory(state_dir)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def record_managed_rc_file(rc_file: Path) -> None:
+    state_dir = managed_rc_state_path().parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise SystemExit(f"managed rc state dir must be a regular directory: {state_dir}")
+    os.chmod(state_dir, 0o700)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    lock_path = state_dir / MANAGED_RC_LOCK_FILE
+    try:
+        lock_fd = os.open(lock_path, flags, 0o600)
+    except OSError as exc:
+        raise SystemExit(f"open managed rc state lock: {lock_path}: {exc}") from exc
+    try:
+        lock_metadata = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_metadata.st_mode):
+            raise SystemExit(f"managed rc state lock must be a regular file: {lock_path}")
+        os.fchmod(lock_fd, 0o600)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        record_managed_rc_file_locked(rc_file)
+    finally:
+        os.close(lock_fd)
+
+
+def record_managed_rc_file_locked(rc_file: Path) -> None:
+    state_path = managed_rc_state_path()
+    state_dir = state_path.parent
+    state_dir.mkdir(parents=True, exist_ok=True)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise SystemExit(f"managed rc state dir must be a regular directory: {state_dir}")
+    os.chmod(state_dir, 0o700)
+    paths: list[str] = []
+    try:
+        metadata = state_path.lstat()
+    except FileNotFoundError:
+        metadata = None
+    if metadata is not None:
+        if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+            raise SystemExit(f"managed rc state must be a regular non-symlink file: {state_path}")
+        if stat.S_IMODE(metadata.st_mode) & 0o077:
+            raise SystemExit(f"managed rc state permissions are too broad: {state_path}")
+        if metadata.st_size > 64 * 1024:
+            raise SystemExit(f"managed rc state is too large: {state_path}")
+        try:
+            existing = json.loads(state_path.read_text(encoding="utf-8"))
+            if existing.get("version") != 1 or not isinstance(existing.get("paths"), list):
+                raise ValueError("unsupported schema")
+            for value in existing["paths"]:
+                if not isinstance(value, str) or not Path(value).is_absolute():
+                    raise ValueError("managed rc paths must be absolute strings")
+                paths.append(value)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise SystemExit(f"invalid managed rc state: {state_path}: {exc}") from exc
+
+    managed_path = str(rc_file.resolve(strict=False))
+    if managed_path not in paths:
+        paths.append(managed_path)
+    if len(set(paths)) > 32:
+        raise SystemExit("too many managed rc paths")
+    payload = json.dumps({"version": 1, "paths": sorted(set(paths))}, indent=2) + "\n"
+    if len(payload.encode("utf-8")) > 64 * 1024:
+        raise SystemExit("managed rc state payload is too large")
+    fd, tmp_name = tempfile.mkstemp(prefix=".managed-rc-files.", dir=str(state_dir))
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, state_path)
+        os.chmod(state_path, 0o600)
+        fsync_directory(state_dir)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def read_pid_file(path: Path) -> int | None:
@@ -1054,14 +1360,16 @@ def background_pid_matches_install(pid: int, install_path: Path) -> bool:
     cmdline = read_proc_cmdline(pid)
     if managed_background_cmdline_kind(cmdline) != "daemon":
         return False
-    return proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path)
+    # This PID came from the private installer-owned pid file, which is also the
+    # migration path for older updater-spawned daemons that lacked the marker.
+    return proc_exe_matches(pid, install_path)
 
 
 def managed_process_matches_install(pid: int, install_path: Path) -> bool:
     if sys.platform != "linux" or not proc_is_current_user(pid):
         return False
     cmdline = read_proc_cmdline(pid)
-    if not (proc_exe_matches(pid, install_path) or cmdline_exe_matches(cmdline, install_path)):
+    if not proc_exe_matches(pid, install_path) or not proc_has_background_manager(pid):
         return False
     kind = managed_background_cmdline_kind(cmdline)
     if kind == "daemon":
@@ -1075,9 +1383,10 @@ def process_has_managed_daemon_ancestor(pid: int, install_path: Path) -> bool:
         if parent_pid is None or parent_pid <= 1 or parent_pid == pid:
             return False
         parent_cmdline = read_proc_cmdline(parent_pid)
-        if managed_background_cmdline_kind(parent_cmdline) == "daemon" and (
-            proc_exe_matches(parent_pid, install_path)
-            or cmdline_exe_matches(parent_cmdline, install_path)
+        if (
+            managed_background_cmdline_kind(parent_cmdline) == "daemon"
+            and proc_exe_matches(parent_pid, install_path)
+            and proc_has_background_manager(parent_pid)
         ):
             return True
         pid = parent_pid
@@ -1117,8 +1426,9 @@ def tail_file_one_line(path: Path, max_bytes: int = 4096) -> str:
     return " ".join(data.split())
 
 
-def render_systemd_user_unit(daemon_args: list[str]) -> str:
+def render_systemd_user_unit(daemon_args: list[str], state_home: Path) -> str:
     exec_start = " ".join(systemd_quote_arg(arg) for arg in daemon_args)
+    state_home_environment = systemd_quote_arg(f"XDG_STATE_HOME={state_home}")
     return f"""[Unit]
 Description=Rustory daemon
 After=network-online.target
@@ -1127,6 +1437,8 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart={exec_start}
+Environment=RUSTORY_DAEMON_MANAGER=systemd-user
+Environment={state_home_environment}
 Restart=always
 RestartSec=5
 
@@ -1138,7 +1450,11 @@ WantedBy=default.target
 def systemd_quote_arg(value: str) -> str:
     if value and all(ch.isalnum() or ch in "/._:=@+-" for ch in value):
         return value
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    return (
+        '"'
+        + value.replace("%", "%%").replace("\\", "\\\\").replace('"', '\\"')
+        + '"'
+    )
 
 
 def run_import_hishtory(install_path: Path, args: argparse.Namespace) -> None:
@@ -1261,6 +1577,7 @@ def install_shell_hook(install_path: Path, args: argparse.Namespace) -> None:
     shell = resolve_hook_shell(args.hook_shell)
     rc_file = Path(args.rc_file).expanduser() if args.rc_file else default_rc_file(shell)
     block = render_hook_block(shell, install_path.parent)
+    record_managed_rc_file(rc_file)
     removed_blocks = update_managed_block(
         rc_file,
         block,

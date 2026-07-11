@@ -46,8 +46,15 @@ impl DaemonChildGuard {
         exe: &Path,
         args: &[String],
         tracker_token_env: Option<&str>,
+        retirement_executor_ready: bool,
     ) -> Result<Self> {
-        let child = spawn_daemon_child(label, exe, args, tracker_token_env)?;
+        let child = spawn_daemon_child(
+            label,
+            exe,
+            args,
+            tracker_token_env,
+            retirement_executor_ready,
+        )?;
         Ok(Self {
             label: label.to_string(),
             child,
@@ -227,13 +234,19 @@ pub(crate) fn spawn_daemon_child(
     exe: &Path,
     args: &[String],
     tracker_token_env: Option<&str>,
+    retirement_executor_ready: bool,
 ) -> Result<Child> {
     eprintln!("daemon: spawn {label}: {}", redacted_command(exe, args));
     let mut cmd = ProcessCommand::new(exe);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
+        .stderr(Stdio::inherit())
+        .env("RUSTORY_MANAGED_DAEMON_CHILD", "1")
+        .env_remove("RUSTORY_RETIREMENT_EXECUTOR_READY");
+    if retirement_executor_ready {
+        cmd.env("RUSTORY_RETIREMENT_EXECUTOR_READY", "1");
+    }
     if let Some(token) = tracker_token_env {
         cmd.env("RUSTORY_TRACKER_TOKEN", token);
     }

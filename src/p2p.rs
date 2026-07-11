@@ -4,7 +4,7 @@ use crate::libp2p::core::transport::choice::OrTransport;
 use crate::libp2p::core::upgrade::Version;
 use crate::libp2p::swarm::{SwarmEvent, dial_opts::DialOpts};
 use crate::libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
-use crate::storage::{LocalStore, PeerBookPeer, PullBatch};
+use crate::storage::{LocalStore, PeerBookPeer, PeerRevocation, PullBatch};
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p_request_response::ProtocolSupport;
@@ -57,6 +57,8 @@ pub struct ServeConfig {
     pub relay_addr: Option<Multiaddr>,
     pub trackers: Vec<String>,
     pub tracker_token: Option<String>,
+    pub require_device_membership: bool,
+    pub retirement_protocol: Option<u32>,
     pub meta: crate::tracker::PeerMeta,
 }
 
@@ -67,6 +69,7 @@ pub struct SyncConfig {
     pub relay_addr: Option<Multiaddr>,
     pub trackers: Vec<String>,
     pub tracker_token: Option<String>,
+    pub require_device_membership: bool,
     pub user_id: Option<String>,
     pub device_id: Option<String>,
     pub request_retry_policy: RequestRetryPolicy,
@@ -432,10 +435,13 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
         relay_addr,
         trackers,
         tracker_token,
+        require_device_membership,
+        retirement_protocol,
         meta,
     } = cfg;
 
     let store = LocalStore::open(db_path)?;
+    let registration_identity = identity.clone();
     let mut swarm = build_rustory_swarm_with_identity(identity, psk)?;
     let verbose_event_logs = p2p_verbose_event_logs_enabled();
 
@@ -505,7 +511,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
             }
             _ = next_register.tick() => {
                 if !trackers.is_empty() && !known_addrs.is_empty() {
-                    spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), meta.clone());
+                    spawn_register_all(trackers.clone(), registration_identity.clone(), known_addrs.iter().cloned().collect(), meta.clone(), require_device_membership, retirement_protocol);
                 }
             }
             event = swarm.select_next_some() => {
@@ -521,7 +527,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
                         // 주소를 1개 이상 확보한 시점에 tracker에 즉시 등록한다.
                         if !trackers.is_empty() {
-                            spawn_register_all(trackers.clone(), local_peer_id, known_addrs.iter().cloned().collect(), meta.clone());
+                            spawn_register_all(trackers.clone(), registration_identity.clone(), known_addrs.iter().cloned().collect(), meta.clone(), require_device_membership, retirement_protocol);
                         }
                     }
                     SwarmEvent::NewExternalAddrCandidate { address } => {
@@ -540,9 +546,11 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         if !trackers.is_empty() {
                             spawn_register_all(
                                 trackers.clone(),
-                                local_peer_id,
+                                registration_identity.clone(),
                                 known_addrs.iter().cloned().collect(),
                                 meta.clone(),
+                                require_device_membership,
+                                retirement_protocol,
                             );
                         }
                     }
@@ -562,9 +570,11 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         if !trackers.is_empty() {
                             spawn_register_all(
                                 trackers.clone(),
-                                local_peer_id,
+                                registration_identity.clone(),
                                 known_addrs.iter().cloned().collect(),
                                 meta.clone(),
+                                require_device_membership,
+                                retirement_protocol,
                             );
                         }
                     }
@@ -580,6 +590,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                     peer,
                                     &meta,
                                     &trackers,
+                                    require_device_membership,
                                 )
                                 .and_then(|_| {
                                     acknowledge_inbound_pull_request(&store, peer, &request)
@@ -616,6 +627,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                     peer,
                                     &meta,
                                     &trackers,
+                                    require_device_membership,
                                 )
                                 .and_then(|authorized| {
                                     validate_push_provenance(&request.entries, &authorized)?;
@@ -737,9 +749,11 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         {
                             spawn_register_all(
                                 trackers.clone(),
-                                local_peer_id,
+                                registration_identity.clone(),
                                 known_addrs.iter().cloned().collect(),
                                 meta.clone(),
+                                require_device_membership,
+                                retirement_protocol,
                             );
                         }
                         if had_relay_listener && relay_addr.is_some() {
@@ -766,9 +780,11 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         if known_addrs.remove(&full.to_string()) && !trackers.is_empty() {
                             spawn_register_all(
                                 trackers.clone(),
-                                local_peer_id,
+                                registration_identity.clone(),
                                 known_addrs.iter().cloned().collect(),
                                 meta.clone(),
+                                require_device_membership,
+                                retirement_protocol,
                             );
                         }
                     }
@@ -802,21 +818,32 @@ fn schedule_relay_relisten(
 
 fn spawn_register_all(
     trackers: Vec<crate::tracker::TrackerClient>,
-    local_peer_id: PeerId,
+    identity: crate::libp2p::identity::Keypair,
     addrs: Vec<String>,
     meta: crate::tracker::PeerMeta,
+    membership_enforced: bool,
+    retirement_protocol: Option<u32>,
 ) {
     // tracker 등록은 블로킹 I/O(ureq)이므로 런타임을 멈추지 않게 분리한다.
-    let peer_id = local_peer_id.to_string();
-    let req = crate::tracker::RegisterRequest {
-        peer_id,
+    let req = match crate::tracker::RegisterRequest::signed_with_capabilities(
+        &identity,
         addrs,
-        meta: Some(meta),
+        Some(meta),
+        membership_enforced,
+        retirement_protocol,
+    ) {
+        Ok(req) => req,
+        Err(err) => {
+            eprintln!("warn: sign tracker registration failed: {err:#}");
+            return;
+        }
     };
 
     drop(tokio::task::spawn_blocking(move || {
         for t in trackers {
-            let _ = t.register(&req);
+            if let Err(error) = t.register(&req) {
+                eprintln!("warn: tracker signed registration failed: {error:#}");
+            }
         }
     }));
 }
@@ -826,8 +853,26 @@ fn authorize_inbound_peer(
     peer: PeerId,
     local_meta: &crate::tracker::PeerMeta,
     trackers: &[crate::tracker::TrackerClient],
+    require_device_membership: bool,
 ) -> Result<AuthorizedPeer> {
     let peer_id = peer.to_string();
+    if store.is_peer_revoked(&peer_id)? {
+        anyhow::bail!("peer is revoked: {peer_id}");
+    }
+    if require_device_membership {
+        let membership = authorize_peer_with_authoritative_tracker(store, trackers, &peer_id)?;
+        return validate_authorized_peer_record(
+            PeerBookPeer {
+                peer_id,
+                addrs: Vec::new(),
+                user_id: membership.user_id,
+                device_id: membership.device_id,
+                rr_version: None,
+                last_seen_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+            },
+            local_meta,
+        );
+    }
     if let Some(peer) = store.get_peer_book_peer(&peer_id)? {
         return validate_authorized_peer_record(peer, local_meta);
     }
@@ -842,6 +887,53 @@ fn authorize_inbound_peer(
     }
 
     anyhow::bail!("peer is not present in peer_book or tracker: {peer_id}");
+}
+
+fn authorize_peer_with_authoritative_tracker(
+    store: &LocalStore,
+    trackers: &[crate::tracker::TrackerClient],
+    peer_id: &str,
+) -> Result<crate::tracker::MembershipResponse> {
+    let tracker = trackers
+        .first()
+        .context("strict device membership requires an authoritative tracker")?;
+    let membership = tracker
+        .authorize_peer(peer_id)
+        .with_context(|| format!("authoritative tracker membership lookup: {peer_id}"))?;
+    anyhow::ensure!(
+        membership.peer_id == peer_id,
+        "authoritative tracker returned membership for a different peer"
+    );
+    anyhow::ensure!(
+        membership.strict,
+        "authoritative tracker is not enforcing device enrollment"
+    );
+    anyhow::ensure!(
+        membership.revoked == membership.revocation.is_some(),
+        "authoritative tracker returned inconsistent revocation state"
+    );
+    anyhow::ensure!(
+        !membership.active || (membership.enrolled && !membership.revoked),
+        "authoritative tracker returned inconsistent active membership"
+    );
+    if let Some(revocation) = membership.revocation.as_ref() {
+        anyhow::ensure!(
+            revocation.peer_id == peer_id,
+            "authoritative tracker returned a revocation for a different peer"
+        );
+        store.apply_peer_revocation(&PeerRevocation {
+            peer_id: revocation.peer_id.clone(),
+            device_id: revocation.device_id.clone(),
+            user_id: revocation.user_id.clone(),
+            revoked_at_unix: revocation.revoked_at_unix,
+            ticket_id: revocation.ticket_id.clone(),
+        })?;
+    }
+    anyhow::ensure!(
+        membership.active,
+        "peer membership is not active: {peer_id}"
+    );
+    Ok(membership)
 }
 
 fn acknowledge_inbound_pull_request(
@@ -886,6 +978,33 @@ fn refresh_peer_book_peer_from_trackers(
     }
 
     Ok(None)
+}
+
+fn apply_tracker_revocations(
+    store: &LocalStore,
+    revocations: &[crate::tracker::RevocationInfo],
+) -> Result<()> {
+    for revocation in revocations {
+        store.apply_peer_revocation(&PeerRevocation {
+            peer_id: revocation.peer_id.clone(),
+            device_id: revocation.device_id.clone(),
+            user_id: revocation.user_id.clone(),
+            revoked_at_unix: revocation.revoked_at_unix,
+            ticket_id: revocation.ticket_id.clone(),
+        })?;
+    }
+    Ok(())
+}
+
+fn apply_tracker_revocations_if_authoritative(
+    store: &LocalStore,
+    revocations: &[crate::tracker::RevocationInfo],
+    require_device_membership: bool,
+) -> Result<()> {
+    if require_device_membership {
+        apply_tracker_revocations(store, revocations)?;
+    }
+    Ok(())
 }
 
 fn validate_authorized_peer_record(
@@ -1077,6 +1196,15 @@ async fn sync_async(
     let mut progress = crate::sync::SyncRunProgress::new();
     let mut last_err: Option<anyhow::Error> = None;
     for t in targets {
+        if let Err(err) = authorize_outbound_peer(&store, &cfg, &t.peer_key) {
+            progress.mark_required_action_failed();
+            eprintln!(
+                "warn: p2p target rejected by membership policy: {}: {err:#}",
+                t.peer_key
+            );
+            last_err = Some(err);
+            continue;
+        }
         let mut client = match P2pClient::new(
             t.peer_id,
             t.dial_addrs,
@@ -1192,6 +1320,24 @@ async fn sync_async(
     }
 }
 
+fn authorize_outbound_peer(store: &LocalStore, cfg: &SyncConfig, peer_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !store.is_peer_revoked(peer_id)?,
+        "peer is revoked: {peer_id}"
+    );
+    if cfg.require_device_membership {
+        let clients = cfg
+            .trackers
+            .iter()
+            .map(|base_url| {
+                crate::tracker::TrackerClient::new(base_url.clone(), cfg.tracker_token.clone())
+            })
+            .collect::<Vec<_>>();
+        authorize_peer_with_authoritative_tracker(store, &clients, peer_id)?;
+    }
+    Ok(())
+}
+
 fn validate_local_sync_limit(limit: usize) -> Result<()> {
     anyhow::ensure!(
         limit <= crate::sync::SERVER_SYNC_PULL_LIMIT_MAX,
@@ -1298,6 +1444,11 @@ fn discover_targets(store: &LocalStore, cfg: &SyncConfig) -> Result<Vec<SyncTarg
             crate::tracker::TrackerClient::new(base_url.clone(), cfg.tracker_token.clone());
         match client.list(cfg.user_id.as_deref()) {
             Ok(list) => {
+                apply_tracker_revocations_if_authoritative(
+                    store,
+                    &list.revocations,
+                    cfg.require_device_membership,
+                )?;
                 for p in list.peers {
                     // self는 제외한다.
                     if sync_target_is_self(
@@ -2693,6 +2844,7 @@ mod tests {
             // connection refused should fail fast on loopback.
             trackers: vec!["http://127.0.0.1:1".to_string()],
             tracker_token: None,
+            require_device_membership: false,
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
             request_retry_policy: RequestRetryPolicy::default(),
@@ -2704,6 +2856,25 @@ mod tests {
         assert_eq!(got[0].peer_key, peer_id);
         assert_eq!(got[0].dial_addrs.len(), 1);
         assert!(got[0].relay_addr.is_none());
+    }
+
+    #[test]
+    fn permissive_tracker_revocations_cannot_poison_the_local_deny_cache() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer_id = PeerId::random().to_string();
+        let revocations = vec![crate::tracker::RevocationInfo {
+            peer_id: peer_id.clone(),
+            device_id: Some("legacy-device".to_string()),
+            user_id: Some("u1".to_string()),
+            revoked_at_unix: 1,
+            ticket_id: uuid::Uuid::new_v4().to_string(),
+        }];
+
+        apply_tracker_revocations_if_authoritative(&store, &revocations, false).unwrap();
+        assert!(!store.is_peer_revoked(&peer_id).unwrap());
+
+        apply_tracker_revocations_if_authoritative(&store, &revocations, true).unwrap();
+        assert!(store.is_peer_revoked(&peer_id).unwrap());
     }
 
     #[test]
@@ -2771,6 +2942,7 @@ mod tests {
             relay_addr: Some(relay_addr.parse().unwrap()),
             trackers: vec!["http://127.0.0.1:1".to_string()],
             tracker_token: None,
+            require_device_membership: false,
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
             request_retry_policy: RequestRetryPolicy::default(),
@@ -2875,7 +3047,7 @@ mod tests {
             build_dirty: None,
         };
 
-        let err = authorize_inbound_peer(&store, peer, &meta, &[]).unwrap_err();
+        let err = authorize_inbound_peer(&store, peer, &meta, &[], false).unwrap_err();
         assert!(format!("{err:#}").contains("not present in peer_book or tracker"));
     }
 
@@ -2902,8 +3074,44 @@ mod tests {
             build_dirty: None,
         };
 
-        let err = authorize_inbound_peer(&store, peer, &meta, &[]).unwrap_err();
+        let err = authorize_inbound_peer(&store, peer, &meta, &[], false).unwrap_err();
         assert!(format!("{err:#}").contains("peer user_id mismatch"));
+    }
+
+    #[test]
+    fn revoked_peer_cache_is_rejected_before_peer_book_authorization() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer = PeerId::random();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: peer.to_string(),
+                addrs: vec![],
+                user_id: Some("u1".to_string()),
+                device_id: Some("dev-remote".to_string()),
+                rr_version: None,
+                last_seen_unix: OffsetDateTime::now_utc().unix_timestamp(),
+            })
+            .unwrap();
+        store
+            .apply_peer_revocation(&PeerRevocation {
+                peer_id: peer.to_string(),
+                device_id: Some("dev-remote".to_string()),
+                user_id: Some("u1".to_string()),
+                revoked_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+                ticket_id: "ticket-1".to_string(),
+            })
+            .unwrap();
+        let meta = crate::tracker::PeerMeta {
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            hostname: None,
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        };
+
+        let err = authorize_inbound_peer(&store, peer, &meta, &[], false).unwrap_err();
+        assert!(format!("{err:#}").contains("peer is revoked"));
     }
 
     #[test]
@@ -3049,6 +3257,7 @@ mod tests {
             relay_addr: Some(relay_addr.parse().unwrap()),
             trackers: vec!["http://127.0.0.1:1".to_string()],
             tracker_token: None,
+            require_device_membership: false,
             user_id: Some("u1".to_string()),
             device_id: Some("dev-local".to_string()),
             request_retry_policy: RequestRetryPolicy::default(),

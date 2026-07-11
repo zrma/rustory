@@ -1,10 +1,31 @@
 use crate::{config, hook, self_update, storage, tracker};
 use anyhow::{Context, Result};
+use serde::Deserialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const DAEMON_AUTOSTART_START: &str = "# >>> rustory daemon autostart >>>";
 const DAEMON_AUTOSTART_END: &str = "# <<< rustory daemon autostart <<<";
+const MANAGED_RC_STATE_FILE: &str = "managed-rc-files.json";
+const MANAGED_RC_LOCK_FILE: &str = ".managed-rc-files.lock";
+const MANAGED_STATE_HOME_FILE: &str = "managed-state-home";
+const MANAGED_STATE_HOMES_FILE: &str = "managed-state-homes.json";
+const MANAGED_STATE_HOMES_LOCK_FILE: &str = ".managed-state-homes.lock";
+const MAX_MANAGED_RC_STATE_BYTES: u64 = 64 * 1024;
+const MAX_MANAGED_RC_FILES: usize = 32;
+const MAX_MANAGED_STATE_HOMES: usize = 32;
+
+#[derive(Deserialize)]
+struct ManagedRcState {
+    version: u32,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Deserialize)]
+struct ManagedStateHomeHistory {
+    version: u32,
+    paths: Vec<PathBuf>,
+}
 
 #[derive(Debug, Clone)]
 pub struct UninstallRequest {
@@ -22,8 +43,169 @@ pub struct UninstallRequest {
     pub extra_rc_files: Vec<PathBuf>,
     pub trackers: Vec<String>,
     pub tracker_token: Option<String>,
+    pub require_device_membership: bool,
     pub local_peer_id: Option<String>,
+    pub local_identity: Option<crate::libp2p::identity::Keypair>,
     pub config_load_error: Option<String>,
+}
+
+pub fn load_managed_rc_files() -> Result<Vec<PathBuf>> {
+    let home = home_dir()?;
+    let path = managed_rc_state_path(&home);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect managed rc state: {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "managed rc state must be a regular non-symlink file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_MANAGED_RC_STATE_BYTES,
+        "managed rc state is too large: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "managed rc state permissions are too broad: {}",
+            path.display()
+        );
+    }
+    let state: ManagedRcState = serde_json::from_slice(
+        &std::fs::read(&path)
+            .with_context(|| format!("read managed rc state: {}", path.display()))?,
+    )
+    .with_context(|| format!("parse managed rc state: {}", path.display()))?;
+    anyhow::ensure!(state.version == 1, "unsupported managed rc state version");
+    anyhow::ensure!(
+        state.paths.len() <= MAX_MANAGED_RC_FILES,
+        "too many managed rc paths"
+    );
+    let mut paths = Vec::new();
+    for path in state.paths {
+        anyhow::ensure!(path.is_absolute(), "managed rc path must be absolute");
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+pub fn load_managed_state_home() -> Result<Option<PathBuf>> {
+    let home = home_dir()?;
+    load_managed_state_home_for(&home)
+}
+
+fn load_managed_state_home_for(home: &Path) -> Result<Option<PathBuf>> {
+    let path = managed_state_home_metadata_path(home);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect managed state home: {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "managed state home must be a regular non-symlink file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= 4096,
+        "managed state home file is too large: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "managed state home permissions are too broad: {}",
+            path.display()
+        );
+    }
+    let raw = std::fs::read_to_string(&path)
+        .with_context(|| format!("read managed state home: {}", path.display()))?;
+    let value = raw.trim();
+    anyhow::ensure!(
+        !value.is_empty() && !value.chars().any(char::is_control),
+        "managed state home is empty or contains control characters: {}",
+        path.display()
+    );
+    let state_home = PathBuf::from(value);
+    anyhow::ensure!(
+        state_home.is_absolute(),
+        "managed state home must be absolute: {}",
+        state_home.display()
+    );
+    Ok(Some(state_home))
+}
+
+fn load_managed_state_home_history_for(home: &Path) -> Result<Vec<PathBuf>> {
+    let path = managed_state_homes_metadata_path(home);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("inspect managed state homes: {}", path.display()));
+        }
+    };
+    anyhow::ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "managed state homes must be a regular non-symlink file: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        metadata.len() <= MAX_MANAGED_RC_STATE_BYTES,
+        "managed state homes file is too large: {}",
+        path.display()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            metadata.permissions().mode() & 0o077 == 0,
+            "managed state homes permissions are too broad: {}",
+            path.display()
+        );
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("read managed state homes: {}", path.display()))?;
+    let history: ManagedStateHomeHistory =
+        serde_json::from_slice(&bytes).context("parse managed state homes json")?;
+    anyhow::ensure!(
+        history.version == 1,
+        "unsupported managed state homes version"
+    );
+    anyhow::ensure!(
+        history.paths.len() <= MAX_MANAGED_STATE_HOMES,
+        "too many managed state homes"
+    );
+    let mut paths = Vec::new();
+    for state_home in history.paths {
+        let value = state_home
+            .to_str()
+            .context("managed state home is not valid UTF-8")?;
+        anyhow::ensure!(
+            state_home.is_absolute() && value.len() <= 4095 && !value.chars().any(char::is_control),
+            "managed state home must be an absolute safe path: {}",
+            state_home.display()
+        );
+        if !paths.contains(&state_home) {
+            paths.push(state_home);
+        }
+    }
+    Ok(paths)
 }
 
 pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
@@ -38,8 +220,13 @@ pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
     }
     validate_path_boundaries(&request)?;
 
-    self_update::stop_managed_daemon(&request.install_path)?;
-    unregister_from_trackers(&request);
+    if request.require_device_membership {
+        unregister_from_trackers(&request)?;
+        self_update::stop_managed_daemon(&request.install_path)?;
+    } else {
+        self_update::stop_managed_daemon(&request.install_path)?;
+        unregister_from_trackers(&request)?;
+    }
     remove_shell_hooks(&request.extra_rc_files)?;
     remove_daemon_autostart_blocks(&request.extra_rc_files)?;
     remove_daemon_service_files()?;
@@ -70,6 +257,10 @@ pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
 
     println!("rustory uninstall ok");
     Ok(())
+}
+
+pub fn validate_uninstall_request(request: &UninstallRequest) -> Result<()> {
+    validate_path_boundaries(request)
 }
 
 fn print_uninstall_plan(request: &UninstallRequest) -> Result<()> {
@@ -136,31 +327,85 @@ fn print_uninstall_plan(request: &UninstallRequest) -> Result<()> {
     Ok(())
 }
 
-fn unregister_from_trackers(request: &UninstallRequest) {
+fn unregister_from_trackers(request: &UninstallRequest) -> Result<()> {
     let Some(peer_id) = request.local_peer_id.as_deref() else {
+        anyhow::ensure!(
+            !request.require_device_membership,
+            "strict device membership uninstall requires the local PeerId and identity key; no local files were removed"
+        );
         println!("tracker_unregister=skipped reason=missing_peer_id");
-        return;
+        return Ok(());
     };
     if request.trackers.is_empty() {
+        anyhow::ensure!(
+            !request.require_device_membership,
+            "strict device membership uninstall requires its authoritative tracker; no local files were removed"
+        );
         println!("tracker_unregister=skipped reason=no_trackers");
-        return;
+        return Ok(());
+    }
+    if request.require_device_membership {
+        anyhow::ensure!(
+            request.trackers.len() == 1,
+            "strict device membership uninstall requires exactly one authoritative tracker; no local files were removed"
+        );
+        crate::device_retirement::validate_retirement_tracker_url(&request.trackers[0])
+            .context("strict device membership uninstall requires an HTTPS tracker")?;
+        anyhow::ensure!(
+            request.local_identity.is_some(),
+            "strict device membership uninstall requires the local identity key; no local files were removed"
+        );
     }
 
     for base_url in &request.trackers {
         let client =
             tracker::TrackerClient::new(base_url.to_string(), request.tracker_token.clone());
-        match client.unregister(&tracker::UnregisterRequest {
-            peer_id: peer_id.to_string(),
-        }) {
-            Ok(resp) => println!(
-                "tracker_unregister=ok tracker={} removed={}",
-                base_url, resp.removed
-            ),
+        let unregister = match request.local_identity.as_ref() {
+            Some(identity) => match tracker::UnregisterRequest::signed(identity) {
+                Ok(unregister) => unregister,
+                Err(error) => {
+                    if request.require_device_membership {
+                        return Err(error).context(
+                            "sign strict tracker unregister proof; no local files were removed",
+                        );
+                    }
+                    println!("warn: tracker unregister proof failed detail={error:#}");
+                    continue;
+                }
+            },
+            None => tracker::UnregisterRequest {
+                peer_id: peer_id.to_string(),
+                device_proof: None,
+            },
+        };
+        match client.unregister(&unregister) {
+            Ok(resp) => {
+                if !resp.ok {
+                    anyhow::ensure!(
+                        !request.require_device_membership,
+                        "strict tracker unregister returned ok=false from {base_url}; no local files were removed"
+                    );
+                    println!("warn: tracker unregister returned ok=false tracker={base_url}");
+                    continue;
+                }
+                println!(
+                    "tracker_unregister=ok tracker={} removed={}",
+                    base_url, resp.removed
+                );
+            }
             Err(err) => {
+                if request.require_device_membership {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "strict tracker unregister was not confirmed by {base_url}; no local files were removed"
+                        )
+                    });
+                }
                 println!("warn: tracker unregister failed tracker={base_url} detail={err:#}")
             }
         }
     }
+    Ok(())
 }
 
 fn remove_shell_hooks(extra_rc_files: &[PathBuf]) -> Result<()> {
@@ -261,8 +506,16 @@ fn daemon_service_files_for_home(home: &Path) -> Vec<PathBuf> {
 }
 
 fn remove_db_path_family(db_path: &Path) -> Result<()> {
+    if is_in_memory_db_path(db_path) {
+        println!("db=remove_skipped path=:memory: reason=sqlite_in_memory");
+        return Ok(());
+    }
     let default_db = config::expand_home_path(storage::DEFAULT_DB_PATH)?;
     remove_db_path_family_with_default(db_path, &default_db)
+}
+
+fn is_in_memory_db_path(path: &Path) -> bool {
+    path == Path::new(":memory:")
 }
 
 fn remove_db_path_family_with_default(db_path: &Path, default_db: &Path) -> Result<()> {
@@ -324,28 +577,47 @@ fn managed_state_locations(marker_paths: &[PathBuf]) -> Result<ManagedStateLocat
             path.display()
         );
     }
+    let mut state_homes = Vec::new();
+    if let Some(path) = xdg_state_home {
+        state_homes.push(path);
+    }
+    if let Some(path) = load_managed_state_home()?
+        && !state_homes.contains(&path)
+    {
+        state_homes.push(path);
+    }
+    for path in load_managed_state_home_history_for(&home)? {
+        if !state_homes.contains(&path) {
+            state_homes.push(path);
+        }
+    }
     Ok(managed_state_locations_for(
         &home,
-        xdg_state_home.as_deref(),
+        &state_homes,
         marker_paths,
     ))
 }
 
 fn managed_state_locations_for(
     home: &Path,
-    xdg_state_home: Option<&Path>,
+    state_homes: &[PathBuf],
     marker_paths: &[PathBuf],
 ) -> ManagedStateLocations {
     let mut files = marker_paths.to_vec();
     files.extend([
         home.join("Library/Logs/rustory-daemon.out.log"),
         home.join("Library/Logs/rustory-daemon.err.log"),
+        managed_rc_state_path(home),
+        managed_rc_lock_path(home),
+        managed_state_home_metadata_path(home),
+        managed_state_homes_metadata_path(home),
+        managed_state_homes_lock_path(home),
     ]);
     let mut dirs = vec![
         home.join(".local/state/rustory"),
         home.join("Library/Logs/rustory"),
     ];
-    if let Some(base) = xdg_state_home {
+    for base in state_homes {
         dirs.push(base.join("rustory"));
     }
     for dir in &dirs {
@@ -356,6 +628,27 @@ fn managed_state_locations_for(
         files: unique_paths(&files),
         dirs: unique_paths(&dirs),
     }
+}
+
+fn managed_rc_state_path(home: &Path) -> PathBuf {
+    home.join(".config/rustory").join(MANAGED_RC_STATE_FILE)
+}
+
+fn managed_rc_lock_path(home: &Path) -> PathBuf {
+    home.join(".config/rustory").join(MANAGED_RC_LOCK_FILE)
+}
+
+fn managed_state_home_metadata_path(home: &Path) -> PathBuf {
+    home.join(".config/rustory").join(MANAGED_STATE_HOME_FILE)
+}
+
+fn managed_state_homes_metadata_path(home: &Path) -> PathBuf {
+    home.join(".config/rustory").join(MANAGED_STATE_HOMES_FILE)
+}
+
+fn managed_state_homes_lock_path(home: &Path) -> PathBuf {
+    home.join(".config/rustory")
+        .join(MANAGED_STATE_HOMES_LOCK_FILE)
 }
 
 fn remove_state_paths(marker_paths: &[PathBuf]) -> Result<()> {
@@ -378,7 +671,9 @@ fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
     let mut protected = Vec::new();
     let mut removed = Vec::new();
 
-    if request.keep_db {
+    if is_in_memory_db_path(&request.db_path) {
+        // SQLite's in-memory sentinel is not a filesystem path and has no WAL/SHM sidecars.
+    } else if request.keep_db {
         protected.push(("db", request.db_path.clone()));
         protected.push(("db_wal", sidecar_path(&request.db_path, "wal")));
         protected.push(("db_shm", sidecar_path(&request.db_path, "shm")));
@@ -405,6 +700,13 @@ fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
             removed.push(("state", path));
         }
     }
+    for path in state_locations.dirs {
+        if request.keep_state {
+            protected.push(("state_dir", path));
+        } else {
+            removed.push(("state_dir", path));
+        }
+    }
 
     if request.remove_binary {
         removed.push(("binary", request.install_path.clone()));
@@ -416,6 +718,11 @@ fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
     }
     for path in shell_profile_candidates(&request.extra_rc_files)? {
         removed.push(("shell_rc", path));
+    }
+
+    validate_uninstall_filesystem_path("binary", &request.install_path)?;
+    for (label, path) in &removed {
+        validate_uninstall_filesystem_path(label, path)?;
     }
 
     for (removed_label, removed_path) in &removed {
@@ -433,9 +740,31 @@ fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
     Ok(())
 }
 
+fn validate_uninstall_filesystem_path(label: &str, path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute(),
+        "uninstall {label} path must be absolute: {}",
+        path.display()
+    );
+    anyhow::ensure!(
+        !path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        }),
+        "uninstall {label} path must not contain . or .. components: {}",
+        path.display()
+    );
+    Ok(())
+}
+
 fn remove_file_if_exists(path: &Path, label: &str) -> Result<()> {
     match std::fs::remove_file(path) {
-        Ok(()) => println!("{label}=removed path={}", path.display()),
+        Ok(()) => {
+            sync_parent_directory(path)?;
+            println!("{label}=removed path={}", path.display());
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             println!(
                 "{label}=remove_skipped path={} reason=missing",
@@ -468,7 +797,24 @@ fn remove_dir_if_empty(path: &Path, label: &str) -> Result<()> {
         return Ok(());
     }
     std::fs::remove_dir(path).with_context(|| format!("remove dir: {}", path.display()))?;
+    sync_parent_directory(path)?;
     println!("{label}=removed path={}", path.display());
+    Ok(())
+}
+
+fn sync_parent_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::File::open(parent)
+            .with_context(|| format!("open parent directory for sync: {}", parent.display()))?
+            .sync_all()
+            .with_context(|| format!("sync parent directory: {}", parent.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -584,6 +930,33 @@ mod tests {
     }
 
     #[test]
+    fn strict_uninstall_requires_confirmable_signed_tracker_departure() {
+        let request = UninstallRequest {
+            apply: true,
+            dry_run: false,
+            keep_db: false,
+            keep_config: false,
+            keep_state: false,
+            remove_binary: true,
+            install_path: PathBuf::from("/tmp/rr"),
+            config_path: PathBuf::from("/tmp/config.toml"),
+            db_path: PathBuf::from("/tmp/history.db"),
+            config_key_paths: Vec::new(),
+            state_marker_paths: Vec::new(),
+            extra_rc_files: Vec::new(),
+            trackers: vec!["http://127.0.0.1:8850".to_string()],
+            tracker_token: None,
+            require_device_membership: true,
+            local_peer_id: Some(crate::libp2p::PeerId::random().to_string()),
+            local_identity: None,
+            config_load_error: None,
+        };
+
+        let error = unregister_from_trackers(&request).unwrap_err();
+        assert!(format!("{error:#}").contains("requires the local identity key"));
+    }
+
+    #[test]
     fn sidecar_path_appends_sqlite_wal_and_shm_suffixes() {
         let db = Path::new("/tmp/rustory/history.db");
 
@@ -595,6 +968,48 @@ mod tests {
             sidecar_path(db, "shm"),
             PathBuf::from("/tmp/rustory/history.db-shm")
         );
+    }
+
+    #[test]
+    fn in_memory_database_sentinel_never_becomes_a_cleanup_path() {
+        assert!(is_in_memory_db_path(Path::new(":memory:")));
+        remove_db_path_family(Path::new(":memory:")).unwrap();
+        assert!(!is_in_memory_db_path(Path::new("/tmp/:memory:")));
+    }
+
+    #[test]
+    fn uninstall_rejects_relative_and_parent_traversal_paths() {
+        assert!(validate_uninstall_filesystem_path("db", Path::new("history.db")).is_err());
+        assert!(
+            validate_uninstall_filesystem_path("config", Path::new("/tmp/../etc/passwd")).is_err()
+        );
+        validate_uninstall_filesystem_path("db", Path::new("/tmp/history.db")).unwrap();
+    }
+
+    #[test]
+    fn uninstall_allows_relative_paths_only_when_they_are_kept() {
+        let request = UninstallRequest {
+            apply: true,
+            dry_run: false,
+            keep_db: true,
+            keep_config: true,
+            keep_state: true,
+            remove_binary: false,
+            install_path: PathBuf::from("/tmp/rr"),
+            config_path: PathBuf::from("config.toml"),
+            db_path: PathBuf::from("history.db"),
+            config_key_paths: vec![PathBuf::from("identity.key")],
+            state_marker_paths: vec![PathBuf::from("marker")],
+            extra_rc_files: Vec::new(),
+            trackers: Vec::new(),
+            tracker_token: None,
+            require_device_membership: false,
+            local_peer_id: None,
+            local_identity: None,
+            config_load_error: None,
+        };
+
+        validate_path_boundaries(&request).unwrap();
     }
 
     #[test]
@@ -654,8 +1069,11 @@ mod tests {
         let home = dir.path().join("home");
         let xdg = dir.path().join("xdg-state");
         let marker = home.join(".config/rustory/async-upload.last");
-        let locations =
-            managed_state_locations_for(&home, Some(&xdg), std::slice::from_ref(&marker));
+        let locations = managed_state_locations_for(
+            &home,
+            std::slice::from_ref(&xdg),
+            std::slice::from_ref(&marker),
+        );
         for path in &locations.files {
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(path, b"state").unwrap();
@@ -668,10 +1086,58 @@ mod tests {
         assert!(!marker.exists());
         assert!(!home.join("Library/Logs/rustory-daemon.out.log").exists());
         assert!(!home.join("Library/Logs/rustory-daemon.err.log").exists());
+        assert!(
+            !home
+                .join(".config/rustory")
+                .join(MANAGED_RC_LOCK_FILE)
+                .exists()
+        );
         assert!(!xdg.join("rustory/daemon.pid").exists());
         assert!(!xdg.join("rustory/daemon.log").exists());
         assert!(unknown.exists());
         assert!(xdg.join("rustory").exists());
+    }
+
+    #[test]
+    fn managed_state_home_metadata_recovers_custom_installer_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config_dir = home.join(".config/rustory");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let state_home = dir.path().join("custom-state");
+        let previous_state_home = dir.path().join("previous-state");
+        let metadata_path = config_dir.join(MANAGED_STATE_HOME_FILE);
+        std::fs::write(&metadata_path, format!("{}\n", state_home.display())).unwrap();
+        let history_path = config_dir.join(MANAGED_STATE_HOMES_FILE);
+        std::fs::write(
+            &history_path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 1,
+                "paths": [
+                    previous_state_home.display().to_string(),
+                    state_home.display().to_string()
+                ],
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&metadata_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            std::fs::set_permissions(&history_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+
+        assert_eq!(
+            load_managed_state_home_for(&home).unwrap(),
+            Some(state_home.clone())
+        );
+        assert_eq!(
+            load_managed_state_home_history_for(&home).unwrap(),
+            vec![previous_state_home, state_home]
+        );
     }
 
     #[test]
@@ -702,7 +1168,9 @@ mod tests {
             extra_rc_files: Vec::new(),
             trackers: Vec::new(),
             tracker_token: None,
+            require_device_membership: false,
             local_peer_id: None,
+            local_identity: None,
             config_load_error: None,
         };
 

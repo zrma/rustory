@@ -482,6 +482,16 @@ enum Command {
         )]
         no_tracker: bool,
     },
+    #[command(about = "Manage enrolled Rustory devices and retirement")]
+    Device {
+        #[command(subcommand)]
+        command: DeviceCommand,
+    },
+    #[command(hide = true)]
+    ApplyRetirement {
+        #[arg(long, help = "Canonical tracker retirement ticket UUID")]
+        job_id: String,
+    },
     #[command(about = "Print Rustory version and build revision")]
     Version {
         #[arg(
@@ -631,6 +641,25 @@ enum Command {
 
         #[arg(
             long,
+            help = "Separate admin token for device enrollment and retirement"
+        )]
+        admin_token: Option<String>,
+
+        #[arg(
+            long,
+            help = "Private durable JSON path for enrollment and retirement state"
+        )]
+        security_state_path: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Reject tracker registration from identities that were not explicitly enrolled"
+        )]
+        require_device_enrollment: bool,
+
+        #[arg(
+            long,
             help = "Allow serving the tracker without a token on non-loopback bind addresses"
         )]
         allow_unauthenticated: bool,
@@ -704,6 +733,13 @@ enum Command {
         #[arg(long, help = "Overwrite an existing config.toml")]
         force: bool,
 
+        #[arg(
+            long,
+            conflicts_with = "force",
+            help = "Atomically enable requested device-security flags in an existing config without rewriting other settings"
+        )]
+        update_existing_security: bool,
+
         #[arg(long, help = "Logical Rustory user id to write into config")]
         user_id: Option<String>,
 
@@ -727,6 +763,21 @@ enum Command {
             help = "Tracker bearer token to write into config"
         )]
         tracker_token: Option<String>,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Require authoritative enrolled-device membership for every P2P peer"
+        )]
+        require_device_membership: bool,
+
+        #[arg(
+            long,
+            default_value_t = false,
+            requires = "require_device_membership",
+            help = "Opt this managed daemon into cooperative remote full uninstall"
+        )]
+        allow_remote_retirement: bool,
     },
     #[command(about = "Diagnose local config, tools, keys, and connectivity")]
     Doctor {
@@ -803,6 +854,65 @@ enum Command {
             help = "Home directory override for tests and scripted cleanup"
         )]
         home: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DeviceCommand {
+    #[command(about = "List tracker-observed, enrolled, and retired devices")]
+    List {
+        #[arg(long, help = "Authoritative tracker base URL")]
+        tracker: Option<String>,
+        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        #[arg(long, default_value_t = false, help = "Print pretty JSON")]
+        json: bool,
+    },
+    #[command(about = "Enroll a signed tracker-observed PeerId")]
+    Enroll {
+        #[arg(long, help = "Exact libp2p PeerId to enroll")]
+        peer_id: String,
+        #[arg(long, help = "Authoritative tracker base URL")]
+        tracker: Option<String>,
+        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+    },
+    #[command(about = "Revoke grid membership without requesting local cleanup")]
+    Revoke {
+        #[arg(long, help = "Exact libp2p PeerId to revoke")]
+        peer_id: String,
+        #[arg(long, help = "Authoritative tracker base URL")]
+        tracker: Option<String>,
+        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        #[arg(long, default_value_t = false, help = "Required to apply revocation")]
+        yes: bool,
+    },
+    #[command(about = "Revoke a device and request its managed full uninstall")]
+    Retire {
+        #[arg(long, help = "Exact libp2p PeerId to retire")]
+        peer_id: String,
+        #[arg(long, help = "Authoritative tracker base URL")]
+        tracker: Option<String>,
+        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        #[arg(
+            long,
+            default_value_t = false,
+            help = "Required to revoke and queue uninstall"
+        )]
+        yes: bool,
+    },
+    #[command(about = "Show membership and cleanup state for one exact PeerId")]
+    Status {
+        #[arg(long, help = "Exact libp2p PeerId to inspect")]
+        peer_id: String,
+        #[arg(long, help = "Authoritative tracker base URL")]
+        tracker: Option<String>,
+        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
+        admin_token: Option<String>,
+        #[arg(long, default_value_t = false, help = "Print pretty JSON")]
+        json: bool,
     },
 }
 
@@ -912,6 +1022,36 @@ pub fn run() -> Result<()> {
             let relay_addr = resolve_relay_addr(relay, &cfg)?;
             let trackers = resolve_trackers(trackers, &cfg)?;
             let tracker_token = resolve_tracker_token(tracker_token, &cfg)?;
+            let require_device_membership = resolve_require_device_membership(&cfg)?;
+            if require_device_membership {
+                anyhow::ensure!(
+                    trackers.len() == 1,
+                    "require_device_membership requires exactly one authoritative tracker"
+                );
+                crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
+            }
+            let allow_remote_retirement = resolve_allow_remote_retirement(&cfg)?;
+            let managed_executor = env_nonempty("RUSTORY_MANAGED_DAEMON_CHILD").as_deref()
+                == Some("1")
+                && env_nonempty("RUSTORY_RETIREMENT_EXECUTOR_READY").as_deref() == Some("1");
+            let cleanup_ready = if allow_remote_retirement && managed_executor {
+                match build_remote_retirement_cleanup_plan(&cfg, &db_path) {
+                    Ok(_) => true,
+                    Err(error) => {
+                        eprintln!(
+                            "warn: remote retirement capability disabled by cleanup preflight: {error:#}"
+                        );
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            let retirement_protocol = advertised_retirement_protocol(
+                require_device_membership,
+                allow_remote_retirement,
+                managed_executor && cleanup_ready,
+            );
             let meta = resolve_peer_meta(&cfg);
 
             p2p::serve(
@@ -923,6 +1063,8 @@ pub fn run() -> Result<()> {
                     relay_addr,
                     trackers,
                     tracker_token,
+                    require_device_membership,
+                    retirement_protocol,
                     meta,
                 },
             )?;
@@ -950,6 +1092,14 @@ pub fn run() -> Result<()> {
             let relay_addr = resolve_relay_addr(relay, &cfg)?;
             let trackers = resolve_trackers(trackers, &cfg)?;
             let tracker_token = resolve_tracker_token(tracker_token, &cfg)?;
+            let require_device_membership = resolve_require_device_membership(&cfg)?;
+            if require_device_membership {
+                anyhow::ensure!(
+                    trackers.len() == 1,
+                    "require_device_membership requires exactly one authoritative tracker"
+                );
+                crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
+            }
             let user_id = resolve_user_id(&cfg);
             let device_id = resolve_device_id(&cfg);
             let request_retry_policy = resolve_p2p_request_retry_policy(
@@ -966,6 +1116,7 @@ pub fn run() -> Result<()> {
                 relay_addr,
                 trackers,
                 tracker_token,
+                require_device_membership,
                 user_id: Some(user_id),
                 device_id: Some(device_id),
                 request_retry_policy,
@@ -1359,7 +1510,7 @@ pub fn run() -> Result<()> {
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
             let local_user_id = resolve_user_id(&cfg);
-            let local_peer_id = resolve_local_p2p_peer_id(&cfg);
+            let local_peer_id = resolve_local_p2p_peer_id(&cfg)?;
             let trackers = if with_tracker {
                 Some(resolve_trackers(Vec::new(), &cfg)?)
             } else {
@@ -1414,7 +1565,7 @@ pub fn run() -> Result<()> {
             let store = storage::LocalStore::open(&db_path)?;
             let local_device_id = resolve_device_id(&cfg);
             let local_user_id = resolve_user_id(&cfg);
-            let local_peer_id = resolve_local_p2p_peer_id(&cfg);
+            let local_peer_id = resolve_local_p2p_peer_id(&cfg)?;
             let trackers = if no_tracker {
                 None
             } else {
@@ -1462,6 +1613,10 @@ pub fn run() -> Result<()> {
                 )
             );
         }
+        Command::Device { command } => run_device_command(command, &cfg)?,
+        Command::ApplyRetirement { job_id } => {
+            run_retirement_helper(&job_id, &cfg, config_load_error.as_deref())?;
+        }
         Command::Version { json } => {
             print_build_info(json)?;
         }
@@ -1499,51 +1654,19 @@ pub fn run() -> Result<()> {
             remove_binary,
             rc_file,
         } => {
-            let install_path = std::env::current_exe().context("resolve current rr executable")?;
-            let config_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
-            let db_path = config::expand_home_path(&db_path)?;
-            let trackers = resolve_trackers(Vec::new(), &cfg)?;
-            let tracker_token = resolve_tracker_token(None, &cfg)?;
-            let local_peer_id = resolve_local_p2p_peer_id(&cfg);
-            let config_key_paths = [
-                resolve_swarm_key_path(None, &cfg),
-                resolve_p2p_identity_key_path(None, &cfg),
-                resolve_relay_identity_key_path(None, &cfg),
-            ]
-            .into_iter()
-            .map(|path| config::expand_home_path(&path))
-            .collect::<Result<Vec<_>>>()?;
-            let state_marker_paths = [
-                resolve_async_upload_marker_path(&cfg),
-                resolve_auto_prune_marker_path(&cfg),
-                resolve_auto_tombstone_gc_marker_path(&cfg),
-            ]
-            .into_iter()
-            .map(|path| config::expand_home_path(&path))
-            .collect::<Result<Vec<_>>>()?;
-            let extra_rc_files = normalize_opt_string(rc_file)
-                .map(|path| config::expand_home_path(&path))
-                .transpose()?
-                .into_iter()
-                .collect();
-            uninstall::run_uninstall(uninstall::UninstallRequest {
-                apply: yes && !dry_run,
+            let request = build_uninstall_request(
+                &cfg,
+                &db_path,
+                yes && !dry_run,
                 dry_run,
                 keep_db,
                 keep_config,
                 keep_state,
                 remove_binary,
-                install_path,
-                config_path,
-                db_path,
-                config_key_paths,
-                state_marker_paths,
-                extra_rc_files,
-                trackers,
-                tracker_token,
-                local_peer_id,
+                rc_file,
                 config_load_error,
-            })?;
+            )?;
+            uninstall::run_uninstall(request)?;
         }
         Command::Hook { shell } => {
             let shell = hook::Shell::parse(shell.as_str())?;
@@ -1554,11 +1677,39 @@ pub fn run() -> Result<()> {
             bind,
             ttl_sec,
             token,
+            admin_token,
+            security_state_path,
+            require_device_enrollment,
             allow_unauthenticated,
         } => {
             let token = resolve_tracker_token(token, &cfg)?;
             validate_tracker_serve_auth(&bind, token.as_deref(), allow_unauthenticated)?;
-            tracker::serve(&bind, ttl_sec, token)?;
+            let admin_token = normalize_opt_string(admin_token).or_else(|| {
+                std::env::var("RUSTORY_TRACKER_ADMIN_TOKEN")
+                    .ok()
+                    .and_then(|value| normalize_opt_string(Some(value)))
+            });
+            if let Some(admin_token) = admin_token.as_deref() {
+                tracker::validate_tracker_admin_token_value(admin_token)?;
+            }
+            let security_state_path = normalize_opt_string(security_state_path)
+                .or_else(|| {
+                    std::env::var("RUSTORY_TRACKER_SECURITY_STATE_PATH")
+                        .ok()
+                        .and_then(|value| normalize_opt_string(Some(value)))
+                })
+                .map(|path| config::expand_home_path(&path))
+                .transpose()?;
+            tracker::serve(
+                &bind,
+                tracker::TrackerServeConfig {
+                    ttl_sec,
+                    token,
+                    admin_token,
+                    security_state_path,
+                    require_device_enrollment,
+                },
+            )?;
         }
         Command::RelayServe {
             listen,
@@ -1595,11 +1746,14 @@ pub fn run() -> Result<()> {
         }
         Command::Init {
             force,
+            update_existing_security,
             user_id,
             device_id,
             trackers,
             relay,
             tracker_token,
+            require_device_membership,
+            allow_remote_retirement,
         } => {
             if let Some(err) = config_load_error.as_deref() {
                 eprintln!("warn: ignoring invalid config because --force was set: {err}");
@@ -1607,11 +1761,14 @@ pub fn run() -> Result<()> {
             run_init(
                 InitArgs {
                     force,
+                    update_existing_security,
                     user_id,
                     device_id,
                     trackers,
                     relay,
                     tracker_token,
+                    require_device_membership,
+                    allow_remote_retirement,
                 },
                 &cfg,
                 &db_path,
@@ -1714,6 +1871,828 @@ pub fn run() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Result<()> {
+    match command {
+        DeviceCommand::List {
+            tracker,
+            admin_token,
+            json,
+        } => {
+            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let response = client.admin_list_devices()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else if response.devices.is_empty() {
+                println!("devices: none");
+            } else {
+                for device in response.devices {
+                    let cleanup = device
+                        .ticket
+                        .as_ref()
+                        .filter(|ticket| {
+                            ticket.cleanup
+                                == crate::device_retirement::RetirementCleanup::FullUninstall
+                        })
+                        .map(|ticket| format!("{:?}", ticket.status).to_ascii_lowercase())
+                        .unwrap_or_else(|| "none".to_string());
+                    println!(
+                        "device peer_id={} device_id={} enrolled={} active={} revoked={} membership_protocol={} membership_enforced={} retirement_protocol={} cleanup={}",
+                        device.peer_id,
+                        device.device_id.as_deref().unwrap_or("unknown"),
+                        device.enrolled,
+                        device.active,
+                        device.revoked,
+                        device
+                            .membership_protocol
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        device.membership_enforced,
+                        device
+                            .retirement_protocol
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "unknown".to_string()),
+                        cleanup,
+                    );
+                }
+            }
+        }
+        DeviceCommand::Enroll {
+            peer_id,
+            tracker,
+            admin_token,
+        } => {
+            let peer_id = normalize_peer_id(&peer_id)?;
+            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let response = client.admin_enroll(peer_id)?;
+            anyhow::ensure!(
+                response.ok,
+                "tracker returned ok=false for device enrollment"
+            );
+            println!("device enrollment ok peer_id={}", response.peer_id);
+        }
+        DeviceCommand::Revoke {
+            peer_id,
+            tracker,
+            admin_token,
+            yes,
+        } => {
+            let peer_id = validate_remote_device_target(&peer_id, cfg)?;
+            if !yes {
+                println!("device revoke plan: peer_id={peer_id} cleanup=revoke_only apply=false");
+                println!("pass --yes to apply");
+                return Ok(());
+            }
+            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let response = client.admin_retire(
+                peer_id,
+                crate::device_retirement::RetirementCleanup::RevokeOnly,
+            )?;
+            anyhow::ensure!(response.ok, "tracker returned ok=false for device revoke");
+            warn_if_fleet_membership_enforcement_incomplete(&response);
+            let ticket = response
+                .ticket
+                .context("tracker omitted revocation ticket")?;
+            println!(
+                "device revoke ok peer_id={} ticket_id={} membership=revoked cleanup=none",
+                response.peer_id, ticket.ticket_id
+            );
+        }
+        DeviceCommand::Retire {
+            peer_id,
+            tracker,
+            admin_token,
+            yes,
+        } => {
+            let peer_id = validate_remote_device_target(&peer_id, cfg)?;
+            if !yes {
+                println!(
+                    "device retire plan: peer_id={peer_id} membership=revoked cleanup=full_uninstall apply=false"
+                );
+                println!("pass --yes to apply");
+                return Ok(());
+            }
+            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let response = client.admin_retire(
+                peer_id,
+                crate::device_retirement::RetirementCleanup::FullUninstall,
+            )?;
+            anyhow::ensure!(
+                response.ok,
+                "tracker returned ok=false for device retirement"
+            );
+            warn_if_fleet_membership_enforcement_incomplete(&response);
+            let ticket = response
+                .ticket
+                .context("tracker omitted retirement ticket")?;
+            println!(
+                "device retire queued peer_id={} ticket_id={} membership=revoked cleanup={:?} status={:?}",
+                response.peer_id, ticket.ticket_id, ticket.cleanup, ticket.status
+            );
+        }
+        DeviceCommand::Status {
+            peer_id,
+            tracker,
+            admin_token,
+            json,
+        } => {
+            let peer_id = normalize_peer_id(&peer_id)?;
+            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let device = client
+                .admin_list_devices()?
+                .devices
+                .into_iter()
+                .find(|device| device.peer_id == peer_id)
+                .context("device not found")?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&device)?);
+            } else {
+                println!(
+                    "device status: peer_id={} device_id={} enrolled={} active={} revoked={} membership_protocol={} membership_enforced={} retirement_protocol={} cleanup={}",
+                    device.peer_id,
+                    device.device_id.as_deref().unwrap_or("unknown"),
+                    device.enrolled,
+                    device.active,
+                    device.revoked,
+                    device
+                        .membership_protocol
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    device.membership_enforced,
+                    device
+                        .retirement_protocol
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "none".to_string()),
+                    device
+                        .ticket
+                        .as_ref()
+                        .filter(|ticket| {
+                            ticket.cleanup
+                                == crate::device_retirement::RetirementCleanup::FullUninstall
+                        })
+                        .map(|ticket| format!("{:?}", ticket.status).to_ascii_lowercase())
+                        .unwrap_or_else(|| "none".to_string()),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn warn_if_fleet_membership_enforcement_incomplete(response: &tracker::AdminMutationResponse) {
+    if response.membership_enforcement_complete == Some(false) {
+        eprintln!(
+            "warn: tracker revocation is recorded, but fleet-wide enforcement is not confirmed; update and strict-enroll legacy peers, and rotate shared fleet/swarm credentials if the target is untrusted"
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_uninstall_request(
+    cfg: &config::FileConfig,
+    db_path: &str,
+    apply: bool,
+    dry_run: bool,
+    keep_db: bool,
+    keep_config: bool,
+    keep_state: bool,
+    remove_binary: bool,
+    rc_file: Option<String>,
+    config_load_error: Option<String>,
+) -> Result<uninstall::UninstallRequest> {
+    let install_path = std::env::current_exe().context("resolve current rr executable")?;
+    let config_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
+    let db_path = config::expand_home_path(db_path)?;
+    let effective_trackers = resolve_trackers(Vec::new(), cfg)?;
+    let effective_tracker_token = resolve_tracker_token(None, cfg)?;
+    let effective_membership = resolve_require_device_membership(cfg)?;
+    let persisted_membership = cfg.require_device_membership.unwrap_or(false);
+    let require_device_membership =
+        strict_uninstall_required(persisted_membership, effective_membership);
+    let trackers = if persisted_membership {
+        persisted_config_trackers(cfg)
+    } else {
+        effective_trackers
+    };
+    let tracker_token = if persisted_membership {
+        let token = normalize_opt_string(cfg.tracker_token.clone());
+        if let Some(token) = token.as_deref() {
+            tracker::validate_tracker_token_value(token, "tracker token")?;
+        }
+        token
+    } else {
+        effective_tracker_token
+    };
+    let identity_key_path = if persisted_membership {
+        normalize_opt_string(cfg.p2p_identity_key_path.clone())
+            .unwrap_or_else(|| config::DEFAULT_P2P_IDENTITY_KEY_PATH.to_string())
+    } else {
+        resolve_p2p_identity_key_path(None, cfg)
+    };
+    let local_identity = config::load_identity_keypair(&identity_key_path)
+        .ok()
+        .flatten();
+    let local_peer_id = local_identity
+        .as_ref()
+        .map(|identity| identity.public().to_peer_id().to_string());
+    let config_key_paths = if persisted_membership {
+        [
+            normalize_opt_string(cfg.swarm_key_path.clone())
+                .unwrap_or_else(|| config::DEFAULT_SWARM_KEY_PATH.to_string()),
+            identity_key_path,
+            normalize_opt_string(cfg.relay_identity_key_path.clone())
+                .unwrap_or_else(|| config::DEFAULT_RELAY_IDENTITY_KEY_PATH.to_string()),
+        ]
+    } else {
+        [
+            resolve_swarm_key_path(None, cfg),
+            identity_key_path,
+            resolve_relay_identity_key_path(None, cfg),
+        ]
+    }
+    .into_iter()
+    .map(|path| config::expand_home_path(&path))
+    .collect::<Result<Vec<_>>>()?;
+    let state_marker_paths = [
+        resolve_async_upload_marker_path(cfg),
+        resolve_auto_prune_marker_path(cfg),
+        resolve_auto_tombstone_gc_marker_path(cfg),
+    ]
+    .into_iter()
+    .map(|path| config::expand_home_path(&path))
+    .collect::<Result<Vec<_>>>()?;
+    let mut extra_rc_files = uninstall::load_managed_rc_files()?;
+    if let Some(path) = normalize_opt_string(rc_file)
+        .map(|path| config::expand_home_path(&path))
+        .transpose()?
+        && !extra_rc_files.contains(&path)
+    {
+        extra_rc_files.push(path);
+    }
+    Ok(uninstall::UninstallRequest {
+        apply,
+        dry_run,
+        keep_db,
+        keep_config,
+        keep_state,
+        remove_binary,
+        install_path,
+        config_path,
+        db_path,
+        config_key_paths,
+        state_marker_paths,
+        extra_rc_files,
+        trackers,
+        tracker_token,
+        require_device_membership,
+        local_peer_id,
+        local_identity,
+        config_load_error,
+    })
+}
+
+fn persisted_config_trackers(cfg: &config::FileConfig) -> Vec<String> {
+    cfg.trackers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tracker| tracker.trim().to_string())
+        .filter(|tracker| !tracker.is_empty())
+        .collect()
+}
+
+fn strict_uninstall_required(persisted_membership: bool, effective_membership: bool) -> bool {
+    persisted_membership || effective_membership
+}
+
+fn run_retirement_helper(
+    job_id: &str,
+    cfg: &config::FileConfig,
+    config_load_error: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        crate::device_retirement::retirement_helper_invocation_is_authorized(),
+        "retirement helper may only be invoked by a managed one-shot job"
+    );
+    let mut job = crate::device_retirement::load_retirement_job(job_id)?;
+
+    if !job.running_accepted() {
+        let identity = config::load_identity_keypair_from_path(job.identity_key_path())?
+            .context("retirement helper requires the existing local identity key")?;
+        crate::device_retirement::validate_retirement_ticket(&job.ticket, &identity)?;
+        let client = tracker::TrackerClient::new(job.tracker_url.clone(), None);
+        let current = client
+            .poll_retirement(&identity)?
+            .ticket
+            .context("tracker no longer reports the retirement ticket")?;
+        validate_retirement_response_ticket(&job, &current, None)?;
+        let tracker_already_running =
+            current.status == crate::device_retirement::RetirementStatus::Running;
+        match current.status {
+            crate::device_retirement::RetirementStatus::Refused => {
+                crate::device_retirement::remove_retirement_job(job_id)?;
+                println!(
+                    "device retirement refusal acknowledged ticket_id={}",
+                    current.ticket_id
+                );
+                return Ok(());
+            }
+            crate::device_retirement::RetirementStatus::Failed => {
+                crate::device_retirement::remove_retirement_helper_artifact(job_id)?;
+                println!(
+                    "device retirement waiting for admin requeue ticket_id={}",
+                    current.ticket_id
+                );
+                return Ok(());
+            }
+            crate::device_retirement::RetirementStatus::Completed => {
+                anyhow::bail!(
+                    "tracker reports completion but the local receipt was never accepted"
+                );
+            }
+            crate::device_retirement::RetirementStatus::Pending
+            | crate::device_retirement::RetirementStatus::Running => {}
+        }
+
+        if !tracker_already_running
+            && let Err(error) = validate_pending_retirement_policy(&job, cfg, config_load_error)
+        {
+            let refused = client.acknowledge_retirement(
+                &identity,
+                current.ticket_id.clone(),
+                crate::device_retirement::RetirementStatus::Refused,
+                Some(crate::device_retirement::bounded_status_detail(&format!(
+                    "target preflight refused: {error:#}"
+                ))),
+                None,
+            )?;
+            anyhow::ensure!(
+                refused.ok,
+                "tracker returned ok=false for retirement refusal"
+            );
+            validate_retirement_response_ticket(
+                &job,
+                &refused.ticket,
+                Some(crate::device_retirement::RetirementStatus::Refused),
+            )?;
+            crate::device_retirement::remove_retirement_job(job_id)?;
+            println!("device retirement refused ticket_id={}", current.ticket_id);
+            return Ok(());
+        }
+
+        let capability_hash = if tracker_already_running {
+            let plan = job
+                .cleanup_plan()
+                .context("tracker accepted retirement but the local receipt has no cleanup plan")?;
+            let capability = job.completion_capability().context(
+                "tracker accepted retirement but the local receipt has no completion capability",
+            )?;
+            // The Running transition is the consent linearization point. Once the tracker
+            // committed it, resume the already-persisted immutable plan even if local opt-in
+            // flags changed during the crash window.
+            let _ = plan;
+            crate::device_retirement::completion_capability_hash(capability)?
+        } else {
+            let plan = job
+                .cleanup_plan()
+                .context("retirement receipt has no startup-pinned cleanup plan")?
+                .clone();
+            let (capability, capability_hash) = match job.completion_capability() {
+                Some(existing_capability) => (
+                    existing_capability.to_string(),
+                    crate::device_retirement::completion_capability_hash(existing_capability)?,
+                ),
+                None => crate::device_retirement::generate_completion_capability()?,
+            };
+            job = crate::device_retirement::store_retirement_acceptance(job_id, plan, capability)?;
+            capability_hash
+        };
+
+        let running = client.acknowledge_retirement(
+            &identity,
+            current.ticket_id.clone(),
+            crate::device_retirement::RetirementStatus::Running,
+            Some("managed retirement helper accepted cleanup".to_string()),
+            Some(capability_hash),
+        )?;
+        anyhow::ensure!(
+            running.ok,
+            "tracker returned ok=false for retirement Running ACK"
+        );
+        validate_retirement_response_ticket(
+            &job,
+            &running.ticket,
+            Some(crate::device_retirement::RetirementStatus::Running),
+        )?;
+        job = crate::device_retirement::mark_retirement_running_accepted(job_id)?;
+    }
+
+    if !job.cleanup_completed() {
+        let plan = job
+            .cleanup_plan()
+            .context("accepted retirement receipt has no cleanup plan")?
+            .clone();
+        uninstall::run_uninstall(uninstall_request_from_retirement_plan(plan))
+            .context("apply managed device retirement uninstall")?;
+        job = crate::device_retirement::mark_retirement_cleanup_completed(job_id)?;
+    }
+
+    complete_retirement_until_confirmed(job_id, &job)
+}
+
+fn validate_pending_retirement_policy(
+    job: &crate::device_retirement::RetirementJob,
+    cfg: &config::FileConfig,
+    config_load_error: Option<&str>,
+) -> Result<()> {
+    if let Some(error) = config_load_error {
+        anyhow::bail!(
+            "retirement helper cannot validate local policy because config loading failed: {error}"
+        );
+    }
+    validate_retirement_local_binding(job, cfg)?;
+    let trackers = resolve_trackers(Vec::new(), cfg)?;
+    anyhow::ensure!(
+        trackers.len() == 1,
+        "retirement helper requires exactly one authoritative tracker"
+    );
+    anyhow::ensure!(
+        trackers[0].trim_end_matches('/') == job.tracker_url.trim_end_matches('/'),
+        "retirement job tracker does not match local configuration"
+    );
+    crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
+    anyhow::ensure!(
+        resolve_allow_remote_retirement(cfg)?
+            && resolve_require_device_membership(cfg)?
+            && managed_retirement_executor_available(),
+        "target-side remote retirement policy is disabled"
+    );
+    let configured_db = cfg.db_path.as_deref().unwrap_or(storage::DEFAULT_DB_PATH);
+    let current_plan = build_remote_retirement_cleanup_plan_for_install_path(
+        cfg,
+        configured_db,
+        job.install_path(),
+    )?;
+    validate_pending_cleanup_plan_unchanged(
+        job.cleanup_plan()
+            .context("retirement receipt has no startup-pinned cleanup plan")?,
+        &current_plan,
+    )?;
+    Ok(())
+}
+
+fn validate_pending_cleanup_plan_unchanged(
+    startup_plan: &crate::device_retirement::RetirementCleanupPlan,
+    current_plan: &crate::device_retirement::RetirementCleanupPlan,
+) -> Result<()> {
+    anyhow::ensure!(
+        startup_plan == current_plan,
+        "retirement cleanup paths changed after the ticket was received; restart the managed daemon and retry retirement"
+    );
+    Ok(())
+}
+
+fn validate_retirement_local_binding(
+    job: &crate::device_retirement::RetirementJob,
+    cfg: &config::FileConfig,
+) -> Result<()> {
+    if let Some(device_id) = job.ticket.device_id.as_deref() {
+        anyhow::ensure!(
+            device_id == resolve_device_id(cfg),
+            "retirement ticket device_id does not match local configuration"
+        );
+    }
+    if let Some(user_id) = job.ticket.user_id.as_deref() {
+        anyhow::ensure!(
+            user_id == resolve_user_id(cfg),
+            "retirement ticket user_id does not match local configuration"
+        );
+    }
+    Ok(())
+}
+
+fn validate_retirement_response_ticket(
+    job: &crate::device_retirement::RetirementJob,
+    ticket: &crate::device_retirement::RetirementTicket,
+    expected_status: Option<crate::device_retirement::RetirementStatus>,
+) -> Result<()> {
+    anyhow::ensure!(
+        ticket.ticket_id == job.ticket.ticket_id
+            && ticket.peer_id == job.ticket.peer_id
+            && ticket.device_id == job.ticket.device_id
+            && ticket.user_id == job.ticket.user_id
+            && ticket.cleanup == crate::device_retirement::RetirementCleanup::FullUninstall,
+        "tracker returned a retirement ticket with different immutable fields"
+    );
+    if let Some(expected_status) = expected_status {
+        anyhow::ensure!(
+            ticket.status == expected_status,
+            "tracker returned an unexpected retirement status"
+        );
+    }
+    Ok(())
+}
+
+fn retirement_cleanup_plan_from_request(
+    request: &uninstall::UninstallRequest,
+) -> Result<crate::device_retirement::RetirementCleanupPlan> {
+    Ok(crate::device_retirement::RetirementCleanupPlan {
+        install_path: request.install_path.clone(),
+        config_path: request.config_path.clone(),
+        db_path: request.db_path.clone(),
+        config_key_paths: request.config_key_paths.clone(),
+        state_marker_paths: request.state_marker_paths.clone(),
+        extra_rc_files: request.extra_rc_files.clone(),
+        local_peer_id: request
+            .local_peer_id
+            .clone()
+            .context("retirement cleanup requires a local peer identity")?,
+    })
+}
+
+fn build_remote_retirement_cleanup_plan(
+    cfg: &config::FileConfig,
+    db_path: &str,
+) -> Result<crate::device_retirement::RetirementCleanupPlan> {
+    let install_path = std::env::current_exe().context("resolve current rr executable")?;
+    build_remote_retirement_cleanup_plan_for_install_path(cfg, db_path, &install_path)
+}
+
+fn build_remote_retirement_cleanup_plan_for_install_path(
+    cfg: &config::FileConfig,
+    db_path: &str,
+    install_path: &Path,
+) -> Result<crate::device_retirement::RetirementCleanupPlan> {
+    let mut request = build_uninstall_request(
+        cfg, db_path, false, true, false, false, false, true, None, None,
+    )?;
+    request.install_path = install_path.to_path_buf();
+    anyhow::ensure!(
+        request.local_peer_id.is_some(),
+        "remote retirement requires an existing local identity"
+    );
+    for (label, path) in std::iter::once(("install", &request.install_path))
+        .chain(std::iter::once(("config", &request.config_path)))
+        .chain(std::iter::once(("database", &request.db_path)))
+        .chain(
+            request
+                .config_key_paths
+                .iter()
+                .map(|path| ("config key", path)),
+        )
+        .chain(
+            request
+                .state_marker_paths
+                .iter()
+                .map(|path| ("state marker", path)),
+        )
+        .chain(
+            request
+                .extra_rc_files
+                .iter()
+                .map(|path| ("managed rc", path)),
+        )
+    {
+        anyhow::ensure!(
+            path.is_absolute(),
+            "remote retirement {label} path must be absolute"
+        );
+        anyhow::ensure!(
+            !path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            }),
+            "remote retirement {label} path must not contain . or .. components: {}",
+            path.display()
+        );
+    }
+    uninstall::validate_uninstall_request(&request)?;
+    retirement_cleanup_plan_from_request(&request)
+}
+
+fn validate_remote_retirement_runtime_reconstructibility(
+    args: &DaemonArgs,
+    cfg: &config::FileConfig,
+    db_path: &str,
+    trackers: &[String],
+) -> Result<()> {
+    anyhow::ensure!(
+        cfg.require_device_membership == Some(true) && cfg.allow_remote_retirement == Some(true),
+        "remote retirement opt-in must be persisted in config.toml, not supplied only by environment"
+    );
+    anyhow::ensure!(
+        normalize_opt_string(cfg.user_id.clone()).is_some()
+            && normalize_opt_string(cfg.device_id.clone()).is_some(),
+        "remote retirement requires persisted user_id and device_id"
+    );
+    anyhow::ensure!(
+        resolve_user_id(cfg) == normalize_opt_string(cfg.user_id.clone()).unwrap()
+            && resolve_device_id(cfg) == normalize_opt_string(cfg.device_id.clone()).unwrap(),
+        "effective user_id or device_id differs from config.toml"
+    );
+
+    let configured_db =
+        config::expand_home_path(cfg.db_path.as_deref().unwrap_or(storage::DEFAULT_DB_PATH))?;
+    let effective_db = config::expand_home_path(db_path)?;
+    anyhow::ensure!(
+        effective_db == configured_db,
+        "effective database path differs from the persisted retirement cleanup path"
+    );
+
+    let configured_identity = config::expand_home_path(
+        cfg.p2p_identity_key_path
+            .as_deref()
+            .unwrap_or(config::DEFAULT_P2P_IDENTITY_KEY_PATH),
+    )?;
+    let effective_identity = config::expand_home_path(&resolve_p2p_identity_key_path(
+        args.identity_key.clone(),
+        cfg,
+    ))?;
+    anyhow::ensure!(
+        effective_identity == configured_identity,
+        "effective identity key path differs from config.toml"
+    );
+
+    let configured_swarm = config::expand_home_path(
+        cfg.swarm_key_path
+            .as_deref()
+            .unwrap_or(config::DEFAULT_SWARM_KEY_PATH),
+    )?;
+    let effective_swarm =
+        config::expand_home_path(&resolve_swarm_key_path(args.swarm_key.clone(), cfg))?;
+    anyhow::ensure!(
+        effective_swarm == configured_swarm,
+        "effective swarm key path differs from config.toml"
+    );
+
+    let configured_relay_identity = config::expand_home_path(
+        cfg.relay_identity_key_path
+            .as_deref()
+            .unwrap_or(config::DEFAULT_RELAY_IDENTITY_KEY_PATH),
+    )?;
+    let effective_relay_identity =
+        config::expand_home_path(&resolve_relay_identity_key_path(None, cfg))?;
+    anyhow::ensure!(
+        effective_relay_identity == configured_relay_identity,
+        "effective relay identity key path differs from config.toml"
+    );
+
+    let marker_paths = [
+        (
+            resolve_async_upload_marker_path(cfg),
+            cfg.async_upload_marker_path
+                .as_deref()
+                .unwrap_or(crate::runtime_tasks::DEFAULT_ASYNC_UPLOAD_MARKER_PATH),
+        ),
+        (
+            resolve_auto_prune_marker_path(cfg),
+            cfg.auto_prune_marker_path
+                .as_deref()
+                .unwrap_or(crate::runtime_tasks::DEFAULT_AUTO_PRUNE_MARKER_PATH),
+        ),
+        (
+            resolve_auto_tombstone_gc_marker_path(cfg),
+            cfg.auto_tombstone_gc_marker_path
+                .as_deref()
+                .unwrap_or(crate::runtime_tasks::DEFAULT_AUTO_TOMBSTONE_GC_MARKER_PATH),
+        ),
+    ];
+    for (effective, configured) in marker_paths {
+        anyhow::ensure!(
+            config::expand_home_path(&effective)? == config::expand_home_path(configured)?,
+            "effective maintenance marker path differs from config.toml"
+        );
+    }
+
+    let configured_trackers = cfg
+        .trackers
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|tracker| tracker.trim().to_string())
+        .filter(|tracker| !tracker.is_empty())
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        trackers == configured_trackers,
+        "effective tracker list differs from config.toml"
+    );
+    Ok(())
+}
+
+fn uninstall_request_from_retirement_plan(
+    plan: crate::device_retirement::RetirementCleanupPlan,
+) -> uninstall::UninstallRequest {
+    uninstall::UninstallRequest {
+        apply: true,
+        dry_run: false,
+        keep_db: false,
+        keep_config: false,
+        keep_state: false,
+        remove_binary: true,
+        install_path: plan.install_path,
+        config_path: plan.config_path,
+        db_path: plan.db_path,
+        config_key_paths: plan.config_key_paths,
+        state_marker_paths: plan.state_marker_paths,
+        extra_rc_files: plan.extra_rc_files,
+        trackers: Vec::new(),
+        tracker_token: None,
+        require_device_membership: false,
+        local_peer_id: Some(plan.local_peer_id),
+        local_identity: None,
+        config_load_error: None,
+    }
+}
+
+fn complete_retirement_until_confirmed(
+    job_id: &str,
+    job: &crate::device_retirement::RetirementJob,
+) -> Result<()> {
+    let capability = job
+        .completion_capability()
+        .context("completed retirement receipt has no completion capability")?
+        .to_string();
+    let client = tracker::TrackerClient::new(job.tracker_url.clone(), None);
+    let mut retry_delay = Duration::from_secs(5);
+    loop {
+        match client.complete_retirement(
+            job.ticket.peer_id.clone(),
+            job.ticket.ticket_id.clone(),
+            capability.clone(),
+        ) {
+            Ok(completed) => {
+                anyhow::ensure!(
+                    completed.ok,
+                    "tracker returned ok=false for retirement completion"
+                );
+                validate_retirement_response_ticket(
+                    job,
+                    &completed.ticket,
+                    Some(crate::device_retirement::RetirementStatus::Completed),
+                )?;
+                crate::device_retirement::remove_retirement_job(job_id)?;
+                println!(
+                    "device retirement completed ticket_id={}",
+                    job.ticket.ticket_id
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                eprintln!(
+                    "warn: retirement cleanup applied; completion ACK will retry in {}s: {error:#}",
+                    retry_delay.as_secs()
+                );
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(60));
+            }
+        }
+    }
+}
+
+fn resolve_tracker_admin_client(
+    tracker: Option<String>,
+    admin_token: Option<String>,
+    cfg: &config::FileConfig,
+) -> Result<tracker::TrackerClient> {
+    let trackers = resolve_trackers(tracker.into_iter().collect(), cfg)?;
+    anyhow::ensure!(
+        trackers.len() == 1,
+        "device administration requires exactly one authoritative tracker"
+    );
+    crate::device_retirement::validate_admin_tracker_url(&trackers[0])
+        .context("device administration requires HTTPS")?;
+    let tracker_token = resolve_tracker_token(None, cfg)?;
+    let admin_token = normalize_opt_string(admin_token)
+        .or_else(|| env_nonempty("RUSTORY_TRACKER_ADMIN_TOKEN"))
+        .context(
+            "tracker admin token is required via --admin-token or RUSTORY_TRACKER_ADMIN_TOKEN",
+        )?;
+    tracker::validate_tracker_admin_token_value(&admin_token)?;
+    Ok(
+        tracker::TrackerClient::new(trackers[0].clone(), tracker_token)
+            .with_admin_token(Some(admin_token)),
+    )
+}
+
+fn normalize_peer_id(peer_id: &str) -> Result<String> {
+    let peer_id = peer_id.trim();
+    anyhow::ensure!(!peer_id.is_empty(), "peer_id is required");
+    let parsed: crate::libp2p::PeerId = peer_id.parse().context("invalid peer_id")?;
+    Ok(parsed.to_string())
+}
+
+fn validate_remote_device_target(peer_id: &str, cfg: &config::FileConfig) -> Result<String> {
+    let peer_id = normalize_peer_id(peer_id)?;
+    if let Some(local_peer_id) = resolve_local_p2p_peer_id(cfg)? {
+        anyhow::ensure!(
+            local_peer_id != peer_id,
+            "refusing remote device mutation for this local PeerId; use rr uninstall on the target"
+        );
+    }
+    Ok(peer_id)
 }
 
 fn print_sync_status_text(
@@ -1825,17 +2804,21 @@ fn can_continue_after_config_load_error(cmd: &Command) -> bool {
             | Command::Uninstall { yes: false, .. }
             | Command::CleanupHishtory { .. }
             | Command::Init { force: true, .. }
+            | Command::ApplyRetirement { .. }
     )
 }
 
 #[derive(Debug, Clone)]
 struct InitArgs {
     force: bool,
+    update_existing_security: bool,
     user_id: Option<String>,
     device_id: Option<String>,
     trackers: Vec<String>,
     relay: Option<String>,
     tracker_token: Option<String>,
+    require_device_membership: bool,
+    allow_remote_retirement: bool,
 }
 
 fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Result<()> {
@@ -1856,8 +2839,32 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
 
     // Fail before spawning children when the durable daily-driver inputs are broken.
     let _ = resolve_swarm_psk(args.swarm_key.clone(), cfg)?;
-    let _ = resolve_p2p_identity(args.identity_key.clone(), cfg)?;
+    let identity_key_path = config::expand_home_path(&resolve_p2p_identity_key_path(
+        args.identity_key.clone(),
+        cfg,
+    ))?;
+    let identity = resolve_p2p_identity(args.identity_key.clone(), cfg)?;
     let tracker_token = resolve_tracker_token(args.tracker_token.clone(), cfg)?;
+    let require_device_membership = resolve_require_device_membership(cfg)?;
+    let allow_remote_retirement = resolve_allow_remote_retirement(cfg)?;
+    if require_device_membership {
+        anyhow::ensure!(
+            trackers.len() == 1,
+            "require_device_membership requires exactly one authoritative tracker"
+        );
+        crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
+    }
+    if allow_remote_retirement {
+        anyhow::ensure!(
+            require_device_membership,
+            "allow_remote_retirement requires require_device_membership=true"
+        );
+        anyhow::ensure!(
+            trackers.len() == 1,
+            "allow_remote_retirement requires exactly one authoritative tracker"
+        );
+        crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
+    }
     let _ = resolve_p2p_watch_start_jitter_sec(args.start_jitter_sec, cfg)?;
     let _ = resolve_p2p_request_retry_policy(
         args.req_attempts,
@@ -1873,6 +2880,35 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
 
     let specs = build_daemon_child_specs(db_path, &args);
     let exe = std::env::current_exe().context("resolve current executable for daemon")?;
+    let retirement_cleanup_plan = if allow_remote_retirement {
+        match validate_remote_retirement_runtime_reconstructibility(&args, cfg, db_path, &trackers)
+            .and_then(|()| build_remote_retirement_cleanup_plan(cfg, db_path))
+        {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                eprintln!(
+                    "warn: remote full uninstall is disabled by cleanup preflight: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let retirement_cleanup_ready = retirement_cleanup_plan.is_some();
+    let retirement_executor_ready = if retirement_cleanup_ready {
+        match crate::device_retirement::managed_retirement_executor_matches_process(
+            std::process::id(),
+        ) {
+            Ok(ready) => ready,
+            Err(error) => {
+                eprintln!("warn: inspect remote retirement manager: {error:#}");
+                false
+            }
+        }
+    } else {
+        false
+    };
     let stop = Arc::new(AtomicBool::new(false));
     {
         let stop = stop.clone();
@@ -1882,7 +2918,29 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         .context("set Ctrl-C/SIGTERM handler")?;
     }
 
+    #[cfg(target_os = "linux")]
+    if std::env::var("RUSTORY_DAEMON_MANAGER").as_deref() == Ok("systemd-user") {
+        crate::self_update::stop_background_daemon_for_systemd_transition(&exe)?;
+    }
+
     managed_logs::spawn_managed_daemon_log_monitor(stop.clone());
+    if allow_remote_retirement && retirement_executor_ready {
+        crate::device_retirement::spawn_retirement_monitor(
+            stop.clone(),
+            trackers[0].clone(),
+            identity,
+            identity_key_path,
+            exe.clone(),
+            retirement_cleanup_plan
+                .clone()
+                .context("retirement cleanup plan disappeared after readiness check")?,
+        )?;
+        eprintln!("daemon: remote retirement monitor enabled");
+    } else if allow_remote_retirement {
+        eprintln!(
+            "warn: remote full uninstall is disabled because its managed cleanup executor is not ready; revoke-only remains available"
+        );
+    }
 
     eprintln!(
         "daemon: starting p2p-serve and p2p-sync watch (push={})",
@@ -1893,6 +2951,7 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         &exe,
         &specs.serve_args,
         specs.tracker_token_env.as_deref(),
+        retirement_executor_ready,
     )?;
 
     sleep_with_stop(
@@ -1916,6 +2975,7 @@ fn run_daemon(args: DaemonArgs, cfg: &config::FileConfig, db_path: &str) -> Resu
         &exe,
         &specs.sync_args,
         specs.tracker_token_env.as_deref(),
+        retirement_executor_ready,
     )?;
 
     supervise_daemon_children(serve.child_mut(), sync.child_mut(), stop.as_ref())
@@ -1975,7 +3035,22 @@ fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<(
     let cfg_path = config::expand_home_path(config::DEFAULT_CONFIG_PATH)?;
     let cfg_exists = std::fs::metadata(&cfg_path).is_ok();
 
-    if cfg_exists && !args.force {
+    if cfg_exists && args.update_existing_security {
+        anyhow::ensure!(
+            args.require_device_membership || args.allow_remote_retirement,
+            "--update-existing-security requires at least one device-security opt-in flag"
+        );
+        validate_existing_security_update(&args, cfg)?;
+        let mut keys = vec!["require_device_membership"];
+        if args.allow_remote_retirement {
+            keys.push("allow_remote_retirement");
+        }
+        let changed = config::enable_top_level_bool_settings(&cfg_path, &keys)?;
+        println!(
+            "updated device security config: {} changed={changed}",
+            cfg_path.display()
+        );
+    } else if cfg_exists && !args.force {
         println!(
             "config already exists: {} (use --force to overwrite)",
             cfg_path.display()
@@ -2025,6 +3100,91 @@ fn run_init(args: InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<(
     Ok(())
 }
 
+fn validate_existing_security_update(args: &InitArgs, cfg: &config::FileConfig) -> Result<()> {
+    let require_device_membership =
+        args.require_device_membership || cfg.require_device_membership.unwrap_or(false);
+    let allow_remote_retirement =
+        args.allow_remote_retirement || cfg.allow_remote_retirement.unwrap_or(false);
+    anyhow::ensure!(
+        !allow_remote_retirement || require_device_membership,
+        "allow_remote_retirement requires require_device_membership=true"
+    );
+    let trackers = cfg
+        .trackers
+        .as_ref()
+        .map(|trackers| {
+            trackers
+                .iter()
+                .filter_map(|tracker| normalize_opt_string(Some(tracker.clone())))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let supplied_trackers = args
+        .trackers
+        .iter()
+        .filter_map(|tracker| normalize_opt_string(Some(tracker.clone())))
+        .collect::<Vec<_>>();
+    if !supplied_trackers.is_empty() {
+        anyhow::ensure!(
+            supplied_trackers == trackers,
+            "--tracker values must exactly match trackers already persisted in config.toml when using --update-existing-security"
+        );
+    }
+    ensure_supplied_setting_matches_persisted(
+        "--user-id",
+        args.user_id.as_deref(),
+        cfg.user_id.as_deref(),
+    )?;
+    ensure_supplied_setting_matches_persisted(
+        "--device-id",
+        args.device_id.as_deref(),
+        cfg.device_id.as_deref(),
+    )?;
+    ensure_supplied_setting_matches_persisted(
+        "--relay",
+        args.relay.as_deref(),
+        cfg.relay_addr.as_deref(),
+    )?;
+    ensure_supplied_setting_matches_persisted(
+        "--tracker-token",
+        args.tracker_token.as_deref(),
+        cfg.tracker_token.as_deref(),
+    )?;
+    anyhow::ensure!(
+        trackers.len() == 1,
+        "updating existing device security requires exactly one tracker already persisted in config.toml; edit the config explicitly before retrying"
+    );
+    crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
+    if allow_remote_retirement {
+        anyhow::ensure!(
+            normalize_opt_string(cfg.user_id.clone()).is_some()
+                && normalize_opt_string(cfg.device_id.clone()).is_some(),
+            "remote retirement activation requires user_id and device_id already persisted in config.toml"
+        );
+        anyhow::ensure!(
+            normalize_opt_string(cfg.relay_addr.clone()).is_some(),
+            "remote retirement activation requires relay_addr already persisted in config.toml"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_supplied_setting_matches_persisted(
+    label: &str,
+    supplied: Option<&str>,
+    persisted: Option<&str>,
+) -> Result<()> {
+    let supplied = supplied.and_then(|value| normalize_opt_string(Some(value.to_string())));
+    if let Some(supplied) = supplied {
+        let persisted = persisted.and_then(|value| normalize_opt_string(Some(value.to_string())));
+        anyhow::ensure!(
+            persisted.as_deref() == Some(supplied.as_str()),
+            "{label} must exactly match the value already persisted in config.toml when using --update-existing-security"
+        );
+    }
+    Ok(())
+}
+
 fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) -> Result<String> {
     // 값 결정(가능하면 기존 config/입력값을 반영).
     let user_id = normalize_opt_string(args.user_id.clone())
@@ -2052,6 +3212,21 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
         .or_else(|| env_nonempty("RUSTORY_TRACKER_TOKEN"));
     if let Some(token) = tracker_token.as_deref() {
         tracker::validate_tracker_token_value(token, "tracker token")?;
+    }
+    let require_device_membership =
+        args.require_device_membership || cfg.require_device_membership.unwrap_or(false);
+    let allow_remote_retirement =
+        args.allow_remote_retirement || cfg.allow_remote_retirement.unwrap_or(false);
+    anyhow::ensure!(
+        !allow_remote_retirement || require_device_membership,
+        "allow_remote_retirement requires require_device_membership=true"
+    );
+    if require_device_membership {
+        anyhow::ensure!(
+            trackers.len() == 1,
+            "require_device_membership requires exactly one authoritative tracker"
+        );
+        crate::device_retirement::validate_retirement_tracker_url(&trackers[0])?;
     }
 
     let swarm_key_path = normalize_opt_string(cfg.swarm_key_path.clone())
@@ -2117,6 +3292,16 @@ fn render_config_toml(args: &InitArgs, cfg: &config::FileConfig, db_path: &str) 
     out.push_str("# p2p_request_timeout_base_sec = 5 # optional\n");
     out.push_str("# p2p_request_timeout_cap_sec = 30 # optional\n");
     out.push_str("# p2p_request_backoff_base_ms = 200 # optional\n");
+    if require_device_membership {
+        out.push_str("require_device_membership = true\n");
+    } else {
+        out.push_str("# require_device_membership = false # staged strict-mode rollout\n");
+    }
+    if allow_remote_retirement {
+        out.push_str("allow_remote_retirement = true\n");
+    } else {
+        out.push_str("# allow_remote_retirement = false # target-side destructive opt-in\n");
+    }
     out.push_str("# search_limit_default = 100000 # optional\n");
     let record_ignore_regex = normalize_opt_string(cfg.record_ignore_regex.clone())
         .unwrap_or_else(|| DEFAULT_RECORD_IGNORE_REGEX.to_string());
@@ -2157,6 +3342,7 @@ struct DoctorReport {
     user_id: String,
     device_id: String,
     hook: DoctorHookStatusReport,
+    device_security: DoctorDeviceSecurityReport,
     p2p_request_retry: DoctorP2pRequestRetryReport,
     record_ignore_regex: DoctorRecordIgnoreRegexReport,
     async_upload: DoctorAsyncUploadStatusReport,
@@ -2190,6 +3376,13 @@ struct DoctorP2pRequestRetryReport {
     timeout_base_sec: Option<u64>,
     timeout_cap_sec: Option<u64>,
     backoff_base_ms: Option<u64>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+struct DoctorDeviceSecurityReport {
+    require_device_membership: Option<bool>,
+    allow_remote_retirement: Option<bool>,
     error: Option<String>,
 }
 
@@ -2325,6 +3518,33 @@ fn build_doctor_report(
     let device_id = resolve_device_id(cfg);
     let hook = build_hook_status_report(cfg);
     let now_unix = time::OffsetDateTime::now_utc().unix_timestamp();
+    let device_security = match (
+        resolve_require_device_membership(cfg),
+        resolve_allow_remote_retirement(cfg),
+    ) {
+        (Ok(require_device_membership), Ok(allow_remote_retirement)) => {
+            DoctorDeviceSecurityReport {
+                require_device_membership: Some(require_device_membership),
+                allow_remote_retirement: Some(allow_remote_retirement),
+                error: (!require_device_membership && allow_remote_retirement).then(|| {
+                    "allow_remote_retirement requires require_device_membership=true".to_string()
+                }),
+            }
+        }
+        (membership, retirement) => {
+            let error = membership
+                .as_ref()
+                .err()
+                .map(|error| format!("{error:#}"))
+                .or_else(|| retirement.as_ref().err().map(|error| format!("{error:#}")))
+                .unwrap_or_else(|| "invalid device security configuration".to_string());
+            DoctorDeviceSecurityReport {
+                require_device_membership: membership.ok(),
+                allow_remote_retirement: retirement.ok(),
+                error: Some(error),
+            }
+        }
+    };
 
     let p2p_request_retry = match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
         Ok(policy) => DoctorP2pRequestRetryReport {
@@ -2518,6 +3738,7 @@ fn build_doctor_report(
         user_id,
         device_id,
         hook,
+        device_security,
         p2p_request_retry,
         record_ignore_regex,
         async_upload,
@@ -2752,6 +3973,29 @@ fn run_doctor(
     println!("user_id: {user_id}");
     println!("device_id: {device_id}");
     print_hook_status(&build_hook_status_report(cfg));
+    match (
+        resolve_require_device_membership(cfg),
+        resolve_allow_remote_retirement(cfg),
+    ) {
+        (Ok(require_device_membership), Ok(allow_remote_retirement)) => println!(
+            "device security: require_membership={} allow_remote_retirement={}{}",
+            require_device_membership,
+            allow_remote_retirement,
+            if allow_remote_retirement && !require_device_membership {
+                " warn: remote retirement requires strict membership"
+            } else {
+                ""
+            }
+        ),
+        (membership, retirement) => println!(
+            "device security: invalid: {}",
+            membership
+                .err()
+                .or_else(|| retirement.err())
+                .map(|error| format!("{error:#}"))
+                .unwrap_or_else(|| "unknown error".to_string())
+        ),
+    }
     match resolve_p2p_request_retry_policy(None, None, None, None, cfg) {
         Ok(request_retry_policy) => {
             println!(
@@ -3403,12 +4647,9 @@ fn file_mode_777(path: &std::path::Path) -> Option<u32> {
     }
 }
 
-fn resolve_local_p2p_peer_id(cfg: &config::FileConfig) -> Option<String> {
+fn resolve_local_p2p_peer_id(cfg: &config::FileConfig) -> Result<Option<String>> {
     let path = resolve_p2p_identity_key_path(None, cfg);
-    config::load_identity_keypair(&path)
-        .ok()
-        .flatten()
-        .map(|key| key.public().to_peer_id().to_string())
+    Ok(config::load_identity_keypair(&path)?.map(|key| key.public().to_peer_id().to_string()))
 }
 
 struct SyncStatusWatchConfig<'a> {
@@ -3852,6 +5093,36 @@ fn resolve_trackers(cli: Vec<String>, cfg: &config::FileConfig) -> Result<Vec<St
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+fn resolve_require_device_membership(cfg: &config::FileConfig) -> Result<bool> {
+    match env_nonempty("RUSTORY_REQUIRE_DEVICE_MEMBERSHIP") {
+        Some(value) => parse_env_bool(&value, "RUSTORY_REQUIRE_DEVICE_MEMBERSHIP"),
+        None => Ok(cfg.require_device_membership.unwrap_or(false)),
+    }
+}
+
+fn resolve_allow_remote_retirement(cfg: &config::FileConfig) -> Result<bool> {
+    match env_nonempty("RUSTORY_ALLOW_REMOTE_RETIREMENT") {
+        Some(value) => parse_env_bool(&value, "RUSTORY_ALLOW_REMOTE_RETIREMENT"),
+        None => Ok(cfg.allow_remote_retirement.unwrap_or(false)),
+    }
+}
+
+fn advertised_retirement_protocol(
+    require_device_membership: bool,
+    allow_remote_retirement: bool,
+    managed_daemon_child: bool,
+) -> Option<u32> {
+    (require_device_membership && allow_remote_retirement && managed_daemon_child)
+        .then_some(crate::device_retirement::RETIREMENT_PROTOCOL_VERSION)
+}
+
+fn managed_retirement_executor_available() -> bool {
+    matches!(
+        env_nonempty("RUSTORY_DAEMON_MANAGER").as_deref(),
+        Some("launchd" | "systemd-user")
+    )
 }
 
 fn resolve_tracker_token_raw(cli: Option<String>, cfg: &config::FileConfig) -> Option<String> {
@@ -4462,6 +5733,25 @@ mod tests {
         let app = App::parse_from(["rr", "uninstall", "--yes"]);
 
         assert!(!can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn persisted_strict_membership_cannot_be_weakened_for_uninstall() {
+        assert!(strict_uninstall_required(true, false));
+        assert!(strict_uninstall_required(false, true));
+        assert!(!strict_uninstall_required(false, false));
+
+        let cfg = config::FileConfig {
+            trackers: Some(vec![
+                " https://persisted.example ".to_string(),
+                "".to_string(),
+            ]),
+            ..config::FileConfig::default()
+        };
+        assert_eq!(
+            persisted_config_trackers(&cfg),
+            vec!["https://persisted.example".to_string()]
+        );
     }
 
     #[test]
@@ -5086,6 +6376,76 @@ mod tests {
     fn daemon_preflight_mode_exits_after_validation() {
         assert!(!run_daemon_preflight_if_requested(false, &[], None).unwrap());
         assert!(run_daemon_preflight_if_requested(true, &[], None).unwrap());
+    }
+
+    #[test]
+    fn remote_retirement_runtime_must_match_persisted_cleanup_inputs() {
+        let mut cfg = config::FileConfig::default();
+        cfg.user_id = Some(resolve_user_id(&cfg));
+        cfg.device_id = Some(resolve_device_id(&cfg));
+        cfg.db_path = Some("/tmp/rustory-retirement.db".to_string());
+        cfg.p2p_identity_key_path = Some(resolve_p2p_identity_key_path(None, &cfg));
+        cfg.swarm_key_path = Some(resolve_swarm_key_path(None, &cfg));
+        cfg.relay_identity_key_path = Some(resolve_relay_identity_key_path(None, &cfg));
+        cfg.async_upload_marker_path = Some(resolve_async_upload_marker_path(&cfg));
+        cfg.auto_prune_marker_path = Some(resolve_auto_prune_marker_path(&cfg));
+        cfg.auto_tombstone_gc_marker_path = Some(resolve_auto_tombstone_gc_marker_path(&cfg));
+        cfg.trackers = Some(vec!["https://tracker.example".to_string()]);
+        cfg.require_device_membership = Some(true);
+        cfg.allow_remote_retirement = Some(true);
+        let mut args = DaemonArgs {
+            listen: "/ip4/0.0.0.0/tcp/0".to_string(),
+            identity_key: None,
+            swarm_key: None,
+            relay: None,
+            trackers: Vec::new(),
+            tracker_token: None,
+            limit: 1000,
+            pull_only: false,
+            interval_sec: 60,
+            start_jitter_sec: None,
+            sync_start_delay_sec: 2,
+            max_peers_per_tick: 0,
+            preflight: false,
+            req_attempts: None,
+            req_timeout_base_sec: None,
+            req_timeout_cap_sec: None,
+            req_backoff_base_ms: None,
+        };
+        let trackers = cfg.trackers.clone().unwrap();
+
+        validate_remote_retirement_runtime_reconstructibility(
+            &args,
+            &cfg,
+            cfg.db_path.as_deref().unwrap(),
+            &trackers,
+        )
+        .unwrap();
+
+        args.identity_key = Some("/tmp/different-identity.key".to_string());
+        assert!(
+            validate_remote_retirement_runtime_reconstructibility(
+                &args,
+                &cfg,
+                cfg.db_path.as_deref().unwrap(),
+                &trackers,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("identity key path")
+        );
+        args.identity_key = None;
+        assert!(
+            validate_remote_retirement_runtime_reconstructibility(
+                &args,
+                &cfg,
+                "/tmp/different.db",
+                &trackers,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("database path")
+        );
     }
 
     #[test]
@@ -5830,6 +7190,7 @@ mod tests {
                 trackers,
                 relay,
                 tracker_token,
+                ..
             } => {
                 assert!(force);
                 assert_eq!(user_id.as_deref(), Some("u1"));
@@ -5879,11 +7240,14 @@ mod tests {
 
         let args = InitArgs {
             force: false,
+            update_existing_security: false,
             user_id: Some("u1".to_string()),
             device_id: Some("d1".to_string()),
             trackers: vec!["http://127.0.0.1:8850".to_string()],
             relay: Some(relay.clone()),
             tracker_token: Some("t1".to_string()),
+            require_device_membership: false,
+            allow_remote_retirement: false,
         };
 
         let text = render_config_toml(&args, &config::FileConfig::default(), "/tmp/x.db").unwrap();
@@ -5896,10 +7260,190 @@ mod tests {
         assert!(text.contains("swarm_key_path"));
         assert!(text.contains("p2p_identity_key_path"));
         assert!(text.contains("p2p_request_attempts"));
+        assert!(text.contains("require_device_membership"));
+        assert!(text.contains("allow_remote_retirement"));
         assert!(text.contains("record_ignore_regex"));
         assert!(text.contains("async_upload"));
         assert!(text.contains("auto_prune"));
         assert!(text.contains("auto_tombstone_gc"));
+    }
+
+    #[test]
+    fn existing_security_update_requires_supplied_values_to_match_persisted_config() {
+        let mut cfg = config::FileConfig {
+            user_id: Some("user".to_string()),
+            device_id: Some("device".to_string()),
+            trackers: Some(vec!["https://tracker.example".to_string()]),
+            tracker_token: Some("fleet-token".to_string()),
+            relay_addr: Some("/dns4/relay.example/tcp/4001".to_string()),
+            ..config::FileConfig::default()
+        };
+        let args = InitArgs {
+            force: false,
+            update_existing_security: true,
+            user_id: Some("user".to_string()),
+            device_id: Some("device".to_string()),
+            trackers: vec!["https://tracker.example".to_string()],
+            relay: Some("/dns4/relay.example/tcp/4001".to_string()),
+            tracker_token: Some("fleet-token".to_string()),
+            require_device_membership: true,
+            allow_remote_retirement: true,
+        };
+        validate_existing_security_update(&args, &cfg).unwrap();
+
+        let mut mismatched = args.clone();
+        mismatched.trackers = vec!["https://other.example".to_string()];
+        assert!(
+            validate_existing_security_update(&mismatched, &cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("must exactly match")
+        );
+
+        cfg.device_id = None;
+        let mut omitted = args;
+        omitted.device_id = None;
+        assert!(
+            validate_existing_security_update(&omitted, &cfg)
+                .unwrap_err()
+                .to_string()
+                .contains("requires user_id and device_id")
+        );
+    }
+
+    #[test]
+    fn device_mutation_commands_require_explicit_yes_to_apply() {
+        let peer_id = libp2p::PeerId::random().to_string();
+        let revoke = App::parse_from(["rr", "device", "revoke", "--peer-id", peer_id.as_str()]);
+        match revoke.cmd {
+            Command::Device {
+                command: DeviceCommand::Revoke { yes, .. },
+            } => assert!(!yes),
+            _ => panic!("expected device revoke"),
+        }
+
+        let retire = App::parse_from([
+            "rr",
+            "device",
+            "retire",
+            "--peer-id",
+            peer_id.as_str(),
+            "--yes",
+        ]);
+        match retire.cmd {
+            Command::Device {
+                command: DeviceCommand::Retire { yes, .. },
+            } => assert!(yes),
+            _ => panic!("expected device retire"),
+        }
+    }
+
+    #[test]
+    fn device_admin_client_rejects_remote_plaintext_before_using_credentials() {
+        let admin_token = "a".repeat(64);
+        let mut cfg = config::FileConfig {
+            trackers: Some(vec!["http://tracker.example:8850".to_string()]),
+            ..config::FileConfig::default()
+        };
+        let error = resolve_tracker_admin_client(None, Some(admin_token.clone()), &cfg)
+            .err()
+            .expect("remote plaintext tracker must be rejected");
+        assert!(format!("{error:#}").contains("requires HTTPS"));
+
+        cfg.trackers = Some(vec!["http://127.0.0.1:8850".to_string()]);
+        assert!(resolve_tracker_admin_client(None, Some(admin_token), &cfg,).is_ok());
+    }
+
+    #[test]
+    fn init_remote_retirement_requires_strict_membership_flag() {
+        let error = App::try_parse_from(["rr", "init", "--allow-remote-retirement"])
+            .err()
+            .expect("init parse should reject remote retirement without strict membership");
+        assert!(error.to_string().contains("--require-device-membership"));
+    }
+
+    #[test]
+    fn remote_retirement_capability_is_advertised_only_by_opted_in_managed_daemon() {
+        assert_eq!(advertised_retirement_protocol(true, true, true), Some(1));
+        assert_eq!(advertised_retirement_protocol(false, true, true), None);
+        assert_eq!(advertised_retirement_protocol(true, false, true), None);
+        assert_eq!(advertised_retirement_protocol(true, true, false), None);
+    }
+
+    #[test]
+    fn retirement_helper_can_resume_after_config_removal() {
+        let app = App::parse_from([
+            "rr",
+            "apply-retirement",
+            "--job-id",
+            &uuid::Uuid::new_v4().to_string(),
+        ]);
+        assert!(matches!(app.cmd, Command::ApplyRetirement { .. }));
+        assert!(can_continue_after_config_load_error(&app.cmd));
+    }
+
+    #[test]
+    fn retirement_cleanup_plan_round_trips_without_credentials() {
+        let request = uninstall::UninstallRequest {
+            apply: true,
+            dry_run: false,
+            keep_db: false,
+            keep_config: false,
+            keep_state: false,
+            remove_binary: true,
+            install_path: PathBuf::from("/opt/rustory/rr"),
+            config_path: PathBuf::from("/home/user/.config/rustory/config.toml"),
+            db_path: PathBuf::from("/home/user/.local/share/rustory/history.db"),
+            config_key_paths: vec![PathBuf::from("/home/user/.config/rustory/identity.key")],
+            state_marker_paths: vec![PathBuf::from(
+                "/home/user/.local/state/rustory/auto-prune.last",
+            )],
+            extra_rc_files: vec![PathBuf::from("/home/user/.zshrc")],
+            trackers: vec!["https://tracker.example".to_string()],
+            tracker_token: Some("fleet-secret".to_string()),
+            require_device_membership: true,
+            local_peer_id: Some(crate::libp2p::PeerId::random().to_string()),
+            local_identity: Some(crate::libp2p::identity::Keypair::generate_ed25519()),
+            config_load_error: None,
+        };
+        let plan = retirement_cleanup_plan_from_request(&request).unwrap();
+        let recovered = uninstall_request_from_retirement_plan(plan);
+        assert_eq!(recovered.install_path, request.install_path);
+        assert_eq!(recovered.config_path, request.config_path);
+        assert_eq!(recovered.db_path, request.db_path);
+        assert_eq!(recovered.config_key_paths, request.config_key_paths);
+        assert_eq!(recovered.state_marker_paths, request.state_marker_paths);
+        assert_eq!(recovered.extra_rc_files, request.extra_rc_files);
+        assert!(recovered.trackers.is_empty());
+        assert!(recovered.tracker_token.is_none());
+        assert!(recovered.local_identity.is_none());
+    }
+
+    #[test]
+    fn pending_retirement_refuses_cleanup_path_drift() {
+        let original = crate::device_retirement::RetirementCleanupPlan {
+            install_path: PathBuf::from("/opt/rustory/rr"),
+            config_path: PathBuf::from("/home/user/.config/rustory/config.toml"),
+            db_path: PathBuf::from("/home/user/.local/share/rustory/history.db"),
+            config_key_paths: vec![PathBuf::from("/home/user/.config/rustory/identity.key")],
+            state_marker_paths: vec![PathBuf::from(
+                "/home/user/.local/state/rustory/auto-prune.last",
+            )],
+            extra_rc_files: vec![PathBuf::from("/home/user/.zshrc")],
+            local_peer_id: crate::libp2p::PeerId::random().to_string(),
+        };
+        validate_pending_cleanup_plan_unchanged(&original, &original).unwrap();
+
+        let mut changed = original.clone();
+        changed.db_path = PathBuf::from("/srv/rustory/history.db");
+        let error = validate_pending_cleanup_plan_unchanged(&original, &changed).unwrap_err();
+        assert!(format!("{error:#}").contains("cleanup paths changed"));
+
+        let mut changed = original.clone();
+        changed
+            .extra_rc_files
+            .push(PathBuf::from("/home/user/.profile"));
+        assert!(validate_pending_cleanup_plan_unchanged(&original, &changed).is_err());
     }
 
     #[test]

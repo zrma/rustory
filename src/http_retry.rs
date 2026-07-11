@@ -22,7 +22,9 @@ impl RetryPolicy {
             read_base: Duration::from_secs(1),
             read_cap: Duration::from_secs(5),
             backoff_base: Duration::from_millis(100),
-            max_redirects: 10,
+            // Tracker requests carry fleet/admin credentials and security decisions.
+            // Never forward them across redirects or accept a redirected membership/ticket body.
+            max_redirects: 0,
         }
     }
 
@@ -127,5 +129,10 @@ mod tests {
         let base = Duration::from_secs(u64::MAX / 8);
 
         assert_eq!(exp_duration(base, 4, None), Duration::MAX);
+    }
+
+    #[test]
+    fn tracker_requests_never_follow_redirects() {
+        assert_eq!(RetryPolicy::tracker().max_redirects, 0);
     }
 }

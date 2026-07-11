@@ -31,6 +31,8 @@ pub struct FileConfig {
     pub p2p_request_timeout_base_sec: Option<u64>,
     pub p2p_request_timeout_cap_sec: Option<u64>,
     pub p2p_request_backoff_base_ms: Option<u64>,
+    pub require_device_membership: Option<bool>,
+    pub allow_remote_retirement: Option<bool>,
 
     pub search_limit_default: Option<usize>,
 
@@ -159,7 +161,11 @@ pub fn load_or_generate_identity_keypair(path: &str) -> Result<libp2p::identity:
 
 pub fn load_identity_keypair(path: &str) -> Result<Option<libp2p::identity::Keypair>> {
     let path = expand_home_path(path)?;
-    match std::fs::read(&path) {
+    load_identity_keypair_from_path(&path)
+}
+
+pub fn load_identity_keypair_from_path(path: &Path) -> Result<Option<libp2p::identity::Keypair>> {
+    match std::fs::read(path) {
         Ok(bytes) => {
             if bytes.is_empty() {
                 anyhow::bail!("identity keypair file is empty: {}", path.display());
@@ -187,6 +193,105 @@ pub fn write_private_file(path: &Path, contents: &[u8], replace_existing: bool) 
         return Ok(());
     }
     anyhow::bail!("private file already exists: {}", path.display())
+}
+
+pub fn enable_top_level_bool_settings(path: &Path, keys: &[&str]) -> Result<bool> {
+    anyhow::ensure!(!keys.is_empty(), "at least one config key is required");
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("read config for security update: {}", path.display()))?;
+    let parsed: toml::Value = toml::from_str(&original).context("parse config toml")?;
+    let table = parsed
+        .as_table()
+        .context("config root must be a TOML table")?;
+    for key in keys {
+        if let Some(value) = table.get(*key) {
+            anyhow::ensure!(
+                value.is_bool(),
+                "config setting {key} must be a boolean before it can be enabled"
+            );
+        }
+    }
+
+    let updated = enable_top_level_bool_settings_text(&original, keys)?;
+    if updated == original {
+        return Ok(false);
+    }
+    let reparsed: toml::Value = toml::from_str(&updated).context("parse updated config toml")?;
+    let updated_table = reparsed
+        .as_table()
+        .context("updated config root must be a TOML table")?;
+    for key in keys {
+        anyhow::ensure!(
+            updated_table.get(*key).and_then(toml::Value::as_bool) == Some(true),
+            "updated config did not enable {key}"
+        );
+    }
+    write_private_file(path, updated.as_bytes(), true)?;
+    Ok(true)
+}
+
+fn enable_top_level_bool_settings_text(original: &str, keys: &[&str]) -> Result<String> {
+    let mut lines: Vec<String> = original.split_inclusive('\n').map(str::to_string).collect();
+    if original.is_empty() {
+        lines.clear();
+    }
+    let first_table = lines
+        .iter()
+        .position(|line| line.trim_start().starts_with('['))
+        .unwrap_or(lines.len());
+
+    for key in keys {
+        let mut found = None;
+        for (index, line) in lines.iter().take(first_table).enumerate() {
+            let body = line
+                .strip_suffix("\r\n")
+                .or_else(|| line.strip_suffix('\n'))
+                .unwrap_or(line);
+            let Some(eq_index) = body.find('=') else {
+                continue;
+            };
+            let assignment_key = body[..eq_index].trim();
+            if assignment_key == *key
+                || assignment_key == format!("\"{key}\"")
+                || assignment_key == format!("'{key}'")
+            {
+                anyhow::ensure!(found.is_none(), "duplicate config setting {key}");
+                found = Some((index, eq_index));
+            }
+        }
+
+        if let Some((index, eq_index)) = found {
+            let line = &lines[index];
+            let (body, newline) = if let Some(body) = line.strip_suffix("\r\n") {
+                (body, "\r\n")
+            } else if let Some(body) = line.strip_suffix('\n') {
+                (body, "\n")
+            } else {
+                (line.as_str(), "")
+            };
+            let comment = body[eq_index + 1..]
+                .find('#')
+                .map(|offset| body[eq_index + 1 + offset..].trim_start());
+            let mut replacement = format!("{} true", &body[..=eq_index]);
+            if let Some(comment) = comment {
+                replacement.push(' ');
+                replacement.push_str(comment);
+            }
+            replacement.push_str(newline);
+            lines[index] = replacement;
+        } else {
+            let insertion = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with('['))
+                .unwrap_or(lines.len());
+            if insertion > 0 && !lines[insertion - 1].ends_with('\n') {
+                lines[insertion - 1].push('\n');
+            }
+            lines.insert(insertion, format!("{key} = true\n"));
+        }
+    }
+
+    Ok(lines.concat())
 }
 
 fn install_private_file(path: &Path, contents: &[u8], replace_existing: bool) -> Result<bool> {
@@ -251,8 +356,32 @@ fn install_private_file(path: &Path, contents: &[u8], replace_existing: bool) ->
             }),
         }
     };
+    let installed = match install_result {
+        Ok(installed) => installed,
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(error);
+        }
+    };
     let _ = std::fs::remove_file(&tmp_path);
-    install_result
+    if installed {
+        sync_parent_directory(parent)?;
+    }
+    Ok(installed)
+}
+
+fn sync_parent_directory(parent: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = std::fs::File::open(parent)
+            .with_context(|| format!("open parent dir for sync: {}", parent.display()))?;
+        directory
+            .sync_all()
+            .with_context(|| format!("sync parent dir: {}", parent.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = parent;
+    Ok(())
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -382,6 +511,84 @@ auto_tombstone_gc_marker_path = "~/.config/rustory/auto-tombstone-gc.custom.last
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn security_flag_update_preserves_unrelated_config_and_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let original = concat!(
+            "# keep this operator comment\n",
+            "trackers = [\"https://tracker.example\"]\n",
+            "require_device_membership = false # staged\n",
+            "record_ignore_regex = \"keep-me\"\n",
+            "\n",
+            "[future_plugin]\n",
+            "enabled = true\n",
+        );
+        write_private_file(&path, original.as_bytes(), false).unwrap();
+
+        assert!(
+            enable_top_level_bool_settings(
+                &path,
+                &["require_device_membership", "allow_remote_retirement"],
+            )
+            .unwrap()
+        );
+
+        let updated = std::fs::read_to_string(&path).unwrap();
+        assert!(updated.contains("# keep this operator comment"));
+        assert!(updated.contains("require_device_membership = true # staged"));
+        assert!(updated.contains("allow_remote_retirement = true\n[future_plugin]"));
+        assert!(updated.contains("record_ignore_regex = \"keep-me\""));
+        assert!(updated.contains("[future_plugin]\nenabled = true"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn security_flag_update_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        write_private_file(
+            &path,
+            b"require_device_membership = true\nallow_remote_retirement = true\n",
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            !enable_top_level_bool_settings(
+                &path,
+                &["require_device_membership", "allow_remote_retirement"],
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn private_file_replace_failure_removes_private_temp_file() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("state.json");
+        std::fs::create_dir(&path).unwrap();
+
+        assert!(write_private_file(&path, b"secret\n", true).is_err());
+        let leftovers = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".state.json.tmp-"))
+            .collect::<Vec<_>>();
+        assert!(
+            leftovers.is_empty(),
+            "leftover private temp files: {leftovers:?}"
+        );
     }
 
     #[cfg(unix)]

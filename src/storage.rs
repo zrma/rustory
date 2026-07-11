@@ -100,6 +100,15 @@ pub struct PeerBookPeer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerRevocation {
+    pub peer_id: String,
+    pub device_id: Option<String>,
+    pub user_id: Option<String>,
+    pub revoked_at_unix: i64,
+    pub ticket_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSyncStatus {
     pub peer_id: String,
     pub last_cursor: i64,
@@ -1303,6 +1312,9 @@ PRAGMA wal_checkpoint(TRUNCATE);
     }
 
     pub fn upsert_peer_book(&self, peer: &PeerBookPeer) -> Result<()> {
+        if self.is_peer_revoked(&peer.peer_id)? {
+            return Ok(());
+        }
         let addrs_json = serde_json::to_string(&peer.addrs).context("serialize peer_book addrs")?;
         self.conn
             .execute(
@@ -1339,6 +1351,58 @@ ON CONFLICT(peer_id) DO UPDATE SET
             )
             .context("upsert peer_book")?;
         Ok(())
+    }
+
+    pub fn apply_peer_revocation(&self, revocation: &PeerRevocation) -> Result<()> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin peer revocation tx")?;
+        tx.execute(
+            r#"
+INSERT INTO peer_revocations(peer_id, device_id, user_id, revoked_at, ticket_id)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(peer_id) DO UPDATE SET
+  device_id = COALESCE(excluded.device_id, peer_revocations.device_id),
+  user_id = COALESCE(excluded.user_id, peer_revocations.user_id),
+  revoked_at = MAX(peer_revocations.revoked_at, excluded.revoked_at),
+  ticket_id = excluded.ticket_id
+"#,
+            params![
+                revocation.peer_id,
+                revocation.device_id,
+                revocation.user_id,
+                revocation.revoked_at_unix,
+                revocation.ticket_id,
+            ],
+        )
+        .context("upsert peer revocation")?;
+        for table in [
+            "peer_book",
+            "peer_state",
+            "peer_push_state",
+            "peer_delete_state",
+            "peer_delete_push_state",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE peer_id = ?"),
+                params![revocation.peer_id],
+            )
+            .with_context(|| format!("remove revoked peer from {table}"))?;
+        }
+        tx.commit().context("commit peer revocation tx")
+    }
+
+    pub fn is_peer_revoked(&self, peer_id: &str) -> Result<bool> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM peer_revocations WHERE peer_id = ?",
+                params![peer_id],
+                |row| row.get(0),
+            )
+            .context("query peer revocation")?;
+        Ok(count > 0)
     }
 
     pub fn list_peer_book(
@@ -1783,6 +1847,14 @@ CREATE TABLE IF NOT EXISTS peer_book (
 );
 
 CREATE INDEX IF NOT EXISTS idx_peer_book_last_seen ON peer_book(last_seen);
+
+CREATE TABLE IF NOT EXISTS peer_revocations (
+  peer_id TEXT PRIMARY KEY,
+  device_id TEXT,
+  user_id TEXT,
+  revoked_at INTEGER NOT NULL,
+  ticket_id TEXT NOT NULL
+);
 "#,
     )
     .context("execute schema batch")?;
@@ -2885,6 +2957,49 @@ mod tests {
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].peer_id, "peer-c");
         assert_eq!(got[1].peer_id, "peer-b");
+    }
+
+    #[test]
+    fn peer_revocation_removes_authorization_and_sync_floor_state() {
+        let store = LocalStore::open(":memory:").unwrap();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec![],
+                user_id: Some("u1".to_string()),
+                device_id: Some("node0".to_string()),
+                rr_version: Some("1.0.53".to_string()),
+                last_seen_unix: 100,
+            })
+            .unwrap();
+        store.set_last_cursor("peer-a", 10).unwrap();
+        store.set_last_pushed_seq("peer-a", 11).unwrap();
+
+        store
+            .apply_peer_revocation(&PeerRevocation {
+                peer_id: "peer-a".to_string(),
+                device_id: Some("node0".to_string()),
+                user_id: Some("u1".to_string()),
+                revoked_at_unix: 200,
+                ticket_id: "ticket-1".to_string(),
+            })
+            .unwrap();
+
+        assert!(store.is_peer_revoked("peer-a").unwrap());
+        assert!(store.get_peer_book_peer("peer-a").unwrap().is_none());
+        assert!(store.get_last_cursor_opt("peer-a").unwrap().is_none());
+        assert!(store.get_last_pushed_seq_opt("peer-a").unwrap().is_none());
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: "peer-a".to_string(),
+                addrs: vec!["stale".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("node0".to_string()),
+                rr_version: None,
+                last_seen_unix: 300,
+            })
+            .unwrap();
+        assert!(store.get_peer_book_peer("peer-a").unwrap().is_none());
     }
 
     #[test]

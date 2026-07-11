@@ -237,6 +237,7 @@ fn managed_daemon_log_paths_for(
         Platform::Macos => Ok(vec![
             home.join("Library/Logs/rustory-daemon.out.log"),
             home.join("Library/Logs/rustory-daemon.err.log"),
+            home.join("Library/Logs/rustory-retirement.log"),
         ]),
         Platform::Linux => {
             let state_home = match xdg_state_home {
@@ -247,7 +248,10 @@ fn managed_daemon_log_paths_for(
                 ),
                 None => home.join(".local/state"),
             };
-            Ok(vec![state_home.join("rustory/daemon.log")])
+            Ok(vec![
+                state_home.join("rustory/daemon.log"),
+                state_home.join("rustory/retirement.log"),
+            ])
         }
         Platform::Other => Ok(Vec::new()),
     }
@@ -362,13 +366,17 @@ mod tests {
             managed_daemon_log_paths_for(Platform::Macos, home, None).unwrap(),
             vec![
                 home.join("Library/Logs/rustory-daemon.out.log"),
-                home.join("Library/Logs/rustory-daemon.err.log")
+                home.join("Library/Logs/rustory-daemon.err.log"),
+                home.join("Library/Logs/rustory-retirement.log")
             ]
         );
         assert_eq!(
             managed_daemon_log_paths_for(Platform::Linux, home, Some(Path::new("/state/tester")))
                 .unwrap(),
-            vec![PathBuf::from("/state/tester/rustory/daemon.log")]
+            vec![
+                PathBuf::from("/state/tester/rustory/daemon.log"),
+                PathBuf::from("/state/tester/rustory/retirement.log")
+            ]
         );
         assert!(
             managed_daemon_log_paths_for(Platform::Linux, home, Some(Path::new("relative/state")))

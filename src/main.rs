@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod core;
 mod daemon;
+mod device_retirement;
 mod hishtory_cleanup;
 mod history_import;
 mod hook;

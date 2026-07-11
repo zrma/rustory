@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("rustory.py")
@@ -91,6 +92,192 @@ class BinaryInstallTests(unittest.TestCase):
             self.assertEqual(install_path.read_bytes(), matching)
             rustory.install_binary(custom, install_path, requested_version="nightly-main")
             self.assertEqual(install_path.read_bytes(), custom)
+
+
+class RetirementInstallerTests(unittest.TestCase):
+    def test_managed_state_home_is_persisted_privately(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "custom state"
+            previous_state_home = root / "previous state"
+            with mock.patch.object(Path, "home", return_value=root):
+                rustory.record_managed_state_home(previous_state_home)
+                rustory.record_managed_state_home(state_home)
+
+            state_path = root / ".config" / "rustory" / "managed-state-home"
+            self.assertEqual(state_path.read_text(encoding="utf-8"), f"{state_home}\n")
+            self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+            history_path = root / ".config" / "rustory" / "managed-state-homes.json"
+            self.assertEqual(
+                rustory.json.loads(history_path.read_text(encoding="utf-8")),
+                {
+                    "version": 1,
+                    "paths": [str(previous_state_home), str(state_home)],
+                },
+            )
+            self.assertEqual(history_path.stat().st_mode & 0o777, 0o600)
+
+    def test_background_child_receives_resolved_state_home_and_manager_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "resolved state"
+            process = mock.Mock(pid=1234)
+            process.poll.return_value = None
+            with mock.patch.object(Path, "home", return_value=root):
+                with mock.patch.object(rustory.subprocess, "Popen", return_value=process) as popen:
+                    rustory.start_background_daemon(
+                        [str(root / "bin" / "rr"), "daemon"],
+                        state_home,
+                    )
+
+            child_env = popen.call_args.kwargs["env"]
+            self.assertEqual(child_env["XDG_STATE_HOME"], str(state_home))
+            self.assertEqual(child_env["RUSTORY_DAEMON_MANAGER"], "background")
+
+    def test_custom_rc_file_is_recorded_for_automated_uninstall(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rc_file = root / "shell" / "custom.rc"
+            state_home = root / "state"
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(root), "XDG_STATE_HOME": str(state_home)},
+            ):
+                with mock.patch.object(Path, "home", return_value=root):
+                    rustory.record_managed_rc_file(rc_file)
+                    rustory.record_managed_rc_file(rc_file)
+
+            state_path = root / ".config" / "rustory" / "managed-rc-files.json"
+            payload = rustory.json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload, {"version": 1, "paths": [str(rc_file.resolve())]})
+            self.assertEqual(state_path.stat().st_mode & 0o777, 0o600)
+
+    def test_custom_rc_is_recorded_before_hook_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            rc_file = root / "custom.rc"
+            state_home = root / "state"
+            args = rustory.argparse.Namespace(hook_shell="zsh", rc_file=str(rc_file))
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": str(root), "XDG_STATE_HOME": str(state_home)},
+            ):
+                with mock.patch.object(Path, "home", return_value=root):
+                    with mock.patch.object(
+                        rustory,
+                        "update_managed_block",
+                        side_effect=OSError("injected write failure"),
+                    ):
+                        with self.assertRaisesRegex(OSError, "injected write failure"):
+                            rustory.install_shell_hook(root / "bin" / "rr", args)
+
+            state_path = root / ".config" / "rustory" / "managed-rc-files.json"
+            payload = rustory.json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["paths"], [str(rc_file.resolve())])
+
+    def test_relative_xdg_state_home_is_rejected(self) -> None:
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": "relative/state"}):
+            with self.assertRaisesRegex(SystemExit, "must be absolute"):
+                rustory.rustory_state_dir()
+
+    def test_remote_retirement_requires_strict_membership_and_one_tracker(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["rustory.py", "--allow-remote-retirement", "--tracker", "https://tracker.example"],
+        ):
+            with self.assertRaises(SystemExit):
+                rustory.parse_args()
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "rustory.py",
+                "--allow-remote-retirement",
+                "--require-device-membership",
+                "--tracker",
+                "https://tracker-a.example",
+                "--tracker",
+                "https://tracker-b.example",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                rustory.parse_args()
+
+    def test_remote_retirement_flags_are_forwarded_to_rr_init(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "rustory.py",
+                "--allow-remote-retirement",
+                "--require-device-membership",
+                "--tracker",
+                "https://tracker.example",
+            ],
+        ):
+            args = rustory.parse_args()
+
+        with mock.patch.object(rustory.subprocess, "run") as run:
+            rustory.run_init(Path("/tmp/rr"), args)
+
+        command = run.call_args.args[0]
+        self.assertIn("--require-device-membership", command)
+        self.assertIn("--allow-remote-retirement", command)
+        self.assertIn("--update-existing-security", command)
+        self.assertTrue(rustory.init_requested(args))
+
+    def test_force_security_init_does_not_request_conflicting_merge(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "rustory.py",
+                "--force",
+                "--require-device-membership",
+                "--tracker",
+                "https://tracker.example",
+            ],
+        ):
+            args = rustory.parse_args()
+
+        with mock.patch.object(rustory.subprocess, "run") as run:
+            rustory.run_init(Path("/tmp/rr"), args)
+
+        command = run.call_args.args[0]
+        self.assertIn("--force", command)
+        self.assertNotIn("--update-existing-security", command)
+
+    def test_user_or_device_only_install_still_requests_rr_init(self) -> None:
+        with mock.patch.object(sys, "argv", ["rustory.py", "--user-id", "u1"]):
+            args = rustory.parse_args()
+        self.assertTrue(rustory.init_requested(args))
+
+    def test_managed_service_templates_identify_the_recovery_manager(self) -> None:
+        launchd = rustory.render_launchd_plist(
+            "com.rustory.daemon",
+            ["/tmp/rr", "daemon"],
+            Path("/tmp/logs"),
+            Path("/tmp/custom state"),
+        )
+        systemd = rustory.render_systemd_user_unit(
+            ["/tmp/rr", "daemon"], Path("/tmp/custom state")
+        )
+        background = rustory.render_daemon_autostart_block(
+            ["/tmp/rr", "daemon"], Path("/tmp/custom state")
+        )
+
+        self.assertIn("RUSTORY_DAEMON_MANAGER", launchd)
+        self.assertIn("<string>launchd</string>", launchd)
+        self.assertIn("<key>XDG_STATE_HOME</key>", launchd)
+        self.assertIn("<string>/tmp/custom state</string>", launchd)
+        self.assertIn("Environment=RUSTORY_DAEMON_MANAGER=systemd-user", systemd)
+        self.assertIn('Environment="XDG_STATE_HOME=/tmp/custom state"', systemd)
+        self.assertIn("RUSTORY_DAEMON_MANAGER=background setsid", background)
+        self.assertIn("RUSTORY_DAEMON_MANAGER=background nohup", background)
+        self.assertIn("systemctl --user is-active --quiet rustory.service", background)
+        self.assertIn("XDG_STATE_HOME='/tmp/custom state'", background)
 
 
 class ManagedBlockSafetyTests(unittest.TestCase):
