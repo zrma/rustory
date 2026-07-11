@@ -187,6 +187,10 @@ build_linux_with_docker() {
 
 zig_target_for_linux_target() {
   local glibc_baseline="${RUSTORY_RELEASE_ZIG_GLIBC:-2.17}"
+  if [[ ! "$glibc_baseline" =~ ^[0-9]+\.[0-9]+$ ]]; then
+    echo "invalid RUSTORY_RELEASE_ZIG_GLIBC baseline: $glibc_baseline" >&2
+    return 1
+  fi
   case "$1" in
     x86_64-unknown-linux-gnu) echo "x86_64-linux-gnu.$glibc_baseline" ;;
     aarch64-unknown-linux-gnu) echo "aarch64-linux-gnu.$glibc_baseline" ;;
@@ -205,6 +209,10 @@ build_linux_with_zig() {
   local zig_global_cache=""
   local target_env_upper=""
   local target_env_lower=""
+  local glibc_baseline=""
+  local glibc_suffix=""
+  local zig_cargo_target_dir=""
+  local zig_binary=""
 
   zig_bin="$(command -v zig || true)"
   if [[ -z "$zig_bin" ]]; then
@@ -266,6 +274,15 @@ EOF
 
   target_env_upper="$(printf '%s' "$target" | tr '[:lower:]-' '[:upper:]_')"
   target_env_lower="$(printf '%s' "$target" | tr '-' '_')"
+  glibc_baseline="${RUSTORY_RELEASE_ZIG_GLIBC:-2.17}"
+  glibc_suffix="$(printf '%s' "$glibc_baseline" | tr '.' '_')"
+  zig_cargo_target_root="${RUSTORY_RELEASE_ZIG_CARGO_TARGET_DIR:-$repo_root/target}"
+  case "$zig_cargo_target_root" in
+    /*) ;;
+    *) zig_cargo_target_root="$repo_root/$zig_cargo_target_root" ;;
+  esac
+  zig_cargo_target_dir="$zig_cargo_target_root/zig-${target}-glibc-${glibc_suffix}"
+  zig_binary="$zig_cargo_target_dir/$target/release/rr"
 
   if ! (
     cd "$repo_root"
@@ -277,12 +294,20 @@ EOF
       "AR_${target_env_lower}=$zig_ar" \
       "ZIG_LOCAL_CACHE_DIR=$zig_local_cache" \
       "ZIG_GLOBAL_CACHE_DIR=$zig_global_cache" \
+      "CARGO_TARGET_DIR=$zig_cargo_target_dir" \
       PKG_CONFIG_ALLOW_CROSS=1 \
       cargo "${cargo_args[@]}"
   ); then
     rm -rf "$tmp_dir"
     return 1
   fi
+  if [[ ! -x "$zig_binary" ]]; then
+    echo "zig build did not produce expected binary: $zig_binary" >&2
+    rm -rf "$tmp_dir"
+    return 1
+  fi
+  mkdir -p "$(dirname "$binary_path")"
+  install -m 755 "$zig_binary" "$binary_path"
   rm -rf "$tmp_dir"
 }
 
