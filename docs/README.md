@@ -30,6 +30,7 @@
 - [Quick Start](quickstart.md)
 - [Distribution](distribution.md)
 - [Hishtory Migration Runbook](hishtory-migration.md)
+- [Atuin Migration Runbook](atuin-migration.md)
 - [P2P 가이드](p2p.md)
 - [Daemon 가이드](daemon.md)
 - [Hook 가이드](hook.md)

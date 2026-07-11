@@ -1,9 +1,25 @@
 use crate::{core, storage::LocalStore};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
 use std::path::Path;
-use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
+
+#[cfg(feature = "import-atuin")]
+mod atuin;
+#[cfg(feature = "import-hishtory")]
+mod hishtory;
+
+#[cfg(all(test, feature = "import-hishtory"))]
+pub use hishtory::{HishtoryImportRequest, import_hishtory_sqlite_into_store};
+
+#[cfg(all(feature = "import-atuin", feature = "import-hishtory"))]
+pub const IMPORT_SOURCE_HELP: &str =
+    "History source format to import: bash, zsh, hishtory, or atuin";
+#[cfg(all(feature = "import-atuin", not(feature = "import-hishtory")))]
+pub const IMPORT_SOURCE_HELP: &str = "History source format to import: bash, zsh, or atuin";
+#[cfg(all(not(feature = "import-atuin"), feature = "import-hishtory"))]
+pub const IMPORT_SOURCE_HELP: &str = "History source format to import: bash, zsh, or hishtory";
+#[cfg(all(not(feature = "import-atuin"), not(feature = "import-hishtory")))]
+pub const IMPORT_SOURCE_HELP: &str = "History source format to import: bash or zsh";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HistoryRecord {
@@ -16,7 +32,10 @@ pub struct HistoryRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryShell {
+    #[cfg(feature = "import-atuin")]
+    Atuin,
     Bash,
+    #[cfg(feature = "import-hishtory")]
     Hishtory,
     Zsh,
 }
@@ -24,32 +43,51 @@ pub enum HistoryShell {
 impl HistoryShell {
     pub fn parse(value: &str) -> Result<Self> {
         match value {
+            #[cfg(feature = "import-atuin")]
+            "atuin" => Ok(Self::Atuin),
             "bash" => Ok(Self::Bash),
+            #[cfg(feature = "import-hishtory")]
             "hishtory" => Ok(Self::Hishtory),
             "zsh" => Ok(Self::Zsh),
-            _ => anyhow::bail!("unsupported shell: {value} (expected: bash|zsh|hishtory)"),
+            _ => anyhow::bail!(
+                "unsupported history source: {value} (enabled: {})",
+                enabled_history_sources()
+            ),
         }
     }
 
     pub fn as_str(self) -> &'static str {
         match self {
+            #[cfg(feature = "import-atuin")]
+            Self::Atuin => "atuin",
             Self::Bash => "bash",
+            #[cfg(feature = "import-hishtory")]
             Self::Hishtory => "hishtory",
             Self::Zsh => "zsh",
         }
     }
 
-    pub fn default_history_path(self) -> &'static str {
+    pub fn default_history_path(self) -> String {
         match self {
-            Self::Bash => "~/.bash_history",
-            Self::Hishtory => "~/.hishtory/.hishtory.db",
-            Self::Zsh => "~/.zsh_history",
+            #[cfg(feature = "import-atuin")]
+            Self::Atuin => atuin::default_history_path(),
+            Self::Bash => "~/.bash_history".to_string(),
+            #[cfg(feature = "import-hishtory")]
+            Self::Hishtory => "~/.hishtory/.hishtory.db".to_string(),
+            Self::Zsh => "~/.zsh_history".to_string(),
         }
     }
+}
 
-    pub fn is_hishtory(self) -> bool {
-        matches!(self, Self::Hishtory)
-    }
+fn enabled_history_sources() -> &'static str {
+    #[cfg(all(feature = "import-atuin", feature = "import-hishtory"))]
+    return "bash|zsh|hishtory|atuin";
+    #[cfg(all(feature = "import-atuin", not(feature = "import-hishtory")))]
+    return "bash|zsh|atuin";
+    #[cfg(all(not(feature = "import-atuin"), feature = "import-hishtory"))]
+    return "bash|zsh|hishtory";
+    #[cfg(all(not(feature = "import-atuin"), not(feature = "import-hishtory")))]
+    return "bash|zsh";
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -60,6 +98,111 @@ pub struct ImportStats {
     pub skipped: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PathImportRequest<'a> {
+    pub path: &'a Path,
+    pub limit: Option<usize>,
+    pub user_id: &'a str,
+    pub device_id: &'a str,
+    pub hostname: &'a str,
+    pub ignore_regex: Option<&'a regex::Regex>,
+}
+
+#[cfg(any(feature = "import-atuin", feature = "import-hishtory"))]
+pub(super) trait HistoryImportAdapter: Sync {
+    fn import(&self, store: &LocalStore, req: PathImportRequest<'_>) -> Result<ImportStats>;
+}
+
+pub fn import_path_into_store(
+    store: &LocalStore,
+    shell: HistoryShell,
+    req: PathImportRequest<'_>,
+) -> Result<ImportStats> {
+    match shell {
+        #[cfg(feature = "import-atuin")]
+        HistoryShell::Atuin => atuin::ADAPTER.import(store, req),
+        HistoryShell::Bash | HistoryShell::Zsh => {
+            let content = read_history_file(req.path)?;
+            import_into_store(
+                store,
+                ImportRequest {
+                    shell,
+                    content: &content,
+                    limit: req.limit,
+                    user_id: req.user_id,
+                    device_id: req.device_id,
+                    hostname: req.hostname,
+                    ignore_regex: req.ignore_regex,
+                },
+            )
+        }
+        #[cfg(feature = "import-hishtory")]
+        HistoryShell::Hishtory => hishtory::ADAPTER.import(store, req),
+    }
+}
+
+#[cfg(any(feature = "import-atuin", feature = "import-hishtory"))]
+pub(super) struct AdapterRecord {
+    pub entry_id: core::EntryId,
+    pub ts: OffsetDateTime,
+    pub duration_ms: i64,
+    pub cmd: String,
+    pub cwd: String,
+    pub exit_code: i32,
+    pub hostname: String,
+}
+
+#[cfg(any(feature = "import-atuin", feature = "import-hishtory"))]
+pub(super) fn insert_adapter_records(
+    store: &LocalStore,
+    req: PathImportRequest<'_>,
+    source: &str,
+    records: Vec<AdapterRecord>,
+) -> Result<ImportStats> {
+    let mut stats = ImportStats::default();
+    const BATCH: usize = 2000;
+    let mut buf: Vec<core::Entry> = Vec::with_capacity(BATCH);
+
+    for record in records {
+        stats.received += 1;
+        let cmd = record.cmd.trim();
+        if should_skip_import_command(cmd, req.ignore_regex) {
+            stats.skipped += 1;
+            continue;
+        }
+
+        buf.push(core::Entry::new_with_id(
+            record.entry_id,
+            core::EntryInput {
+                device_id: req.device_id.to_string(),
+                user_id: req.user_id.to_string(),
+                ts: record.ts,
+                cmd: cmd.to_string(),
+                cwd: normalize_import_text(&record.cwd, "unknown"),
+                exit_code: record.exit_code,
+                duration_ms: record.duration_ms,
+                shell: source.to_string(),
+                hostname: normalize_import_text(&record.hostname, req.hostname),
+            },
+        ));
+
+        if buf.len() >= BATCH {
+            let inserted = store.insert_entries_with_stats(&buf)?;
+            stats.inserted += inserted.inserted;
+            stats.ignored += inserted.ignored;
+            buf.clear();
+        }
+    }
+
+    if !buf.is_empty() {
+        let inserted = store.insert_entries_with_stats(&buf)?;
+        stats.inserted += inserted.inserted;
+        stats.ignored += inserted.ignored;
+    }
+
+    Ok(stats)
+}
+
 pub fn read_history_file(path: &Path) -> Result<String> {
     let bytes =
         std::fs::read(path).with_context(|| format!("read history file: {}", path.display()))?;
@@ -68,7 +211,10 @@ pub fn read_history_file(path: &Path) -> Result<String> {
 
 pub fn parse_history(shell: HistoryShell, content: &str) -> Vec<HistoryRecord> {
     match shell {
+        #[cfg(feature = "import-atuin")]
+        HistoryShell::Atuin => Vec::new(),
         HistoryShell::Bash => parse_bash_history(content),
+        #[cfg(feature = "import-hishtory")]
         HistoryShell::Hishtory => Vec::new(),
         HistoryShell::Zsh => parse_zsh_history(content),
     }
@@ -162,8 +308,8 @@ fn filled_ts_unix(total: usize, index: usize, original: Option<i64>, now: Offset
 
 pub fn import_into_store(store: &LocalStore, req: ImportRequest<'_>) -> Result<ImportStats> {
     anyhow::ensure!(
-        !req.shell.is_hishtory(),
-        "hishtory imports require import_hishtory_sqlite_into_store"
+        matches!(req.shell, HistoryShell::Bash | HistoryShell::Zsh),
+        "SQLite history sources require import_path_into_store"
     );
 
     let mut records = parse_history(req.shell, req.content);
@@ -249,338 +395,6 @@ pub fn import_into_store(store: &LocalStore, req: ImportRequest<'_>) -> Result<I
     Ok(stats)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct HishtoryImportRequest<'a> {
-    pub path: &'a Path,
-    pub limit: Option<usize>,
-    pub user_id: &'a str,
-    pub device_id: &'a str,
-    pub hostname: &'a str,
-    pub ignore_regex: Option<&'a regex::Regex>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct HishtoryRecord {
-    source_entry_id: Option<String>,
-    fallback_source_key: String,
-    ts_unix: i64,
-    duration_ms: i64,
-    cmd: String,
-    cwd: String,
-    exit_code: i32,
-    hostname: String,
-}
-
-pub fn import_hishtory_sqlite_into_store(
-    store: &LocalStore,
-    req: HishtoryImportRequest<'_>,
-) -> Result<ImportStats> {
-    let conn = Connection::open_with_flags(
-        req.path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .with_context(|| format!("open hishtory sqlite read-only: {}", req.path.display()))?;
-    conn.busy_timeout(StdDuration::from_secs(5))
-        .context("set hishtory sqlite busy_timeout")?;
-
-    let records = read_hishtory_records(&conn, req.limit, req.hostname)?;
-    let mut stats = ImportStats::default();
-
-    const BATCH: usize = 2000;
-    let mut buf: Vec<core::Entry> = Vec::with_capacity(BATCH);
-
-    for r in records {
-        stats.received += 1;
-
-        let cmd = r.cmd.trim();
-        if should_skip_import_command(cmd, req.ignore_regex) {
-            stats.skipped += 1;
-            continue;
-        }
-
-        let ts = OffsetDateTime::from_unix_timestamp(r.ts_unix)
-            .map_err(|_| anyhow::anyhow!("invalid hishtory unix timestamp: {}", r.ts_unix))?;
-
-        let entry_id = hishtory_import_entry_id(
-            req.user_id,
-            r.source_entry_id.as_deref(),
-            &r.fallback_source_key,
-        );
-
-        buf.push(core::Entry::new_with_id(
-            entry_id,
-            core::EntryInput {
-                device_id: req.device_id.to_string(),
-                user_id: req.user_id.to_string(),
-                ts,
-                cmd: cmd.to_string(),
-                cwd: normalize_import_text(&r.cwd, "unknown"),
-                exit_code: r.exit_code,
-                duration_ms: r.duration_ms,
-                shell: HistoryShell::Hishtory.as_str().to_string(),
-                hostname: normalize_import_text(&r.hostname, req.hostname),
-            },
-        ));
-
-        if buf.len() >= BATCH {
-            let s = store.insert_entries_with_stats(&buf)?;
-            stats.inserted += s.inserted;
-            stats.ignored += s.ignored;
-            buf.clear();
-        }
-    }
-
-    if !buf.is_empty() {
-        let s = store.insert_entries_with_stats(&buf)?;
-        stats.inserted += s.inserted;
-        stats.ignored += s.ignored;
-    }
-
-    Ok(stats)
-}
-
-fn read_hishtory_records(
-    conn: &Connection,
-    limit: Option<usize>,
-    fallback_hostname: &str,
-) -> Result<Vec<HishtoryRecord>> {
-    let sql_all = r#"
-SELECT
-  rowid AS source_rowid,
-  NULLIF(TRIM(COALESCE(entry_id, '')), '') AS source_entry_id,
-  command,
-  COALESCE(NULLIF(current_working_directory, ''), 'unknown') AS cwd,
-  COALESCE(exit_code, 0) AS exit_code,
-  unixepoch(start_time) AS start_ts,
-  unixepoch(end_time) AS end_ts,
-  COALESCE(NULLIF(hostname, ''), ?1) AS hostname,
-  local_username,
-  hostname AS source_hostname,
-  current_working_directory AS source_cwd,
-  home_directory,
-  start_time,
-  end_time,
-  device_id,
-  exit_code AS source_exit_code
-FROM history_entries
-WHERE command IS NOT NULL
-  AND TRIM(command) != ''
-  AND unixepoch(start_time) IS NOT NULL
-ORDER BY start_ts ASC, source_rowid ASC
-"#;
-
-    let sql_limited = r#"
-SELECT
-  source_rowid,
-  source_entry_id,
-  command,
-  cwd,
-  exit_code,
-  start_ts,
-  end_ts,
-  hostname,
-  local_username,
-  source_hostname,
-  source_cwd,
-  home_directory,
-  start_time,
-  end_time,
-  source_device_id,
-  source_exit_code
-FROM (
-  SELECT
-    rowid AS source_rowid,
-    NULLIF(TRIM(COALESCE(entry_id, '')), '') AS source_entry_id,
-    command,
-    COALESCE(NULLIF(current_working_directory, ''), 'unknown') AS cwd,
-    COALESCE(exit_code, 0) AS exit_code,
-    unixepoch(start_time) AS start_ts,
-    unixepoch(end_time) AS end_ts,
-    COALESCE(NULLIF(hostname, ''), ?1) AS hostname,
-    local_username,
-    hostname AS source_hostname,
-    current_working_directory AS source_cwd,
-    home_directory,
-    start_time,
-    end_time,
-    device_id AS source_device_id,
-    exit_code AS source_exit_code
-  FROM history_entries
-  WHERE command IS NOT NULL
-    AND TRIM(command) != ''
-    AND unixepoch(start_time) IS NOT NULL
-  ORDER BY start_ts DESC, source_rowid DESC
-  LIMIT ?2
-) selected
-ORDER BY start_ts ASC, source_rowid ASC
-"#;
-
-    let mut out = Vec::new();
-    if let Some(limit) = limit {
-        let mut stmt = conn
-            .prepare(sql_limited)
-            .context("prepare hishtory limited import query")?;
-        let rows = stmt
-            .query_map(
-                params![fallback_hostname, limit as i64],
-                row_to_hishtory_record,
-            )
-            .context("query hishtory limited records")?;
-        for row in rows {
-            out.push(row?);
-        }
-    } else {
-        let mut stmt = conn
-            .prepare(sql_all)
-            .context("prepare hishtory import query")?;
-        let rows = stmt
-            .query_map(params![fallback_hostname], row_to_hishtory_record)
-            .context("query hishtory records")?;
-        for row in rows {
-            out.push(row?);
-        }
-    }
-
-    Ok(out)
-}
-
-fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryRecord> {
-    let start_ts: i64 = row.get(5)?;
-    let end_ts: Option<i64> = row.get(6)?;
-    let duration_ms = end_ts
-        .filter(|end| *end > start_ts)
-        .map(|end| end.saturating_sub(start_ts).saturating_mul(1000))
-        .unwrap_or(0);
-
-    let cmd = row_lossy_string(row, 2)?;
-    let cwd = row_lossy_string(row, 3)?;
-    let exit_code: i32 = row.get(4)?;
-    let hostname = row_lossy_string(row, 7)?;
-    let local_username = row_lossy_opt_string(row, 8)?;
-    let source_hostname = row_lossy_opt_string(row, 9)?;
-    let source_cwd = row_lossy_opt_string(row, 10)?;
-    let home_directory = row_lossy_opt_string(row, 11)?;
-    let start_time = row_lossy_opt_string(row, 12)?;
-    let end_time = row_lossy_opt_string(row, 13)?;
-    let source_device_id = row_lossy_opt_string(row, 14)?;
-    let source_exit_code: Option<i64> = row.get(15)?;
-    let fallback_source_key = hishtory_composite_source_key(HishtoryCompositeSourceKey {
-        local_username: local_username.as_deref(),
-        hostname: source_hostname.as_deref(),
-        cmd: &cmd,
-        cwd: source_cwd.as_deref(),
-        home_directory: home_directory.as_deref(),
-        exit_code: source_exit_code,
-        start_time: start_time.as_deref(),
-        end_time: end_time.as_deref(),
-        source_device_id: source_device_id.as_deref(),
-    });
-
-    Ok(HishtoryRecord {
-        source_entry_id: row_lossy_opt_string(row, 1)?,
-        fallback_source_key,
-        ts_unix: start_ts,
-        duration_ms,
-        cmd,
-        cwd,
-        exit_code,
-        hostname,
-    })
-}
-
-fn row_lossy_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
-    Ok(sqlite_value_ref_to_lossy_string(row.get_ref(index)?))
-}
-
-fn row_lossy_opt_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
-    let value = row.get_ref(index)?;
-    Ok(match value {
-        ValueRef::Null => None,
-        _ => Some(sqlite_value_ref_to_lossy_string(value)),
-    })
-}
-
-fn sqlite_value_ref_to_lossy_string(value: ValueRef<'_>) -> String {
-    match value {
-        ValueRef::Null => String::new(),
-        ValueRef::Integer(value) => value.to_string(),
-        ValueRef::Real(value) => value.to_string(),
-        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-    }
-}
-
-fn should_skip_import_command(cmd: &str, ignore_regex: Option<&regex::Regex>) -> bool {
-    if cmd.is_empty() {
-        return true;
-    }
-    if let Some(re) = ignore_regex
-        && re.is_match(cmd)
-    {
-        return true;
-    }
-    false
-}
-
-fn normalize_import_text(value: &str, fallback: &str) -> String {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        fallback.to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-fn hishtory_import_entry_id(
-    user_id: &str,
-    source_entry_id: Option<&str>,
-    fallback_source_key: &str,
-) -> core::EntryId {
-    let source_key = match source_entry_id.and_then(|id| {
-        let trimmed = id.trim();
-        (!trimmed.is_empty()).then_some(trimmed)
-    }) {
-        Some(id) => format!("entry_id\0{id}"),
-        None => format!("fallback\0{fallback_source_key}"),
-    };
-    let name = format!("rustory:hishtory-import\0{user_id}\0{source_key}");
-    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, name.as_bytes()).to_string()
-}
-
-struct HishtoryCompositeSourceKey<'a> {
-    local_username: Option<&'a str>,
-    hostname: Option<&'a str>,
-    cmd: &'a str,
-    cwd: Option<&'a str>,
-    home_directory: Option<&'a str>,
-    exit_code: Option<i64>,
-    start_time: Option<&'a str>,
-    end_time: Option<&'a str>,
-    source_device_id: Option<&'a str>,
-}
-
-fn hishtory_composite_source_key(key: HishtoryCompositeSourceKey<'_>) -> String {
-    // Hishtory's SQLite unique index is based on these source fields, not on SQLite rowid.
-    // Using the same composite shape keeps old rows with blank entry_id stable across machines.
-    let exit_code = key.exit_code.map(|v| v.to_string()).unwrap_or_default();
-    let parts = [
-        key.local_username.unwrap_or(""),
-        key.hostname.unwrap_or(""),
-        key.cmd,
-        key.cwd.unwrap_or(""),
-        key.home_directory.unwrap_or(""),
-        key.start_time.unwrap_or(""),
-        key.end_time.unwrap_or(""),
-        key.source_device_id.unwrap_or(""),
-    ];
-    format!(
-        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
-        parts[0], parts[1], parts[2], parts[3], parts[4], exit_code, parts[5], parts[6], parts[7]
-    )
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct ImportRequest<'a> {
     pub shell: HistoryShell,
     pub content: &'a str,
@@ -591,11 +405,36 @@ pub struct ImportRequest<'a> {
     pub ignore_regex: Option<&'a regex::Regex>,
 }
 
+#[cfg(any(feature = "import-atuin", feature = "import-hishtory"))]
+fn should_skip_import_command(cmd: &str, ignore_regex: Option<&regex::Regex>) -> bool {
+    if cmd.is_empty() {
+        return true;
+    }
+    if let Some(regex) = ignore_regex
+        && regex.is_match(cmd)
+    {
+        return true;
+    }
+    false
+}
+
+#[cfg(any(feature = "import-atuin", feature = "import-hishtory"))]
+fn normalize_import_text(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::LocalStore;
-    use rusqlite::params;
+    #[cfg(feature = "import-hishtory")]
+    use rusqlite::{Connection, params};
+    #[cfg(feature = "import-hishtory")]
     use std::collections::BTreeSet;
 
     #[test]
@@ -749,6 +588,7 @@ mod tests {
         assert_eq!(store.list_recent(10).unwrap().len(), 1);
     }
 
+    #[cfg(feature = "import-hishtory")]
     #[test]
     fn import_hishtory_sqlite_preserves_metadata_and_is_idempotent() {
         let hishtory_db = synthetic_hishtory_db(&[
@@ -845,6 +685,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "import-hishtory")]
     #[test]
     fn import_hishtory_sqlite_decodes_invalid_utf8_lossily() {
         let hishtory_db = synthetic_hishtory_db(&[]);
@@ -929,6 +770,7 @@ INSERT INTO history_entries (
         assert_eq!(s2.ignored, 1);
     }
 
+    #[cfg(feature = "import-hishtory")]
     #[test]
     fn import_hishtory_sqlite_blank_entry_id_uses_stable_composite_key() {
         let first_db = synthetic_hishtory_db(&[HishtoryFixtureRow {
@@ -996,6 +838,7 @@ INSERT INTO history_entries (
         assert_eq!(store.list_recent(10).unwrap().len(), 2);
     }
 
+    #[cfg(feature = "import-hishtory")]
     #[test]
     fn import_hishtory_sqlite_limit_keeps_newest_rows() {
         let hishtory_db = synthetic_hishtory_db(&[
@@ -1054,6 +897,7 @@ INSERT INTO history_entries (
         assert_eq!(commands, vec!["echo three", "echo two"]);
     }
 
+    #[cfg(feature = "import-hishtory")]
     #[test]
     fn import_hishtory_sqlite_entries_are_pushable_for_import_device() {
         let hishtory_db = synthetic_hishtory_db(&[HishtoryFixtureRow {
@@ -1102,6 +946,7 @@ INSERT INTO history_entries (
         assert_eq!(remote_entries[0].device_id, "rustory-device-a");
     }
 
+    #[cfg(feature = "import-hishtory")]
     #[derive(Clone, Copy)]
     struct HishtoryFixtureRow<'a> {
         entry_id: &'a str,
@@ -1113,6 +958,7 @@ INSERT INTO history_entries (
         end_time: &'a str,
     }
 
+    #[cfg(feature = "import-hishtory")]
     fn synthetic_hishtory_db(rows: &[HishtoryFixtureRow<'_>]) -> tempfile::NamedTempFile {
         let file = tempfile::NamedTempFile::new().unwrap();
         let conn = Connection::open(file.path()).unwrap();
@@ -1170,5 +1016,47 @@ INSERT INTO history_entries (
         }
         drop(conn);
         file
+    }
+}
+
+#[cfg(test)]
+mod feature_contract_tests {
+    use super::*;
+
+    #[test]
+    fn flat_file_sources_are_always_enabled() {
+        assert_eq!(HistoryShell::parse("bash").unwrap(), HistoryShell::Bash);
+        assert_eq!(HistoryShell::parse("zsh").unwrap(), HistoryShell::Zsh);
+    }
+
+    #[cfg(feature = "import-atuin")]
+    #[test]
+    fn atuin_feature_registers_adapter() {
+        assert_eq!(HistoryShell::parse("atuin").unwrap(), HistoryShell::Atuin);
+        assert_eq!(
+            HistoryShell::Atuin.default_history_path(),
+            atuin::default_history_path_from_xdg(None)
+        );
+    }
+
+    #[cfg(not(feature = "import-atuin"))]
+    #[test]
+    fn atuin_source_is_absent_without_feature() {
+        assert!(HistoryShell::parse("atuin").is_err());
+    }
+
+    #[cfg(feature = "import-hishtory")]
+    #[test]
+    fn hishtory_feature_registers_adapter() {
+        assert_eq!(
+            HistoryShell::parse("hishtory").unwrap(),
+            HistoryShell::Hishtory
+        );
+    }
+
+    #[cfg(not(feature = "import-hishtory"))]
+    #[test]
+    fn hishtory_source_is_absent_without_feature() {
+        assert!(HistoryShell::parse("hishtory").is_err());
     }
 }

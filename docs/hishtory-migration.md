@@ -1,7 +1,7 @@
 # Hishtory Migration Runbook
 
 이 문서는 Hishtory가 이미 설치된 머신에서 Rustory로 로컬 히스토리를 seed하고, P2P sync로 점진 이관하는 절차를 정리한다.
-현재 CLI 옵션과 default는 `rr import --help`, `rr init --help`, `rr p2p-sync --help`, `rr sync-status --help`, `src/cli.rs`, `src/history_import.rs`를 직접 확인한다.
+현재 CLI 옵션과 default는 `rr import --help`, `rr init --help`, `rr p2p-sync --help`, `rr sync-status --help`, `src/cli.rs`, `src/history_import/`를 직접 확인한다.
 
 ## 범위
 
@@ -10,6 +10,7 @@
 - 기본 Hishtory DB 경로는 `~/.hishtory/.hishtory.db`이다. 다른 경로는 `--path`로 지정한다.
 - import는 additive/idempotent다. 같은 source를 다시 import하면 이미 들어간 row는 `ignored`로 집계된다.
 - Hishtory SQLite TEXT 값에 invalid UTF-8 byte가 있어도 import는 중단하지 않고 lossless byte 보존 대신 UTF-8 replacement 문자로 변환해 계속 진행한다.
+- Hishtory importer는 기본 활성 `import-hishtory` Cargo feature가 소유한다. `--no-default-features` 또는 Atuin-only build에서는 CLI dispatch에서 빠지며, flat-file/P2P/storage 핵심 경로와 독립적으로 제거할 수 있다. feature 조합과 공통 adapter 계약은 `docs/atuin-migration.md`의 `선택형 adapter 계약`을 따른다.
 
 ## 이관 전 확인
 

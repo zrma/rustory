@@ -123,6 +123,9 @@ rr import --shell bash
 
 # Hishtory local SQLite DB
 rr import --shell hishtory
+
+# Atuin local SQLite DB
+rr import --shell atuin
 ```
 
 필요하면:
@@ -130,7 +133,7 @@ rr import --shell hishtory
 - 마지막 N개만: `rr import --shell zsh --limit 100000`
 
 import는 `RUSTORY_RECORD_IGNORE_REGEX` / `record_ignore_regex`를 존중한다.
-Hishtory에서 Rustory P2P 클러스터로 점진 이관하려면 `docs/hishtory-migration.md`를 먼저 확인한다.
+Hishtory 또는 Atuin에서 Rustory P2P grid로 점진 이관하려면 각각 `docs/hishtory-migration.md`, `docs/atuin-migration.md`를 먼저 확인한다.
 
 ### 2-3) P2P 멤버 실행(추천: daemon)
 각 디바이스가 클러스터 멤버로 보이려면 serve 등록과 watch sync가 같이 돌아야 한다.

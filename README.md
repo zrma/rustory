@@ -37,8 +37,8 @@ private archive나 secret store에 보관하고 이 저장소에 커밋하지 �
 
 설치 후에는 `rr doctor`, `rr sync-status --json --with-tracker`, `rr mesh --watch`로
 config, tracker, peer cursor, pending row/delete 상태를 확인한다. 자세한 onboarding,
-self-update, daemon, Hishtory import 절차는 `docs/quickstart.md`, `docs/distribution.md`,
-`docs/daemon.md`, `docs/hishtory-migration.md`가 소유한다.
+self-update, daemon, Hishtory/Atuin import 절차는 `docs/quickstart.md`, `docs/distribution.md`,
+`docs/daemon.md`, `docs/hishtory-migration.md`, `docs/atuin-migration.md`가 소유한다.
 
 ## Agent Navigation
 
@@ -70,6 +70,7 @@ AI agent에게 이 repo를 맡길 때 하네스 계약은 `docs/agent-harness.md
 - shell hook: `docs/hook.md`
 - 보안과 프라이버시 모델: `docs/security.md`
 - Hishtory migration: `docs/hishtory-migration.md`
+- Atuin migration: `docs/atuin-migration.md`
 - acceptance guide: `docs/acceptance/README.md`
 - 전체 문서 인덱스: `docs/README.md`
 

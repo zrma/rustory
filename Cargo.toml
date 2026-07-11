@@ -8,6 +8,11 @@ autobins = false
 name = "rr"
 path = "src/main.rs"
 
+[features]
+default = ["import-atuin", "import-hishtory"]
+import-atuin = []
+import-hishtory = []
+
 [dependencies]
 anyhow = "1.0"
 async-trait = "0.1"

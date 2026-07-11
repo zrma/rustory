@@ -32,6 +32,7 @@ repositories:
       - docs/quickstart.md
       - docs/distribution.md
       - docs/hishtory-migration.md
+      - docs/atuin-migration.md
       - docs/p2p.md
       - docs/daemon.md
       - docs/hook.md
@@ -56,6 +57,9 @@ repositories:
       - cargo fmt --all --check
       - cargo test --workspace
       - cargo clippy --workspace --all-targets -- -D warnings
+      - cargo test --no-default-features --workspace
+      - cargo check --no-default-features --features import-hishtory
+      - cargo check --no-default-features --features import-atuin
       - python3 install/test_rustory.py
       - scripts/smoke_p2p_local.sh
       - ci:.github/workflows/ci.yml
