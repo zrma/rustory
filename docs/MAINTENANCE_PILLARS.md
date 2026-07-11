@@ -2,7 +2,7 @@
 
 - Audience: Rustory maintainer, AI agent
 - Owner: Rustory
-- Last Verified: 2026-07-09
+- Last Verified: 2026-07-12
 
 Rustory의 다음 단계는 기능을 계속 붙이는 것보다, 오래 써도 무너지지 않는 daily-driver 운영 체계를 유지하는 것이다. 이 문서는 구현을 재서술하지 않는다. 각 유지보수 축의 판단 기준, 소유 위치, 검증 증거를 연결하는 얇은 지도다.
 
@@ -15,7 +15,7 @@ Rustory의 다음 단계는 기능을 계속 붙이는 것보다, 오래 써도 
 | Agent handoff and gates | 사람이 모든 컨텍스트를 기억하지 않아도 후속 agent가 이어받아야 한다. | `AGENTS.md`, `docs/HANDOFF.md`, `docs/EXECUTION_LOOP.md`, `docs/CHANGE_CONTROL.md`, `docs/REPO_MANIFEST.yaml`, `scripts/start-work.sh`, `scripts/check.sh`, `scripts/finalize-and-push.sh` | `scripts/run-manifest-checks.sh`, `scripts/check-release-gates.sh`, `scripts/finalize-and-push.sh` |
 | Node lifecycle and identity hygiene | `uninstall`, 재가입, 중복 hostname/device identity가 grid membership을 흔들 수 있다. | `docs/dev-playbook.md`, `docs/p2p.md`, `src/uninstall.rs`, `src/cli.rs` | `rr uninstall --dry-run`, `rr uninstall --yes`, `rr doctor`, `rr sync-status --with-tracker`, duplicate active peer warning |
 | Sync observability | pending row/delete가 실제 stuck인지, 단순 대기인지 구분해야 한다. | `docs/p2p.md`, `docs/acceptance/README.md`, `src/cli.rs`, `src/sync.rs`, `src/storage.rs` | `rr sync-status --json --with-tracker`, `rr mesh --watch`, acceptance canary |
-| Log signal vs noise | relay/NAT retry, DCUtR 실패, stale daemon이 정상 동기화를 장애처럼 보이게 만들 수 있다. | `docs/p2p.md`, `docs/LESSONS_LOG.md`, `docs/todo-p2p-log-noise/spec.md`, `src/p2p.rs`, `src/cli.rs` | `~/.local/state/rustory/daemon.log`, `RUSTORY_P2P_LOG=verbose`, p2p log tests |
+| Log signal vs noise | relay/NAT retry, DCUtR 실패, stale daemon이 정상 동기화를 장애처럼 보이게 만들 수 있다. | `docs/p2p.md`, `docs/LESSONS_LOG.md`, `src/p2p.rs`, `src/cli.rs` | `~/.local/state/rustory/daemon.log`, `RUSTORY_P2P_LOG=verbose`, p2p log tests |
 | Data hygiene and GC | dedupe/delete/tombstone/prune이 peer cursor보다 앞서가면 삭제 동기화나 복구 판단이 깨진다. | `docs/p2p.md`, `src/sync.rs`, `src/storage.rs`, `src/cli.rs` | `rr dedupe --dry-run`, `rr delete --dry-run`, `rr tombstone-gc --dry-run`, `rr sync-status --json --with-tracker` |
 | Installer, update, and daemon resilience | one-shot install/update가 macOS, systemd user, container fallback에서 같은 결과를 내야 한다. | `docs/distribution.md`, `docs/daemon.md`, `install/rustory.py`, `src/self_update.rs` | `rr update`, `rr doctor --auto-fix`, daemon process check, installer smoke, self-update tests |
 | CI green and release traceability | published binary, source revision, fleet state가 서로 맞아야 운영 판단을 신뢰할 수 있다. | `docs/CHANGE_CONTROL.md`, `docs/REPO_MANIFEST.yaml`, `docs/LESSONS_LOG.md`, `scripts/release-version.sh` | `cargo fmt`, `cargo test`, `cargo clippy`, `scripts/check-release-gates.sh`, GitHub Actions, deployed `rr version` |
