@@ -518,22 +518,20 @@ fn restart_managed_daemon(install_path: &Path) {
     {
         stop_stale_managed_rr_processes_before_restart(install_path);
 
-        let systemd_bus_unavailable = match restart_systemd_user_daemon() {
+        match restart_systemd_user_daemon() {
             DaemonRestartStatus::Restarted => return,
             DaemonRestartStatus::Failed(error) if systemd_user_bus_unavailable_text(&error) => {
                 println!(
                     "daemon=restart_deferred manager=systemd-user reason=user_bus_unavailable"
                 );
-                true
             }
             DaemonRestartStatus::Failed(error) => {
                 println!("warn: daemon restart failed manager=systemd-user detail={error}");
-                false
             }
-            DaemonRestartStatus::Skipped => false,
-        };
+            DaemonRestartStatus::Skipped => {}
+        }
 
-        match restart_background_daemon(install_path, systemd_bus_unavailable) {
+        match restart_background_daemon(install_path) {
             DaemonRestartStatus::Restarted => return,
             DaemonRestartStatus::Failed(error) => {
                 println!("warn: daemon restart failed manager=background detail={error}");
@@ -889,7 +887,7 @@ fn stop_background_daemon(install_path: &Path) -> DaemonRestartStatus {
 }
 
 #[cfg(target_os = "linux")]
-fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRestartStatus {
+fn restart_background_daemon(install_path: &Path) -> DaemonRestartStatus {
     let state_dir = match rustory_state_dir() {
         Ok(path) => path,
         Err(error) => return DaemonRestartStatus::Failed(error),
@@ -916,7 +914,11 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
         pid = None;
     }
 
-    if !force_start && pid.is_none() {
+    // Self-update may restart only an installer-managed background daemon for
+    // which the private PID file remains as ownership evidence. A missing or
+    // rejected PID must never turn a systemd user-bus failure into a second
+    // unmanaged daemon next to an existing process.
+    if !background_restart_has_managed_evidence(pid) {
         return DaemonRestartStatus::Skipped;
     }
 
@@ -1010,6 +1012,11 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
         log_path.display()
     );
     DaemonRestartStatus::Restarted
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn background_restart_has_managed_evidence(pid: Option<u32>) -> bool {
+    pid.is_some()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -2034,6 +2041,12 @@ mod tests {
         assert!(!systemd_user_bus_unavailable_text(
             "Unit rustory.service not found"
         ));
+    }
+
+    #[test]
+    fn background_restart_requires_private_pid_evidence() {
+        assert!(!background_restart_has_managed_evidence(None));
+        assert!(background_restart_has_managed_evidence(Some(42)));
     }
 
     #[cfg(target_os = "linux")]
