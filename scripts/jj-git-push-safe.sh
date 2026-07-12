@@ -107,7 +107,16 @@ if [[ -n "$PUSH_GATES_WORK_ID" ]]; then
 elif [[ "$ALLOW_MISSING_WORK_ID" == "1" ]]; then
   release_gate_cmd+=(--allow-missing-work-id)
 fi
-"${release_gate_cmd[@]}"
+for bookmark in "${TARGET_BOOKMARKS[@]}"; do
+  target_sha="$(jj log -r "$bookmark" --no-graph -T 'commit_id' | tr -d '\r\n')"
+  if [[ -z "$target_sha" ]]; then
+    echo "[FAIL] failed to resolve target SHA for bookmark: $bookmark" >&2
+    exit 1
+  fi
+  TODO_UNPUBLISHED_BASE_REF="refs/remotes/$REMOTE/$bookmark" \
+    TODO_UNPUBLISHED_TARGET_REV="$target_sha" \
+    "${release_gate_cmd[@]}"
+done
 
 run_conflict_gate
 

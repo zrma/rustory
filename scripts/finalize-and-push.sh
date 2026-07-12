@@ -32,8 +32,8 @@ Options:
                           for all docs/todo-* when multiple exist;
                           no todo workspace면 기본 실패.
                           단, 현재 diff 또는 (로컬 변경이 없을 때)
-                          직전 커밋 또는 origin/main 이후 미푸시 커밋에
-                          단일 docs/todo-* 삭제가 감지되면
+                          실제 push 기준 이후 최신 todo 변경에
+                          docs/todo-* 삭제가 감지되면
                           해당 work-id를 마감 커밋으로 자동 허용)
   --allow-missing-work-id force no-work-id path (skip single auto-selection;
                           debug only, requires DEBUG_GATES_OVERRIDE=1 and non-CI env)
@@ -278,12 +278,12 @@ fi
 if [[ -n "$WORK_ID" && ! -d "$todo_abs" && "$CLOSED_WORK_ID" -ne 1 ]]; then
   if todo_workspace_has_deleted_work_id "$ROOT" "$WORK_ID" auto; then
     CLOSED_WORK_ID=1
-    warn "$todo_rel not found; treat as closed work from detected workspace deletion"
+    warn "$todo_rel not found; treat as closed work from the latest target-bound todo change"
   else
     if [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
       warn "$todo_rel not found. continue due --allow-missing-work-id override"
     else
-      fail "$todo_rel not found. explicit --work-id requires matching deleted workspace evidence in current diff or clean unpublished history"
+      fail "$todo_rel not found. explicit --work-id requires matching deletion in the current or latest target-bound todo change"
     fi
   fi
 fi
@@ -328,7 +328,15 @@ if [[ -n "$WORK_ID" ]]; then
 elif [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
   gate_args+=(--allow-missing-work-id)
 fi
-run_argv "${gate_args[@]}"
+gate_target_sha="$(cd "$ROOT" && jj log -r @ --no-graph -T 'commit_id' | tr -d '\r\n')"
+if [[ -z "$gate_target_sha" ]]; then
+  fail "failed to resolve gate target SHA for @"
+fi
+gate_base_ref="refs/remotes/$REMOTE/$BOOKMARK"
+run_argv env \
+  TODO_UNPUBLISHED_BASE_REF="$gate_base_ref" \
+  TODO_UNPUBLISHED_TARGET_REV="$gate_target_sha" \
+  "${gate_args[@]}"
 ok "release gates passed"
 
 describe_current_change "$MESSAGE"

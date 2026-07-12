@@ -17,8 +17,10 @@ Linux targets default to the native host when target == host target. On
 non-Linux or cross-arch hosts, auto mode prefers Zig when available so release
 assets do not inherit the glibc version of an arbitrary remote builder. Set
 RUSTORY_RELEASE_ZIG_GLIBC=2.17 to override the default glibc baseline. When Zig
-is not available, auto uses RUSTORY_RELEASE_LINUX_REMOTE as an SSH builder when
-set, otherwise Docker buildx. Set --linux-builder host, or
+is not available, auto uses Docker buildx. The SSH builder is an explicit
+trusted-infrastructure escape hatch: select --linux-builder ssh and set both
+RUSTORY_RELEASE_LINUX_REMOTE and RUSTORY_ALLOW_TRUSTED_SSH_BUILDER=1. Set
+--linux-builder host, or
 RUSTORY_RELEASE_LINUX_BUILDER=host, when a native cross C toolchain such as
 x86_64-linux-gnu-gcc is available.
 USAGE
@@ -328,6 +330,10 @@ remote_matches_target() {
 }
 
 build_linux_with_ssh() {
+  if [[ "${RUSTORY_ALLOW_TRUSTED_SSH_BUILDER:-0}" != "1" ]]; then
+    echo "SSH release builders are not independently verifiable; set RUSTORY_ALLOW_TRUSTED_SSH_BUILDER=1 only for explicitly trusted build infrastructure" >&2
+    return 1
+  fi
   if [[ -z "$linux_remote" ]]; then
     echo "RUSTORY_RELEASE_LINUX_REMOTE is required when --linux-builder ssh is used" >&2
     return 1
@@ -395,10 +401,10 @@ if linux_platform="$(linux_platform_for_target "$target")"; then
       elif command -v zig >/dev/null 2>&1; then
         echo "linux_builder=zig target=$(zig_target_for_linux_target "$target")"
         build_linux_with_zig
-      elif [[ -n "$linux_remote" ]]; then
-        echo "linux_builder=ssh remote=$linux_remote"
-        build_linux_with_ssh
       else
+        if [[ -n "$linux_remote" ]]; then
+          echo "warn: ignore RUSTORY_RELEASE_LINUX_REMOTE in auto mode; use --linux-builder ssh with explicit trusted-builder opt-in" >&2
+        fi
         echo "linux_builder=docker platform=$linux_platform"
         build_linux_with_docker "$linux_platform"
       fi

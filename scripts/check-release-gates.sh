@@ -28,8 +28,8 @@ Options:
                                 for all docs/todo-* when multiple exist;
                                 no todo workspace면 기본 실패.
                                 단, 현재 diff 또는 (로컬 변경이 없을 때)
-                                직전 커밋 또는 origin/main 이후 미푸시 커밋에
-                                단일 docs/todo-* 삭제가 감지되면
+                                실제 push 기준 이후 최신 todo 변경에
+                                docs/todo-* 삭제가 감지되면
                                 해당 work-id를 마감 커밋으로 자동 허용)
                                 open-questions 닫힘 검사는 --work-id 지정 시
                                 docs/todo-<work-id>/open-questions.md만 대상으로 수행,
@@ -238,12 +238,12 @@ fi
 if [[ -n "$WORK_ID" && ! -d "$todo_abs" && "$CLOSED_WORK_ID" -ne 1 ]]; then
   if todo_workspace_has_deleted_work_id "$ROOT" "$WORK_ID" auto; then
     CLOSED_WORK_ID=1
-    warn "$todo_rel not found; treat as closed work from detected workspace deletion"
+    warn "$todo_rel not found; treat as closed work from the latest target-bound todo change"
   else
     if [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
       warn "$todo_rel not found. continue due --allow-missing-work-id override"
     else
-      fail "$todo_rel not found. explicit --work-id requires matching deleted workspace evidence in current diff or clean unpublished history"
+      fail "$todo_rel not found. explicit --work-id requires matching deletion in the current or latest target-bound todo change"
     fi
   fi
 fi
@@ -258,7 +258,12 @@ if [[ -n "$WORK_ID" ]]; then
     printf -v todo_cmd 'scripts/check-todo-readiness.sh %q' "$todo_rel"
     safe_run "$todo_cmd"
   elif [[ "$CLOSED_WORK_ID" -eq 1 ]]; then
-    warn "skip todo readiness for closed work-id: $WORK_ID (workspace deleted in current diff)"
+    warn "skip scoped readiness for closed work-id: $WORK_ID; validate every remaining active todo"
+    while IFS= read -r todo_dir; do
+      [[ -z "$todo_dir" ]] && continue
+      printf -v todo_cmd 'scripts/check-todo-readiness.sh %q' "${todo_dir#$ROOT/}"
+      safe_run "$todo_cmd"
+    done < <(todo_workspace_find_dirs "$ROOT")
   elif [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
     warn "skip todo readiness due --allow-missing-work-id override: $WORK_ID"
   else
@@ -293,7 +298,16 @@ declare -a OPEN_QUESTION_TARGETS=()
 if [[ -n "$WORK_ID" && -d "$todo_abs" ]]; then
   OPEN_QUESTION_TARGETS+=("$todo_rel/open-questions.md")
 elif [[ -n "$WORK_ID" && "$CLOSED_WORK_ID" -eq 1 ]]; then
-  warn "skip scoped open-questions check for closed work-id: $WORK_ID (workspace deleted in current diff)"
+  warn "skip scoped open-questions check for closed work-id: $WORK_ID; validate every remaining active todo"
+  while IFS= read -r todo_dir; do
+    [[ -z "$todo_dir" ]] && continue
+    todo_open_q_rel="${todo_dir#$ROOT/}/open-questions.md"
+    if [[ -f "$ROOT/$todo_open_q_rel" ]]; then
+      OPEN_QUESTION_TARGETS+=("$todo_open_q_rel")
+    else
+      fail "missing open-questions: $todo_open_q_rel"
+    fi
+  done < <(todo_workspace_find_dirs "$ROOT")
 elif [[ -z "$WORK_ID" && "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
   warn "skip open-questions checks due --allow-missing-work-id override"
 else

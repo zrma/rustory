@@ -733,6 +733,7 @@ printf 'ELF fixture GLIBC_2.39\n' > "$glibc_new_fixture"
 run_cmd "scripts/check-linux-glibc-baseline.sh $glibc_ok_fixture 2.17"
 expect_fail_cmd "scripts/check-linux-glibc-baseline.sh $glibc_new_fixture 2.17"
 expect_fail_cmd "scripts/check-linux-glibc-baseline.sh $glibc_ok_fixture invalid"
+expect_fail_cmd "RUSTORY_RELEASE_LINUX_BUILDER=ssh RUSTORY_RELEASE_LINUX_REMOTE=untrusted.invalid scripts/build-release-assets.sh --target x86_64-unknown-linux-gnu --dist-dir $tmp_root/untrusted-ssh-dist"
 
 setup_multi_todo_workspaces
 run_cmd "scripts/check-push-gates.sh --mode strict --dry-run"
@@ -768,10 +769,30 @@ git -C "$closed_work_repo_dir" commit -qm "feat: create second closed-work fixtu
 rm -rf "$closed_work_repo_dir/docs/todo-$second_closed_work_id"
 git -C "$closed_work_repo_dir" add -A
 git -C "$closed_work_repo_dir" commit -qm "chore: close second closed-work fixture"
-expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run)"
-run_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $CLOSED_WORK_FIXTURE_WORK_ID)"
+run_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run)"
+expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $CLOSED_WORK_FIXTURE_WORK_ID)"
 run_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $second_closed_work_id)"
 expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id script-smoke-closed-missing)"
+closed_target_sha="$(git -C "$closed_work_repo_dir" rev-parse HEAD)"
+git -C "$closed_work_repo_dir" update-ref refs/remotes/upstream/release HEAD
+expect_fail_cmd "(cd \"$closed_work_repo_dir\" && TODO_UNPUBLISHED_BASE_REF=refs/remotes/upstream/release TODO_UNPUBLISHED_TARGET_REV=$closed_target_sha scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $second_closed_work_id)"
+
+third_closed_work_id="script-smoke-closed-third"
+active_after_close_work_id="script-smoke-active-after-close"
+mkdir -p "$closed_work_repo_dir/docs/todo-$third_closed_work_id"
+printf '# Spec: third closed-work fixture\n' > "$closed_work_repo_dir/docs/todo-$third_closed_work_id/spec.md"
+git -C "$closed_work_repo_dir" add .
+git -C "$closed_work_repo_dir" commit -qm "feat: create third closed-work fixture"
+rm -rf "$closed_work_repo_dir/docs/todo-$third_closed_work_id"
+mkdir -p "$closed_work_repo_dir/docs/todo-$active_after_close_work_id"
+printf '# Spec: incomplete active fixture\n' > "$closed_work_repo_dir/docs/todo-$active_after_close_work_id/spec.md"
+printf '# Open Questions\n\n## Q1\n' > "$closed_work_repo_dir/docs/todo-$active_after_close_work_id/open-questions.md"
+git -C "$closed_work_repo_dir" add -A
+git -C "$closed_work_repo_dir" commit -qm "chore: close third fixture with active follow-up"
+run_cmd "output=\$(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $third_closed_work_id); [[ \"\$output\" == *\"scripts/check-todo-readiness.sh docs/todo-$active_after_close_work_id\"* ]] && [[ \"\$output\" == *\"docs/todo-$active_after_close_work_id/open-questions.md\"* ]]"
+rm -rf "$closed_work_repo_dir/docs/todo-$active_after_close_work_id"
+git -C "$closed_work_repo_dir" add -A
+git -C "$closed_work_repo_dir" commit -qm "chore: remove active fixture"
 git -C "$closed_work_repo_dir" update-ref refs/remotes/origin/main HEAD
 expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $CLOSED_WORK_FIXTURE_WORK_ID)"
 

@@ -62,8 +62,11 @@ scripts/release-version.sh --profile daily-driver --gate none
 Linux target은 현재 host와 target이 같으면 로컬에서 빌드한다. macOS 같은 non-Linux host에서는
 `zig`가 있으면 Zig cross C toolchain을 먼저 써서 remote builder의 glibc version을 release asset에
 묶지 않는다. baseline override가 필요하면 `RUSTORY_RELEASE_ZIG_GLIBC=<glibc-version>`을 지정한다.
-Zig가 없고 `RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`가 설정되어 있으면 native Linux SSH builder를 쓰며,
-마지막 fallback은 Docker buildx다. 빌더를 고정해야 하면 `RUSTORY_RELEASE_LINUX_BUILDER=zig|ssh|docker|host`
+Zig가 없으면 Docker buildx를 쓴다. SSH builder 결과는 publisher가 독립적으로 provenance를 검증할 수
+없으므로 auto mode에서는 선택하지 않는다. 불가피하게 신뢰된 SSH build host를 쓸 때만
+`RUSTORY_RELEASE_LINUX_BUILDER=ssh`, `RUSTORY_RELEASE_LINUX_REMOTE=<ssh-host>`,
+`RUSTORY_ALLOW_TRUSTED_SSH_BUILDER=1`을 모두 명시한다. 그 외 빌더를 고정하려면
+`RUSTORY_RELEASE_LINUX_BUILDER=zig|docker|host`
 또는 `--linux-builder zig|ssh|docker|host`를 명시한다. 실제 옵션/default는
 `scripts/build-release-assets.sh --help`와 스크립트 본문을 기준으로 한다.
 Linux asset은 빌더 종류와 무관하게 기본 최대 `GLIBC_2.17` 요구사항을 검사하며, 이를 넘으면 checksum
@@ -75,6 +78,9 @@ Zig build는 `target/zig-<target>-glibc-<baseline>/`처럼 baseline별 별도 Ca
 cache root를 바꿀 때는 `RUSTORY_RELEASE_ZIG_CARGO_TARGET_DIR`을 쓴다. 스크립트가 그 아래에
 target과 glibc baseline을 포함한 디렉터리를 별도로 만들어 교차 오염을 막는다.
 
+`--skip-build`는 신뢰된 publisher가 직전에 만든 staging을 재사용하는 복구 경로다. version/revision,
+target architecture, GLIBC, checksum을 다시 검사하지만 binary provenance나 benign behavior를 독립적으로
+인증하지는 않으므로 외부 전달물이나 신뢰하지 않는 builder 결과에 사용하지 않는다.
 `--skip-upload`은 asset/checksum만 만들고 GitHub Release는 건드리지 않는다.
 `--dry-run`은 release plan과 실행할 명령만 출력한다.
 

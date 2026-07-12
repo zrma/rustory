@@ -143,7 +143,10 @@ todo_workspace_collect_deleted_work_ids() {
   local root="$1"
   local include_head_range="${2:-auto}"
   local run_head_range=0
-  local unpublished_base_ref="refs/remotes/origin/main"
+  local unpublished_base_ref="${TODO_UNPUBLISHED_BASE_REF:-refs/remotes/origin/main}"
+  local unpublished_target_rev="${TODO_UNPUBLISHED_TARGET_REV:-HEAD}"
+  local current_todo_changes=""
+  local latest_todo_commit=""
   local path_prefix="$TODO_WORKSPACE_PARENT_REL/$TODO_WORKSPACE_NAME_PREFIX"
 
   if [[ "$include_head_range" == "auto" ]]; then
@@ -154,20 +157,34 @@ todo_workspace_collect_deleted_work_ids() {
     run_head_range=1
   fi
 
-  {
+  current_todo_changes="$({
     if command -v jj >/dev/null 2>&1 && (cd "$root" && jj root >/dev/null 2>&1); then
       (cd "$root" && jj diff --summary 2>/dev/null) || true
     fi
     git -C "$root" diff --name-status -- "$TODO_WORKSPACE_PARENT_REL"
     git -C "$root" diff --cached --name-status -- "$TODO_WORKSPACE_PARENT_REL"
-    if (( run_head_range == 1 )) && git -C "$root" rev-parse --verify --quiet HEAD^ >/dev/null; then
-      git -C "$root" diff --name-status HEAD^..HEAD -- "$TODO_WORKSPACE_PARENT_REL"
-    fi
-    if (( run_head_range == 1 )) \
-      && git -C "$root" rev-parse --verify --quiet "$unpublished_base_ref" >/dev/null \
-      && git -C "$root" merge-base --is-ancestor "$unpublished_base_ref" HEAD; then
-      git -C "$root" log --format= --name-status --diff-filter=D \
-        "$unpublished_base_ref..HEAD" -- "$TODO_WORKSPACE_PARENT_REL"
+  } | awk -v prefix="$path_prefix" '
+    $2 != "" && index($2, prefix) == 1 { print }
+  ')"
+
+  {
+    if [[ -n "$current_todo_changes" ]]; then
+      printf '%s\n' "$current_todo_changes"
+    elif (( run_head_range == 1 )) \
+      && [[ "$unpublished_base_ref" == refs/remotes/* ]] \
+      && git -C "$root" check-ref-format "$unpublished_base_ref" >/dev/null 2>&1 \
+      && { [[ "$unpublished_target_rev" == "HEAD" ]] || [[ "$unpublished_target_rev" =~ ^[0-9a-fA-F]{40}$ ]]; } \
+      && git -C "$root" rev-parse --verify --quiet "$unpublished_base_ref^{commit}" >/dev/null \
+      && git -C "$root" rev-parse --verify --quiet "$unpublished_target_rev^{commit}" >/dev/null \
+      && git -C "$root" merge-base --is-ancestor "$unpublished_base_ref" "$unpublished_target_rev"; then
+      latest_todo_commit="$(
+        git -C "$root" log -1 --format=%H \
+          "$unpublished_base_ref..$unpublished_target_rev" -- "$TODO_WORKSPACE_GLOB"
+      )"
+      if [[ -n "$latest_todo_commit" ]]; then
+        git -C "$root" diff-tree --no-commit-id --name-status -r \
+          "$latest_todo_commit" -- "$TODO_WORKSPACE_GLOB"
+      fi
     fi
   } \
     | awk -v prefix="$path_prefix" '
