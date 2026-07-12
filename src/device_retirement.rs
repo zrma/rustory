@@ -10,6 +10,7 @@ use std::time::Duration;
 
 pub const RETIREMENT_PROTOCOL_VERSION: u32 = 1;
 pub const DEVICE_MEMBERSHIP_PROTOCOL_VERSION: u32 = 1;
+pub const RETIREMENT_INITIAL_ATTEMPT: u32 = 1;
 pub const DEVICE_PROOF_MAX_SKEW_SEC: i64 = 5 * 60;
 const DEVICE_PROOF_MAX_PUBLIC_KEY_BYTES: usize = 1024;
 const DEVICE_PROOF_MAX_SIGNATURE_BYTES: usize = 1024;
@@ -52,9 +53,22 @@ pub struct RetirementTicket {
     pub user_id: Option<String>,
     pub cleanup: RetirementCleanup,
     pub issued_at_unix: i64,
+    #[serde(
+        default = "initial_retirement_attempt",
+        skip_serializing_if = "is_initial_retirement_attempt"
+    )]
+    pub attempt: u32,
     pub status: RetirementStatus,
     pub status_updated_at_unix: i64,
     pub status_detail: Option<String>,
+}
+
+fn initial_retirement_attempt() -> u32 {
+    RETIREMENT_INITIAL_ATTEMPT
+}
+
+fn is_initial_retirement_attempt(attempt: &u32) -> bool {
+    *attempt == RETIREMENT_INITIAL_ATTEMPT
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -222,6 +236,7 @@ pub fn spawn_retirement_monitor(
                                     match client.acknowledge_retirement(
                                         &identity,
                                         ticket.ticket_id.clone(),
+                                        ticket.attempt,
                                         RetirementStatus::Failed,
                                         Some(detail),
                                         None,
@@ -539,6 +554,10 @@ fn validate_retirement_ticket_shape(ticket: &RetirementTicket) -> Result<()> {
         .peer_id
         .parse::<crate::libp2p::PeerId>()
         .context("parse retirement ticket peer_id")?;
+    anyhow::ensure!(
+        ticket.attempt > 0,
+        "retirement ticket attempt must be positive"
+    );
     anyhow::ensure!(
         ticket.cleanup == RetirementCleanup::FullUninstall,
         "retirement helper only accepts full_uninstall tickets"
@@ -1506,6 +1525,7 @@ mod tests {
             user_id: Some("u1".to_string()),
             cleanup: RetirementCleanup::FullUninstall,
             issued_at_unix: now,
+            attempt: RETIREMENT_INITIAL_ATTEMPT,
             status: RetirementStatus::Pending,
             status_updated_at_unix: now,
             status_detail: None,
@@ -1528,6 +1548,7 @@ mod tests {
             cleanup: RetirementCleanup::RevokeOnly,
             status: RetirementStatus::Completed,
             issued_at_unix: now,
+            attempt: RETIREMENT_INITIAL_ATTEMPT,
             status_updated_at_unix: now,
             status_detail: None,
         };
@@ -1560,6 +1581,7 @@ mod tests {
             user_id: Some("user0".to_string()),
             cleanup: RetirementCleanup::FullUninstall,
             issued_at_unix: now,
+            attempt: RETIREMENT_INITIAL_ATTEMPT,
             status: RetirementStatus::Pending,
             status_updated_at_unix: now,
             status_detail: None,

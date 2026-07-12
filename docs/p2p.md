@@ -109,7 +109,9 @@ binary version과 fresh registration 시각을 별도로 확인한다.
 대상 자체는 offline이어도 revoke할 수 있으며, full-uninstall capability를 광고했던 cooperative 대상은
 재접속 때 ticket을 처리한다. 동일 PeerId에 다른 cleanup 정책을 덮어쓰는 것은 거부한다. scheduling
 실패나 대상의 명시적 거부는 같은 admin retire 명령으로 안전 precondition을 다시 확인한 뒤
-`Pending`으로 재큐잉할 수 있다. 먼저 revoke-only로 격리한 대상은 이후 precondition이 충족되면
+`Pending`으로 재큐잉할 수 있다. 재큐잉할 때 durable attempt가 증가하고 target ACK 서명에도 attempt가
+포함되므로 tracker 재시작 뒤 과거 `Failed`/`Refused` ACK를 재생해 새 시도를 되돌릴 수 없다. 먼저
+revoke-only로 격리한 대상은 이후 precondition이 충족되면
 `rr device retire`로 새 full-uninstall ticket을 발급하는 단방향 승격이 가능하다. full-uninstall을
 revoke-only로 낮추거나 이미 실행 중인 ticket의 cleanup 정책을 바꾸는 것은 거부한다.
 
@@ -148,7 +150,10 @@ deadline과 64개 동시 요청 상한을 두므로 느린 unauthenticated body 
 멈추지 않는다. TLS reverse proxy에도 request-body/header size와 read/write timeout을 같은 수준 이하로 둔다.
 `X-Rustory-Device-Request`와 해당 request body에는 signed proof 및 completion capability가 포함될 수
 있으므로 access log에서 header/body를 반드시 redact하거나 기록하지 않는다. tracker 응답은
-`Cache-Control: no-store, private`이므로 proxy에서 cache하지 않는다.
+`Cache-Control: no-store, private`이므로 proxy에서 cache하지 않는다. client도 tracker JSON 응답을
+512 KiB로 제한한다. strict P2P inbound membership 조회는 전체 64개·peer별 4개의 background check로 제한하고,
+큰 decoded payload를 보유하는 push는 동시에 1개만 대기시킨다. local revocation deny cache를 먼저 확인하고
+tracker가 실패하면 요청을 fail-closed하되 swarm event loop를 동기 HTTP timeout 동안 멈추지 않는다.
 
 ### Strict mode rollback 경계
 

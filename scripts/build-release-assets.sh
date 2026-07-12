@@ -211,6 +211,7 @@ build_linux_with_zig() {
   local target_env_lower=""
   local glibc_baseline=""
   local glibc_suffix=""
+  local zig_cargo_target_root=""
   local zig_cargo_target_dir=""
   local zig_binary=""
 

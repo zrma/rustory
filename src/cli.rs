@@ -2221,6 +2221,7 @@ fn run_retirement_helper(
             let refused = client.acknowledge_retirement(
                 &identity,
                 current.ticket_id.clone(),
+                current.attempt,
                 crate::device_retirement::RetirementStatus::Refused,
                 Some(crate::device_retirement::bounded_status_detail(&format!(
                     "target preflight refused: {error:#}"
@@ -2272,6 +2273,7 @@ fn run_retirement_helper(
         let running = client.acknowledge_retirement(
             &identity,
             current.ticket_id.clone(),
+            current.attempt,
             crate::device_retirement::RetirementStatus::Running,
             Some("managed retirement helper accepted cleanup".to_string()),
             Some(capability_hash),

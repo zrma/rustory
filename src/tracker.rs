@@ -9,9 +9,9 @@ use std::time::Duration;
 use time::OffsetDateTime;
 
 use crate::device_retirement::{
-    DEVICE_MEMBERSHIP_PROTOCOL_VERSION, DeviceProof, RETIREMENT_PROTOCOL_VERSION,
-    RetirementCleanup, RetirementStatus, RetirementTicket, completion_capability_hash,
-    sign_device_action, verify_device_action,
+    DEVICE_MEMBERSHIP_PROTOCOL_VERSION, DeviceProof, RETIREMENT_INITIAL_ATTEMPT,
+    RETIREMENT_PROTOCOL_VERSION, RetirementCleanup, RetirementStatus, RetirementTicket,
+    completion_capability_hash, sign_device_action, verify_device_action,
 };
 use crate::terminal::contains_terminal_control;
 
@@ -174,11 +174,24 @@ pub struct RetirementPollResponse {
 pub struct RetirementAckRequest {
     pub peer_id: String,
     pub ticket_id: String,
+    #[serde(
+        default = "initial_retirement_attempt",
+        skip_serializing_if = "is_initial_retirement_attempt"
+    )]
+    pub attempt: u32,
     pub status: RetirementStatus,
     pub detail: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion_capability_hash: Option<String>,
     pub device_proof: DeviceProof,
+}
+
+fn initial_retirement_attempt() -> u32 {
+    RETIREMENT_INITIAL_ATTEMPT
+}
+
+fn is_initial_retirement_attempt(attempt: &u32) -> bool {
+    *attempt == RETIREMENT_INITIAL_ATTEMPT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -728,6 +741,8 @@ impl RetirementPollRequest {
 struct RetirementAckProofPayload<'a> {
     peer_id: &'a str,
     ticket_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    attempt: Option<u32>,
     status: RetirementStatus,
     detail: &'a Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -738,6 +753,7 @@ fn retirement_ack_payload(req: &RetirementAckRequest) -> Result<Vec<u8>> {
     serde_json::to_vec(&RetirementAckProofPayload {
         peer_id: &req.peer_id,
         ticket_id: &req.ticket_id,
+        attempt: (req.attempt != RETIREMENT_INITIAL_ATTEMPT).then_some(req.attempt),
         status: req.status,
         detail: &req.detail,
         completion_capability_hash: &req.completion_capability_hash,
@@ -749,6 +765,7 @@ impl RetirementAckRequest {
     pub fn signed(
         identity: &crate::libp2p::identity::Keypair,
         ticket_id: String,
+        attempt: u32,
         status: RetirementStatus,
         detail: Option<String>,
         completion_capability_hash: Option<String>,
@@ -756,6 +773,7 @@ impl RetirementAckRequest {
         let mut req = Self {
             peer_id: identity.public().to_peer_id().to_string(),
             ticket_id,
+            attempt,
             status,
             detail,
             completion_capability_hash,
@@ -1658,6 +1676,7 @@ fn handle_admin_retire<R: TrackerHttpRequest + ?Sized>(
                 user_id: enrolled.user_id,
                 cleanup: RetirementCleanup::FullUninstall,
                 issued_at_unix: now_unix,
+                attempt: RETIREMENT_INITIAL_ATTEMPT,
                 status: RetirementStatus::Pending,
                 status_updated_at_unix: now_unix,
                 status_detail: None,
@@ -1720,6 +1739,10 @@ fn handle_admin_retire<R: TrackerHttpRequest + ?Sized>(
                 ));
             }
             let mut requeued = previous_ticket.clone();
+            let Some(next_attempt) = requeued.attempt.checked_add(1) else {
+                return Ok(respond_text(409, "retirement ticket retry limit reached\n"));
+            };
+            requeued.attempt = next_attempt;
             requeued.status = RetirementStatus::Pending;
             requeued.status_updated_at_unix = now_unix;
             requeued.status_detail = None;
@@ -1797,6 +1820,7 @@ fn handle_admin_retire<R: TrackerHttpRequest + ?Sized>(
         user_id: enrolled.user_id.clone(),
         cleanup: request.cleanup,
         issued_at_unix: now_unix,
+        attempt: RETIREMENT_INITIAL_ATTEMPT,
         status,
         status_updated_at_unix: now_unix,
         status_detail: None,
@@ -2025,6 +2049,9 @@ fn handle_retirement_ack<R: TrackerHttpRequest + ?Sized>(
     };
     if previous_ticket.peer_id != peer_id {
         return Ok(respond_text(403, "retirement ticket target mismatch\n"));
+    }
+    if request.attempt == 0 || request.attempt != previous_ticket.attempt {
+        return Ok(respond_text(409, "retirement ticket attempt mismatch\n"));
     }
     if request.status == RetirementStatus::Completed {
         return Ok(respond_text(
@@ -2720,6 +2747,7 @@ impl TrackerClient {
         &self,
         identity: &crate::libp2p::identity::Keypair,
         ticket_id: String,
+        attempt: u32,
         status: RetirementStatus,
         detail: Option<String>,
         completion_capability_hash: Option<String>,
@@ -2727,6 +2755,7 @@ impl TrackerClient {
         let request = RetirementAckRequest::signed(
             identity,
             ticket_id,
+            attempt,
             status,
             detail,
             completion_capability_hash,
@@ -2894,11 +2923,19 @@ fn parse_json_response<T: for<'de> Deserialize<'de>>(
         "unexpected HTTP status for {label}: {}",
         response.status()
     );
-    let text = response
+    let mut bytes = Vec::new();
+    response
         .body_mut()
-        .read_to_string()
+        .as_reader()
+        .take((MAX_TRACKER_RESPONSE_BODY_BYTES as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
         .with_context(|| format!("read {label}"))?;
-    serde_json::from_str(&text).with_context(|| format!("parse {label} json"))
+    anyhow::ensure!(
+        bytes.len() <= MAX_TRACKER_RESPONSE_BODY_BYTES,
+        "{label} exceeds the bounded tracker response size"
+    );
+    let text = std::str::from_utf8(&bytes).with_context(|| format!("decode {label} as UTF-8"))?;
+    serde_json::from_str(text).with_context(|| format!("parse {label} json"))
 }
 
 fn validate_admin_tracker_url(base_url: &str) -> Result<()> {
@@ -4091,13 +4128,20 @@ mod tests {
             .ticket
             .unwrap();
         assert_eq!(polled.ticket_id, ticket.ticket_id);
-        let failed = completion_client
-            .acknowledge_retirement(
-                &identity,
-                ticket.ticket_id.clone(),
-                RetirementStatus::Failed,
-                Some("transient helper scheduling failure".to_string()),
-                None,
+        let failed_request = RetirementAckRequest::signed(
+            &identity,
+            ticket.ticket_id.clone(),
+            ticket.attempt,
+            RetirementStatus::Failed,
+            Some("transient helper scheduling failure".to_string()),
+            None,
+        )
+        .unwrap();
+        let failed: RetirementAckResponse = completion_client
+            .post_device_json(
+                "/api/v1/devices/retirement/ack",
+                &failed_request,
+                "failed retirement ack response",
             )
             .unwrap();
         assert_eq!(failed.ticket.status, RetirementStatus::Failed);
@@ -4115,11 +4159,48 @@ mod tests {
             .ticket
             .unwrap();
         assert_eq!(requeued.status, RetirementStatus::Pending);
+        assert_eq!(requeued.attempt, ticket.attempt + 1);
         assert!(requeued.status_detail.is_none());
+        server.shutdown();
+
+        let server = start_test_server_with_config(TrackerServeConfig {
+            ttl_sec: 60,
+            token: Some("fleet-token".to_string()),
+            admin_token: Some("admin-token".to_string()),
+            security_state_path: Some(state_path.clone()),
+            require_device_enrollment: true,
+        });
+        let client = TrackerClient::new(server.base_url.clone(), Some("fleet-token".to_string()));
+        let admin = client
+            .clone()
+            .with_admin_token(Some("admin-token".to_string()));
+        let completion_client = TrackerClient::new(server.base_url.clone(), None);
+        let stale_ack_error: anyhow::Error = completion_client
+            .post_device_json::<_, RetirementAckResponse>(
+                "/api/v1/devices/retirement/ack",
+                &failed_request,
+                "stale retirement ack response",
+            )
+            .unwrap_err();
+        assert_ureq_status(&stale_ack_error, 409);
+        assert_eq!(
+            admin
+                .admin_list_devices()
+                .unwrap()
+                .devices
+                .into_iter()
+                .find(|device| device.peer_id == peer_id)
+                .unwrap()
+                .ticket
+                .unwrap()
+                .status,
+            RetirementStatus::Pending
+        );
         let missing_hash = completion_client
             .acknowledge_retirement(
                 &identity,
                 ticket.ticket_id.clone(),
+                requeued.attempt,
                 RetirementStatus::Running,
                 None,
                 None,
@@ -4130,6 +4211,7 @@ mod tests {
             .acknowledge_retirement(
                 &identity,
                 ticket.ticket_id.clone(),
+                requeued.attempt,
                 RetirementStatus::Running,
                 None,
                 Some("A".repeat(64)),
@@ -4139,6 +4221,7 @@ mod tests {
         let mut tampered = RetirementAckRequest::signed(
             &identity,
             ticket.ticket_id.clone(),
+            requeued.attempt,
             RetirementStatus::Running,
             None,
             Some(completion_capability_hash.clone()),
@@ -4157,6 +4240,7 @@ mod tests {
             .acknowledge_retirement(
                 &identity,
                 ticket.ticket_id.clone(),
+                requeued.attempt,
                 RetirementStatus::Running,
                 None,
                 Some(completion_capability_hash.clone()),
@@ -4179,6 +4263,7 @@ mod tests {
             .acknowledge_retirement(
                 &identity,
                 ticket.ticket_id.clone(),
+                requeued.attempt,
                 RetirementStatus::Completed,
                 None,
                 None,
@@ -4189,6 +4274,7 @@ mod tests {
             .acknowledge_retirement(
                 &identity,
                 ticket.ticket_id.clone(),
+                requeued.attempt,
                 RetirementStatus::Failed,
                 Some("late scheduler error".to_string()),
                 None,
@@ -4201,6 +4287,7 @@ mod tests {
             .acknowledge_retirement(
                 &identity,
                 ticket.ticket_id.clone(),
+                requeued.attempt,
                 RetirementStatus::Running,
                 None,
                 Some(mismatched_hash),
@@ -4318,6 +4405,7 @@ mod tests {
         let without_hash = RetirementAckRequest::signed(
             &identity,
             uuid::Uuid::new_v4().to_string(),
+            RETIREMENT_INITIAL_ATTEMPT,
             RetirementStatus::Failed,
             None,
             None,
@@ -4329,10 +4417,16 @@ mod tests {
                 .unwrap()
                 .contains("completion_capability_hash")
         );
+        assert!(
+            !serde_json::to_string(&without_hash)
+                .unwrap()
+                .contains("attempt")
+        );
 
         let with_hash = RetirementAckRequest::signed(
             &identity,
             uuid::Uuid::new_v4().to_string(),
+            RETIREMENT_INITIAL_ATTEMPT,
             RetirementStatus::Running,
             None,
             Some("0".repeat(64)),
@@ -4344,6 +4438,32 @@ mod tests {
                 .unwrap()
                 .contains("completion_capability_hash")
         );
+
+        let retry = RetirementAckRequest::signed(
+            &identity,
+            uuid::Uuid::new_v4().to_string(),
+            RETIREMENT_INITIAL_ATTEMPT + 1,
+            RetirementStatus::Failed,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            String::from_utf8(retirement_ack_payload(&retry).unwrap())
+                .unwrap()
+                .contains("\"attempt\":2")
+        );
+    }
+
+    #[test]
+    fn tracker_client_rejects_oversized_json_responses() {
+        let response = ureq::http::Response::builder()
+            .status(200)
+            .body(ureq::Body::builder().data(vec![b'x'; MAX_TRACKER_RESPONSE_BODY_BYTES + 1]))
+            .unwrap();
+        let error =
+            parse_json_response::<ListResponse>(response, "oversized response").unwrap_err();
+        assert!(format!("{error:#}").contains("bounded tracker response size"));
     }
 
     #[test]

@@ -48,6 +48,9 @@ pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
 const REQUEST_RESPONSE_INTERNAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
 const RELAY_RELISTEN_MIN_DELAY: Duration = Duration::from_secs(5);
 const RELAY_RELISTEN_MAX_DELAY: Duration = Duration::from_secs(60);
+const MAX_PENDING_MEMBERSHIP_CHECKS: usize = 64;
+const MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER: usize = 4;
+const MAX_PENDING_PUSH_MEMBERSHIP_CHECKS: usize = 1;
 static NEXT_TARGET_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -201,6 +204,32 @@ struct AuthorizedPeer {
     peer_id: String,
     user_id: Option<String>,
     device_id: Option<String>,
+}
+
+enum PendingInboundMembershipRequest {
+    Pull {
+        peer: PeerId,
+        request: SyncPull,
+        channel: libp2p_request_response::ResponseChannel<SyncBatch>,
+    },
+    Push {
+        peer: PeerId,
+        request: EntriesPush,
+        channel: libp2p_request_response::ResponseChannel<PushAck>,
+    },
+}
+
+impl PendingInboundMembershipRequest {
+    fn peer(&self) -> PeerId {
+        match self {
+            Self::Pull { peer, .. } | Self::Push { peer, .. } => *peer,
+        }
+    }
+}
+
+struct CompletedMembershipCheck {
+    id: u64,
+    result: std::result::Result<crate::tracker::MembershipResponse, String>,
 }
 
 #[derive(libp2p_swarm::NetworkBehaviour)]
@@ -467,9 +496,58 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
 
     let mut known_addrs: HashSet<String> = HashSet::new();
     let mut next_register = tokio::time::interval(Duration::from_secs(30));
+    let (membership_result_tx, mut membership_result_rx) =
+        tokio::sync::mpsc::channel::<CompletedMembershipCheck>(MAX_PENDING_MEMBERSHIP_CHECKS);
+    let mut pending_membership_checks: HashMap<u64, PendingInboundMembershipRequest> =
+        HashMap::new();
+    let mut next_membership_check_id = 1u64;
 
     loop {
         tokio::select! {
+            completed = membership_result_rx.recv(), if !pending_membership_checks.is_empty() => {
+                let Some(completed) = completed else {
+                    anyhow::bail!("strict membership worker channel closed unexpectedly");
+                };
+                let Some(pending) = pending_membership_checks.remove(&completed.id) else {
+                    continue;
+                };
+                match pending {
+                    PendingInboundMembershipRequest::Pull { peer, request, channel } => {
+                        let response = completed
+                            .result
+                            .map_err(anyhow::Error::msg)
+                            .and_then(|membership| {
+                                authorize_inbound_membership_response(&store, peer, &meta, membership)
+                            })
+                            .and_then(|_| build_inbound_pull_response(&store, peer, &request));
+                        match response {
+                            Ok(response) => {
+                                let _ = swarm.behaviour_mut().sync.send_response(channel, response);
+                            }
+                            Err(error) => {
+                                eprintln!("warn: p2p pull rejected: peer={peer} error={error:#}");
+                            }
+                        }
+                    }
+                    PendingInboundMembershipRequest::Push { peer, request, channel } => {
+                        let response = completed
+                            .result
+                            .map_err(anyhow::Error::msg)
+                            .and_then(|membership| {
+                                authorize_inbound_membership_response(&store, peer, &meta, membership)
+                            })
+                            .and_then(|authorized| apply_inbound_push(&store, &request, &authorized));
+                        let response = match response {
+                            Ok(response) => response,
+                            Err(error) => {
+                                eprintln!("warn: p2p push rejected: peer={peer} error={error:#}");
+                                rejected_push_ack()
+                            }
+                        };
+                        let _ = swarm.behaviour_mut().push.send_response(channel, response);
+                    }
+                }
+            }
             _ = wait_for_relay_relisten(relay_relisten_deadline) => {
                 relay_relisten_deadline = None;
                 if relay_listener_id.is_none()
@@ -585,32 +663,62 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                 channel,
                                 ..
                             } => {
+                                if require_device_membership {
+                                    if store.is_peer_revoked(&peer.to_string())? {
+                                        eprintln!(
+                                            "warn: p2p pull rejected: peer={peer} error=peer is revoked"
+                                        );
+                                        continue;
+                                    }
+                                    if pending_membership_checks.len()
+                                        >= MAX_PENDING_MEMBERSHIP_CHECKS
+                                        || pending_membership_checks
+                                            .values()
+                                            .filter(|pending| pending.peer() == peer)
+                                            .count()
+                                            >= MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER
+                                    {
+                                        eprintln!(
+                                            "warn: p2p pull rejected: peer={peer} error=strict membership check limit reached"
+                                        );
+                                        continue;
+                                    }
+                                    let check_id = next_membership_check_id;
+                                    next_membership_check_id =
+                                        next_membership_check_id.checked_add(1).unwrap_or(1);
+                                    anyhow::ensure!(
+                                        !pending_membership_checks.contains_key(&check_id),
+                                        "strict membership check id exhausted"
+                                    );
+                                    pending_membership_checks.insert(
+                                        check_id,
+                                        PendingInboundMembershipRequest::Pull {
+                                            peer,
+                                            request,
+                                            channel,
+                                        },
+                                    );
+                                    spawn_membership_check(
+                                        check_id,
+                                        peer.to_string(),
+                                        trackers.clone(),
+                                        membership_result_tx.clone(),
+                                    );
+                                    continue;
+                                }
                                 if let Err(err) = authorize_inbound_peer(
                                     &store,
                                     peer,
                                     &meta,
                                     &trackers,
-                                    require_device_membership,
+                                    false,
                                 )
-                                .and_then(|_| {
-                                    acknowledge_inbound_pull_request(&store, peer, &request)
-                                })
                                 {
                                     eprintln!("warn: p2p pull rejected: peer={peer} error={err:#}");
                                     continue;
                                 }
 
-                                let batch = store.pull_sync_batch(
-                                    request.cursor,
-                                    request.delete_cursor,
-                                    clamp_remote_pull_limit(request.limit),
-                                )?;
-                                let resp = SyncBatch {
-                                    entries: batch.entries,
-                                    next_cursor: batch.next_cursor,
-                                    deletions: batch.deletions,
-                                    next_delete_cursor: batch.next_delete_cursor,
-                                };
+                                let resp = build_inbound_pull_response(&store, peer, &request)?;
                                 let _ = swarm.behaviour_mut().sync.send_response(channel, resp);
                             }
                             libp2p_request_response::Message::Response { .. } => {}
@@ -622,43 +730,79 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                     SwarmEvent::Behaviour(RustoryBehaviourEvent::Push(event)) => match event {
                         libp2p_request_response::Event::Message { peer, message, .. } => match message {
                             libp2p_request_response::Message::Request { request, channel, .. } => {
+                                if require_device_membership {
+                                    if store.is_peer_revoked(&peer.to_string())? {
+                                        eprintln!(
+                                            "warn: p2p push rejected: peer={peer} error=peer is revoked"
+                                        );
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .push
+                                            .send_response(channel, rejected_push_ack());
+                                        continue;
+                                    }
+                                    if pending_membership_checks.len()
+                                        >= MAX_PENDING_MEMBERSHIP_CHECKS
+                                        || pending_membership_checks
+                                            .values()
+                                            .filter(|pending| {
+                                                matches!(
+                                                    pending,
+                                                    PendingInboundMembershipRequest::Push { .. }
+                                                )
+                                            })
+                                            .count()
+                                            >= MAX_PENDING_PUSH_MEMBERSHIP_CHECKS
+                                        || pending_membership_checks
+                                            .values()
+                                            .filter(|pending| pending.peer() == peer)
+                                            .count()
+                                            >= MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER
+                                    {
+                                        eprintln!(
+                                            "warn: p2p push rejected: peer={peer} error=strict membership check limit reached"
+                                        );
+                                        let _ = swarm
+                                            .behaviour_mut()
+                                            .push
+                                            .send_response(channel, rejected_push_ack());
+                                        continue;
+                                    }
+                                    let check_id = next_membership_check_id;
+                                    next_membership_check_id =
+                                        next_membership_check_id.checked_add(1).unwrap_or(1);
+                                    anyhow::ensure!(
+                                        !pending_membership_checks.contains_key(&check_id),
+                                        "strict membership check id exhausted"
+                                    );
+                                    pending_membership_checks.insert(
+                                        check_id,
+                                        PendingInboundMembershipRequest::Push {
+                                            peer,
+                                            request,
+                                            channel,
+                                        },
+                                    );
+                                    spawn_membership_check(
+                                        check_id,
+                                        peer.to_string(),
+                                        trackers.clone(),
+                                        membership_result_tx.clone(),
+                                    );
+                                    continue;
+                                }
                                 let resp = match authorize_inbound_peer(
                                     &store,
                                     peer,
                                     &meta,
                                     &trackers,
-                                    require_device_membership,
+                                    false,
                                 )
-                                .and_then(|authorized| {
-                                    validate_push_provenance(&request.entries, &authorized)?;
-                                    validate_deletion_provenance(
-                                        &request.deletions,
-                                        &authorized,
-                                    )?;
-                                    let entry_stats =
-                                        store.insert_entries_with_stats(&request.entries)?;
-                                    let deletion_stats = store
-                                        .apply_entry_deletions_with_stats(&request.deletions)?;
-                                    Ok((entry_stats, deletion_stats))
-                                }) {
-                                    Ok((entry_stats, deletion_stats)) => PushAck {
-                                        ok: true,
-                                        inserted: Some(entry_stats.inserted),
-                                        ignored: Some(entry_stats.ignored),
-                                        deletion_inserted: Some(deletion_stats.inserted),
-                                        deletion_ignored: Some(deletion_stats.ignored),
-                                        deletion_deleted: Some(deletion_stats.deleted),
-                                    },
+                                .and_then(|authorized| apply_inbound_push(&store, &request, &authorized)) {
+                                    Ok(response) => response,
                                     Err(err) => {
                                         eprintln!("warn: p2p push rejected: peer={peer} error={err:#}");
-                                        PushAck {
-                                            ok: false,
-                                            inserted: None,
-                                            ignored: None,
-                                            deletion_inserted: None,
-                                            deletion_ignored: None,
-                                            deletion_deleted: None,
-                                        }
+                                        rejected_push_ack()
                                     }
                                 };
 
@@ -894,12 +1038,27 @@ fn authorize_peer_with_authoritative_tracker(
     trackers: &[crate::tracker::TrackerClient],
     peer_id: &str,
 ) -> Result<crate::tracker::MembershipResponse> {
+    let membership = request_authoritative_membership(trackers, peer_id)?;
+    validate_authoritative_membership(store, peer_id, membership)
+}
+
+fn request_authoritative_membership(
+    trackers: &[crate::tracker::TrackerClient],
+    peer_id: &str,
+) -> Result<crate::tracker::MembershipResponse> {
     let tracker = trackers
         .first()
         .context("strict device membership requires an authoritative tracker")?;
-    let membership = tracker
+    tracker
         .authorize_peer(peer_id)
-        .with_context(|| format!("authoritative tracker membership lookup: {peer_id}"))?;
+        .with_context(|| format!("authoritative tracker membership lookup: {peer_id}"))
+}
+
+fn validate_authoritative_membership(
+    store: &LocalStore,
+    peer_id: &str,
+    membership: crate::tracker::MembershipResponse,
+) -> Result<crate::tracker::MembershipResponse> {
     anyhow::ensure!(
         membership.peer_id == peer_id,
         "authoritative tracker returned membership for a different peer"
@@ -936,12 +1095,105 @@ fn authorize_peer_with_authoritative_tracker(
     Ok(membership)
 }
 
+fn authorize_inbound_membership_response(
+    store: &LocalStore,
+    peer: PeerId,
+    local_meta: &crate::tracker::PeerMeta,
+    membership: crate::tracker::MembershipResponse,
+) -> Result<AuthorizedPeer> {
+    let peer_id = peer.to_string();
+    anyhow::ensure!(
+        !store.is_peer_revoked(&peer_id)?,
+        "peer is revoked: {peer_id}"
+    );
+    let membership = validate_authoritative_membership(store, &peer_id, membership)?;
+    validate_authorized_peer_record(
+        PeerBookPeer {
+            peer_id,
+            addrs: Vec::new(),
+            user_id: membership.user_id,
+            device_id: membership.device_id,
+            rr_version: None,
+            last_seen_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+        },
+        local_meta,
+    )
+}
+
+fn spawn_membership_check(
+    id: u64,
+    peer_id: String,
+    trackers: Vec<crate::tracker::TrackerClient>,
+    sender: tokio::sync::mpsc::Sender<CompletedMembershipCheck>,
+) {
+    drop(tokio::spawn(async move {
+        let result = match tokio::task::spawn_blocking(move || {
+            request_authoritative_membership(&trackers, &peer_id)
+        })
+        .await
+        {
+            Ok(result) => result.map_err(|error| format!("{error:#}")),
+            Err(error) => Err(format!("membership worker failed: {error}")),
+        };
+        let _ = sender.send(CompletedMembershipCheck { id, result }).await;
+    }));
+}
+
 fn acknowledge_inbound_pull_request(
     store: &LocalStore,
     peer: PeerId,
     request: &SyncPull,
 ) -> Result<()> {
     store.acknowledge_peer_pull_cursors(&peer.to_string(), request.cursor, request.delete_cursor)
+}
+
+fn build_inbound_pull_response(
+    store: &LocalStore,
+    peer: PeerId,
+    request: &SyncPull,
+) -> Result<SyncBatch> {
+    acknowledge_inbound_pull_request(store, peer, request)?;
+    let batch = store.pull_sync_batch(
+        request.cursor,
+        request.delete_cursor,
+        clamp_remote_pull_limit(request.limit),
+    )?;
+    Ok(SyncBatch {
+        entries: batch.entries,
+        next_cursor: batch.next_cursor,
+        deletions: batch.deletions,
+        next_delete_cursor: batch.next_delete_cursor,
+    })
+}
+
+fn apply_inbound_push(
+    store: &LocalStore,
+    request: &EntriesPush,
+    authorized: &AuthorizedPeer,
+) -> Result<PushAck> {
+    validate_push_provenance(&request.entries, authorized)?;
+    validate_deletion_provenance(&request.deletions, authorized)?;
+    let entry_stats = store.insert_entries_with_stats(&request.entries)?;
+    let deletion_stats = store.apply_entry_deletions_with_stats(&request.deletions)?;
+    Ok(PushAck {
+        ok: true,
+        inserted: Some(entry_stats.inserted),
+        ignored: Some(entry_stats.ignored),
+        deletion_inserted: Some(deletion_stats.inserted),
+        deletion_ignored: Some(deletion_stats.ignored),
+        deletion_deleted: Some(deletion_stats.deleted),
+    })
+}
+
+fn rejected_push_ack() -> PushAck {
+    PushAck {
+        ok: false,
+        inserted: None,
+        ignored: None,
+        deletion_inserted: None,
+        deletion_ignored: None,
+        deletion_deleted: None,
+    }
 }
 
 fn refresh_peer_book_peer_from_trackers(
@@ -2516,6 +2768,7 @@ mod tests {
     use super::*;
     use crate::core::Entry;
     use libp2p_request_response::OutboundFailure;
+    use std::io::{Read, Write};
     use tempfile::tempdir;
     use time::OffsetDateTime;
 
@@ -2533,6 +2786,74 @@ mod tests {
             hostname: "host".to_string(),
             version: crate::build_info::VERSION.to_string(),
         }
+    }
+
+    #[test]
+    fn strict_membership_lookup_does_not_block_current_thread_runtime() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer_id = PeerId::random().to_string();
+        let response_body = serde_json::to_vec(&crate::tracker::MembershipResponse {
+            peer_id: peer_id.clone(),
+            active: true,
+            enrolled: true,
+            revoked: false,
+            strict: true,
+            device_id: Some("device".to_string()),
+            user_id: Some("user".to_string()),
+            revocation: None,
+        })
+        .unwrap();
+        let (release_server, wait_for_runtime) = std::sync::mpsc::sync_channel(1);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            wait_for_runtime
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response_body.len()
+            )
+            .unwrap();
+            stream.write_all(&response_body).unwrap();
+        });
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
+            spawn_membership_check(
+                7,
+                peer_id,
+                vec![crate::tracker::TrackerClient::new(
+                    format!("http://{address}"),
+                    None,
+                )],
+                sender,
+            );
+            let started = std::time::Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            release_server
+                .send(())
+                .expect("membership lookup blocked the P2P event runtime");
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(receiver.try_recv().is_err());
+            let completed = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(completed.id, 7);
+            assert!(completed.result.is_ok());
+        });
+        server.join().unwrap();
     }
 
     #[test]
@@ -3111,6 +3432,24 @@ mod tests {
         };
 
         let err = authorize_inbound_peer(&store, peer, &meta, &[], false).unwrap_err();
+        assert!(format!("{err:#}").contains("peer is revoked"));
+
+        let err = authorize_inbound_membership_response(
+            &store,
+            peer,
+            &meta,
+            crate::tracker::MembershipResponse {
+                peer_id: peer.to_string(),
+                active: true,
+                enrolled: true,
+                revoked: false,
+                strict: true,
+                device_id: Some("dev-remote".to_string()),
+                user_id: Some("u1".to_string()),
+                revocation: None,
+            },
+        )
+        .unwrap_err();
         assert!(format!("{err:#}").contains("peer is revoked"));
     }
 
