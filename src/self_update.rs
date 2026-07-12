@@ -4,12 +4,14 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+#[cfg(any(target_os = "linux", test))]
+use std::process::Child;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_RELEASE_REPO: &str = "zrma/rustory";
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const SYSTEMD_USER_UNIT: &str = "rustory.service";
 #[cfg(target_os = "linux")]
 const LEGACY_SYSTEMD_USER_UNITS: &[&str] = &["rustory-daemon.service"];
@@ -17,6 +19,8 @@ const LEGACY_SYSTEMD_USER_UNITS: &[&str] = &["rustory-daemon.service"];
 const MAX_ASSET_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const DOWNLOADED_BINARY_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(any(target_os = "linux", test))]
+const BACKGROUND_DAEMON_STARTUP_GRACE: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpdateRequest {
@@ -749,16 +753,18 @@ fn restart_systemd_user_daemon() -> DaemonRestartStatus {
         Err(error) => return DaemonRestartStatus::Failed(error),
     }
 
-    for args in [
-        &["--user", "daemon-reload"][..],
-        &["--user", "restart", SYSTEMD_USER_UNIT][..],
-    ] {
+    for args in systemd_user_restart_steps() {
         if let Err(error) = run_systemctl_user(args) {
             return DaemonRestartStatus::Failed(error);
         }
     }
     println!("daemon=restarted manager=systemd-user unit={SYSTEMD_USER_UNIT}");
     DaemonRestartStatus::Restarted
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn systemd_user_restart_steps() -> [&'static [&'static str]; 2] {
+    [&["daemon-reload"], &["restart", SYSTEMD_USER_UNIT]]
 }
 
 #[cfg(target_os = "linux")]
@@ -985,7 +991,7 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
         });
     }
 
-    let child = match command.spawn() {
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(err) => {
             return DaemonRestartStatus::Failed(format!(
@@ -994,21 +1000,63 @@ fn restart_background_daemon(install_path: &Path, force_start: bool) -> DaemonRe
             ));
         }
     };
-    let pid = child.id();
-    if let Err(err) = std::fs::write(&pid_path, format!("{pid}\n")) {
-        return DaemonRestartStatus::Failed(format!("write pid {}: {err}", pid_path.display()));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&pid_path, std::fs::Permissions::from_mode(0o600));
-    }
+    let pid = match finalize_background_daemon_start(&mut child, &pid_path) {
+        Ok(pid) => pid,
+        Err(error) => return DaemonRestartStatus::Failed(error),
+    };
 
     println!(
         "daemon=restarted manager=background pid={pid} log={}",
         log_path.display()
     );
     DaemonRestartStatus::Restarted
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn finalize_background_daemon_start(
+    child: &mut Child,
+    pid_path: &Path,
+) -> std::result::Result<u32, String> {
+    let pid = child.id();
+    if let Err(error) =
+        crate::config::write_private_file(pid_path, format!("{pid}\n").as_bytes(), true)
+    {
+        terminate_spawned_background_child(child);
+        return Err(format!("write pid {}: {error:#}", pid_path.display()));
+    }
+
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let _ = std::fs::remove_file(pid_path);
+                return Err(format!("background daemon exited during startup: {status}"));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                let _ = std::fs::remove_file(pid_path);
+                terminate_spawned_background_child(child);
+                return Err(format!("poll background daemon startup: {error}"));
+            }
+        }
+        if started.elapsed() >= BACKGROUND_DAEMON_STARTUP_GRACE {
+            return Ok(pid);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn terminate_spawned_background_child(child: &mut Child) {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = terminate_background_process(child.id(), libc::SIGKILL);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
 }
 
 fn home_dir() -> PathBuf {
@@ -1933,6 +1981,48 @@ mod tests {
             post_update_daemon_action(false, false),
             PostUpdateDaemonAction::SkipNoRestartDaemon
         );
+    }
+
+    #[test]
+    fn systemd_user_restart_steps_do_not_duplicate_user_scope() {
+        assert_eq!(
+            systemd_user_restart_steps(),
+            [&["daemon-reload"][..], &["restart", "rustory.service"][..]]
+        );
+        assert!(
+            systemd_user_restart_steps()
+                .into_iter()
+                .flatten()
+                .all(|arg| *arg != "--user")
+        );
+    }
+
+    #[test]
+    fn failed_background_pid_persistence_reaps_spawned_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        std::fs::create_dir(&pid_path).unwrap();
+        let mut child = ProcessCommand::new("sleep").arg("30").spawn().unwrap();
+
+        let error = finalize_background_daemon_start(&mut child, &pid_path).unwrap_err();
+
+        assert!(error.contains("write pid"));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn immediately_exited_background_daemon_removes_pid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("daemon.pid");
+        let mut child = ProcessCommand::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+
+        let error = finalize_background_daemon_start(&mut child, &pid_path).unwrap_err();
+
+        assert!(error.contains("exited during startup"));
+        assert!(!pid_path.exists());
     }
 
     #[cfg(target_os = "linux")]

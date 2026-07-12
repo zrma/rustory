@@ -850,11 +850,15 @@ def start_background_daemon(
             },
         )
 
-    pid_path.write_text(f"{proc.pid}\n", encoding="utf-8")
-    os.chmod(pid_path, 0o600)
+    try:
+        write_background_pid_file(pid_path, proc.pid)
+    except OSError:
+        cleanup_failed_background_start(proc, pid_path)
+        raise
     time.sleep(0.2)
     exit_code = proc.poll()
     if exit_code is not None:
+        remove_background_pid_file(pid_path)
         detail = tail_file_one_line(log_path)
         print(
             f"daemon=failed manager=background exit_code={exit_code} log={log_path}",
@@ -867,6 +871,65 @@ def start_background_daemon(
     action = "restarted" if restart else "started"
     print(f"daemon={action} manager=background pid={proc.pid} log={log_path}")
     print("daemon=start_note manager=background persistence=until_process_exit_or_reboot")
+
+
+def write_background_pid_file(pid_path: Path, pid: int) -> None:
+    fd, tmp_name = tempfile.mkstemp(prefix=".daemon.pid.", dir=str(pid_path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        file = os.fdopen(fd, "w", encoding="utf-8", newline="")
+        fd = -1
+        with file:
+            file.write(f"{pid}\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(tmp_path, pid_path)
+        fsync_directory(pid_path.parent)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_path.exists():
+            tmp_path.unlink()
+
+
+def remove_background_pid_file(pid_path: Path) -> None:
+    try:
+        pid_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        detail = " ".join(str(exc).split())
+        print(
+            f"warn: daemon pid cleanup failed path={pid_path} detail={detail}",
+            file=sys.stderr,
+        )
+
+
+def cleanup_failed_background_start(proc: subprocess.Popen, pid_path: Path) -> None:
+    try:
+        remove_background_pid_file(pid_path)
+    except OSError:
+        pass
+    if proc.poll() is not None:
+        return
+    try:
+        signal_background_process(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=2)
+        return
+    except (subprocess.TimeoutExpired, SystemExit):
+        pass
+    try:
+        signal_background_process(proc.pid, signal.SIGKILL)
+    except SystemExit:
+        try:
+            proc.kill()
+        except OSError:
+            return
+    try:
+        proc.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
 
 
 def stop_background_daemon(pid: int, install_path: Path) -> None:

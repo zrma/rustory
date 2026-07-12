@@ -134,6 +134,84 @@ class RetirementInstallerTests(unittest.TestCase):
             self.assertEqual(child_env["XDG_STATE_HOME"], str(state_home))
             self.assertEqual(child_env["RUSTORY_DAEMON_MANAGER"], "background")
 
+    def test_background_pid_write_failure_terminates_spawned_child(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "state"
+            pid_path = state_home / "rustory" / "daemon.pid"
+            pid_path.mkdir(parents=True)
+            process = mock.Mock(pid=1234)
+            process.poll.return_value = None
+            process.wait.return_value = 0
+            with (
+                mock.patch.object(Path, "home", return_value=root),
+                mock.patch.object(rustory.subprocess, "Popen", return_value=process),
+                mock.patch.object(rustory, "signal_background_process") as signal_process,
+                mock.patch.object(
+                    rustory,
+                    "remove_background_pid_file",
+                    side_effect=PermissionError("injected cleanup failure"),
+                ),
+            ):
+                with self.assertRaises(OSError):
+                    rustory.start_background_daemon(
+                        [str(root / "bin" / "rr"), "daemon"],
+                        state_home,
+                    )
+
+            signal_process.assert_called_once_with(1234, rustory.signal.SIGTERM)
+            process.wait.assert_called_once_with(timeout=2)
+
+    def test_background_pid_writer_closes_raw_fd_on_setup_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            captured_fds: list[int] = []
+            original_mkstemp = rustory.tempfile.mkstemp
+
+            def capture_mkstemp(*args, **kwargs):
+                fd, path = original_mkstemp(*args, **kwargs)
+                captured_fds.append(fd)
+                return fd, path
+
+            with (
+                mock.patch.object(
+                    rustory.tempfile,
+                    "mkstemp",
+                    side_effect=capture_mkstemp,
+                ),
+                mock.patch.object(
+                    rustory.os,
+                    "fchmod",
+                    side_effect=OSError("injected chmod failure"),
+                ),
+            ):
+                with self.assertRaises(OSError):
+                    rustory.write_background_pid_file(root / "daemon.pid", 1234)
+
+            self.assertEqual(len(captured_fds), 1)
+            with self.assertRaises(OSError):
+                os.fstat(captured_fds[0])
+
+    def test_immediately_exited_background_child_removes_pid_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "state"
+            process = mock.Mock(pid=1234)
+            process.poll.return_value = 7
+            with (
+                mock.patch.object(Path, "home", return_value=root),
+                mock.patch.object(rustory.subprocess, "Popen", return_value=process),
+                mock.patch.object(rustory.time, "sleep"),
+            ):
+                with self.assertRaises(SystemExit) as raised:
+                    rustory.start_background_daemon(
+                        [str(root / "bin" / "rr"), "daemon"],
+                        state_home,
+                    )
+
+            self.assertEqual(raised.exception.code, 7)
+            self.assertFalse((state_home / "rustory" / "daemon.pid").exists())
+
     def test_custom_rc_file_is_recorded_for_automated_uninstall(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
