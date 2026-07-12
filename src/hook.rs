@@ -82,11 +82,13 @@ pub fn auto_fix_existing_managed_hook_blocks(
     Ok(reports)
 }
 
-pub fn remove_existing_managed_hook_blocks(
-    extra_rc_files: &[PathBuf],
+pub(crate) fn remove_managed_hook_blocks_from_paths(
+    rc_files: &[PathBuf],
 ) -> Result<Vec<ManagedHookFixReport>> {
     let mut reports = Vec::new();
-    for (rc_file, shell) in managed_hook_candidate_files(extra_rc_files)? {
+    for rc_file in rc_files {
+        let rc_file = rc_file.clone();
+        let shell = shell_for_rc_file(&rc_file);
         let existing = match std::fs::read_to_string(&rc_file) {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,

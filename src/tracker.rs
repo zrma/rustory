@@ -1151,14 +1151,13 @@ fn route_http_request<R: TrackerHttpRequest + ?Sized>(
                 let mut locked = state.lock().unwrap();
                 prune_expired(&mut locked, now, config.ttl_sec);
                 let now_unix = now.unix_timestamp();
-                if locked.revocations.contains_key(&peer_id)
-                    || reg.meta.as_ref().is_some_and(|meta| {
-                        locked.revocations.values().any(|revocation| {
-                            revocation.device_id.is_some()
-                                && revocation.device_id == meta.device_id
-                                && revocation.user_id == meta.user_id
-                        })
-                    })
+                if effective_revocation(
+                    &locked,
+                    &peer_id,
+                    reg.meta.as_ref().and_then(|meta| meta.device_id.as_deref()),
+                    reg.meta.as_ref().and_then(|meta| meta.user_id.as_deref()),
+                )
+                .is_some()
                 {
                     return Ok(respond_text(403, "device is revoked\n"));
                 }
@@ -1462,11 +1461,18 @@ fn route_http_request<R: TrackerHttpRequest + ?Sized>(
             };
             let peer_id = peer_id.to_string();
             let locked = state.lock().unwrap();
-            let revoked = locked.revocations.contains_key(&peer_id);
-            let revocation = locked.revocations.get(&peer_id).cloned();
             let enrolled_device = locked.enrolled_devices.get(&peer_id);
             let enrolled = enrolled_device.is_some();
             let observed_device = locked.observed_devices.get(&peer_id);
+            let device_id = enrolled_device
+                .and_then(|device| device.device_id.clone())
+                .or_else(|| observed_device.and_then(|device| device.device_id.clone()));
+            let user_id = enrolled_device
+                .and_then(|device| device.user_id.clone())
+                .or_else(|| observed_device.and_then(|device| device.user_id.clone()));
+            let revocation =
+                effective_revocation(&locked, &peer_id, device_id.as_deref(), user_id.as_deref());
+            let revoked = revocation.is_some();
             let active = !revoked && (!config.require_device_enrollment || enrolled);
             respond_json(
                 200,
@@ -1476,12 +1482,8 @@ fn route_http_request<R: TrackerHttpRequest + ?Sized>(
                     enrolled,
                     revoked,
                     strict: config.require_device_enrollment,
-                    device_id: enrolled_device
-                        .and_then(|device| device.device_id.clone())
-                        .or_else(|| observed_device.and_then(|device| device.device_id.clone())),
-                    user_id: enrolled_device
-                        .and_then(|device| device.user_id.clone())
-                        .or_else(|| observed_device.and_then(|device| device.user_id.clone())),
+                    device_id,
+                    user_id,
                     revocation,
                 },
             )
@@ -1505,16 +1507,14 @@ fn route_http_request<R: TrackerHttpRequest + ?Sized>(
                 prune_expired(&mut locked, now, config.ttl_sec);
                 let mut estimated_bytes = 0usize;
                 let mut peers = Vec::new();
-                for (peer_id, rec) in
-                    locked
-                        .peers
-                        .iter()
-                        .filter(|(_, rec)| match (user_id.as_deref(), &rec.meta) {
+                for (peer_id, rec) in locked.peers.iter().filter(|(peer_id, rec)| {
+                    effective_revocation_for_peer(&locked, peer_id).is_none()
+                        && match (user_id.as_deref(), &rec.meta) {
                             (None, _) => true,
                             (Some(want), Some(meta)) => meta.user_id.as_deref() == Some(want),
                             (Some(_), None) => false,
-                        })
-                {
+                        }
+                }) {
                     estimated_bytes = estimated_bytes
                         .saturating_add(peer_id.len())
                         .saturating_add(rec.addrs.iter().map(String::len).sum::<usize>())
@@ -1583,6 +1583,32 @@ fn handle_admin_enroll<R: TrackerHttpRequest + ?Sized>(
             "device must complete a signed registration before enrollment\n",
         ));
     };
+    if !optional_binding_is_canonical(observed.device_id.as_deref())
+        || !optional_binding_is_canonical(observed.user_id.as_deref())
+    {
+        return Ok(respond_text(
+            409,
+            "device enrollment binding is not canonical\n",
+        ));
+    }
+    if let Some((device_id, user_id)) =
+        canonical_binding_pair(observed.device_id.as_deref(), observed.user_id.as_deref())
+        && locked
+            .enrolled_devices
+            .iter()
+            .any(|(candidate_peer_id, candidate)| {
+                candidate_peer_id != &peer_id
+                    && canonical_binding_pair(
+                        candidate.device_id.as_deref(),
+                        candidate.user_id.as_deref(),
+                    ) == Some((device_id, user_id))
+            })
+    {
+        return Ok(respond_text(
+            409,
+            "device binding is already enrolled to a different peer_id\n",
+        ));
+    }
     let previous = locked.enrolled_devices.insert(
         peer_id.clone(),
         EnrolledDevice {
@@ -1662,7 +1688,9 @@ fn handle_admin_retire<R: TrackerHttpRequest + ?Sized>(
                     "device does not advertise the retirement protocol\n",
                 ));
             }
-            if enrolled.device_id.is_none() || enrolled.user_id.is_none() {
+            if canonical_binding_pair(enrolled.device_id.as_deref(), enrolled.user_id.as_deref())
+                .is_none()
+            {
                 return Ok(respond_text(
                     409,
                     "full uninstall requires enrolled device_id and user_id bindings\n",
@@ -1799,7 +1827,8 @@ fn handle_admin_retire<R: TrackerHttpRequest + ?Sized>(
         ));
     }
     if request.cleanup == RetirementCleanup::FullUninstall
-        && (enrolled.device_id.is_none() || enrolled.user_id.is_none())
+        && canonical_binding_pair(enrolled.device_id.as_deref(), enrolled.user_id.as_deref())
+            .is_none()
     {
         return Ok(respond_text(
             409,
@@ -1862,13 +1891,19 @@ fn handle_admin_retire<R: TrackerHttpRequest + ?Sized>(
 fn fleet_membership_enforcement_complete(state: &TrackerState, target_peer_id: &str) -> bool {
     let enrolled_devices_ready = state.enrolled_devices.iter().all(|(peer_id, device)| {
         peer_id == target_peer_id
-            || state.revocations.contains_key(peer_id)
+            || effective_revocation(
+                state,
+                peer_id,
+                device.device_id.as_deref(),
+                device.user_id.as_deref(),
+            )
+            .is_some()
             || (device.membership_protocol == Some(DEVICE_MEMBERSHIP_PROTOCOL_VERSION)
                 && device.membership_enforced)
     });
     let active_peers_enrolled = state.peers.keys().all(|peer_id| {
         peer_id == target_peer_id
-            || state.revocations.contains_key(peer_id)
+            || effective_revocation_for_peer(state, peer_id).is_some()
             || state.enrolled_devices.contains_key(peer_id)
     });
     enrolled_devices_ready && active_peers_enrolled
@@ -1898,20 +1933,23 @@ fn handle_admin_device_list<R: TrackerHttpRequest + ?Sized>(
         .map(|peer_id| {
             let enrolled = locked.enrolled_devices.get(&peer_id);
             let observed = locked.observed_devices.get(&peer_id);
-            let revocation = locked.revocations.get(&peer_id);
-            let ticket = revocation.and_then(|revocation| {
+            let device_id = enrolled
+                .and_then(|device| device.device_id.clone())
+                .or_else(|| observed.and_then(|device| device.device_id.clone()));
+            let user_id = enrolled
+                .and_then(|device| device.user_id.clone())
+                .or_else(|| observed.and_then(|device| device.user_id.clone()));
+            let revocation =
+                effective_revocation(&locked, &peer_id, device_id.as_deref(), user_id.as_deref());
+            let ticket = revocation.as_ref().and_then(|revocation| {
                 locked
                     .retirement_tickets
                     .get(&revocation.ticket_id)
                     .cloned()
             });
             AdminDeviceInfo {
-                device_id: enrolled
-                    .and_then(|device| device.device_id.clone())
-                    .or_else(|| observed.and_then(|device| device.device_id.clone())),
-                user_id: enrolled
-                    .and_then(|device| device.user_id.clone())
-                    .or_else(|| observed.and_then(|device| device.user_id.clone())),
+                device_id,
+                user_id,
                 enrolled: enrolled.is_some(),
                 active: locked.peers.contains_key(&peer_id) && revocation.is_none(),
                 revoked: revocation.is_some(),
@@ -2382,6 +2420,11 @@ fn validate_register_meta(meta: &Option<PeerMeta>) -> std::result::Result<(), &'
     let Some(meta) = meta else {
         return Ok(());
     };
+    if !optional_binding_is_canonical(meta.device_id.as_deref())
+        || !optional_binding_is_canonical(meta.user_id.as_deref())
+    {
+        return Err("device_id and user_id must be trimmed non-empty values\n");
+    }
     for field in [
         meta.device_id.as_deref(),
         meta.hostname.as_deref(),
@@ -2400,6 +2443,60 @@ fn validate_register_meta(meta: &Option<PeerMeta>) -> std::result::Result<(), &'
         }
     }
     Ok(())
+}
+
+fn optional_binding_is_canonical(value: Option<&str>) -> bool {
+    value.is_none_or(|value| !value.is_empty() && value.trim() == value)
+}
+
+fn canonical_binding_pair<'a>(
+    device_id: Option<&'a str>,
+    user_id: Option<&'a str>,
+) -> Option<(&'a str, &'a str)> {
+    let device_id = device_id.filter(|value| optional_binding_is_canonical(Some(value)))?;
+    let user_id = user_id.filter(|value| optional_binding_is_canonical(Some(value)))?;
+    Some((device_id, user_id))
+}
+
+fn effective_revocation(
+    state: &TrackerState,
+    peer_id: &str,
+    device_id: Option<&str>,
+    user_id: Option<&str>,
+) -> Option<RevocationInfo> {
+    if let Some(revocation) = state.revocations.get(peer_id) {
+        return Some(revocation.clone());
+    }
+    let binding = canonical_binding_pair(device_id, user_id)?;
+    state.revocations.values().find_map(|revocation| {
+        (canonical_binding_pair(
+            revocation.device_id.as_deref(),
+            revocation.user_id.as_deref(),
+        ) == Some(binding))
+        .then(|| {
+            let mut logical = revocation.clone();
+            logical.peer_id = peer_id.to_string();
+            logical
+        })
+    })
+}
+
+fn effective_revocation_for_peer(state: &TrackerState, peer_id: &str) -> Option<RevocationInfo> {
+    let enrolled = state.enrolled_devices.get(peer_id);
+    let observed = state.observed_devices.get(peer_id);
+    let record = state.peers.get(peer_id).and_then(|peer| peer.meta.as_ref());
+    effective_revocation(
+        state,
+        peer_id,
+        enrolled
+            .and_then(|device| device.device_id.as_deref())
+            .or_else(|| observed.and_then(|device| device.device_id.as_deref()))
+            .or_else(|| record.and_then(|meta| meta.device_id.as_deref())),
+        enrolled
+            .and_then(|device| device.user_id.as_deref())
+            .or_else(|| observed.and_then(|device| device.user_id.as_deref()))
+            .or_else(|| record.and_then(|meta| meta.user_id.as_deref())),
+    )
 }
 
 fn estimated_peer_meta_bytes(meta: &PeerMeta) -> usize {
@@ -4792,6 +4889,88 @@ mod tests {
         let stale_enroll = admin.admin_enroll(departing_peer_id).unwrap_err();
         assert_ureq_status(&stale_enroll, 409);
         server.shutdown();
+    }
+
+    #[test]
+    fn tracker_rejects_noncanonical_and_duplicate_device_bindings() {
+        let invalid_meta = Some(PeerMeta {
+            device_id: Some(" node0 ".to_string()),
+            hostname: None,
+            user_id: Some("u1".to_string()),
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        });
+        assert!(validate_register_meta(&invalid_meta).is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let server = start_test_server_with_config(TrackerServeConfig {
+            ttl_sec: 60,
+            token: Some("fleet-token".to_string()),
+            admin_token: Some("admin-token".to_string()),
+            security_state_path: Some(dir.path().join("tracker-security.json")),
+            require_device_enrollment: false,
+        });
+        let client = TrackerClient::new(server.base_url.clone(), Some("fleet-token".to_string()));
+        let admin = client
+            .clone()
+            .with_admin_token(Some("admin-token".to_string()));
+        let meta = Some(PeerMeta {
+            device_id: Some("node0".to_string()),
+            hostname: None,
+            user_id: Some("u1".to_string()),
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        });
+        let first = crate::libp2p::identity::Keypair::generate_ed25519();
+        client
+            .register(&RegisterRequest::signed(&first, Vec::new(), meta.clone()).unwrap())
+            .unwrap();
+        admin
+            .admin_enroll(first.public().to_peer_id().to_string())
+            .unwrap();
+
+        let duplicate = crate::libp2p::identity::Keypair::generate_ed25519();
+        let duplicate_peer_id = duplicate.public().to_peer_id().to_string();
+        client
+            .register(&RegisterRequest::signed(&duplicate, Vec::new(), meta).unwrap())
+            .unwrap();
+        let error = admin.admin_enroll(duplicate_peer_id).unwrap_err();
+        assert_ureq_status(&error, 409);
+        server.shutdown();
+    }
+
+    #[test]
+    fn logical_device_revocation_applies_to_preexisting_sibling_identity() {
+        let mut state = TrackerState::default();
+        state.revocations.insert(
+            "retired-peer".to_string(),
+            RevocationInfo {
+                peer_id: "retired-peer".to_string(),
+                device_id: Some("node0".to_string()),
+                user_id: Some("u1".to_string()),
+                revoked_at_unix: 1,
+                ticket_id: uuid::Uuid::new_v4().to_string(),
+            },
+        );
+        state.enrolled_devices.insert(
+            "sibling-peer".to_string(),
+            EnrolledDevice {
+                peer_id: "sibling-peer".to_string(),
+                public_key: vec![1],
+                device_id: Some("node0".to_string()),
+                user_id: Some("u1".to_string()),
+                retirement_protocol: Some(RETIREMENT_PROTOCOL_VERSION),
+                membership_protocol: Some(DEVICE_MEMBERSHIP_PROTOCOL_VERSION),
+                membership_enforced: true,
+                enrolled_at_unix: 1,
+            },
+        );
+
+        let revocation = effective_revocation_for_peer(&state, "sibling-peer").unwrap();
+        assert_eq!(revocation.peer_id, "sibling-peer");
+        assert_eq!(revocation.device_id.as_deref(), Some("node0"));
     }
 
     #[cfg(unix)]

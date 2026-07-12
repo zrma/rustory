@@ -2295,8 +2295,12 @@ fn run_retirement_helper(
             .cleanup_plan()
             .context("accepted retirement receipt has no cleanup plan")?
             .clone();
-        uninstall::run_uninstall(uninstall_request_from_retirement_plan(plan))
-            .context("apply managed device retirement uninstall")?;
+        let pinned_paths = plan.pinned_paths.clone();
+        uninstall::run_uninstall_with_pinned_paths(
+            uninstall_request_from_retirement_plan(plan),
+            &pinned_paths,
+        )
+        .context("apply managed device retirement uninstall")?;
         job = crate::device_retirement::mark_retirement_cleanup_completed(job_id)?;
     }
 
@@ -2399,6 +2403,10 @@ fn validate_retirement_response_ticket(
 fn retirement_cleanup_plan_from_request(
     request: &uninstall::UninstallRequest,
 ) -> Result<crate::device_retirement::RetirementCleanupPlan> {
+    let pinned_paths = uninstall::resolve_pinned_uninstall_paths(
+        &request.state_marker_paths,
+        &request.extra_rc_files,
+    )?;
     Ok(crate::device_retirement::RetirementCleanupPlan {
         install_path: request.install_path.clone(),
         config_path: request.config_path.clone(),
@@ -2406,6 +2414,7 @@ fn retirement_cleanup_plan_from_request(
         config_key_paths: request.config_key_paths.clone(),
         state_marker_paths: request.state_marker_paths.clone(),
         extra_rc_files: request.extra_rc_files.clone(),
+        pinned_paths,
         local_peer_id: request
             .local_peer_id
             .clone()
@@ -7409,13 +7418,21 @@ mod tests {
             config_load_error: None,
         };
         let plan = retirement_cleanup_plan_from_request(&request).unwrap();
-        let recovered = uninstall_request_from_retirement_plan(plan);
+        let recovered = uninstall_request_from_retirement_plan(plan.clone());
         assert_eq!(recovered.install_path, request.install_path);
         assert_eq!(recovered.config_path, request.config_path);
         assert_eq!(recovered.db_path, request.db_path);
         assert_eq!(recovered.config_key_paths, request.config_key_paths);
         assert_eq!(recovered.state_marker_paths, request.state_marker_paths);
         assert_eq!(recovered.extra_rc_files, request.extra_rc_files);
+        assert_eq!(
+            plan.pinned_paths,
+            uninstall::resolve_pinned_uninstall_paths(
+                &request.state_marker_paths,
+                &request.extra_rc_files
+            )
+            .unwrap()
+        );
         assert!(recovered.trackers.is_empty());
         assert!(recovered.tracker_token.is_none());
         assert!(recovered.local_identity.is_none());
@@ -7432,6 +7449,16 @@ mod tests {
                 "/home/user/.local/state/rustory/auto-prune.last",
             )],
             extra_rc_files: vec![PathBuf::from("/home/user/.zshrc")],
+            pinned_paths: uninstall::PinnedUninstallPaths {
+                state_files: vec![PathBuf::from(
+                    "/home/user/.local/state/rustory/auto-prune.last",
+                )],
+                state_dirs: vec![PathBuf::from("/home/user/.local/state/rustory")],
+                daemon_service_files: vec![PathBuf::from(
+                    "/home/user/.config/systemd/user/rustory.service",
+                )],
+                shell_rc_files: vec![PathBuf::from("/home/user/.zshrc")],
+            },
             local_peer_id: crate::libp2p::PeerId::random().to_string(),
         };
         validate_pending_cleanup_plan_unchanged(&original, &original).unwrap();
@@ -7445,6 +7472,13 @@ mod tests {
         changed
             .extra_rc_files
             .push(PathBuf::from("/home/user/.profile"));
+        assert!(validate_pending_cleanup_plan_unchanged(&original, &changed).is_err());
+
+        let mut changed = original.clone();
+        changed
+            .pinned_paths
+            .state_files
+            .push(PathBuf::from("/srv/rustory/daemon.log"));
         assert!(validate_pending_cleanup_plan_unchanged(&original, &changed).is_err());
     }
 

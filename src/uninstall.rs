@@ -1,6 +1,6 @@
 use crate::{config, hook, self_update, storage, tracker};
 use anyhow::{Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -47,6 +47,14 @@ pub struct UninstallRequest {
     pub local_peer_id: Option<String>,
     pub local_identity: Option<crate::libp2p::identity::Keypair>,
     pub config_load_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PinnedUninstallPaths {
+    pub state_files: Vec<PathBuf>,
+    pub state_dirs: Vec<PathBuf>,
+    pub daemon_service_files: Vec<PathBuf>,
+    pub shell_rc_files: Vec<PathBuf>,
 }
 
 pub fn load_managed_rc_files() -> Result<Vec<PathBuf>> {
@@ -209,8 +217,17 @@ fn load_managed_state_home_history_for(home: &Path) -> Result<Vec<PathBuf>> {
 }
 
 pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
+    let pinned_paths =
+        resolve_pinned_uninstall_paths(&request.state_marker_paths, &request.extra_rc_files)?;
+    run_uninstall_with_pinned_paths(request, &pinned_paths)
+}
+
+pub fn run_uninstall_with_pinned_paths(
+    request: UninstallRequest,
+    pinned_paths: &PinnedUninstallPaths,
+) -> Result<()> {
     if request.dry_run || !request.apply {
-        print_uninstall_plan(&request)?;
+        print_uninstall_plan_with_paths(&request, pinned_paths)?;
         return Ok(());
     }
     if let Some(error) = request.config_load_error.as_deref() {
@@ -218,7 +235,7 @@ pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
             "refusing destructive uninstall because config could not be loaded: {error}; fix or move config.toml, then retry"
         );
     }
-    validate_path_boundaries(&request)?;
+    validate_path_boundaries_with_paths(&request, pinned_paths)?;
 
     if request.require_device_membership {
         unregister_from_trackers(&request)?;
@@ -227,9 +244,9 @@ pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
         self_update::stop_managed_daemon(&request.install_path)?;
         unregister_from_trackers(&request)?;
     }
-    remove_shell_hooks(&request.extra_rc_files)?;
-    remove_daemon_autostart_blocks(&request.extra_rc_files)?;
-    remove_daemon_service_files()?;
+    remove_shell_hooks(&pinned_paths.shell_rc_files)?;
+    remove_daemon_autostart_blocks(&pinned_paths.shell_rc_files)?;
+    remove_daemon_service_files(&pinned_paths.daemon_service_files)?;
 
     if request.keep_db {
         println!("db=keep path={}", request.db_path.display());
@@ -240,7 +257,10 @@ pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
     if request.keep_state {
         println!("state=keep");
     } else {
-        remove_state_paths(&request.state_marker_paths)?;
+        remove_state_locations(ManagedStateLocations {
+            files: pinned_paths.state_files.clone(),
+            dirs: pinned_paths.state_dirs.clone(),
+        })?;
     }
 
     if request.keep_config {
@@ -260,11 +280,16 @@ pub fn run_uninstall(request: UninstallRequest) -> Result<()> {
 }
 
 pub fn validate_uninstall_request(request: &UninstallRequest) -> Result<()> {
-    validate_path_boundaries(request)
+    let pinned_paths =
+        resolve_pinned_uninstall_paths(&request.state_marker_paths, &request.extra_rc_files)?;
+    validate_path_boundaries_with_paths(request, &pinned_paths)
 }
 
-fn print_uninstall_plan(request: &UninstallRequest) -> Result<()> {
-    validate_path_boundaries(request)?;
+fn print_uninstall_plan_with_paths(
+    request: &UninstallRequest,
+    pinned_paths: &PinnedUninstallPaths,
+) -> Result<()> {
+    validate_path_boundaries_with_paths(request, pinned_paths)?;
     println!(
         "uninstall plan: apply=false peer_id={} trackers={} hook=true daemon=true db={} config={} state={} binary={}",
         request.local_peer_id.as_deref().unwrap_or("(missing)"),
@@ -282,7 +307,7 @@ fn print_uninstall_plan(request: &UninstallRequest) -> Result<()> {
     }
     println!("hook=planned remove_managed_blocks=true");
     println!("daemon=planned stop_managed_daemon=true");
-    for path in unique_paths(&request.extra_rc_files) {
+    for path in &pinned_paths.shell_rc_files {
         println!("rc_file=planned path={}", path.display());
     }
     println!(
@@ -303,15 +328,14 @@ fn print_uninstall_plan(request: &UninstallRequest) -> Result<()> {
         );
     }
     println!("state=planned keep={}", request.keep_state);
-    let locations = managed_state_locations(&request.state_marker_paths)?;
-    for path in locations.files {
+    for path in &pinned_paths.state_files {
         println!(
             "state_file=planned keep={} path={}",
             request.keep_state,
             path.display()
         );
     }
-    for path in locations.dirs {
+    for path in &pinned_paths.state_dirs {
         println!(
             "state_dir=planned keep={} path={}",
             request.keep_state,
@@ -408,8 +432,8 @@ fn unregister_from_trackers(request: &UninstallRequest) -> Result<()> {
     Ok(())
 }
 
-fn remove_shell_hooks(extra_rc_files: &[PathBuf]) -> Result<()> {
-    let reports = hook::remove_existing_managed_hook_blocks(extra_rc_files)?;
+fn remove_shell_hooks(rc_files: &[PathBuf]) -> Result<()> {
+    let reports = hook::remove_managed_hook_blocks_from_paths(rc_files)?;
     if reports.is_empty() {
         println!("hook=remove_skipped reason=no_managed_hook_blocks");
         return Ok(());
@@ -427,10 +451,10 @@ fn remove_shell_hooks(extra_rc_files: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
-fn remove_daemon_autostart_blocks(extra_rc_files: &[PathBuf]) -> Result<()> {
+fn remove_daemon_autostart_blocks(rc_files: &[PathBuf]) -> Result<()> {
     let mut removed_files = 0usize;
-    for rc_file in shell_profile_candidates(extra_rc_files)? {
-        let existing = match std::fs::read_to_string(&rc_file) {
+    for rc_file in rc_files {
+        let existing = match std::fs::read_to_string(rc_file) {
             Ok(content) => content,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
             Err(err) => {
@@ -442,7 +466,7 @@ fn remove_daemon_autostart_blocks(extra_rc_files: &[PathBuf]) -> Result<()> {
         if removed_blocks == 0 || cleaned == existing {
             continue;
         }
-        hook::atomic_write_text_preserving_symlink(&rc_file, &cleaned)
+        hook::atomic_write_text_preserving_symlink(rc_file, &cleaned)
             .with_context(|| format!("write rc file: {}", rc_file.display()))?;
         removed_files += 1;
         println!(
@@ -485,9 +509,9 @@ fn strip_marker_blocks(
     hook::strip_managed_marker_blocks(content, &[(start_marker, end_marker)])
 }
 
-fn remove_daemon_service_files() -> Result<()> {
-    for path in daemon_service_files()? {
-        remove_file_if_exists(&path, "daemon_service")?;
+fn remove_daemon_service_files(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        remove_file_if_exists(path, "daemon_service")?;
     }
     Ok(())
 }
@@ -598,6 +622,19 @@ fn managed_state_locations(marker_paths: &[PathBuf]) -> Result<ManagedStateLocat
     ))
 }
 
+pub fn resolve_pinned_uninstall_paths(
+    marker_paths: &[PathBuf],
+    extra_rc_files: &[PathBuf],
+) -> Result<PinnedUninstallPaths> {
+    let state = managed_state_locations(marker_paths)?;
+    Ok(PinnedUninstallPaths {
+        state_files: state.files,
+        state_dirs: state.dirs,
+        daemon_service_files: daemon_service_files()?,
+        shell_rc_files: shell_profile_candidates(extra_rc_files)?,
+    })
+}
+
 fn managed_state_locations_for(
     home: &Path,
     state_homes: &[PathBuf],
@@ -651,11 +688,6 @@ fn managed_state_homes_lock_path(home: &Path) -> PathBuf {
         .join(MANAGED_STATE_HOMES_LOCK_FILE)
 }
 
-fn remove_state_paths(marker_paths: &[PathBuf]) -> Result<()> {
-    let locations = managed_state_locations(marker_paths)?;
-    remove_state_locations(locations)
-}
-
 fn remove_state_locations(locations: ManagedStateLocations) -> Result<()> {
     for path in locations.files {
         remove_file_if_exists(&path, "state_file")?;
@@ -666,8 +698,17 @@ fn remove_state_locations(locations: ManagedStateLocations) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
-    let state_locations = managed_state_locations(&request.state_marker_paths)?;
+    let pinned_paths =
+        resolve_pinned_uninstall_paths(&request.state_marker_paths, &request.extra_rc_files)?;
+    validate_path_boundaries_with_paths(request, &pinned_paths)
+}
+
+fn validate_path_boundaries_with_paths(
+    request: &UninstallRequest,
+    pinned_paths: &PinnedUninstallPaths,
+) -> Result<()> {
     let mut protected = Vec::new();
     let mut removed = Vec::new();
 
@@ -693,18 +734,18 @@ fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
         }
     }
 
-    for path in state_locations.files {
+    for path in &pinned_paths.state_files {
         if request.keep_state {
-            protected.push(("state", path));
+            protected.push(("state", path.clone()));
         } else {
-            removed.push(("state", path));
+            removed.push(("state", path.clone()));
         }
     }
-    for path in state_locations.dirs {
+    for path in &pinned_paths.state_dirs {
         if request.keep_state {
-            protected.push(("state_dir", path));
+            protected.push(("state_dir", path.clone()));
         } else {
-            removed.push(("state_dir", path));
+            removed.push(("state_dir", path.clone()));
         }
     }
 
@@ -713,11 +754,26 @@ fn validate_path_boundaries(request: &UninstallRequest) -> Result<()> {
     } else {
         protected.push(("binary", request.install_path.clone()));
     }
-    for path in daemon_service_files()? {
-        removed.push(("daemon_service", path));
+    for path in &pinned_paths.daemon_service_files {
+        removed.push(("daemon_service", path.clone()));
     }
-    for path in shell_profile_candidates(&request.extra_rc_files)? {
-        removed.push(("shell_rc", path));
+    for path in &pinned_paths.shell_rc_files {
+        removed.push(("shell_rc", path.clone()));
+    }
+
+    for marker in &request.state_marker_paths {
+        anyhow::ensure!(
+            pinned_paths.state_files.contains(marker),
+            "pinned uninstall paths omit state marker: {}",
+            marker.display()
+        );
+    }
+    for rc_file in &request.extra_rc_files {
+        anyhow::ensure!(
+            pinned_paths.shell_rc_files.contains(rc_file),
+            "pinned uninstall paths omit managed rc file: {}",
+            rc_file.display()
+        );
     }
 
     validate_uninstall_filesystem_path("binary", &request.install_path)?;

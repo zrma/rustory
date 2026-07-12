@@ -15,7 +15,7 @@ pub const DEVICE_PROOF_MAX_SKEW_SEC: i64 = 5 * 60;
 const DEVICE_PROOF_MAX_PUBLIC_KEY_BYTES: usize = 1024;
 const DEVICE_PROOF_MAX_SIGNATURE_BYTES: usize = 1024;
 const DEVICE_PROOF_MAX_NONCE_BYTES: usize = 64;
-const RETIREMENT_JOB_VERSION: u32 = 3;
+const RETIREMENT_JOB_VERSION: u32 = 4;
 const RETIREMENT_POLL_INTERVAL: Duration = Duration::from_secs(30);
 const RETIREMENT_HELPER_ENV: &str = "RUSTORY_RETIREMENT_HELPER";
 
@@ -92,6 +92,7 @@ pub struct RetirementCleanupPlan {
     pub config_key_paths: Vec<PathBuf>,
     pub state_marker_paths: Vec<PathBuf>,
     pub extra_rc_files: Vec<PathBuf>,
+    pub pinned_paths: crate::uninstall::PinnedUninstallPaths,
     pub local_peer_id: String,
 }
 
@@ -450,6 +451,10 @@ fn validate_cleanup_plan(plan: &RetirementCleanupPlan, job: &RetirementJob) -> R
         .iter()
         .chain(plan.state_marker_paths.iter())
         .chain(plan.extra_rc_files.iter())
+        .chain(plan.pinned_paths.state_files.iter())
+        .chain(plan.pinned_paths.state_dirs.iter())
+        .chain(plan.pinned_paths.daemon_service_files.iter())
+        .chain(plan.pinned_paths.shell_rc_files.iter())
     {
         anyhow::ensure!(
             path.is_absolute(),
@@ -470,6 +475,10 @@ fn validate_cleanup_plan(plan: &RetirementCleanupPlan, job: &RetirementJob) -> R
     cleanup_paths.extend(plan.config_key_paths.iter().cloned());
     cleanup_paths.extend(plan.state_marker_paths.iter().cloned());
     cleanup_paths.extend(plan.extra_rc_files.iter().cloned());
+    cleanup_paths.extend(plan.pinned_paths.state_files.iter().cloned());
+    cleanup_paths.extend(plan.pinned_paths.state_dirs.iter().cloned());
+    cleanup_paths.extend(plan.pinned_paths.daemon_service_files.iter().cloned());
+    cleanup_paths.extend(plan.pinned_paths.shell_rc_files.iter().cloned());
     let protected_paths = [
         retirement_job_path(&job.ticket.ticket_id)?,
         retirement_helper_path(&job.ticket.ticket_id)?,
@@ -1599,6 +1608,14 @@ mod tests {
                 config_key_paths: Vec::new(),
                 state_marker_paths: Vec::new(),
                 extra_rc_files: Vec::new(),
+                pinned_paths: crate::uninstall::PinnedUninstallPaths {
+                    state_files: vec![PathBuf::from("/home/user/.local/state/rustory/daemon.log")],
+                    state_dirs: vec![PathBuf::from("/home/user/.local/state/rustory")],
+                    daemon_service_files: vec![PathBuf::from(
+                        "/home/user/.config/systemd/user/rustory.service",
+                    )],
+                    shell_rc_files: vec![PathBuf::from("/home/user/.zshrc")],
+                },
                 local_peer_id: identity.public().to_peer_id().to_string(),
             }),
             completion_capability: None,
