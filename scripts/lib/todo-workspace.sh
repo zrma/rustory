@@ -215,3 +215,12 @@ todo_workspace_discover_closed_work_id() {
   done
   return 3
 }
+
+todo_workspace_has_deleted_work_id() {
+  local root="$1"
+  local work_id="$2"
+  local include_head_range="${3:-auto}"
+
+  todo_workspace_collect_deleted_work_ids "$root" "$include_head_range" \
+    | grep -Fqx -- "$work_id"
+}

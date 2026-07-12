@@ -236,25 +236,12 @@ if [[ -n "$WORK_ID" ]]; then
 fi
 
 if [[ -n "$WORK_ID" && ! -d "$todo_abs" && "$CLOSED_WORK_ID" -ne 1 ]]; then
-  closed_work_id_output=""
-  closed_work_id_status=0
-  if closed_work_id_output="$(todo_workspace_discover_closed_work_id "$ROOT" auto)"; then
-    if [[ "$closed_work_id_output" == "$WORK_ID" ]]; then
-      CLOSED_WORK_ID=1
-      warn "$todo_rel not found; treat as closed work from detected workspace deletion"
-    else
-      fail "$todo_rel not found and deleted workspace candidate is '$closed_work_id_output'"
-    fi
+  if todo_workspace_has_deleted_work_id "$ROOT" "$WORK_ID" auto; then
+    CLOSED_WORK_ID=1
+    warn "$todo_rel not found; treat as closed work from detected workspace deletion"
   else
-    closed_work_id_status=$?
     if [[ "$ALLOW_MISSING_WORK_ID" -eq 1 ]]; then
       warn "$todo_rel not found. continue due --allow-missing-work-id override"
-    elif [[ "$closed_work_id_status" -eq 3 ]]; then
-      fail "$todo_rel not found and multiple deleted workspace candidates exist; cannot resolve closed work-id"
-      while IFS= read -r closed_work_id; do
-        [[ -z "$closed_work_id" ]] && continue
-        echo "       - $closed_work_id"
-      done <<< "$closed_work_id_output"
     else
       fail "$todo_rel not found. explicit --work-id requires matching deleted workspace evidence in current diff or clean unpublished history"
     fi

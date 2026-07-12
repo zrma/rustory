@@ -186,8 +186,7 @@ if [[ -n "$WORK_ID" ]]; then
   RESOLVED_WORK_ID="$WORK_ID"
   smoke_work_rel="$(todo_workspace_rel_for_work_id "$RESOLVED_WORK_ID")"
   if [[ ! -d "$ROOT/$smoke_work_rel" ]]; then
-    closed_work_id_output=""
-    if closed_work_id_output="$(todo_workspace_discover_closed_work_id "$ROOT" auto)" && [[ "$closed_work_id_output" == "$RESOLVED_WORK_ID" ]]; then
+    if todo_workspace_has_deleted_work_id "$ROOT" "$RESOLVED_WORK_ID" auto; then
       RESOLVED_WORK_ID="$DEFAULT_WORK_ID"
     fi
   fi
@@ -501,14 +500,21 @@ setup_closed_work_commit_fixture() {
   ensure_tmp_root
 
   closed_work_repo_dir="$tmp_root/closed-work-commit"
-  mkdir -p \
-    "$closed_work_repo_dir/scripts/lib" \
-    "$closed_work_repo_dir/docs/todo-$CLOSED_WORK_FIXTURE_WORK_ID"
+  mkdir -p "$closed_work_repo_dir/scripts/lib"
 
   cp "$ROOT/scripts/check-release-gates.sh" "$closed_work_repo_dir/scripts/check-release-gates.sh"
   cp "$ROOT/scripts/lib/todo-workspace.sh" "$closed_work_repo_dir/scripts/lib/todo-workspace.sh"
   chmod +x "$closed_work_repo_dir/scripts/check-release-gates.sh"
+  printf 'baseline\n' > "$closed_work_repo_dir/README.md"
 
+  git -C "$closed_work_repo_dir" init -q
+  git -C "$closed_work_repo_dir" config user.name "script-smoke"
+  git -C "$closed_work_repo_dir" config user.email "script-smoke@example.com"
+  git -C "$closed_work_repo_dir" add .
+  git -C "$closed_work_repo_dir" commit -qm "chore: initialize closed-work fixture"
+  git -C "$closed_work_repo_dir" update-ref refs/remotes/origin/main HEAD
+
+  mkdir -p "$closed_work_repo_dir/docs/todo-$CLOSED_WORK_FIXTURE_WORK_ID"
   cat > "$closed_work_repo_dir/docs/todo-$CLOSED_WORK_FIXTURE_WORK_ID/spec.md" <<'EOF'
 # Spec: script-smoke closed-work fixture
 EOF
@@ -518,13 +524,8 @@ EOF
 
 현재 미결 항목 없음.
 EOF
-
-  git -C "$closed_work_repo_dir" init -q
-  git -C "$closed_work_repo_dir" config user.name "script-smoke"
-  git -C "$closed_work_repo_dir" config user.email "script-smoke@example.com"
   git -C "$closed_work_repo_dir" add .
-  git -C "$closed_work_repo_dir" commit -qm "feat: initialize closed-work fixture"
-  git -C "$closed_work_repo_dir" update-ref refs/remotes/origin/main HEAD
+  git -C "$closed_work_repo_dir" commit -qm "feat: create closed-work fixture"
 
   rm -rf "$closed_work_repo_dir/docs/todo-$CLOSED_WORK_FIXTURE_WORK_ID"
   git -C "$closed_work_repo_dir" add -A
@@ -693,6 +694,21 @@ run_cmd "output=\$(scripts/check-release-gates.sh --manifest-mode full --dry-run
 setup_closed_work_commit_fixture
 run_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run)"
 expect_fail_cmd "(cd \"$closed_work_repo_dir\" && printf 'dirty fixture\\n' > README.md && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $CLOSED_WORK_FIXTURE_WORK_ID)"
+git -C "$closed_work_repo_dir" restore README.md
+second_closed_work_id="script-smoke-closed-second"
+mkdir -p "$closed_work_repo_dir/docs/todo-$second_closed_work_id"
+printf '# Spec: second closed-work fixture\n' > "$closed_work_repo_dir/docs/todo-$second_closed_work_id/spec.md"
+git -C "$closed_work_repo_dir" add .
+git -C "$closed_work_repo_dir" commit -qm "feat: create second closed-work fixture"
+rm -rf "$closed_work_repo_dir/docs/todo-$second_closed_work_id"
+git -C "$closed_work_repo_dir" add -A
+git -C "$closed_work_repo_dir" commit -qm "chore: close second closed-work fixture"
+expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run)"
+run_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $CLOSED_WORK_FIXTURE_WORK_ID)"
+run_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $second_closed_work_id)"
+expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id script-smoke-closed-missing)"
+git -C "$closed_work_repo_dir" update-ref refs/remotes/origin/main HEAD
+expect_fail_cmd "(cd \"$closed_work_repo_dir\" && scripts/check-release-gates.sh --manifest-mode full --dry-run --work-id $CLOSED_WORK_FIXTURE_WORK_ID)"
 
 setup_todo_closure_fixture
 expect_fail_cmd "(cd \"$todo_closure_repo_dir\" && scripts/check-todo-closure.sh)"
