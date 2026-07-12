@@ -31,5 +31,6 @@ Baseline ID: `openai-gpt-5.6-2026-07-11`.
 ## Project Overlay
 
 - local-first/P2P 경계와 relay acceptance는 `docs/agent-harness.md`와 제품 source를 따른다.
+- background daemon spawn과 PID persistence는 하나의 성공 단위로 다룬다. PID 기록 또는 startup 확인이 실패하면 child를 종료·회수하고 restart 성공을 보고하지 않으며, Rust updater와 Python installer의 fallback 동작을 함께 검증한다.
 - 기본 검증은 `scripts/check.sh --fast`; 출고 경계는 `docs/CHANGE_CONTROL.md`를 따른다.
 - 로컬 VCS는 `jj`를 사용하고 push는 명시적 권한이 있을 때만 수행한다.
