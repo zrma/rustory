@@ -143,6 +143,7 @@ todo_workspace_collect_deleted_work_ids() {
   local root="$1"
   local include_head_range="${2:-auto}"
   local run_head_range=0
+  local unpublished_base_ref="refs/remotes/origin/main"
   local path_prefix="$TODO_WORKSPACE_PARENT_REL/$TODO_WORKSPACE_NAME_PREFIX"
 
   if [[ "$include_head_range" == "auto" ]]; then
@@ -161,6 +162,12 @@ todo_workspace_collect_deleted_work_ids() {
     git -C "$root" diff --cached --name-status -- "$TODO_WORKSPACE_PARENT_REL"
     if (( run_head_range == 1 )) && git -C "$root" rev-parse --verify --quiet HEAD^ >/dev/null; then
       git -C "$root" diff --name-status HEAD^..HEAD -- "$TODO_WORKSPACE_PARENT_REL"
+    fi
+    if (( run_head_range == 1 )) \
+      && git -C "$root" rev-parse --verify --quiet "$unpublished_base_ref" >/dev/null \
+      && git -C "$root" merge-base --is-ancestor "$unpublished_base_ref" HEAD; then
+      git -C "$root" log --format= --name-status --diff-filter=D \
+        "$unpublished_base_ref..HEAD" -- "$TODO_WORKSPACE_PARENT_REL"
     fi
   } \
     | awk -v prefix="$path_prefix" '

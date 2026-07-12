@@ -28,7 +28,7 @@ Options:
                                 for all docs/todo-* when multiple exist;
                                 no todo workspace면 기본 실패.
                                 단, 현재 diff 또는 (로컬 변경이 없을 때)
-                                직전 커밋(HEAD^..HEAD)에
+                                직전 커밋 또는 origin/main 이후 미푸시 커밋에
                                 단일 docs/todo-* 삭제가 감지되면
                                 해당 work-id를 마감 커밋으로 자동 허용)
                                 open-questions 닫힘 검사는 --work-id 지정 시
@@ -241,7 +241,7 @@ if [[ -n "$WORK_ID" && ! -d "$todo_abs" && "$CLOSED_WORK_ID" -ne 1 ]]; then
   if closed_work_id_output="$(todo_workspace_discover_closed_work_id "$ROOT" auto)"; then
     if [[ "$closed_work_id_output" == "$WORK_ID" ]]; then
       CLOSED_WORK_ID=1
-      warn "$todo_rel not found; treat as closed-work commit from deleted workspace diff"
+      warn "$todo_rel not found; treat as closed work from detected workspace deletion"
     else
       fail "$todo_rel not found and deleted workspace candidate is '$closed_work_id_output'"
     fi
@@ -256,7 +256,7 @@ if [[ -n "$WORK_ID" && ! -d "$todo_abs" && "$CLOSED_WORK_ID" -ne 1 ]]; then
         echo "       - $closed_work_id"
       done <<< "$closed_work_id_output"
     else
-      fail "$todo_rel not found. explicit --work-id requires matching deleted workspace evidence in current diff or (clean tree) HEAD^..HEAD"
+      fail "$todo_rel not found. explicit --work-id requires matching deleted workspace evidence in current diff or clean unpublished history"
     fi
   fi
 fi

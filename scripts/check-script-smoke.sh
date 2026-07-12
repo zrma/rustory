@@ -524,10 +524,15 @@ EOF
   git -C "$closed_work_repo_dir" config user.email "script-smoke@example.com"
   git -C "$closed_work_repo_dir" add .
   git -C "$closed_work_repo_dir" commit -qm "feat: initialize closed-work fixture"
+  git -C "$closed_work_repo_dir" update-ref refs/remotes/origin/main HEAD
 
   rm -rf "$closed_work_repo_dir/docs/todo-$CLOSED_WORK_FIXTURE_WORK_ID"
   git -C "$closed_work_repo_dir" add -A
   git -C "$closed_work_repo_dir" commit -qm "chore: close closed-work fixture"
+
+  printf 'post-closure hardening\n' > "$closed_work_repo_dir/README.md"
+  git -C "$closed_work_repo_dir" add README.md
+  git -C "$closed_work_repo_dir" commit -qm "fix: harden closed-work fixture"
 }
 
 setup_todo_closure_fixture() {
