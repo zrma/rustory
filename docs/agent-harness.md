@@ -12,7 +12,7 @@
 
 `AGENTS.md`가 공통 GPT-5.6 계약을 소유하고, 이 문서는 Rustory overlay와 기존 운영 문서로 가는 canonical 진입점이다.
 
-Publication class는 현재 저장소 자체의 공개 경계만 선언한다. public gate는 다른 저장소의 inventory를 기록하지 않고 직접 식별자, checkout 경로, 외부 revision, local draft 상태를 차단하며 식별 불가능한 책임 경계는 허용한다.
+Publication class는 현재 저장소 자체의 공개 경계만 선언한다. public gate는 다른 저장소의 inventory뿐 아니라 개인 hostname, 머신 로컬 경로, 실제 운영 endpoint/IP, 정확한 fleet topology와 rollout 증거를 차단한다. 공개 문서에는 식별 불가능한 책임 경계와 repository-owned 검증 판정만 허용한다.
 
 ## Project Objective
 

@@ -42,13 +42,13 @@ check_jj_orphan_heads() {
 
   heads="$(
     cd "$repo_path"
-    jj log -r 'heads(all()) & ~bookmarks() & ~empty() & ~@' --no-graph \
+    jj log -r 'heads(all()) & ~bookmarks() & ~remote_bookmarks() & ~empty() & ~@' --no-graph \
       -T 'change_id.short() ++ " " ++ commit_id.short() ++ " " ++ description.first_line() ++ "\n"' || true
   )"
 
   if [[ -n "$heads" ]]; then
     fail "$label: unbookmarked non-empty jj head(s) detected"
-    echo "       hint: run 'jj log -r \"heads(all()) & ~bookmarks() & ~empty()\"' to inspect"
+    echo "       hint: run 'jj log -r \"heads(all()) & ~bookmarks() & ~remote_bookmarks() & ~empty()\"' to inspect"
     echo "       hint: bookmark the intended head or run 'jj abandon <change-id>'"
     while IFS= read -r head; do
       [[ -z "$head" ]] && continue

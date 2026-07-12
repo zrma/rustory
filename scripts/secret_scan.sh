@@ -42,14 +42,35 @@ if ! git rev-parse --git-dir >/dev/null 2>&1; then
 	exit 1
 fi
 
-base=""
-if git rev-parse --verify -q origin/main >/dev/null; then
-	base="$(git merge-base origin/main HEAD)"
-elif git rev-parse --verify -q main >/dev/null; then
-	base="$(git merge-base main HEAD)"
+scan_ref="${SECRET_SCAN_REF:-}"
+if [[ -z "$scan_ref" ]]; then
+	if current_branch="$(git symbolic-ref --quiet --short HEAD 2>/dev/null)"; then
+		scan_ref="$current_branch"
+	elif git rev-parse --verify -q refs/heads/main >/dev/null; then
+		# A colocated jj working copy commonly keeps Git HEAD detached at the
+		# working commit's parent while the publishable commit is on main.
+		scan_ref="main"
+	else
+		scan_ref="HEAD"
+	fi
+fi
+if ! git rev-parse --verify -q "$scan_ref" >/dev/null; then
+	echo "secret scan ref does not exist: $scan_ref" >&2
+	exit 1
 fi
 
-head="$(git rev-parse HEAD)"
+base=""
+if git rev-parse --verify -q origin/main >/dev/null; then
+	if candidate="$(git merge-base origin/main "$scan_ref" 2>/dev/null)"; then
+		base="$candidate"
+	fi
+elif [[ "$scan_ref" != "main" ]] && git rev-parse --verify -q main >/dev/null; then
+	if candidate="$(git merge-base main "$scan_ref" 2>/dev/null)"; then
+		base="$candidate"
+	fi
+fi
+
+head="$(git rev-parse "$scan_ref")"
 if [[ -n "$base" && "$base" == "$head" ]]; then
 	# Nothing to scan in a range; fall back to scanning all history.
 	base=""
@@ -60,7 +81,8 @@ args=(
 	file:///repo/
 	--no-update
 	--fail
-	--branch HEAD
+	--results=verified,unknown
+	--branch "$scan_ref"
 	--exclude-globs 'target/**,.git/**,.jj/**'
 )
 if [[ -n "$base" ]]; then

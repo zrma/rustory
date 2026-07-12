@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-06-28
+- Last Verified: 2026-07-12
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
@@ -25,6 +25,8 @@
 - 실행 동작, 옵션 default, 스크립트 내부 분기는 문서가 재서술하지 않고 해당 스크립트와 CLI help를 직접 확인한다.
 - `docs/todo-*` staged 변경(`spec.md`, `open-questions.md`, todo 삭제 증거 포함)은 `lefthook pre-commit`에서 `scripts/check-todo-readiness.sh` + `scripts/check-todo-closure.sh`를 먼저 통과해야 한다.
 - 출고/푸시 직전 strict 게이트의 정책 경계는 이 문서를 기준으로 유지하고, 실제 실행 순서/옵션/default는 runner 스크립트가 소유한다.
+- 공개 출고 증거는 repository-owned 검사 결과로 제한한다. 개인 배포 inventory, hostname, 실제 endpoint/IP, fleet 규모, rollout revision/checksum, 머신 로컬 경로는 commit·tag·Release 본문에 기록하지 않는다.
+- published history 정리 후에는 현재 tree만 검사하지 않고 `publication boundary --mode all`, 원격 `main`·전체 tag target, GitHub Release와 source archive를 함께 재검증한다.
 
 ## work-id/manifest 모드 기준 요약
 

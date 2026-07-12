@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-09
+- Last Verified: 2026-07-12
 
 이 문서는 반복 개발에서 누락/회귀를 줄이기 위한 경량 운영 루프를 정의한다.
 
@@ -74,6 +74,8 @@
 - 필요 시 스크립트/검증: `scripts/` 또는 모듈 검증 스크립트
 - 교훈 기록 기준: 자동화/강제 장치가 이미 있어도 반복 실패, 우회 시도, 예외 승인 사용이 발생한 항목은 `LESSONS_LOG`에 기록한다. 단순 정상 통과만 반복된 항목은 기록하지 않는다.
 - 경로 표기 기준: `LESSONS_LOG`에 과거 `docs/todo-*` 경로를 증적 식별자로 남길 때는 "현재는 삭제될 수 있는 과거 경로"임을 명시하고, 재실행 대상은 현행 문서/스크립트 경로를 함께 적는다.
+- 공개 경계: `LESSONS_LOG`/`LESSONS_ARCHIVE`에는 일반화 가능한 제품 규칙과 repository-owned 검증만 남긴다. 개인 hostname, 실제 endpoint/IP, 정확한 fleet·cluster 규모, rollout revision/checksum, 머신 로컬 경로는 저장소 밖의 비공개 운영 기록으로 분리하며 공개 문서에서 그 위치나 식별자를 링크하지 않는다.
+- 검증 표기: 공개 로그에는 `full gate 통과`, `release API 검증`처럼 재실행 가능한 검증 종류와 판정만 남긴다. 실제 배포 대상 목록, workload 수, 장치 수, 개인 환경의 용량·상태 수치는 적지 않는다.
 
 ## 크기 관리 규칙
 
