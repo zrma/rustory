@@ -620,6 +620,13 @@ pub fn stop_background_daemon_for_systemd_transition(install_path: &Path) -> Res
 
 #[cfg(target_os = "linux")]
 fn stop_stale_managed_rr_processes_before_restart(install_path: &Path) {
+    match stop_legacy_background_rr_processes_for_migration(install_path) {
+        Ok(0) => {}
+        Ok(count) => println!("daemon=legacy_processes_stopped manager=pre_restart count={count}"),
+        Err(err) => {
+            println!("warn: daemon legacy process cleanup failed manager=pre_restart detail={err}")
+        }
+    }
     match stop_stale_background_rr_processes(install_path) {
         Ok(0) => {}
         Ok(count) => println!("daemon=stale_processes_stopped manager=pre_restart count={count}"),
@@ -627,6 +634,67 @@ fn stop_stale_managed_rr_processes_before_restart(install_path: &Path) {
             println!("warn: daemon stale process cleanup failed manager=pre_restart detail={err}")
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn stop_legacy_background_rr_processes_for_migration(
+    install_path: &Path,
+) -> std::io::Result<usize> {
+    let state_dir = rustory_state_dir().map_err(std::io::Error::other)?;
+    let Some(manager_pid) = read_pid_file(&state_dir.join("daemon.pid")) else {
+        return Ok(0);
+    };
+    if !managed_pid_is_running(manager_pid, install_path) {
+        return Ok(0);
+    }
+
+    let current_pid = std::process::id();
+    let mut child_targets = Vec::new();
+    let mut daemon_targets = Vec::new();
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<u32>() else {
+            continue;
+        };
+        if pid == current_pid || !legacy_process_matches_install(pid, install_path) {
+            continue;
+        }
+        let Some(cmdline) = read_proc_cmdline(pid) else {
+            continue;
+        };
+        match legacy_background_migration_kind(&cmdline, true, false) {
+            Some(ManagedBackgroundCmdlineKind::Child) => child_targets.push(pid),
+            Some(ManagedBackgroundCmdlineKind::Daemon) => daemon_targets.push(pid),
+            None => {}
+        }
+    }
+
+    child_targets.sort_unstable();
+    daemon_targets.sort_unstable();
+    child_targets.extend(daemon_targets);
+    child_targets.dedup();
+
+    let mut stopped = 0;
+    for pid in child_targets {
+        if !legacy_process_matches_install(pid, install_path) {
+            continue;
+        }
+        terminate_background_process(pid, libc::SIGTERM)?;
+        if !wait_legacy_process_stopped(pid, install_path, Duration::from_secs(2)) {
+            let _ = terminate_background_process(pid, libc::SIGKILL);
+            if !wait_legacy_process_stopped(pid, install_path, Duration::from_secs(1)) {
+                return Err(std::io::Error::other(format!(
+                    "legacy pid {pid} did not stop after SIGTERM/SIGKILL"
+                )));
+            }
+        }
+        stopped += 1;
+    }
+    Ok(stopped)
 }
 
 #[cfg(target_os = "macos")]
@@ -1233,6 +1301,19 @@ fn process_has_background_manager_env(pid: u32) -> bool {
 }
 
 #[cfg(target_os = "linux")]
+fn legacy_process_matches_install(pid: u32, install_path: &Path) -> bool {
+    if !process_is_current_user(pid)
+        || !process_exe_matches(pid, install_path)
+        || process_has_background_manager_env(pid)
+    {
+        return false;
+    }
+    read_proc_cmdline(pid)
+        .and_then(|cmdline| legacy_background_migration_kind(&cmdline, true, false))
+        .is_some()
+}
+
+#[cfg(target_os = "linux")]
 fn background_pid_matches_install(pid: u32, install_path: &Path) -> bool {
     if !process_is_current_user(pid) {
         return false;
@@ -1291,6 +1372,18 @@ fn managed_background_cmdline_kind(cmdline: &[String]) -> Option<ManagedBackgrou
             .then_some(ManagedBackgroundCmdlineKind::Child);
     }
     None
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn legacy_background_migration_kind(
+    cmdline: &[String],
+    owned_manager_present: bool,
+    has_background_marker: bool,
+) -> Option<ManagedBackgroundCmdlineKind> {
+    if !owned_manager_present || has_background_marker {
+        return None;
+    }
+    managed_background_cmdline_kind(cmdline)
 }
 
 #[cfg(test)]
@@ -1361,6 +1454,18 @@ fn wait_managed_process_stopped(pid: u32, install_path: &Path, timeout: Duration
         std::thread::sleep(Duration::from_millis(100));
     }
     !managed_process_is_running(pid, install_path)
+}
+
+#[cfg(target_os = "linux")]
+fn wait_legacy_process_stopped(pid: u32, install_path: &Path, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if !pid_is_running(pid) || !legacy_process_matches_install(pid, install_path) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    !pid_is_running(pid) || !legacy_process_matches_install(pid, install_path)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1957,6 +2062,42 @@ mod tests {
             ],
             true
         ));
+    }
+
+    #[test]
+    fn legacy_background_migration_requires_owned_manager_and_no_marker() {
+        let legacy_child = [
+            "/home/user/.local/bin/rr".to_string(),
+            "--db-path".to_string(),
+            "/home/user/.rustory/history.db".to_string(),
+            "p2p-serve".to_string(),
+        ];
+
+        assert_eq!(
+            legacy_background_migration_kind(&legacy_child, true, false),
+            Some(ManagedBackgroundCmdlineKind::Child)
+        );
+        assert_eq!(
+            legacy_background_migration_kind(&legacy_child, false, false),
+            None
+        );
+        assert_eq!(
+            legacy_background_migration_kind(&legacy_child, true, true),
+            None
+        );
+        assert_eq!(
+            legacy_background_migration_kind(
+                &[
+                    "/home/user/.local/bin/rr".to_string(),
+                    "--db-path".to_string(),
+                    "/tmp/manual.db".to_string(),
+                    "p2p-serve".to_string(),
+                ],
+                true,
+                false,
+            ),
+            None
+        );
     }
 
     #[cfg(target_os = "linux")]
