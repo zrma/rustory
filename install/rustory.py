@@ -929,7 +929,7 @@ def stop_stale_background_daemon_processes(install_path: Path) -> int:
         kind = managed_background_cmdline_kind(cmdline)
         if kind == "daemon":
             daemon_targets.append(pid)
-        elif kind == "child" and process_has_managed_daemon_ancestor(pid, install_path):
+        elif kind == "child":
             child_targets.append(pid)
 
     stopped = 0
@@ -1375,9 +1375,7 @@ def background_pid_matches_install(pid: int, install_path: Path) -> bool:
     cmdline = read_proc_cmdline(pid)
     if managed_background_cmdline_kind(cmdline) != "daemon":
         return False
-    # This PID came from the private installer-owned pid file, which is also the
-    # migration path for older updater-spawned daemons that lacked the marker.
-    return proc_exe_matches(pid, install_path)
+    return proc_exe_matches(pid, install_path) and proc_has_background_manager(pid)
 
 
 def managed_process_matches_install(pid: int, install_path: Path) -> bool:
@@ -1389,32 +1387,9 @@ def managed_process_matches_install(pid: int, install_path: Path) -> bool:
     kind = managed_background_cmdline_kind(cmdline)
     if kind == "daemon":
         return True
-    return kind == "child" and process_has_managed_daemon_ancestor(pid, install_path)
-
-
-def process_has_managed_daemon_ancestor(pid: int, install_path: Path) -> bool:
-    for _ in range(64):
-        parent_pid = read_proc_parent_pid(pid)
-        if parent_pid is None or parent_pid <= 1 or parent_pid == pid:
-            return False
-        parent_cmdline = read_proc_cmdline(parent_pid)
-        if (
-            managed_background_cmdline_kind(parent_cmdline) == "daemon"
-            and proc_exe_matches(parent_pid, install_path)
-            and proc_has_background_manager(parent_pid)
-        ):
-            return True
-        pid = parent_pid
-    return False
-
-
-def read_proc_parent_pid(pid: int) -> int | None:
-    try:
-        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        after_comm = stat_text.rsplit(") ", 1)[1]
-        return int(after_comm.split()[1])
-    except (OSError, IndexError, ValueError):
-        return None
+    # Managed children inherit the installer-only marker. They remain ours
+    # after an OOM/SIGKILL reparents them away from the daemon process.
+    return kind == "child"
 
 
 def pid_is_running(pid: int) -> bool:

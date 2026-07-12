@@ -28,11 +28,14 @@ pub struct ManagedLogCleanup {
 pub fn managed_daemon_log_paths() -> Result<Vec<PathBuf>> {
     let home = std::env::var_os("HOME").context("HOME env var not set")?;
     let xdg_state_home = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from);
-    managed_daemon_log_paths_for(
+    let mut paths = managed_daemon_log_paths_for(
         current_platform(),
         Path::new(&home),
         xdg_state_home.as_deref(),
-    )
+    )?;
+    let pinned = crate::uninstall::resolve_pinned_uninstall_paths(&[], &[])?;
+    extend_with_managed_state_logs(&mut paths, &pinned.state_dirs);
+    Ok(paths)
 }
 
 pub fn cleanup_managed_daemon_logs() -> Result<Vec<ManagedLogCleanup>> {
@@ -257,6 +260,15 @@ fn managed_daemon_log_paths_for(
     }
 }
 
+fn extend_with_managed_state_logs(paths: &mut Vec<PathBuf>, state_dirs: &[PathBuf]) {
+    for state_dir in state_dirs {
+        paths.push(state_dir.join("daemon.log"));
+        paths.push(state_dir.join("retirement.log"));
+    }
+    paths.sort();
+    paths.dedup();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -316,6 +328,28 @@ mod tests {
 
         assert_eq!(result.status, ManagedLogCleanupStatus::Missing);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn managed_state_history_adds_daemon_and_retirement_logs_once() {
+        let mut paths = vec![PathBuf::from("/state/a/rustory/daemon.log")];
+        extend_with_managed_state_logs(
+            &mut paths,
+            &[
+                PathBuf::from("/state/a/rustory"),
+                PathBuf::from("/state/b/rustory"),
+            ],
+        );
+
+        assert_eq!(
+            paths,
+            vec![
+                PathBuf::from("/state/a/rustory/daemon.log"),
+                PathBuf::from("/state/a/rustory/retirement.log"),
+                PathBuf::from("/state/b/rustory/daemon.log"),
+                PathBuf::from("/state/b/rustory/retirement.log"),
+            ]
+        );
     }
 
     #[cfg(unix)]

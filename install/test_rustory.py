@@ -365,6 +365,37 @@ class BackgroundDaemonSafetyTests(unittest.TestCase):
             )
         )
 
+    def test_orphan_managed_child_remains_owned_by_background_marker(self) -> None:
+        cmdline = [
+            "rr",
+            "--db-path",
+            "/home/user/.rustory/history.db",
+            "p2p-serve",
+        ]
+        with (
+            mock.patch.object(rustory.sys, "platform", "linux"),
+            mock.patch.object(rustory, "proc_is_current_user", return_value=True),
+            mock.patch.object(rustory, "read_proc_cmdline", return_value=cmdline),
+            mock.patch.object(rustory, "proc_exe_matches", return_value=True),
+            mock.patch.object(rustory, "proc_has_background_manager", return_value=True),
+        ):
+            self.assertTrue(
+                rustory.managed_process_matches_install(1234, Path("/home/user/.local/bin/rr"))
+            )
+
+    def test_pid_file_daemon_requires_background_marker(self) -> None:
+        cmdline = ["rr", "daemon", "--interval-sec", "60", "--start-jitter-sec", "10"]
+        with (
+            mock.patch.object(rustory.sys, "platform", "linux"),
+            mock.patch.object(rustory, "proc_is_current_user", return_value=True),
+            mock.patch.object(rustory, "read_proc_cmdline", return_value=cmdline),
+            mock.patch.object(rustory, "proc_exe_matches", return_value=True),
+            mock.patch.object(rustory, "proc_has_background_manager", return_value=False),
+        ):
+            self.assertFalse(
+                rustory.background_pid_matches_install(1234, Path("/home/user/.local/bin/rr"))
+            )
+
     @unittest.skipUnless(sys.platform == "linux", "Linux /proc validation only")
     def test_stale_pid_file_for_unrelated_process_is_removed_without_signal(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

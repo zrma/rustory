@@ -404,9 +404,21 @@ fn install_binary(bytes: &[u8], install_path: &Path, requested_version: &str) ->
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("rr");
-    let tmp_path = parent.join(format!(".{file_name}.download-{}", std::process::id()));
+    let tmp_path = parent.join(format!(
+        ".{file_name}.download-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
     {
-        let mut file = std::fs::File::create(&tmp_path)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o700).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&tmp_path)
             .with_context(|| format!("create temporary binary: {}", tmp_path.display()))?;
         file.write_all(bytes)
             .with_context(|| format!("write temporary binary: {}", tmp_path.display()))?;
@@ -414,19 +426,38 @@ fn install_binary(bytes: &[u8], install_path: &Path, requested_version: &str) ->
             .with_context(|| format!("sync temporary binary: {}", tmp_path.display()))?;
     }
     make_executable(&tmp_path)?;
+    std::fs::File::open(&tmp_path)
+        .with_context(|| format!("open temporary binary for sync: {}", tmp_path.display()))?
+        .sync_all()
+        .with_context(|| format!("sync temporary binary mode: {}", tmp_path.display()))?;
     let result = verify_downloaded_binary(&tmp_path, requested_version).and_then(|()| {
-        std::fs::rename(&tmp_path, install_path).with_context(|| {
-            format!(
-                "replace {} with downloaded binary {}",
-                install_path.display(),
-                tmp_path.display()
-            )
-        })
+        std::fs::rename(&tmp_path, install_path)
+            .with_context(|| {
+                format!(
+                    "replace {} with downloaded binary {}",
+                    install_path.display(),
+                    tmp_path.display()
+                )
+            })
+            .and_then(|()| sync_directory(parent))
     });
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp_path);
     }
     result.with_context(|| format!("install downloaded binary to {}", install_path.display()))?;
+    Ok(())
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(path)
+            .with_context(|| format!("open directory for sync: {}", path.display()))?
+            .sync_all()
+            .with_context(|| format!("sync directory: {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -1077,11 +1108,7 @@ fn stop_stale_background_rr_processes(install_path: &Path) -> std::io::Result<us
         }
         match managed_background_cmdline_kind(&cmdline) {
             Some(ManagedBackgroundCmdlineKind::Daemon) => daemon_targets.push(pid),
-            Some(ManagedBackgroundCmdlineKind::Child)
-                if process_has_managed_daemon_ancestor(pid, install_path) =>
-            {
-                child_targets.push(pid);
-            }
+            Some(ManagedBackgroundCmdlineKind::Child) => child_targets.push(pid),
             _ => {}
         }
     }
@@ -1158,11 +1185,9 @@ fn background_pid_matches_install(pid: u32, install_path: &Path) -> bool {
     let Some(cmdline) = read_proc_cmdline(pid) else {
         return false;
     };
-    // The caller obtained this PID from the private installer-owned pid file.
-    // Accept that provenance for migration from older updater children that did
-    // not yet carry RUSTORY_DAEMON_MANAGER; broad /proc scans require the marker.
     managed_background_cmdline_kind(&cmdline) == Some(ManagedBackgroundCmdlineKind::Daemon)
         && process_exe_matches(pid, install_path)
+        && process_has_background_manager_env(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -1178,42 +1203,12 @@ fn managed_process_matches_install(pid: u32, install_path: &Path) -> bool {
     }
     match managed_background_cmdline_kind(&cmdline) {
         Some(ManagedBackgroundCmdlineKind::Daemon) => true,
-        Some(ManagedBackgroundCmdlineKind::Child) => {
-            process_has_managed_daemon_ancestor(pid, install_path)
-        }
+        // Background children inherit the private manager marker from the
+        // installer-owned daemon. Keep recognizing them after an OOM/SIGKILL
+        // reparents them to init so update/uninstall cannot leave them behind.
+        Some(ManagedBackgroundCmdlineKind::Child) => true,
         None => false,
     }
-}
-
-#[cfg(target_os = "linux")]
-fn process_has_managed_daemon_ancestor(mut pid: u32, install_path: &Path) -> bool {
-    for _ in 0..64 {
-        let Some(parent_pid) = read_proc_parent_pid(pid) else {
-            return false;
-        };
-        if parent_pid <= 1 || parent_pid == pid {
-            return false;
-        }
-        let Some(parent_cmdline) = read_proc_cmdline(parent_pid) else {
-            return false;
-        };
-        if managed_background_cmdline_kind(&parent_cmdline)
-            == Some(ManagedBackgroundCmdlineKind::Daemon)
-            && process_exe_matches(parent_pid, install_path)
-            && process_has_background_manager_env(parent_pid)
-        {
-            return true;
-        }
-        pid = parent_pid;
-    }
-    false
-}
-
-#[cfg(target_os = "linux")]
-fn read_proc_parent_pid(pid: u32) -> Option<u32> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let after_comm = stat.rsplit_once(") ")?.1;
-    after_comm.split_whitespace().nth(1)?.parse().ok()
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -1751,6 +1746,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert!(!installed_binary_matches(&path, b"rr-binary").unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_binary_ignores_predictable_legacy_temp_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let install_path = dir.path().join("rr");
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"preserve-me").unwrap();
+        let legacy_tmp = dir
+            .path()
+            .join(format!(".rr.download-{}", std::process::id()));
+        symlink(&victim, &legacy_tmp).unwrap();
+
+        install_binary(b"#!/bin/sh\necho 'rr 9.9.9'\n", &install_path, "latest").unwrap();
+
+        assert_eq!(std::fs::read(&victim).unwrap(), b"preserve-me");
+        assert!(legacy_tmp.is_symlink());
+        assert_eq!(
+            std::fs::read(&install_path).unwrap(),
+            b"#!/bin/sh\necho 'rr 9.9.9'\n"
+        );
     }
 
     #[test]
