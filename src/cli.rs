@@ -641,12 +641,6 @@ enum Command {
 
         #[arg(
             long,
-            help = "Separate admin token for device enrollment and retirement"
-        )]
-        admin_token: Option<String>,
-
-        #[arg(
-            long,
             help = "Private durable JSON path for enrollment and retirement state"
         )]
         security_state_path: Option<String>,
@@ -863,8 +857,6 @@ enum DeviceCommand {
     List {
         #[arg(long, help = "Authoritative tracker base URL")]
         tracker: Option<String>,
-        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
-        admin_token: Option<String>,
         #[arg(long, default_value_t = false, help = "Print pretty JSON")]
         json: bool,
     },
@@ -874,8 +866,6 @@ enum DeviceCommand {
         peer_id: String,
         #[arg(long, help = "Authoritative tracker base URL")]
         tracker: Option<String>,
-        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
-        admin_token: Option<String>,
     },
     #[command(about = "Revoke grid membership without requesting local cleanup")]
     Revoke {
@@ -883,8 +873,6 @@ enum DeviceCommand {
         peer_id: String,
         #[arg(long, help = "Authoritative tracker base URL")]
         tracker: Option<String>,
-        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
-        admin_token: Option<String>,
         #[arg(long, default_value_t = false, help = "Required to apply revocation")]
         yes: bool,
     },
@@ -894,8 +882,6 @@ enum DeviceCommand {
         peer_id: String,
         #[arg(long, help = "Authoritative tracker base URL")]
         tracker: Option<String>,
-        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
-        admin_token: Option<String>,
         #[arg(
             long,
             default_value_t = false,
@@ -909,8 +895,6 @@ enum DeviceCommand {
         peer_id: String,
         #[arg(long, help = "Authoritative tracker base URL")]
         tracker: Option<String>,
-        #[arg(long, help = "Tracker admin token; prefer RUSTORY_TRACKER_ADMIN_TOKEN")]
-        admin_token: Option<String>,
         #[arg(long, default_value_t = false, help = "Print pretty JSON")]
         json: bool,
     },
@@ -1677,18 +1661,13 @@ pub fn run() -> Result<()> {
             bind,
             ttl_sec,
             token,
-            admin_token,
             security_state_path,
             require_device_enrollment,
             allow_unauthenticated,
         } => {
             let token = resolve_tracker_token(token, &cfg)?;
             validate_tracker_serve_auth(&bind, token.as_deref(), allow_unauthenticated)?;
-            let admin_token = normalize_opt_string(admin_token).or_else(|| {
-                std::env::var("RUSTORY_TRACKER_ADMIN_TOKEN")
-                    .ok()
-                    .and_then(|value| normalize_opt_string(Some(value)))
-            });
+            let admin_token = env_nonempty("RUSTORY_TRACKER_ADMIN_TOKEN");
             if let Some(admin_token) = admin_token.as_deref() {
                 tracker::validate_tracker_admin_token_value(admin_token)?;
             }
@@ -1875,12 +1854,8 @@ pub fn run() -> Result<()> {
 
 fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Result<()> {
     match command {
-        DeviceCommand::List {
-            tracker,
-            admin_token,
-            json,
-        } => {
-            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+        DeviceCommand::List { tracker, json } => {
+            let client = resolve_tracker_admin_client(tracker, cfg)?;
             let response = client.admin_list_devices()?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&response)?);
@@ -1918,13 +1893,9 @@ fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Resul
                 }
             }
         }
-        DeviceCommand::Enroll {
-            peer_id,
-            tracker,
-            admin_token,
-        } => {
+        DeviceCommand::Enroll { peer_id, tracker } => {
             let peer_id = normalize_peer_id(&peer_id)?;
-            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let client = resolve_tracker_admin_client(tracker, cfg)?;
             let response = client.admin_enroll(peer_id)?;
             anyhow::ensure!(
                 response.ok,
@@ -1935,7 +1906,6 @@ fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Resul
         DeviceCommand::Revoke {
             peer_id,
             tracker,
-            admin_token,
             yes,
         } => {
             let peer_id = validate_remote_device_target(&peer_id, cfg)?;
@@ -1944,7 +1914,7 @@ fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Resul
                 println!("pass --yes to apply");
                 return Ok(());
             }
-            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let client = resolve_tracker_admin_client(tracker, cfg)?;
             let response = client.admin_retire(
                 peer_id,
                 crate::device_retirement::RetirementCleanup::RevokeOnly,
@@ -1962,7 +1932,6 @@ fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Resul
         DeviceCommand::Retire {
             peer_id,
             tracker,
-            admin_token,
             yes,
         } => {
             let peer_id = validate_remote_device_target(&peer_id, cfg)?;
@@ -1973,7 +1942,7 @@ fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Resul
                 println!("pass --yes to apply");
                 return Ok(());
             }
-            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let client = resolve_tracker_admin_client(tracker, cfg)?;
             let response = client.admin_retire(
                 peer_id,
                 crate::device_retirement::RetirementCleanup::FullUninstall,
@@ -1994,11 +1963,10 @@ fn run_device_command(command: DeviceCommand, cfg: &config::FileConfig) -> Resul
         DeviceCommand::Status {
             peer_id,
             tracker,
-            admin_token,
             json,
         } => {
             let peer_id = normalize_peer_id(&peer_id)?;
-            let client = resolve_tracker_admin_client(tracker, admin_token, cfg)?;
+            let client = resolve_tracker_admin_client(tracker, cfg)?;
             let device = client
                 .admin_list_devices()?
                 .devices
@@ -2665,7 +2633,16 @@ fn complete_retirement_until_confirmed(
 
 fn resolve_tracker_admin_client(
     tracker: Option<String>,
-    admin_token: Option<String>,
+    cfg: &config::FileConfig,
+) -> Result<tracker::TrackerClient> {
+    let admin_token = env_nonempty("RUSTORY_TRACKER_ADMIN_TOKEN")
+        .context("tracker admin token is required via RUSTORY_TRACKER_ADMIN_TOKEN")?;
+    build_tracker_admin_client(tracker, admin_token, cfg)
+}
+
+fn build_tracker_admin_client(
+    tracker: Option<String>,
+    admin_token: String,
     cfg: &config::FileConfig,
 ) -> Result<tracker::TrackerClient> {
     let trackers = resolve_trackers(tracker.into_iter().collect(), cfg)?;
@@ -2676,11 +2653,6 @@ fn resolve_tracker_admin_client(
     crate::device_retirement::validate_admin_tracker_url(&trackers[0])
         .context("device administration requires HTTPS")?;
     let tracker_token = resolve_tracker_token(None, cfg)?;
-    let admin_token = normalize_opt_string(admin_token)
-        .or_else(|| env_nonempty("RUSTORY_TRACKER_ADMIN_TOKEN"))
-        .context(
-            "tracker admin token is required via --admin-token or RUSTORY_TRACKER_ADMIN_TOKEN",
-        )?;
     tracker::validate_tracker_admin_token_value(&admin_token)?;
     Ok(
         tracker::TrackerClient::new(trackers[0].clone(), tracker_token)
@@ -7356,13 +7328,32 @@ mod tests {
             trackers: Some(vec!["http://tracker.example:8850".to_string()]),
             ..config::FileConfig::default()
         };
-        let error = resolve_tracker_admin_client(None, Some(admin_token.clone()), &cfg)
+        let error = build_tracker_admin_client(None, admin_token.clone(), &cfg)
             .err()
             .expect("remote plaintext tracker must be rejected");
         assert!(format!("{error:#}").contains("requires HTTPS"));
 
         cfg.trackers = Some(vec!["http://127.0.0.1:8850".to_string()]);
-        assert!(resolve_tracker_admin_client(None, Some(admin_token), &cfg,).is_ok());
+        assert!(build_tracker_admin_client(None, admin_token, &cfg).is_ok());
+    }
+
+    #[test]
+    fn admin_credentials_are_not_accepted_in_process_arguments() {
+        let peer_id = libp2p::PeerId::random().to_string();
+        let tracker =
+            App::try_parse_from(["rr", "tracker-serve", "--admin-token", "secret-from-argv"]);
+        assert!(tracker.is_err());
+
+        let device = App::try_parse_from([
+            "rr",
+            "device",
+            "retire",
+            "--peer-id",
+            peer_id.as_str(),
+            "--admin-token",
+            "secret-from-argv",
+        ]);
+        assert!(device.is_err());
     }
 
     #[test]

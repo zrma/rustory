@@ -133,7 +133,8 @@ TLS reverse proxy에서 admin endpoint, `/api/v1/peers/register`, signed
 limit을 적용한다. 정상 poll 30초와 completion retry 5~60초 cadence보다 충분히 여유 있게 두고
 request/response read/write timeout을 설정하며,
 backend port는 loopback/private network policy로 직접 접근을 막는다.
-CLI 인자의 `--admin-token`보다 `RUSTORY_TRACKER_ADMIN_TOKEN`을 권장한다. tracker security state는
+admin token은 프로세스 인자에 노출되지 않도록 CLI 플래그로 받지 않으며,
+`RUSTORY_TRACKER_ADMIN_TOKEN`으로만 전달한다. tracker security state는
 재시작 후 enrollment, revocation, cleanup ACK와 ticket-scoped completion capability hash를 복원하며
 group/world-readable 파일이나 symlink를 거부한다. state file에는 process-lifetime exclusive lock을
 잡으므로 같은 path를 공유하는 tracker replica는 하나만 실행한다.
