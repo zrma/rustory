@@ -278,6 +278,10 @@ class RetirementInstallerTests(unittest.TestCase):
         self.assertIn("RUSTORY_DAEMON_MANAGER=background nohup", background)
         self.assertIn("systemctl --user is-active --quiet rustory.service", background)
         self.assertIn("XDG_STATE_HOME='/tmp/custom state'", background)
+        self.assertIn('__rustory_daemon_expected_exe=/tmp/rr', background)
+        self.assertIn('/proc/$__rustory_daemon_pid/exe', background)
+        self.assertIn('/proc/$__rustory_daemon_pid/cmdline', background)
+        self.assertIn('__rustory_daemon_subcommand" = "daemon"', background)
 
 
 class ManagedBlockSafetyTests(unittest.TestCase):
@@ -372,6 +376,125 @@ class BackgroundDaemonSafetyTests(unittest.TestCase):
             self.assertIsNone(validated)
             self.assertFalse(pid_path.exists())
             os.kill(os.getpid(), 0)
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and Path("/bin/bash").is_file(),
+        "Linux shell autostart validation only",
+    )
+    def test_shell_autostart_does_not_trust_reused_unrelated_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "state"
+            state_dir = state_home / "rustory"
+            state_dir.mkdir(parents=True)
+            (state_dir / "daemon.pid").write_text(f"{os.getpid()}\n")
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "daemon-started"
+            fake_rr = fake_bin / "rr"
+            fake_rr.write_text('#!/bin/sh\n: > "$RUSTORY_TEST_MARKER"\n')
+            fake_rr.chmod(0o755)
+            fake_systemctl = fake_bin / "systemctl"
+            fake_systemctl.write_text("#!/bin/sh\nexit 1\n")
+            fake_systemctl.chmod(0o755)
+            fake_setsid = fake_bin / "setsid"
+            fake_setsid.write_text('#!/bin/sh\nexec "$@"\n')
+            fake_setsid.chmod(0o755)
+
+            block_path = root / "autostart.sh"
+            block_path.write_text(
+                rustory.render_daemon_autostart_block(
+                    [str(fake_rr), "daemon"], state_home
+                )
+            )
+            command = (
+                f". {rustory.shell_quote_arg(str(block_path))}; "
+                "i=0; while [ ! -e \"$RUSTORY_TEST_MARKER\" ] && [ $i -lt 50 ]; do "
+                "i=$((i + 1)); sleep 0.02; done"
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["RUSTORY_TEST_MARKER"] = str(marker)
+
+            completed = rustory.subprocess.run(
+                ["/bin/bash", "--noprofile", "--norc", "-ic", command],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertTrue(marker.exists(), completed.stderr)
+
+    @unittest.skipUnless(
+        sys.platform == "linux" and Path("/bin/bash").is_file(),
+        "Linux shell autostart validation only",
+    )
+    def test_shell_autostart_trusts_matching_daemon_process(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            state_home = root / "state"
+            state_dir = state_home / "rustory"
+            state_dir.mkdir(parents=True)
+            daemon_script = root / "daemon"
+            daemon_script.write_text("sleep 30\n")
+            real_bash = Path("/bin/bash").resolve()
+            daemon = rustory.subprocess.Popen(
+                [str(real_bash), daemon_script.name],
+                cwd=root,
+                stdout=rustory.subprocess.DEVNULL,
+                stderr=rustory.subprocess.DEVNULL,
+            )
+
+            def cleanup_daemon() -> None:
+                if daemon.poll() is None:
+                    daemon.kill()
+                daemon.wait(timeout=5)
+
+            self.addCleanup(cleanup_daemon)
+            (state_dir / "daemon.pid").write_text(f"{daemon.pid}\n")
+
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            marker = root / "unexpected-daemon-start"
+            fake_systemctl = fake_bin / "systemctl"
+            fake_systemctl.write_text("#!/bin/sh\nexit 1\n")
+            fake_systemctl.chmod(0o755)
+            fake_setsid = fake_bin / "setsid"
+            fake_setsid.write_text('#!/bin/sh\n: > "$RUSTORY_TEST_MARKER"\n')
+            fake_setsid.chmod(0o755)
+
+            block_path = root / "autostart.sh"
+            block_path.write_text(
+                rustory.render_daemon_autostart_block(
+                    [str(real_bash), daemon_script.name], state_home
+                )
+            )
+            env = os.environ.copy()
+            env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env["RUSTORY_TEST_MARKER"] = str(marker)
+            completed = rustory.subprocess.run(
+                [
+                    str(real_bash),
+                    "--noprofile",
+                    "--norc",
+                    "-ic",
+                    f". {rustory.shell_quote_arg(str(block_path))}",
+                ],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(marker.exists(), completed.stderr)
+            self.assertIsNone(daemon.poll())
 
 
 if __name__ == "__main__":

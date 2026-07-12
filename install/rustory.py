@@ -1050,7 +1050,10 @@ def install_background_daemon_autostart(
 def render_daemon_autostart_block(
     daemon_args: list[str], state_home: Path
 ) -> str:
+    if not daemon_args:
+        raise ValueError("daemon_args must include the rustory executable")
     daemon_command = " ".join(shell_quote_arg(arg) for arg in daemon_args)
+    daemon_executable_command = shell_quote_arg(daemon_args[0])
     state_home_command = shell_quote_arg(str(state_home))
     state_dir_command = shell_quote_arg(str(state_home / "rustory"))
     return "\n".join(
@@ -1062,6 +1065,7 @@ def render_daemon_autostart_block(
             f"    __rustory_daemon_state_dir={state_dir_command}",
             '    __rustory_daemon_pid_file="$__rustory_daemon_state_dir/daemon.pid"',
             '    __rustory_daemon_log_file="$__rustory_daemon_state_dir/daemon.log"',
+            f"    __rustory_daemon_expected_exe={daemon_executable_command}",
             "    __rustory_daemon_running=0",
             "    if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet rustory.service >/dev/null 2>&1; then",
             "      __rustory_daemon_running=1",
@@ -1069,7 +1073,17 @@ def render_daemon_autostart_block(
             '      __rustory_daemon_pid="$(cat "$__rustory_daemon_pid_file" 2>/dev/null)"',
             '      case "$__rustory_daemon_pid" in',
             "        ''|*[!0-9]*) __rustory_daemon_running=0 ;;",
-            '        *) kill -0 "$__rustory_daemon_pid" >/dev/null 2>&1 && __rustory_daemon_running=1 ;;',
+            "        *)",
+            '          __rustory_daemon_exe="$(readlink "/proc/$__rustory_daemon_pid/exe" 2>/dev/null || true)"',
+            '          __rustory_daemon_subcommand="$(tr "\\000" "\\n" < "/proc/$__rustory_daemon_pid/cmdline" 2>/dev/null | sed -n "2p")"',
+            '          case "$__rustory_daemon_exe" in',
+            '            "$__rustory_daemon_expected_exe"|"$__rustory_daemon_expected_exe (deleted)")',
+            '              if [ "$__rustory_daemon_subcommand" = "daemon" ] && kill -0 "$__rustory_daemon_pid" >/dev/null 2>&1; then',
+            "                __rustory_daemon_running=1",
+            "              fi",
+            "              ;;",
+            "          esac",
+            "          ;;",
             "      esac",
             "    fi",
             '    if [ "$__rustory_daemon_running" != "1" ]; then',
@@ -1083,6 +1097,7 @@ def render_daemon_autostart_block(
             '      chmod 600 "$__rustory_daemon_pid_file" "$__rustory_daemon_log_file" 2>/dev/null || true',
             "    fi",
             "    unset __rustory_daemon_state_dir __rustory_daemon_pid_file __rustory_daemon_log_file",
+            "    unset __rustory_daemon_expected_exe __rustory_daemon_exe __rustory_daemon_subcommand",
             "    unset __rustory_daemon_running __rustory_daemon_pid",
             "    ;;",
             "esac",
