@@ -148,7 +148,11 @@ setup_release_tree_fixture() {
   release_tree_repo_dir="$tmp_root/release-tree-repo"
   mkdir -p "$release_tree_repo_dir/scripts" "$release_tree_repo_dir/dist/release-v1.2.3"
   cp "$ROOT/scripts/release-version.sh" "$release_tree_repo_dir/scripts/release-version.sh"
-  chmod +x "$release_tree_repo_dir/scripts/release-version.sh"
+  cp "$ROOT/scripts/check-linux-glibc-baseline.sh" \
+    "$release_tree_repo_dir/scripts/check-linux-glibc-baseline.sh"
+  chmod +x \
+    "$release_tree_repo_dir/scripts/release-version.sh" \
+    "$release_tree_repo_dir/scripts/check-linux-glibc-baseline.sh"
   cat > "$release_tree_repo_dir/Cargo.toml" <<'EOF'
 [package]
 name = "release-tree-fixture"
