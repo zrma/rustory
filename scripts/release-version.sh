@@ -27,7 +27,7 @@ Options:
   --gate <none|quick|full>  Pre-release gate mode (default: quick)
                             quick: scripts/run-manifest-checks.sh --mode quick
                             full: scripts/check-release-gates.sh --manifest-mode full
-  --skip-build              Upload/verify already staged assets.
+  --skip-build              Upload/verify already staged assets, including binary metadata.
   --skip-upload             Build assets but do not call gh release.
   --skip-update-verify      Do not run rr update --dry-run after upload.
   --allow-dirty             Allow publishing from a dirty working copy.
@@ -156,6 +156,124 @@ verify_asset_checksum_entry() {
     "invalid SHA-256 for $asset_name in $checksum_file"
   [[ "$entries" == "$actual" ]] || fail \
     "checksum mismatch for $asset_name in $checksum_file: expected $actual, found $entries"
+}
+
+verify_linux_asset_architecture() {
+  local asset="$1"
+  local target="$2"
+
+  need_cmd python3
+  python3 - "$asset" "$target" <<'PY'
+import pathlib
+import struct
+import sys
+
+asset = pathlib.Path(sys.argv[1])
+target = sys.argv[2]
+expected_machines = {
+    "x86_64-unknown-linux-gnu": 62,
+    "aarch64-unknown-linux-gnu": 183,
+}
+expected = expected_machines[target]
+header = asset.read_bytes()[:32]
+
+if len(header) < 32 or header[:4] != b"\x7fELF":
+    print(f"[FAIL] staged Linux release asset is not an ELF binary: {asset}", file=sys.stderr)
+    raise SystemExit(1)
+if header[4] != 2 or header[5] != 1:
+    print(f"[FAIL] staged Linux release asset must be a 64-bit little-endian ELF binary: {asset}", file=sys.stderr)
+    raise SystemExit(1)
+
+actual = struct.unpack_from("<H", header, 18)[0]
+if actual != expected:
+    print(
+        f"[FAIL] staged Linux release asset architecture mismatch for {target}: "
+        f"expected ELF machine {expected}, found {actual}: {asset}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+elf_type = struct.unpack_from("<H", header, 16)[0]
+entry = struct.unpack_from("<Q", header, 24)[0]
+if elf_type not in (2, 3) or entry == 0:
+    print(f"[FAIL] staged Linux release asset is not an executable ELF binary: {asset}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+verify_staged_asset_identity() {
+  local asset="$1"
+  local expected_identity="$VERSION (rev ${COMMIT_SHA:0:12})"
+
+  python3 - "$asset" "$expected_identity" <<'PY'
+import pathlib
+import sys
+
+asset = pathlib.Path(sys.argv[1])
+identity = sys.argv[2].encode("utf-8")
+if identity not in asset.read_bytes():
+    print(
+        f"[FAIL] staged release asset does not contain expected build identity "
+        f"{sys.argv[2]!r}: {asset}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
+verify_staged_asset_metadata() {
+  local asset="$1"
+  local target="$2"
+  local report=""
+  local expected_revision="${COMMIT_SHA:0:12}"
+
+  need_cmd python3
+  verify_staged_asset_identity "$asset"
+  case "$target" in
+    *-unknown-linux-gnu)
+      verify_linux_asset_architecture "$asset" "$target"
+      "$ROOT/scripts/check-linux-glibc-baseline.sh" \
+        "$asset" "${RUSTORY_RELEASE_MAX_GLIBC:-${RUSTORY_RELEASE_ZIG_GLIBC:-2.17}}"
+      ;;
+  esac
+
+  if [[ "$target" != "$(current_target)" ]]; then
+    ok "staged release asset matches target: $target version=$VERSION revision=$expected_revision"
+    return 0
+  fi
+  if ! report="$("$asset" version --json)"; then
+    fail "staged release asset failed version probe: $asset"
+  fi
+
+  if ! printf '%s\n' "$report" | python3 -c '
+import json
+import sys
+
+expected_version, expected_revision, asset = sys.argv[1:]
+try:
+    report = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeDecodeError) as error:
+    print(f"[FAIL] invalid version report from staged release asset {asset}: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+checks = {
+    "version": expected_version,
+    "build_revision": expected_revision,
+    "build_revision_source": "git",
+    "build_dirty": False,
+}
+for field, expected in checks.items():
+    actual = report.get(field)
+    if actual != expected:
+        print(
+            f"[FAIL] staged release asset {field} mismatch: "
+            f"expected {expected!r}, found {actual!r}: {asset}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+' "$VERSION" "$expected_revision" "$asset"; then
+    fail "staged release asset metadata verification failed: $asset"
+  fi
+  ok "staged release asset matches target: $target version=$VERSION revision=$expected_revision"
 }
 
 resolve_targets_from_profile() {
@@ -334,6 +452,14 @@ build_or_collect_assets() {
       verify_asset_checksum_entry "$asset" "$asset.sha256"
       verify_asset_checksum_entry "$asset" "$checksums"
     done
+    if [[ "$SKIP_BUILD" -eq 1 ]]; then
+      local release_asset=""
+      local release_target=""
+      for release_asset in "${release_assets[@]}"; do
+        release_target="${release_asset##*/rr-}"
+        verify_staged_asset_metadata "$release_asset" "$release_target"
+      done
+    fi
   fi
   ASSETS+=("$checksums")
 }

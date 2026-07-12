@@ -116,6 +116,31 @@ ensure_tmp_root() {
   tmp_root="$(mktemp -d "$ROOT/.tmp-script-smoke.XXXXXX")"
 }
 
+build_release_fixture_asset() {
+  local asset="$1"
+  local revision="$2"
+  cat > "$asset.c" <<EOF
+#include <stdio.h>
+#include <string.h>
+
+static const char *BUILD_IDENTITY = "1.2.3 (rev $revision)";
+
+int main(int argc, char **argv) {
+  if (argc == 2 && strcmp(argv[1], "--version") == 0) {
+    puts(BUILD_IDENTITY);
+    return 0;
+  }
+  if (argc != 3 || strcmp(argv[1], "version") != 0 || strcmp(argv[2], "--json") != 0) {
+    return 2;
+  }
+  puts("{\"version\":\"1.2.3\",\"build_revision\":\"$revision\",\"build_revision_source\":\"git\",\"build_dirty\":false}");
+  return 0;
+}
+EOF
+  "${CC:-cc}" "$asset.c" -o "$asset"
+  rm -f "$asset.c"
+}
+
 setup_release_tree_fixture() {
   ensure_tmp_root
   release_tree_repo_dir="$tmp_root/release-tree-repo"
@@ -141,8 +166,9 @@ EOF
   if [[ "$(uname -s)" == "Linux" ]]; then
     asset="$release_tree_repo_dir/dist/release-v1.2.3/rr-$(uname -m | sed 's/^arm64$/aarch64/')-unknown-linux-gnu"
   fi
-  printf '#!/usr/bin/env sh\nexit 0\n' > "$asset"
-  chmod +x "$asset"
+  local revision=""
+  revision="$(git -C "$release_tree_repo_dir" rev-parse --short=12 main)"
+  build_release_fixture_asset "$asset" "$revision"
   local digest=""
   if command -v sha256sum >/dev/null 2>&1; then
     digest="$(sha256sum "$asset" | awk '{print $1}')"
@@ -151,6 +177,17 @@ EOF
   fi
   printf '%s  %s\n' "$digest" "$(basename "$asset")" > "$asset.sha256"
   cp "$asset.sha256" "$release_tree_repo_dir/dist/release-v1.2.3/checksums.txt"
+}
+
+refresh_release_fixture_checksums() {
+  local digest=""
+  if command -v sha256sum >/dev/null 2>&1; then
+    digest="$(sha256sum "$release_fixture_asset" | awk '{print $1}')"
+  else
+    digest="$(shasum -a 256 "$release_fixture_asset" | awk '{print $1}')"
+  fi
+  printf '%s  %s\n' "$digest" "$(basename "$release_fixture_asset")" > "$release_fixture_checksum"
+  cp "$release_fixture_checksum" "$release_fixture_checksums"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -609,25 +646,53 @@ run_cmd "bash -n scripts/acceptance_docker_macos_linux.sh"
 run_cmd "bash -n scripts/acceptance_device_retirement_vms.sh"
 run_cmd "scripts/release-version.sh --profile current --skip-upload --dry-run"
 setup_release_tree_fixture
+release_fixture_env="RUSTORY_RELEASE_MAX_GLIBC=998.0"
 git -C "$release_tree_repo_dir" checkout -qb divergent
 printf 'divergent source\n' > "$release_tree_repo_dir/source.txt"
 git -C "$release_tree_repo_dir" add source.txt
 git -C "$release_tree_repo_dir" commit -qm "fix: diverge release source"
-expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+expect_fail_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
 git -C "$release_tree_repo_dir" checkout -qb same-tree main
 git -C "$release_tree_repo_dir" commit --allow-empty -qm "chore: empty child"
-run_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+run_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
 release_fixture_asset="$(find "$release_tree_repo_dir/dist/release-v1.2.3" -type f -name 'rr-*' ! -name '*.sha256' -print -quit)"
 release_fixture_checksum="$release_fixture_asset.sha256"
 release_fixture_checksums="$release_tree_repo_dir/dist/release-v1.2.3/checksums.txt"
 cp "$release_fixture_checksum" "$release_fixture_checksum.good"
 printf '%064d  %s\n' 0 "$(basename "$release_fixture_asset")" > "$release_fixture_checksum"
-expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+expect_fail_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
 mv "$release_fixture_checksum.good" "$release_fixture_checksum"
 cp "$release_fixture_checksums" "$release_fixture_checksums.good"
 printf '%064d  %s\n' 0 "$(basename "$release_fixture_asset")" > "$release_fixture_checksums"
-expect_fail_cmd "(cd $release_tree_repo_dir && scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+expect_fail_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
 mv "$release_fixture_checksums.good" "$release_fixture_checksums"
+cp "$release_fixture_asset" "$release_fixture_asset.good"
+build_release_fixture_asset "$release_fixture_asset" "000000000000"
+refresh_release_fixture_checksums
+expect_fail_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+mv "$release_fixture_asset.good" "$release_fixture_asset"
+refresh_release_fixture_checksums
+if [[ "$(uname -s)" == "Linux" ]]; then
+  cp "$release_fixture_asset" "$release_fixture_asset.good"
+  python3 - "$release_fixture_asset" <<'PY'
+import pathlib
+import sys
+
+asset = pathlib.Path(sys.argv[1])
+data = bytearray(asset.read_bytes())
+data[18:20] = (0).to_bytes(2, "little")
+asset.write_bytes(data)
+PY
+  refresh_release_fixture_checksums
+  expect_fail_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+  mv "$release_fixture_asset.good" "$release_fixture_asset"
+  cp "$release_fixture_asset" "$release_fixture_asset.good"
+  printf 'GLIBC_999.0\n' >> "$release_fixture_asset"
+  refresh_release_fixture_checksums
+  expect_fail_cmd "(cd $release_tree_repo_dir && $release_fixture_env scripts/release-version.sh --target-ref main --profile current --gate none --skip-build --skip-upload --skip-update-verify)"
+  mv "$release_fixture_asset.good" "$release_fixture_asset"
+  refresh_release_fixture_checksums
+fi
 run_cmd "scripts/check-push-gates.sh --mode quick --dry-run"
 run_cmd "$push_strict_cmd"
 run_debug_override_cmd "ALLOW_MISSING_WORK_ID_IN_CI=0 DEBUG_GATES_OVERRIDE=1 scripts/check-push-gates.sh --mode strict --allow-missing-work-id --dry-run"
