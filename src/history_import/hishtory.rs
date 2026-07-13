@@ -1,9 +1,10 @@
 use super::{
     AdapterRecord, HistoryImportAdapter, ImportStats, PathImportRequest, insert_adapter_records,
+    sqlite::{row_lossy_opt_string, row_lossy_string},
 };
 use crate::storage::LocalStore;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OpenFlags, params, types::ValueRef};
+use rusqlite::{Connection, OpenFlags, params};
 use std::time::Duration as StdDuration;
 use time::OffsetDateTime;
 
@@ -215,29 +216,6 @@ fn row_to_hishtory_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<HishtoryR
         exit_code,
         hostname,
     })
-}
-
-fn row_lossy_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<String> {
-    Ok(sqlite_value_ref_to_lossy_string(row.get_ref(index)?))
-}
-
-fn row_lossy_opt_string(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Option<String>> {
-    let value = row.get_ref(index)?;
-    Ok(match value {
-        ValueRef::Null => None,
-        _ => Some(sqlite_value_ref_to_lossy_string(value)),
-    })
-}
-
-fn sqlite_value_ref_to_lossy_string(value: ValueRef<'_>) -> String {
-    match value {
-        ValueRef::Null => String::new(),
-        ValueRef::Integer(value) => value.to_string(),
-        ValueRef::Real(value) => value.to_string(),
-        ValueRef::Text(bytes) | ValueRef::Blob(bytes) => {
-            String::from_utf8_lossy(bytes).into_owned()
-        }
-    }
 }
 
 fn hishtory_import_entry_id(

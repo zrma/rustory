@@ -4,6 +4,7 @@ use crate::libp2p::core::transport::choice::OrTransport;
 use crate::libp2p::core::upgrade::Version;
 use crate::libp2p::swarm::{SwarmEvent, dial_opts::DialOpts};
 use crate::libp2p::{Multiaddr, PeerId, StreamProtocol, Swarm, Transport};
+use crate::retry::exponential_duration;
 use crate::storage::{LocalStore, PeerBookPeer, PeerRevocation, PullBatch};
 use anyhow::{Context, Result};
 use futures::StreamExt;
@@ -2249,7 +2250,7 @@ impl P2pClient {
         let mut last_err: Option<anyhow::Error> = None;
 
         for attempt in 0..ATTEMPTS {
-            let timeout = exp_duration(base_timeout, attempt as u32, timeout_cap);
+            let timeout = exponential_duration(base_timeout, attempt as u32, timeout_cap);
 
             match self.dial_once(&addrs, timeout).await {
                 Ok(()) => return Ok(()),
@@ -2257,7 +2258,7 @@ impl P2pClient {
             }
 
             if attempt + 1 < ATTEMPTS {
-                let backoff = exp_duration(BACKOFF_BASE, attempt as u32, None);
+                let backoff = exponential_duration(BACKOFF_BASE, attempt as u32, None);
                 tokio::time::sleep(backoff).await;
             }
         }
@@ -2327,7 +2328,7 @@ impl P2pClient {
 
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..attempts {
-            let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
+            let timeout = exponential_duration(timeout_base, attempt as u32, Some(timeout_cap));
 
             match self
                 .pull_batch_once(cursor, delete_cursor, limit, timeout)
@@ -2345,7 +2346,7 @@ impl P2pClient {
             // pending 상태를 정리하기 위해 best-effort disconnect를 시도한다.
             let _ = self.swarm.disconnect_peer_id(self.peer_id);
 
-            let backoff = exp_duration(backoff_base, attempt as u32, None);
+            let backoff = exponential_duration(backoff_base, attempt as u32, None);
             if backoff > Duration::from_millis(0) {
                 tokio::time::sleep(backoff).await;
             }
@@ -2441,7 +2442,7 @@ impl P2pClient {
 
         let mut last_err: Option<anyhow::Error> = None;
         for attempt in 0..attempts {
-            let timeout = exp_duration(timeout_base, attempt as u32, Some(timeout_cap));
+            let timeout = exponential_duration(timeout_base, attempt as u32, Some(timeout_cap));
 
             match self
                 .push_batch_once(entries.clone(), deletions.clone(), timeout)
@@ -2458,7 +2459,7 @@ impl P2pClient {
 
             let _ = self.swarm.disconnect_peer_id(self.peer_id);
 
-            let backoff = exp_duration(backoff_base, attempt as u32, None);
+            let backoff = exponential_duration(backoff_base, attempt as u32, None);
             if backoff > Duration::from_millis(0) {
                 tokio::time::sleep(backoff).await;
             }
@@ -2750,17 +2751,6 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     }
 
     false
-}
-
-fn exp_duration(base: Duration, attempt: u32, cap: Option<Duration>) -> Duration {
-    let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
-    let got = base
-        .checked_mul(factor)
-        .unwrap_or_else(|| cap.unwrap_or(Duration::MAX));
-    match cap {
-        Some(cap) if got > cap => cap,
-        _ => got,
-    }
 }
 
 #[cfg(test)]
@@ -4088,20 +4078,5 @@ mod tests {
         assert!(!is_dcutr_direct_upgrade_noise(
             "Failed to connect to destination.: Relay has no reservation for destination."
         ));
-    }
-
-    #[test]
-    fn exp_duration_saturates_to_cap_on_multiplication_overflow() {
-        let base = Duration::from_secs(u64::MAX / 8);
-        let cap = Duration::from_secs(u64::MAX / 4);
-
-        assert_eq!(exp_duration(base, 4, Some(cap)), cap);
-    }
-
-    #[test]
-    fn exp_duration_saturates_to_duration_max_without_cap_on_overflow() {
-        let base = Duration::from_secs(u64::MAX / 8);
-
-        assert_eq!(exp_duration(base, 4, None), Duration::MAX);
     }
 }

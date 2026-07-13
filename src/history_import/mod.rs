@@ -7,6 +7,8 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 mod atuin;
 #[cfg(feature = "import-hishtory")]
 mod hishtory;
+#[cfg(any(feature = "import-atuin", feature = "import-hishtory"))]
+mod sqlite;
 
 #[cfg(all(test, feature = "import-hishtory"))]
 pub use hishtory::{HishtoryImportRequest, import_hishtory_sqlite_into_store};

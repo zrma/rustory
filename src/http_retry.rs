@@ -1,3 +1,4 @@
+use crate::retry::exponential_duration;
 use anyhow::Result;
 use std::time::Duration;
 
@@ -51,12 +52,12 @@ where
     let mut last_err: Option<anyhow::Error> = None;
 
     for attempt in 0..attempts {
-        let connect = exp_duration(
+        let connect = exponential_duration(
             policy.connect_base,
             attempt as u32,
             Some(policy.connect_cap),
         );
-        let read = exp_duration(policy.read_base, attempt as u32, Some(policy.read_cap));
+        let read = exponential_duration(policy.read_base, attempt as u32, Some(policy.read_cap));
 
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .timeout_connect(Some(connect))
@@ -76,7 +77,7 @@ where
                     return Err(last_err.expect("last_err must be set"));
                 }
 
-                let backoff = exp_duration(policy.backoff_base, attempt as u32, None);
+                let backoff = exponential_duration(policy.backoff_base, attempt as u32, None);
                 if backoff > Duration::from_millis(0) {
                     std::thread::sleep(backoff);
                 }
@@ -101,35 +102,9 @@ fn is_retryable_error(err: &ureq::Error) -> bool {
     }
 }
 
-fn exp_duration(base: Duration, attempt: u32, cap: Option<Duration>) -> Duration {
-    let factor = 1u32.checked_shl(attempt).unwrap_or(u32::MAX);
-    let got = base
-        .checked_mul(factor)
-        .unwrap_or_else(|| cap.unwrap_or(Duration::MAX));
-    match cap {
-        Some(cap) if got > cap => cap,
-        _ => got,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn exp_duration_saturates_to_cap_on_multiplication_overflow() {
-        let base = Duration::from_secs(u64::MAX / 8);
-        let cap = Duration::from_secs(u64::MAX / 4);
-
-        assert_eq!(exp_duration(base, 4, Some(cap)), cap);
-    }
-
-    #[test]
-    fn exp_duration_saturates_to_duration_max_without_cap_on_overflow() {
-        let base = Duration::from_secs(u64::MAX / 8);
-
-        assert_eq!(exp_duration(base, 4, None), Duration::MAX);
-    }
 
     #[test]
     fn tracker_requests_never_follow_redirects() {
