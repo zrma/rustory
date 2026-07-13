@@ -14,6 +14,8 @@
 
 Publication class는 현재 저장소 자체의 공개 경계만 선언한다. public gate는 다른 저장소의 inventory뿐 아니라 개인 hostname, 머신 로컬 경로, 실제 운영 endpoint/IP, 정확한 fleet topology와 rollout 증거를 차단한다. 공개 문서에는 식별 불가능한 책임 경계와 repository-owned 검증 판정만 허용한다.
 
+Tracked artifact contract: raw tool output와 정확한 로컬 환경 evidence는 local-only로 취급한다. 공개 가능한 기록에는 repository-owned 결정, 필요한 명령 이름, redacted 검증 판정만 남기고 경로·호스트·주소·클러스터 값은 placeholder로 바꾼다.
+
 ## Project Objective
 
 Rustory를 local-first 셸 히스토리 daily driver로 유지한다. 기록은 각 디바이스의 SQLite에 먼저 남고, tracker와 relay를 통한 P2P grid 동기화가 서로 다른 NAT 환경에서도 검증 가능해야 한다.
