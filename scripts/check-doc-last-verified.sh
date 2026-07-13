@@ -103,7 +103,8 @@ def git_stdout(repo_root: Path, args):
     return result.stdout.strip()
 
 def git_last_change_date(repo_root: Path, rel_path: str):
-    raw = git_stdout(repo_root, ["log", "-1", "--format=%cI", "--", rel_path])
+    # History rewrites update committer dates even when document content is unchanged.
+    raw = git_stdout(repo_root, ["log", "-1", "--format=%aI", "--", rel_path])
     if not raw:
         return None
     try:
