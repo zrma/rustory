@@ -372,8 +372,14 @@ fn normalize_sha256_hex(raw: &str) -> Result<String> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
     let digest = Sha256::digest(bytes);
-    format!("{digest:x}")
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    encoded
 }
 
 fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {

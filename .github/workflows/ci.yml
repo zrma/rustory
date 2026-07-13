@@ -15,10 +15,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@e081816240890017053eacbb1bdf337761dc5582 # 1.95.0
+        uses: dtolnay/rust-toolchain@1a3a6d54512beeaffd394f8d516ca16f2c506a20 # 1.97.0
         with:
           components: rustfmt, clippy
 
@@ -42,12 +42,12 @@ jobs:
 
     steps:
       - name: Checkout (full history)
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
       - name: TruffleHog secret scan
-        uses: trufflesecurity/trufflehog@7635b24fd512a2e817dd3e9dd661caaf035a079d # v3.93.1
+        uses: trufflesecurity/trufflehog@27b0417c16317ca9a472a9a8092acce143b49c55 # v3.95.9
         with:
           path: ./
           version: "3.93.1"
