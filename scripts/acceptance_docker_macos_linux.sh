@@ -61,6 +61,8 @@ trap cleanup EXIT
 echo "[1/8] prepare acceptance dir: $ACC_DIR"
 rm -rf "$ACC_DIR"
 mkdir -p "$ACC_DIR"
+MAC_HOME="$ACC_DIR/home"
+mkdir -p "$MAC_HOME"
 
 echo "[2/8] start tracker/relay (docker)"
 RUSTORY_ACCEPTANCE_DIR="$ACC_DIR" \
@@ -205,7 +207,8 @@ echo "[8/8] run p2p-sync on macOS host"
 cargo build --bin rr >/dev/null
 
 MAC_DB="$ACC_DIR/mac.db"
-MAC_ENTRY_ID="$(RUSTORY_USER_ID="$USER_ID" \
+MAC_ENTRY_ID="$(HOME="$MAC_HOME" \
+  RUSTORY_USER_ID="$USER_ID" \
   RUSTORY_DEVICE_ID="mac" \
   target/debug/rr --db-path "$MAC_DB" record \
     --cmd "echo acceptance-from-mac" \
@@ -220,6 +223,7 @@ if [[ -z "$MAC_ENTRY_ID" ]]; then
 fi
 
 MAC_P2P_LOG="$ACC_DIR/mac-p2p.log"
+HOME="$MAC_HOME" \
 RUSTORY_USER_ID="$USER_ID" \
 RUSTORY_DEVICE_ID="mac" \
 RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
@@ -251,6 +255,7 @@ if [[ "$MAC_REGISTERED" != "1" ]]; then
   exit 1
 fi
 
+HOME="$MAC_HOME" \
 RUSTORY_USER_ID="$USER_ID" \
 RUSTORY_DEVICE_ID="mac" \
 RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
