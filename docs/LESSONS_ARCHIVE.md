@@ -4,6 +4,7 @@
 
 ## Todo Closure Tokens
 
+- 2026-07-15: `todo-docker-acceptance-refresh`
 - 2026-07-06: `todo-shell-hook-replace-buffer`
 - 2026-07-06: `todo-shell-hook-reloadable`
 - 2026-07-03: `todo-release-v1-0-27`
