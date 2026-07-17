@@ -20,6 +20,16 @@ const FOOTER: &str = "rustory: Search your shell history  • ctrl+h help";
 const TTY_LINE_ENDING: &str = "\r\n";
 const ENABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000h\x1b[?1006h";
 const DISABLE_MOUSE_REPORTING: &[u8] = b"\x1b[?1000l\x1b[?1006l";
+const COMMAND_FIELD_WEIGHT: usize = 6_000;
+const COMPACT_CWD_FIELD_WEIGHT: usize = 4_000;
+const CWD_FIELD_WEIGHT: usize = 3_900;
+const HOSTNAME_FIELD_WEIGHT: usize = 3_000;
+const DEVICE_FIELD_WEIGHT: usize = 2_600;
+const USER_FIELD_WEIGHT: usize = 1_800;
+const EXPLICIT_FIELD_WEIGHT: usize = 6_000;
+const SAME_CWD_BOOST: usize = 80;
+const SAME_HOSTNAME_BOOST: usize = 20;
+const MAX_TEXT_MATCH_QUALITY: usize = 2_100;
 
 const COLUMNS: [ColumnSpec; 6] = [
     ColumnSpec {
@@ -71,11 +81,18 @@ struct SearchRow {
 #[derive(Debug, Clone)]
 struct SearchFields {
     command: String,
+    command_ascii_mask: u128,
     cwd: String,
+    cwd_ascii_mask: u128,
     compact_cwd: String,
+    compact_cwd_ascii_mask: u128,
     hostname: String,
+    hostname_ascii_mask: u128,
     device_id: String,
+    device_ascii_mask: u128,
     user_id: String,
+    user_ascii_mask: u128,
+    metadata_ascii_mask: u128,
     exit_code: String,
 }
 
@@ -83,6 +100,56 @@ struct SearchFields {
 struct SearchTerm {
     negate: bool,
     matcher: SearchMatcher,
+}
+
+#[derive(Debug)]
+struct PreparedSearchTerm<'a> {
+    negate: bool,
+    field: Option<SearchField>,
+    token: PreparedToken<'a>,
+}
+
+#[derive(Debug)]
+struct PreparedToken<'a> {
+    value: &'a str,
+    chars: Vec<char>,
+    all_alphanumeric: bool,
+    ascii_mask: Option<u128>,
+}
+
+impl<'a> PreparedToken<'a> {
+    fn new(value: &'a str) -> Self {
+        let chars = value.chars().collect::<Vec<_>>();
+        let all_alphanumeric = chars.iter().all(|ch| ch.is_alphanumeric());
+        let ascii_mask = value.is_ascii().then(|| ascii_mask(value));
+        Self {
+            value,
+            chars,
+            all_alphanumeric,
+            ascii_mask,
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.chars.len()
+    }
+
+    fn may_match_ascii_mask(&self, haystack_mask: u128) -> bool {
+        let Some(token_mask) = self.ascii_mask else {
+            return true;
+        };
+        let missing = (token_mask & !haystack_mask).count_ones();
+        // 한 글자 오타 후보는 query에만 있는 문자 하나를 허용해야 false negative가 없다.
+        let allowed_missing = usize::from(self.len() >= 4 && self.all_alphanumeric);
+        missing as usize <= allowed_missing
+    }
+}
+
+fn ascii_mask(value: &str) -> u128 {
+    value
+        .bytes()
+        .filter(|byte| byte.is_ascii())
+        .fold(0u128, |mask, byte| mask | (1u128 << byte))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,8 +199,24 @@ pub enum SearchAction {
     Select(String),
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SearchContext {
+    cwd: Option<String>,
+    hostname: Option<String>,
+}
+
+impl SearchContext {
+    pub(crate) fn new(cwd: Option<String>, hostname: Option<String>) -> Self {
+        Self {
+            cwd: normalize_context_value(cwd),
+            hostname: normalize_context_value(hostname),
+        }
+    }
+}
+
 pub fn select_action(
     entries: &[Entry],
+    context: SearchContext,
     mut delete_entry: impl FnMut(&str) -> Result<()>,
 ) -> Result<Option<SearchAction>> {
     if entries.is_empty() {
@@ -141,7 +224,7 @@ pub fn select_action(
     }
 
     let rows = build_search_rows(entries);
-    let mut tui = SearchTui::new(entries, rows)?;
+    let mut tui = SearchTui::new(entries, rows, context)?;
     tui.run(&mut delete_entry)
 }
 
@@ -151,15 +234,32 @@ fn build_search_rows(entries: &[Entry]) -> Vec<SearchRow> {
         .enumerate()
         .map(|(entry_index, entry)| {
             let compact = compact_cwd(&entry.cwd);
+            let command = sanitize_one_line(&entry.cmd).to_lowercase();
+            let cwd = sanitize_one_line(&entry.cwd).to_lowercase();
+            let compact_cwd = compact.to_lowercase();
+            let hostname = sanitize_one_line(&entry.hostname).to_lowercase();
+            let device_id = sanitize_one_line(&entry.device_id).to_lowercase();
+            let user_id = sanitize_one_line(&entry.user_id).to_lowercase();
             SearchRow {
                 entry_index,
                 search_fields: SearchFields {
-                    command: sanitize_one_line(&entry.cmd).to_lowercase(),
-                    cwd: sanitize_one_line(&entry.cwd).to_lowercase(),
-                    compact_cwd: compact.to_lowercase(),
-                    hostname: sanitize_one_line(&entry.hostname).to_lowercase(),
-                    device_id: sanitize_one_line(&entry.device_id).to_lowercase(),
-                    user_id: sanitize_one_line(&entry.user_id).to_lowercase(),
+                    command_ascii_mask: ascii_mask(&command),
+                    cwd_ascii_mask: ascii_mask(&cwd),
+                    compact_cwd_ascii_mask: ascii_mask(&compact_cwd),
+                    hostname_ascii_mask: ascii_mask(&hostname),
+                    device_ascii_mask: ascii_mask(&device_id),
+                    user_ascii_mask: ascii_mask(&user_id),
+                    metadata_ascii_mask: ascii_mask(&cwd)
+                        | ascii_mask(&compact_cwd)
+                        | ascii_mask(&hostname)
+                        | ascii_mask(&device_id)
+                        | ascii_mask(&user_id),
+                    command,
+                    cwd,
+                    compact_cwd,
+                    hostname,
+                    device_id,
+                    user_id,
                     exit_code: entry.exit_code.to_string(),
                 },
                 cells: [
@@ -189,10 +289,11 @@ struct SearchTui<'a> {
     tty: Tty,
     last_rendered_lines: usize,
     deleted_entry_ids: HashSet<String>,
+    context: SearchContext,
 }
 
 impl<'a> SearchTui<'a> {
-    fn new(entries: &'a [Entry], rows: Vec<SearchRow>) -> Result<Self> {
+    fn new(entries: &'a [Entry], rows: Vec<SearchRow>, context: SearchContext) -> Result<Self> {
         let tty = Tty::open().context("open controlling terminal for search TUI")?;
         let mut tui = Self {
             entries,
@@ -208,6 +309,7 @@ impl<'a> SearchTui<'a> {
             tty,
             last_rendered_lines: 0,
             deleted_entry_ids: HashSet::new(),
+            context,
         };
         tui.refresh_matches(true);
         Ok(tui)
@@ -339,11 +441,12 @@ impl<'a> SearchTui<'a> {
 
     fn refresh_matches(&mut self, reset_cursor: bool) {
         let query = self.query_string();
-        self.filtered = filter_rows_excluding_deleted(
+        self.filtered = filter_rows_excluding_deleted_with_context(
             self.entries,
             &self.rows,
             &query,
             &self.deleted_entry_ids,
+            &self.context,
         );
         if reset_cursor {
             self.cursor = 0;
@@ -731,19 +834,34 @@ fn terminal_size(fd: RawFd) -> Option<(usize, usize)> {
     }
 }
 
+#[cfg(test)]
 fn filter_rows(rows: &[SearchRow], query: &str) -> Vec<usize> {
+    filter_rows_with_context(rows, query, &SearchContext::default())
+}
+
+fn filter_rows_with_context(
+    rows: &[SearchRow],
+    query: &str,
+    context: &SearchContext,
+) -> Vec<usize> {
     let terms = parse_search_terms(query);
     if terms.is_empty() {
         return (0..rows.len()).collect();
     }
+    let prepared_terms = prepare_search_terms(&terms);
+    let plain_phrase = plain_query_phrase(&terms);
+    let prepared_phrase = plain_phrase.as_deref().map(PreparedToken::new);
 
     let mut scored = rows
         .iter()
         .enumerate()
-        .filter_map(|(idx, row)| match_row_score(row, &terms).map(|score| (idx, score)))
+        .filter_map(|(idx, row)| {
+            match_row_score(row, &prepared_terms, prepared_phrase.as_ref(), context)
+                .map(|score| (idx, score))
+        })
         .collect::<Vec<_>>();
 
-    scored.sort_by(|(left_idx, left_score), (right_idx, right_score)| {
+    scored.sort_unstable_by(|(left_idx, left_score), (right_idx, right_score)| {
         right_score
             .cmp(left_score)
             .then_with(|| left_idx.cmp(right_idx))
@@ -751,13 +869,30 @@ fn filter_rows(rows: &[SearchRow], query: &str) -> Vec<usize> {
     scored.into_iter().map(|(idx, _)| idx).collect()
 }
 
+#[cfg(test)]
 fn filter_rows_excluding_deleted(
     entries: &[Entry],
     rows: &[SearchRow],
     query: &str,
     deleted_entry_ids: &HashSet<String>,
 ) -> Vec<usize> {
-    let mut filtered = filter_rows(rows, query);
+    filter_rows_excluding_deleted_with_context(
+        entries,
+        rows,
+        query,
+        deleted_entry_ids,
+        &SearchContext::default(),
+    )
+}
+
+fn filter_rows_excluding_deleted_with_context(
+    entries: &[Entry],
+    rows: &[SearchRow],
+    query: &str,
+    deleted_entry_ids: &HashSet<String>,
+    context: &SearchContext,
+) -> Vec<usize> {
+    let mut filtered = filter_rows_with_context(rows, query, context);
     if deleted_entry_ids.is_empty() {
         return filtered;
     }
@@ -823,10 +958,50 @@ fn normalize_query_token(token: &str) -> String {
     unescape_query(token).to_lowercase()
 }
 
-fn match_row_score(row: &SearchRow, terms: &[SearchTerm]) -> Option<usize> {
+fn prepare_search_terms(terms: &[SearchTerm]) -> Vec<PreparedSearchTerm<'_>> {
+    terms
+        .iter()
+        .map(|term| match &term.matcher {
+            SearchMatcher::Any(value) => PreparedSearchTerm {
+                negate: term.negate,
+                field: None,
+                token: PreparedToken::new(value),
+            },
+            SearchMatcher::Field { field, value } => PreparedSearchTerm {
+                negate: term.negate,
+                field: Some(*field),
+                token: PreparedToken::new(value),
+            },
+        })
+        .collect()
+}
+
+fn plain_query_phrase(terms: &[SearchTerm]) -> Option<String> {
+    let mut values = Vec::with_capacity(terms.len());
+    for term in terms {
+        if term.negate {
+            return None;
+        }
+        let SearchMatcher::Any(value) = &term.matcher else {
+            return None;
+        };
+        values.push(value.as_str());
+    }
+    (values.len() > 1).then(|| values.join(" "))
+}
+
+fn match_row_score(
+    row: &SearchRow,
+    terms: &[PreparedSearchTerm<'_>],
+    plain_phrase: Option<&PreparedToken<'_>>,
+    context: &SearchContext,
+) -> Option<usize> {
     let mut total = 0usize;
     for term in terms {
-        let score = matcher_score(row, &term.matcher);
+        let score = match term.field {
+            Some(field) => field_score(&row.search_fields, field, &term.token),
+            None => any_field_score(&row.search_fields, &term.token),
+        };
         if term.negate {
             if score > 0 {
                 return None;
@@ -837,42 +1012,84 @@ fn match_row_score(row: &SearchRow, terms: &[SearchTerm]) -> Option<usize> {
             total = total.saturating_add(score);
         }
     }
-    Some(total)
+    let phrase_bonus = plain_phrase
+        .and_then(|phrase| contiguous_match_score(&row.search_fields.command, phrase))
+        .unwrap_or(0);
+    Some(
+        total
+            .saturating_add(phrase_bonus)
+            .saturating_add(context_score(&row.search_fields, context)),
+    )
 }
 
-fn matcher_score(row: &SearchRow, matcher: &SearchMatcher) -> usize {
-    match matcher {
-        SearchMatcher::Any(token) => any_field_score(&row.search_fields, token),
-        SearchMatcher::Field { field, value } => field_score(&row.search_fields, *field, value),
+fn any_field_score(fields: &SearchFields, token: &PreparedToken<'_>) -> usize {
+    let command_score = if token.may_match_ascii_mask(fields.command_ascii_mask) {
+        text_match_score(&fields.command, token, COMMAND_FIELD_WEIGHT)
+    } else {
+        0
+    };
+    if command_score > 0 {
+        return command_score;
     }
-}
+    if !token.may_match_ascii_mask(fields.metadata_ascii_mask) {
+        return 0;
+    }
 
-fn any_field_score(fields: &SearchFields, token: &str) -> usize {
+    let compact_cwd_score = if token.may_match_ascii_mask(fields.compact_cwd_ascii_mask) {
+        text_match_score(&fields.compact_cwd, token, COMPACT_CWD_FIELD_WEIGHT)
+    } else {
+        0
+    };
+    let full_cwd_score = if token.may_match_ascii_mask(fields.cwd_ascii_mask) {
+        text_match_score(&fields.cwd, token, CWD_FIELD_WEIGHT)
+    } else {
+        0
+    };
+    let cwd_score = compact_cwd_score.max(full_cwd_score);
+    if cwd_score > HOSTNAME_FIELD_WEIGHT + MAX_TEXT_MATCH_QUALITY {
+        return cwd_score;
+    }
+
     [
-        text_match_score(&fields.command, token, 1000),
-        text_match_score(&fields.compact_cwd, token, 780),
-        text_match_score(&fields.cwd, token, 760),
-        text_match_score(&fields.hostname, token, 680),
-        text_match_score(&fields.device_id, token, 620),
-        text_match_score(&fields.user_id, token, 420),
+        cwd_score,
+        if token.may_match_ascii_mask(fields.hostname_ascii_mask) {
+            text_match_score(&fields.hostname, token, HOSTNAME_FIELD_WEIGHT)
+        } else {
+            0
+        },
+        if token.may_match_ascii_mask(fields.device_ascii_mask) {
+            text_match_score(&fields.device_id, token, DEVICE_FIELD_WEIGHT)
+        } else {
+            0
+        },
+        if token.may_match_ascii_mask(fields.user_ascii_mask) {
+            text_match_score(&fields.user_id, token, USER_FIELD_WEIGHT)
+        } else {
+            0
+        },
     ]
     .into_iter()
     .max()
     .unwrap_or(0)
 }
 
-fn field_score(fields: &SearchFields, field: SearchField, value: &str) -> usize {
+fn field_score(fields: &SearchFields, field: SearchField, token: &PreparedToken<'_>) -> usize {
     match field {
-        SearchField::Command => text_match_score(&fields.command, value, 1000),
-        SearchField::Cwd => text_match_score(&fields.cwd, value.trim_end_matches('/'), 1000).max(
-            text_match_score(&fields.compact_cwd, value.trim_end_matches('/'), 1000),
-        ),
-        SearchField::Hostname => text_match_score(&fields.hostname, value, 1000),
-        SearchField::User => text_match_score(&fields.user_id, value, 1000),
-        SearchField::Device => text_match_score(&fields.device_id, value, 1000),
+        SearchField::Command => text_match_score(&fields.command, token, EXPLICIT_FIELD_WEIGHT),
+        SearchField::Cwd => {
+            let trimmed = PreparedToken::new(token.value.trim_end_matches('/'));
+            text_match_score(&fields.cwd, &trimmed, EXPLICIT_FIELD_WEIGHT).max(text_match_score(
+                &fields.compact_cwd,
+                &trimmed,
+                EXPLICIT_FIELD_WEIGHT,
+            ))
+        }
+        SearchField::Hostname => text_match_score(&fields.hostname, token, EXPLICIT_FIELD_WEIGHT),
+        SearchField::User => text_match_score(&fields.user_id, token, EXPLICIT_FIELD_WEIGHT),
+        SearchField::Device => text_match_score(&fields.device_id, token, EXPLICIT_FIELD_WEIGHT),
         SearchField::ExitCode => {
-            if fields.exit_code == value.trim() {
-                1000
+            if fields.exit_code == token.value.trim() {
+                EXPLICIT_FIELD_WEIGHT
             } else {
                 0
             }
@@ -880,32 +1097,213 @@ fn field_score(fields: &SearchFields, field: SearchField, value: &str) -> usize 
     }
 }
 
-fn text_match_score(haystack: &str, token: &str, base: usize) -> usize {
-    if token.is_empty() {
+fn text_match_score(haystack: &str, token: &PreparedToken<'_>, base: usize) -> usize {
+    if token.value.is_empty() {
         return 0;
     }
-    if let Some(pos) = haystack.find(token) {
-        return base
-            .saturating_add(boundary_bonus(haystack, pos))
-            .saturating_add(token.chars().count().min(32) * 4)
-            .saturating_add(60usize.saturating_sub(pos.min(60)));
+
+    if let Some(score) = contiguous_match_score(haystack, token) {
+        return base.saturating_add(score);
     }
-    if token.chars().count() >= 3 && fuzzy_token_matches(haystack, token) {
-        return base / 3 + token.chars().count().min(32);
+
+    if let Some(score) = typo_match_score(haystack, token) {
+        return base.saturating_add(score);
+    }
+
+    if let Some(score) = fuzzy_token_score(haystack, token) {
+        return base.saturating_add(score);
     }
     0
 }
 
-fn boundary_bonus(haystack: &str, byte_pos: usize) -> usize {
-    if byte_pos == 0 {
-        return 80;
+fn contiguous_match_score(haystack: &str, token: &PreparedToken<'_>) -> Option<usize> {
+    let token_len = token.len();
+    let length_bonus = token_len.min(32) * 4;
+    let mut best = None;
+
+    for (byte_pos, _) in haystack.match_indices(token.value) {
+        let byte_end = byte_pos + token.value.len();
+        let starts_at_boundary = is_text_boundary_before(haystack, byte_pos);
+        let ends_at_boundary = is_text_boundary_after(haystack, byte_end);
+        let quality = if byte_pos == 0 && byte_end == haystack.len() {
+            1_800
+        } else if starts_at_boundary && ends_at_boundary {
+            1_500
+        } else if starts_at_boundary {
+            1_300
+        } else if ends_at_boundary {
+            1_050
+        } else {
+            900
+        };
+        let char_pos = haystack[..byte_pos].chars().count();
+        let score = quality + length_bonus + 80usize.saturating_sub(char_pos.min(80));
+        best = Some(best.map_or(score, |current: usize| current.max(score)));
     }
-    haystack[..byte_pos]
-        .chars()
-        .next_back()
-        .filter(|ch| !ch.is_alphanumeric())
-        .map(|_| 35)
-        .unwrap_or(0)
+
+    best
+}
+
+fn is_text_boundary_before(haystack: &str, byte_pos: usize) -> bool {
+    byte_pos == 0
+        || haystack[..byte_pos]
+            .chars()
+            .next_back()
+            .is_none_or(|ch| !ch.is_alphanumeric())
+}
+
+fn is_text_boundary_after(haystack: &str, byte_end: usize) -> bool {
+    byte_end == haystack.len()
+        || haystack[byte_end..]
+            .chars()
+            .next()
+            .is_none_or(|ch| !ch.is_alphanumeric())
+}
+
+fn typo_match_score(haystack: &str, token: &PreparedToken<'_>) -> Option<usize> {
+    let token_len = token.len();
+    if token_len < 4 || !token.all_alphanumeric {
+        return None;
+    }
+
+    haystack
+        .split(|ch: char| !ch.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .any(|word| edit_distance_at_most_one_chars(word, &token.chars))
+        .then(|| 650 + token_len.min(32) * 4)
+}
+
+fn edit_distance_at_most_one_chars(left: &str, right: &[char]) -> bool {
+    if left.chars().eq(right.iter().copied()) {
+        return true;
+    }
+    let left_len = left.chars().count();
+    let right_len = right.len();
+    if left_len.abs_diff(right_len) > 1 {
+        return false;
+    }
+
+    if left_len == right_len {
+        let mut first_mismatch = None;
+        let mut second_mismatch = None;
+        for (idx, (left_ch, right_ch)) in left.chars().zip(right.iter().copied()).enumerate() {
+            if left_ch == right_ch {
+                continue;
+            }
+            if first_mismatch.is_none() {
+                first_mismatch = Some((idx, left_ch, right_ch));
+            } else if second_mismatch.is_none() {
+                second_mismatch = Some((idx, left_ch, right_ch));
+            } else {
+                return false;
+            }
+        }
+        return match (first_mismatch, second_mismatch) {
+            (Some(_), None) => true,
+            (
+                Some((first_idx, first_left, first_right)),
+                Some((second_idx, second_left, second_right)),
+            ) => {
+                second_idx == first_idx + 1
+                    && first_left == second_right
+                    && second_left == first_right
+            }
+            _ => false,
+        };
+    }
+
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let (shorter, longer): (&[char], &[char]) = if left_len < right_len {
+        (&left_chars, right)
+    } else {
+        (right, &left_chars)
+    };
+    let mut shorter = shorter.iter().peekable();
+    let mut longer = longer.iter().peekable();
+    let mut skipped = false;
+    while let (Some(short_ch), Some(long_ch)) = (shorter.peek(), longer.peek()) {
+        if short_ch == long_ch {
+            shorter.next();
+            longer.next();
+        } else if skipped {
+            return false;
+        } else {
+            skipped = true;
+            longer.next();
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+fn edit_distance_at_most_one(left: &str, right: &str) -> bool {
+    edit_distance_at_most_one_chars(left, &right.chars().collect::<Vec<_>>())
+}
+
+fn fuzzy_token_score(haystack: &str, token: &PreparedToken<'_>) -> Option<usize> {
+    let token_len = token.len();
+    if token_len < 3 {
+        return None;
+    }
+    let first_token_char = *token.chars.first()?;
+
+    let mut best = None;
+    for (start_idx, (byte_pos, ch)) in haystack.char_indices().enumerate() {
+        if ch != first_token_char {
+            continue;
+        }
+
+        let mut token_idx = 1usize;
+        let mut end_idx = start_idx;
+        let rest = &haystack[byte_pos + ch.len_utf8()..];
+        for (offset, candidate) in rest.chars().enumerate() {
+            if token.chars.get(token_idx).copied() == Some(candidate) {
+                end_idx = start_idx + offset + 1;
+                token_idx += 1;
+                if token_idx == token_len {
+                    break;
+                }
+            }
+        }
+        if token_idx != token_len {
+            continue;
+        }
+
+        let span = end_idx.saturating_sub(start_idx) + 1;
+        let gaps = span.saturating_sub(token_len);
+        let boundary = if is_text_boundary_before(haystack, byte_pos) {
+            60
+        } else {
+            0
+        };
+        let compactness = 120usize.saturating_sub(gaps.min(24) * 5);
+        let position = 40usize.saturating_sub(start_idx.min(40));
+        let score = (250 + token_len.min(32) * 4 + boundary + compactness + position).min(590);
+        best = Some(best.map_or(score, |current: usize| current.max(score)));
+    }
+    best
+}
+
+fn context_score(fields: &SearchFields, context: &SearchContext) -> usize {
+    let cwd_score = context
+        .cwd
+        .as_ref()
+        .filter(|cwd| fields.cwd == cwd.as_str())
+        .map(|_| SAME_CWD_BOOST)
+        .unwrap_or(0);
+    let hostname_score = context
+        .hostname
+        .as_ref()
+        .filter(|hostname| fields.hostname == hostname.as_str())
+        .map(|_| SAME_HOSTNAME_BOOST)
+        .unwrap_or(0);
+    cwd_score + hostname_score
+}
+
+fn normalize_context_value(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| sanitize_one_line(&value).trim().to_lowercase())
+        .filter(|value| !value.is_empty())
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -1009,24 +1407,6 @@ fn selected_entry<'a>(
     let row_index = *filtered.get(cursor)?;
     let entry_index = rows.get(row_index)?.entry_index;
     entries.get(entry_index)
-}
-
-fn fuzzy_token_matches(haystack: &str, token: &str) -> bool {
-    if token.is_empty() || haystack.contains(token) {
-        return true;
-    }
-
-    let mut needle = token.chars();
-    let mut wanted = needle.next();
-    for ch in haystack.chars() {
-        if Some(ch) == wanted {
-            wanted = needle.next();
-            if wanted.is_none() {
-                return true;
-            }
-        }
-    }
-    wanted.is_none()
 }
 
 fn render_query(query: &[char], cursor: usize) -> String {
@@ -1396,6 +1776,370 @@ mod tests {
         }
     }
 
+    fn quality_entry(id: &str, hostname: &str, cwd: &str, cmd: &str) -> Entry {
+        let mut entry = entry(hostname, cwd, cmd);
+        entry.entry_id = id.to_string();
+        entry
+    }
+
+    struct SearchQualityCase {
+        name: &'static str,
+        query: &'static str,
+        context: SearchContext,
+        expected_id: String,
+        expected_command: String,
+        entries: Vec<Entry>,
+    }
+
+    fn search_quality_case(
+        name: &'static str,
+        query: &'static str,
+        context: SearchContext,
+        expected_id: &'static str,
+        candidates: &[(&str, &str, &str, &str)],
+    ) -> SearchQualityCase {
+        let expected_command = candidates
+            .iter()
+            .find(|(id, _, _, _)| *id == expected_id)
+            .map(|(_, _, _, cmd)| (*cmd).to_string())
+            .expect("quality case expected candidate must exist");
+        SearchQualityCase {
+            name,
+            query,
+            context,
+            expected_id: format!("{name}:{expected_id}"),
+            expected_command,
+            entries: candidates
+                .iter()
+                .map(|(id, hostname, cwd, cmd)| {
+                    quality_entry(&format!("{name}:{id}"), hostname, cwd, cmd)
+                })
+                .collect(),
+        }
+    }
+
+    fn search_quality_cases() -> Vec<SearchQualityCase> {
+        vec![
+            search_quality_case(
+                "exact command",
+                "git status",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/app", "git status --short"),
+                    ("noise-2", "workstation", "/work/app", "echo git status"),
+                    ("target", "workstation", "/work/app", "git status"),
+                ],
+            ),
+            search_quality_case(
+                "executable and subcommand prefixes",
+                "git reb",
+                SearchContext::default(),
+                "target",
+                &[
+                    (
+                        "noise-1",
+                        "workstation",
+                        "/work/app",
+                        "echo git repository backup",
+                    ),
+                    ("noise-2", "workstation", "/work/app", "rg rebase git-notes"),
+                    (
+                        "target",
+                        "workstation",
+                        "/work/app",
+                        "git rebase --continue",
+                    ),
+                ],
+            ),
+            search_quality_case(
+                "out of order plain tokens",
+                "workspace cargo test",
+                SearchContext::default(),
+                "target",
+                &[
+                    (
+                        "noise-1",
+                        "workstation",
+                        "/work/app",
+                        "echo workspace cargo build",
+                    ),
+                    (
+                        "noise-2",
+                        "workstation",
+                        "/work/app",
+                        "cargo metadata --workspace",
+                    ),
+                    (
+                        "target",
+                        "workstation",
+                        "/work/app",
+                        "cargo test --workspace",
+                    ),
+                ],
+            ),
+            search_quality_case(
+                "adjacent transposition typo",
+                "kubetcl get pods",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/app", "echo get pods"),
+                    (
+                        "noise-2",
+                        "workstation",
+                        "/work/app",
+                        "kubectl describe pod",
+                    ),
+                    ("target", "workstation", "/work/app", "kubectl get pods"),
+                ],
+            ),
+            search_quality_case(
+                "inserted character typo",
+                "carggo test",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/app", "go test ./..."),
+                    ("noise-2", "workstation", "/work/app", "cargo build"),
+                    (
+                        "target",
+                        "workstation",
+                        "/work/app",
+                        "cargo test --workspace",
+                    ),
+                ],
+            ),
+            search_quality_case(
+                "deleted character typo",
+                "pythn manage",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/app", "manage service"),
+                    ("noise-2", "workstation", "/work/app", "python -m pytest"),
+                    (
+                        "target",
+                        "workstation",
+                        "/work/app",
+                        "python manage.py runserver",
+                    ),
+                ],
+            ),
+            search_quality_case(
+                "compact fuzzy token",
+                "dcmp",
+                SearchContext::default(),
+                "target",
+                &[
+                    (
+                        "noise-1",
+                        "workstation",
+                        "/work/app",
+                        "deploy cluster migration plan",
+                    ),
+                    ("noise-2", "workstation", "/work/app", "docker build"),
+                    ("target", "workstation", "/work/app", "docker compose ps"),
+                ],
+            ),
+            search_quality_case(
+                "command before metadata",
+                "docker",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "docker-host", "/work/app", "echo ready"),
+                    ("noise-2", "workstation", "/work/docker", "ls -lah"),
+                    ("target", "workstation", "/work/app", "docker build"),
+                ],
+            ),
+            search_quality_case(
+                "current cwd tie break",
+                "cargo test",
+                SearchContext::new(Some("/work/current".to_string()), None),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/other", "cargo test"),
+                    ("target", "workstation", "/work/current", "cargo test"),
+                    ("noise-2", "workstation", "/work/third", "cargo test"),
+                ],
+            ),
+            search_quality_case(
+                "current host tie break",
+                "rr sync-status",
+                SearchContext::new(None, Some("current-host".to_string())),
+                "target",
+                &[
+                    ("noise-1", "other-host", "/work/app", "rr sync-status"),
+                    ("target", "current-host", "/work/app", "rr sync-status"),
+                    ("noise-2", "third-host", "/work/app", "rr sync-status"),
+                ],
+            ),
+            search_quality_case(
+                "exact phrase before contextual wrapper",
+                "kubectl get pods",
+                SearchContext::new(Some("/work/current".to_string()), None),
+                "target",
+                &[
+                    (
+                        "noise-1",
+                        "workstation",
+                        "/work/current",
+                        "echo kubectl get pods",
+                    ),
+                    ("target", "workstation", "/work/other", "kubectl get pods"),
+                    (
+                        "noise-2",
+                        "workstation",
+                        "/work/current",
+                        "kubectl get pods --all-namespaces",
+                    ),
+                ],
+            ),
+            search_quality_case(
+                "plain tokens across command and cwd",
+                "rustory test",
+                SearchContext::default(),
+                "target",
+                &[
+                    (
+                        "noise-1",
+                        "workstation",
+                        "/work/other",
+                        "echo rustory notes",
+                    ),
+                    ("noise-2", "workstation", "/work/rustory", "cargo build"),
+                    ("target", "workstation", "/work/rustory", "cargo test"),
+                ],
+            ),
+            search_quality_case(
+                "unicode plain tokens",
+                "배포 상태",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/app", "echo 배포"),
+                    ("noise-2", "workstation", "/work/app", "상태 확인"),
+                    ("target", "workstation", "/work/app", "rr 배포 상태 확인"),
+                ],
+            ),
+            search_quality_case(
+                "whole token before internal substring",
+                "release",
+                SearchContext::default(),
+                "target",
+                &[
+                    (
+                        "noise-1",
+                        "workstation",
+                        "/work/app",
+                        "echo prerelease-ready",
+                    ),
+                    ("target", "workstation", "/work/app", "release --dry-run"),
+                    ("noise-2", "workstation", "/work/app", "echo release notes"),
+                ],
+            ),
+            search_quality_case(
+                "recency for equal relevance",
+                "just check",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("target", "workstation", "/work/app", "just check"),
+                    ("noise-1", "workstation", "/work/app", "just check"),
+                    ("noise-2", "workstation", "/work/app", "just check"),
+                ],
+            ),
+            search_quality_case(
+                "shell flag as plain token",
+                "workspace test",
+                SearchContext::default(),
+                "target",
+                &[
+                    ("noise-1", "workstation", "/work/app", "cargo test"),
+                    (
+                        "noise-2",
+                        "workstation",
+                        "/work/app",
+                        "cargo metadata --workspace",
+                    ),
+                    (
+                        "target",
+                        "workstation",
+                        "/work/app",
+                        "cargo test --workspace",
+                    ),
+                ],
+            ),
+        ]
+    }
+
+    fn expected_rank_in_entries(
+        case: &SearchQualityCase,
+        entries: &[Entry],
+        query: &str,
+    ) -> Option<usize> {
+        let rows = build_search_rows(entries);
+        filter_rows_with_context(&rows, query, &case.context)
+            .iter()
+            .position(|row_index| {
+                rows.get(*row_index)
+                    .and_then(|row| entries.get(row.entry_index))
+                    .is_some_and(|entry| entry.entry_id == case.expected_id)
+            })
+            .map(|rank| rank + 1)
+    }
+
+    fn expected_rank(case: &SearchQualityCase, query: &str) -> Option<usize> {
+        expected_rank_in_entries(case, &case.entries, query)
+    }
+
+    fn expected_command_rank_in_entries(
+        case: &SearchQualityCase,
+        entries: &[Entry],
+        query: &str,
+    ) -> Option<usize> {
+        let rows = build_search_rows(entries);
+        filter_rows_with_context(&rows, query, &case.context)
+            .iter()
+            .position(|row_index| {
+                rows.get(*row_index)
+                    .and_then(|row| entries.get(row.entry_index))
+                    .is_some_and(|entry| entry.cmd == case.expected_command)
+            })
+            .map(|rank| rank + 1)
+    }
+
+    fn top_entry_ids(case: &SearchQualityCase, entries: &[Entry], query: &str) -> Vec<String> {
+        let rows = build_search_rows(entries);
+        filter_rows_with_context(&rows, query, &case.context)
+            .into_iter()
+            .take(3)
+            .filter_map(|row_index| {
+                rows.get(row_index)
+                    .and_then(|row| entries.get(row.entry_index))
+                    .map(|entry| entry.entry_id.clone())
+            })
+            .collect()
+    }
+
+    fn keystrokes_to_rank(
+        case: &SearchQualityCase,
+        entries: &[Entry],
+        target_rank: usize,
+    ) -> usize {
+        let query_chars = case.query.chars().collect::<Vec<_>>();
+        for count in 1..=query_chars.len() {
+            let prefix = query_chars[..count].iter().collect::<String>();
+            if expected_command_rank_in_entries(case, entries, &prefix)
+                .is_some_and(|rank| rank <= target_rank)
+            {
+                return count;
+            }
+        }
+        query_chars.len() + 1
+    }
+
     #[test]
     fn sanitize_one_line_replaces_control_separators() {
         assert_eq!(sanitize_one_line("a\nb\rc\td"), "a b c d");
@@ -1496,6 +2240,161 @@ mod tests {
         let matches = filter_rows(&rows, "docker");
 
         assert_eq!(matches, vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn search_quality_corpus_meets_targets() {
+        let cases = search_quality_cases();
+        let corpus = cases
+            .iter()
+            .flat_map(|case| case.entries.iter().cloned())
+            .collect::<Vec<_>>();
+        let mut hit_at_one = 0usize;
+        let mut hit_at_three = 0usize;
+        let mut reciprocal_rank_sum = 0.0f64;
+        let mut top_one_misses = Vec::new();
+        let mut top_three_misses = Vec::new();
+        let mut top_one_keystrokes = Vec::new();
+        let mut top_three_keystrokes = Vec::new();
+
+        for case in &cases {
+            let rank = expected_command_rank_in_entries(case, &corpus, case.query);
+            if rank == Some(1) {
+                hit_at_one += 1;
+            } else {
+                top_one_misses.push((case.name, rank, top_entry_ids(case, &corpus, case.query)));
+            }
+            if rank.is_some_and(|rank| rank <= 3) {
+                hit_at_three += 1;
+            } else {
+                top_three_misses.push((case.name, rank));
+            }
+            if let Some(rank) = rank {
+                reciprocal_rank_sum += 1.0 / rank as f64;
+            }
+            top_one_keystrokes.push(keystrokes_to_rank(case, &corpus, 1));
+            top_three_keystrokes.push(keystrokes_to_rank(case, &corpus, 3));
+        }
+
+        top_one_keystrokes.sort_unstable();
+        top_three_keystrokes.sort_unstable();
+        let median_top_one_keystrokes = top_one_keystrokes[top_one_keystrokes.len() / 2];
+        let median_top_three_keystrokes = top_three_keystrokes[top_three_keystrokes.len() / 2];
+        let mrr = reciprocal_rank_sum / cases.len() as f64;
+        eprintln!(
+            "search_quality cases={} hit_at_1={} hit_at_3={} mrr={mrr:.3} median_top1_keystrokes={median_top_one_keystrokes} median_top3_keystrokes={median_top_three_keystrokes}",
+            cases.len(),
+            hit_at_one,
+            hit_at_three
+        );
+        assert!(
+            hit_at_one * 100 >= cases.len() * 75,
+            "Hit@1 target missed: {hit_at_one}/{}; misses={top_one_misses:?}",
+            cases.len()
+        );
+        assert!(
+            hit_at_three * 100 >= cases.len() * 90,
+            "Hit@3 target missed: {hit_at_three}/{}; misses={top_three_misses:?}",
+            cases.len()
+        );
+        assert!(mrr >= 0.80, "MRR target missed: {mrr:.3}");
+        assert!(
+            median_top_one_keystrokes <= 6,
+            "median Top-1 keystrokes target missed: {median_top_one_keystrokes}; all={top_one_keystrokes:?}"
+        );
+        assert!(
+            median_top_three_keystrokes <= 5,
+            "median Top-3 keystrokes target missed: {median_top_three_keystrokes}; all={top_three_keystrokes:?}"
+        );
+    }
+
+    #[test]
+    fn typo_match_handles_single_edit_and_transposition() {
+        assert!(edit_distance_at_most_one("kubectl", "kubetcl"));
+        assert!(edit_distance_at_most_one("kubectl", "kubactl"));
+        assert!(edit_distance_at_most_one("cargo", "carggo"));
+        assert!(edit_distance_at_most_one("python", "pythn"));
+        assert!(!edit_distance_at_most_one("kubectl", "kubeadm"));
+    }
+
+    #[test]
+    fn current_context_breaks_ties_without_overriding_phrase_quality() {
+        let cwd_case = &search_quality_cases()[8];
+        assert_eq!(expected_rank(cwd_case, cwd_case.query), Some(1));
+
+        let phrase_case = &search_quality_cases()[10];
+        assert_eq!(expected_rank(phrase_case, phrase_case.query), Some(1));
+    }
+
+    #[test]
+    #[ignore = "release-mode 100k-row latency budget"]
+    fn search_quality_benchmark_100k_rows() {
+        let entries = (0..100_000)
+            .map(|idx| {
+                quality_entry(
+                    &format!("entry-{idx}"),
+                    if idx % 5 == 0 { "node-a" } else { "node-b" },
+                    &format!("/work/project-{}", idx % 200),
+                    match idx % 5 {
+                        0 => "cargo test --workspace",
+                        1 => "docker compose ps",
+                        2 => "kubectl get pods --all-namespaces",
+                        3 => "git rebase --continue",
+                        _ => "python manage.py runserver",
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let rows = build_search_rows(&entries);
+        let context = SearchContext::new(
+            Some("/work/project-42".to_string()),
+            Some("node-a".to_string()),
+        );
+        let queries = [
+            "cargo test",
+            "docker comp",
+            "kubetcl pods",
+            "git reb",
+            "project-42",
+        ];
+
+        for query in queries {
+            std::hint::black_box(filter_rows_with_context(&rows, query, &context));
+        }
+
+        let mut samples = Vec::new();
+        let mut per_query = vec![Vec::new(); queries.len()];
+        for _ in 0..5 {
+            for (query_idx, query) in queries.iter().enumerate() {
+                let started = std::time::Instant::now();
+                let matches = filter_rows_with_context(&rows, query, &context);
+                std::hint::black_box(matches.len());
+                let elapsed = started.elapsed();
+                samples.push(elapsed);
+                per_query[query_idx].push(elapsed);
+            }
+        }
+        for (query, query_samples) in queries.iter().zip(per_query.iter_mut()) {
+            query_samples.sort_unstable();
+            let query_p95 = query_samples[query_samples.len() - 1];
+            eprintln!(
+                "search_quality_benchmark query={query:?} p95_ms={:.2}",
+                query_p95.as_secs_f64() * 1000.0
+            );
+        }
+        samples.sort_unstable();
+        let p95_index = (samples.len() * 95).div_ceil(100).saturating_sub(1);
+        let p95 = samples[p95_index];
+        eprintln!(
+            "search_quality_benchmark rows={} samples={} p95_ms={:.2}",
+            rows.len(),
+            samples.len(),
+            p95.as_secs_f64() * 1000.0
+        );
+        assert!(
+            p95 <= Duration::from_millis(50),
+            "100k-row p95 latency budget exceeded: {p95:?}"
+        );
     }
 
     #[test]

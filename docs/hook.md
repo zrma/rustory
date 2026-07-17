@@ -72,7 +72,11 @@ auto_tombstone_gc_marker_path = "~/.config/rustory/auto-tombstone-gc.last"
 - 업로드(선택): `RUSTORY_ASYNC_UPLOAD=1`이면 `rr record`가 주기 제한(`RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC`)을 적용해 백그라운드 push를 트리거한다.
 - 보관(선택): `RUSTORY_AUTO_PRUNE=1`이면 `rr record`가 주기 제한(`RUSTORY_AUTO_PRUNE_INTERVAL_SEC`)을 적용해 오래된 로컬 엔트리를 정리하고, 필요 시 최신 N개(`RUSTORY_AUTO_PRUNE_KEEP_RECENT`)를 보존한다.
 - tombstone GC(선택): `RUSTORY_AUTO_TOMBSTONE_GC=1`이면 `rr record`가 주기 제한(`RUSTORY_AUTO_TOMBSTONE_GC_INTERVAL_SEC`)을 적용해 오래되고 알려진 peer로 delete cursor가 전파된 삭제 tombstone만 정리한다.
-- 검색: `ctrl+r`에서 `rr search` inline TUI로 선택한 커맨드를 현재 입력 버퍼에 삽입한다. 검색 UI는 alt-screen/fullscreen을 쓰지 않고 현재 화면 아래에 compact table을 그리며, hostname, CWD, timestamp, runtime, exit code, command를 표시한다. 쿼리는 Hishtory처럼 일반 토큰을 command/CWD/hostname/device/user에서 AND로 찾고, `cwd:/tmp`, `hostname:node0`, `command:"docker run"`, `exit_code:127`, `-token` 같은 필드/제외 검색을 지원한다. 일반 토큰은 command match를 가장 우선하고 CWD, hostname/device 순으로 ranking하며, `smp pro doc`처럼 sparse token이 hostname/CWD/command에 흩어진 경우도 검색 후보를 좁힐 수 있다. command가 길어 화면에서 잘리면 `shift+left` / `shift+right`로 table viewport를 좌우 이동한다. 선택 row는 `ctrl+k`로 로컬 DB에서 삭제할 수 있으며, 이 경우 셸 입력 버퍼에는 아무 텍스트도 삽입하지 않는다. limit 해석 순서는 `rr doctor`와 관련 resolver 코드를 확인한다.
+- 검색: `ctrl+r`에서 `rr search` inline TUI로 선택한 커맨드를 현재 입력 버퍼에 삽입한다. 검색 UI는 alt-screen/fullscreen을 쓰지 않고 현재 화면 아래에 compact table을 그리며, hostname, CWD, timestamp, runtime, exit code, command를 표시한다.
+  - 기본 사용법은 기억나는 command, subcommand, flag, 경로 일부를 공백으로 구분해 그대로 입력하는 것이다. 별도 검색식을 배울 필요가 없다.
+  - 일반 토큰은 command match를 가장 우선하고, exact phrase, 단어 전체, 단어 prefix, substring, 한 글자 오타, compact fuzzy 순으로 ranking한다. 동률에 가까운 결과에서는 현재 CWD와 hostname을 보조 신호로 사용하고 최신 기록을 우선한다.
+  - 토큰은 command/CWD/hostname/device/user에 흩어져 있어도 AND 조건으로 후보를 좁힐 수 있다. 기존 `cwd:/tmp`, `hostname:node0`, `command:"docker run"`, `exit_code:127`, `-token` 문법은 고급 호환 기능으로 유지한다.
+  - command가 길어 화면에서 잘리면 `shift+left` / `shift+right`로 table viewport를 좌우 이동한다. 선택 row는 `ctrl+k`로 로컬 DB에서 삭제할 수 있으며, 이 경우 셸 입력 버퍼에는 아무 텍스트도 삽입하지 않는다. limit 해석 순서는 `rr doctor`와 관련 resolver 코드를 확인한다.
 
 ### duration_ms(소요 시간)
 - zsh: `EPOCHREALTIME` 기반으로 `duration_ms`를 기록한다.

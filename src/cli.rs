@@ -1300,7 +1300,13 @@ pub fn run() -> Result<()> {
             let entries = store.list_recent(limit)?;
             let user_id = resolve_user_id(&cfg);
             let device_id = resolve_device_id(&cfg);
-            match search::select_action(&entries, |entry_id| {
+            let search_context = search::SearchContext::new(
+                std::env::current_dir()
+                    .ok()
+                    .map(|path| path.to_string_lossy().into_owned()),
+                resolve_hostname(),
+            );
+            match search::select_action(&entries, search_context, |entry_id| {
                 store.tombstone_entries_by_ids(
                     &[entry_id.to_string()],
                     &user_id,

@@ -52,6 +52,12 @@ unit 테스트가 아니라도 된다. 다음 중 하나면 된다.
 - Restart: 파일 기반 상태(identity/키/설정) 저장/복구
 - E2E smoke: (가능하면) tracker + relay + 2 peer를 띄워 실제 동기화/폴백/업그레이드 관측
 
+### Ctrl+R 검색 품질 게이트
+
+- ranking 변경은 private shell history를 fixture로 복사하지 않고 source의 synthetic corpus로 Hit@1, Hit@3, MRR, Top-3 도달 입력 수를 검증한다.
+- 일반 검색 시나리오는 field query 없이 통과해야 하며, 기존 field/negation/quote 문법은 호환 회귀로 별도 확인한다.
+- 10만 건 hot path 예산은 release mode의 ignored benchmark로 확인한다. 검증 명령과 현재 예산은 검색 테스트 이름과 활성 `docs/todo-*` spec을 기준으로 한다.
+
 ## Definition of Done (네트워크/동기화 계열 기준)
 - 표준 로컬 검증 진입점은 `scripts/check.sh`다.
 - 현재 검증 명령 선언은 `docs/REPO_MANIFEST.yaml`에서 확인한다.
