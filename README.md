@@ -1,8 +1,19 @@
 # Rustory
 
-Rustory는 `rr` 하나로 쓰는 local-first 셸 히스토리 도구다. Hishtory처럼 가볍게
-`Ctrl-R`로 검색하면서도, 서로 다른 WiFi/NAT/router 뒤에 있는 머신들이 tracker +
-relay 기반 P2P grid로 동기화되는 daily-driver 환경을 목표로 한다.
+<p align="center">
+  <img src="docs/assets/rustory-mark.svg" width="360" alt="두 개의 양피지 기록이 붉은 실로 연결된 Rustory 로고">
+</p>
+
+<p align="center">
+  <strong>기록은 로컬에, 히스토리는 P2P로 이어지게.</strong>
+</p>
+
+Rustory는 `rr` 하나로 기록하고, `Ctrl-R`로 다시 찾고, 여러 디바이스와 동기화하는
+local-first 셸 히스토리 도구다.
+
+- **Local-first** — 각 명령은 디바이스의 SQLite DB에 먼저 기록된다.
+- **Fast recall** — 익숙한 `Ctrl-R` 흐름에서 필요한 히스토리를 빠르게 찾는다.
+- **P2P grid** — 서로 다른 WiFi/NAT/router 뒤의 머신도 tracker와 relay를 통해 이어진다.
 
 이 README는 긴 운영 런북이 아니라 프로젝트의 공개 얼굴과 handoff index다. 실제 옵션,
 default, 데이터 구조, 실행 분기는 `src/*`, `scripts/*`, `Cargo.toml`,
