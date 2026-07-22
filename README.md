@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <strong>기록은 로컬에, 히스토리는 P2P로 이어지게.</strong>
+  <strong>로컬에 남기고, P2P로 잇는다.</strong>
 </p>
 
 Rustory는 `rr` 하나로 기록하고, `Ctrl-R`로 다시 찾고, 여러 디바이스와 동기화하는
