@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-22
+- Last Verified: 2026-07-23
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-07-23 | `todo-readme-tagline-copy`에서 로고 아래 문구의 의미와 운율을 다듬음 | 짧은 태그라인은 유사어를 나란히 두기보다 제품의 두 축을 대구로 대비해야 기억하기 쉽다. Rustory에서는 local-first 저장을 `남기고`, P2P 연결을 `잇는다`로 대응시키면 의미와 리듬이 함께 선명해진다. | README 태그라인을 `로컬에 남기고, P2P로 잇는다.`로 교체했다. | `scripts/check-readme-policy.sh`, `scripts/check-doc-links.sh`, repository publication boundary, full release gate |
 | 2026-07-22 | `todo-readme-brand-mark`에서 승인된 래스터 시안을 README용 SVG로 옮김 | 승인된 시안을 단순 도형으로 재해석하면 비율·곡선·음영·매듭이 열화된다. 원본의 세부를 보존하는 저장소 소유 벡터 경로로 옮기고 원본 크기와 실제 표시 크기에서 나란히 검증해야 한다. | 두 기록과 세 연결 매듭을 고밀도 SVG 경로로 보존하고 README 상단에는 로고·짧은 가치 문장·핵심 특성만 추가해 랜딩 페이지 역할을 유지했다. | `xmllint --noout docs/assets/rustory-mark.svg`, 360px 원본 대조 렌더링, `scripts/check-readme-policy.sh`, `scripts/check-doc-links.sh`, full release gate |
 | 2026-07-17 | `todo-search-quality-ranking`에서 query마다 소수 후보만 둔 초기 평가가 Hit@3와 입력 글자 수를 과대평가함 | 검색 relevance 평가는 query별 격리 목록이 아니라 모든 distractor가 섞인 공용 corpus에서 실행하고, 동일 command의 중복 이력은 같은 정답으로 판정해야 실제 Ctrl+R 선택 품질에 가깝다. | 48개 후보와 16개 query를 하나의 synthetic corpus로 평가하고, Hit@1/Hit@3/MRR/도달 글자 수와 10만 건 p95 성능 예산을 회귀 테스트로 고정했다. | `cargo test search::tests::search_quality_corpus_meets_targets -- --nocapture`, `cargo test --release search_quality_benchmark_100k_rows -- --ignored --nocapture`, full release gate |
 | 2026-07-15 | Docker acceptance의 호스트 peer가 기존 사용자 config의 보안 설정을 상속해 격리된 loopback fixture 등록 전에 종료됨 | end-to-end acceptance는 DB와 endpoint만 격리해서는 부족하며, CLI가 읽는 config/home 경계도 테스트 전용 디렉터리로 격리해야 운영자 설정에 따라 결과가 달라지지 않는다. | macOS host peer의 `record`, `p2p-serve`, `p2p-sync` 실행에 acceptance-owned `HOME`을 적용해 제품의 HTTPS 보안 가드는 유지하면서 호스트 config 의존성을 제거했다. | `bash scripts/acceptance_docker_macos_linux.sh`, `scripts/check.sh --acceptance` |
