@@ -2280,7 +2280,7 @@ dependencies = [
 
 [[package]]
 name = "rustory"
-version = "1.0.59"
+version = "1.0.60"
 dependencies = [
  "anyhow",
  "async-trait",
