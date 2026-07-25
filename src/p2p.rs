@@ -1411,6 +1411,15 @@ struct SyncTarget {
     relay_addr: Option<Multiaddr>,
 }
 
+#[derive(Clone, Copy)]
+struct SyncTargetParams<'a> {
+    store: &'a LocalStore,
+    cfg: &'a SyncConfig,
+    limit: usize,
+    push: bool,
+    push_device_id: Option<&'a str>,
+}
+
 async fn sync_async(
     peers: &[String],
     limit: usize,
@@ -1448,121 +1457,31 @@ async fn sync_async(
 
     let mut progress = crate::sync::SyncRunProgress::new();
     let mut last_err: Option<anyhow::Error> = None;
+    let peer_sync_timeout = cfg.request_retry_policy.timeout_cap;
     for t in targets {
-        if let Err(err) = authorize_outbound_peer(&store, &cfg, &t.peer_key) {
+        let peer_key = t.peer_key.clone();
+        if tokio::time::timeout(
+            peer_sync_timeout,
+            sync_target_async(
+                SyncTargetParams {
+                    store: &store,
+                    cfg: &cfg,
+                    limit,
+                    push,
+                    push_device_id,
+                },
+                t,
+                &mut progress,
+                &mut last_err,
+            ),
+        )
+        .await
+        .is_err()
+        {
+            let err = anyhow::anyhow!("p2p peer sync timeout after {peer_sync_timeout:?}");
             progress.mark_required_action_failed();
-            eprintln!(
-                "warn: p2p target rejected by membership policy: {}: {err:#}",
-                t.peer_key
-            );
+            log_p2p_sync_failure("sync", &peer_key, &err);
             last_err = Some(err);
-            continue;
-        }
-        let mut client = match P2pClient::new(
-            t.peer_id,
-            t.dial_addrs,
-            t.relay_addr,
-            cfg.identity.clone(),
-            cfg.psk,
-            cfg.request_retry_policy.clone(),
-        ) {
-            Ok(v) => v,
-            Err(err) => {
-                progress.mark_required_action_failed();
-                eprintln!("warn: p2p client init failed: {}: {err:#}", t.peer_key);
-                last_err = Some(err);
-                continue;
-            }
-        };
-
-        let pull_res =
-            crate::sync::sync_pull_from_peer_async(&store, &t.peer_key, limit, &mut client)
-                .await
-                .with_context(|| format!("p2p pull peer: {}", t.peer_key));
-
-        match pull_res {
-            Ok(stats) => {
-                progress.mark_pull_ok();
-                if stats.received > 0
-                    || stats.inserted > 0
-                    || stats.deletion_received > 0
-                    || stats.deletion_deleted > 0
-                {
-                    eprintln!(
-                        "p2p pull summary: {}: received={} inserted={} ignored={} deletions_received={} deletions_deleted={}",
-                        t.peer_key,
-                        stats.received,
-                        stats.inserted,
-                        stats.ignored,
-                        stats.deletion_received,
-                        stats.deletion_deleted
-                    );
-                }
-            }
-            Err(err) => {
-                progress.mark_required_action_failed();
-                log_p2p_sync_failure("pull", &t.peer_key, &err);
-                last_err = Some(err);
-            }
-        }
-
-        if push {
-            let _pending_push = match store.count_pending_push_items(&t.peer_key, push_device_id) {
-                Ok(count) => count,
-                Err(err) => {
-                    progress.mark_required_action_failed();
-                    eprintln!("warn: p2p push preflight failed: {}: {err:#}", t.peer_key);
-                    last_err = Some(err);
-                    continue;
-                }
-            };
-            client.reset_push_ack_stats();
-
-            let push_res = crate::sync::sync_push_to_peer_async(
-                &store,
-                &t.peer_key,
-                limit,
-                push_device_id,
-                &mut client,
-            )
-            .await
-            .with_context(|| format!("p2p push peer: {}", t.peer_key));
-
-            match push_res {
-                Ok(pushed) => {
-                    if let Some(stats) = client.take_push_ack_stats() {
-                        eprintln!(
-                            "p2p push summary: {}: sent={pushed} inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
-                            t.peer_key,
-                            stats.total_inserted(),
-                            stats.total_ignored(),
-                            stats.entry_inserted,
-                            stats.entry_ignored,
-                            stats.deletion_inserted,
-                            stats.deletion_ignored,
-                            stats.deletion_deleted,
-                        );
-                    }
-                }
-                Err(err) => {
-                    progress.mark_required_action_failed();
-                    if let Some(stats) = client.take_push_ack_stats() {
-                        eprintln!(
-                            "warn: p2p push partial: {}: inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
-                            t.peer_key,
-                            stats.total_inserted(),
-                            stats.total_ignored(),
-                            stats.entry_inserted,
-                            stats.entry_ignored,
-                            stats.deletion_inserted,
-                            stats.deletion_ignored,
-                            stats.deletion_deleted,
-                        );
-                    }
-                    log_p2p_sync_failure("push", &t.peer_key, &err);
-                    last_err = Some(err);
-                }
-            }
         }
     }
 
@@ -1570,6 +1489,139 @@ async fn sync_async(
         Ok(())
     } else {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p sync failed")))
+    }
+}
+
+async fn sync_target_async(
+    params: SyncTargetParams<'_>,
+    target: SyncTarget,
+    progress: &mut crate::sync::SyncRunProgress,
+    last_err: &mut Option<anyhow::Error>,
+) {
+    if let Err(err) = authorize_outbound_peer(params.store, params.cfg, &target.peer_key) {
+        progress.mark_required_action_failed();
+        eprintln!(
+            "warn: p2p target rejected by membership policy: {}: {err:#}",
+            target.peer_key
+        );
+        *last_err = Some(err);
+        return;
+    }
+    let mut client = match P2pClient::new(
+        target.peer_id,
+        target.dial_addrs,
+        target.relay_addr,
+        params.cfg.identity.clone(),
+        params.cfg.psk,
+        params.cfg.request_retry_policy.clone(),
+    ) {
+        Ok(v) => v,
+        Err(err) => {
+            progress.mark_required_action_failed();
+            eprintln!("warn: p2p client init failed: {}: {err:#}", target.peer_key);
+            *last_err = Some(err);
+            return;
+        }
+    };
+
+    let pull_res = crate::sync::sync_pull_from_peer_async(
+        params.store,
+        &target.peer_key,
+        params.limit,
+        &mut client,
+    )
+    .await
+    .with_context(|| format!("p2p pull peer: {}", target.peer_key));
+
+    match pull_res {
+        Ok(stats) => {
+            progress.mark_pull_ok();
+            if stats.received > 0
+                || stats.inserted > 0
+                || stats.deletion_received > 0
+                || stats.deletion_deleted > 0
+            {
+                eprintln!(
+                    "p2p pull summary: {}: received={} inserted={} ignored={} deletions_received={} deletions_deleted={}",
+                    target.peer_key,
+                    stats.received,
+                    stats.inserted,
+                    stats.ignored,
+                    stats.deletion_received,
+                    stats.deletion_deleted
+                );
+            }
+        }
+        Err(err) => {
+            progress.mark_required_action_failed();
+            log_p2p_sync_failure("pull", &target.peer_key, &err);
+            *last_err = Some(err);
+            return;
+        }
+    }
+
+    if !params.push {
+        return;
+    }
+
+    if let Err(err) = params
+        .store
+        .count_pending_push_items(&target.peer_key, params.push_device_id)
+    {
+        progress.mark_required_action_failed();
+        eprintln!(
+            "warn: p2p push preflight failed: {}: {err:#}",
+            target.peer_key
+        );
+        *last_err = Some(err);
+        return;
+    }
+    client.reset_push_ack_stats();
+
+    let push_res = crate::sync::sync_push_to_peer_async(
+        params.store,
+        &target.peer_key,
+        params.limit,
+        params.push_device_id,
+        &mut client,
+    )
+    .await
+    .with_context(|| format!("p2p push peer: {}", target.peer_key));
+
+    match push_res {
+        Ok(pushed) => {
+            if let Some(stats) = client.take_push_ack_stats() {
+                eprintln!(
+                    "p2p push summary: {}: sent={pushed} inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
+                    target.peer_key,
+                    stats.total_inserted(),
+                    stats.total_ignored(),
+                    stats.entry_inserted,
+                    stats.entry_ignored,
+                    stats.deletion_inserted,
+                    stats.deletion_ignored,
+                    stats.deletion_deleted,
+                );
+            }
+        }
+        Err(err) => {
+            progress.mark_required_action_failed();
+            if let Some(stats) = client.take_push_ack_stats() {
+                eprintln!(
+                    "warn: p2p push partial: {}: inserted={} ignored={} entry_inserted={} entry_ignored={} deletion_inserted={} deletion_ignored={} deletion_deleted={}",
+                    target.peer_key,
+                    stats.total_inserted(),
+                    stats.total_ignored(),
+                    stats.entry_inserted,
+                    stats.entry_ignored,
+                    stats.deletion_inserted,
+                    stats.deletion_ignored,
+                    stats.deletion_deleted,
+                );
+            }
+            log_p2p_sync_failure("push", &target.peer_key, &err);
+            *last_err = Some(err);
+        }
     }
 }
 
@@ -2707,9 +2759,12 @@ fn is_retryable_p2p_request_error(err: &anyhow::Error) -> bool {
     // request-response 자체를 `tokio::select!`로 타임아웃 처리할 때는 anyhow string-only 에러가 된다.
     // 이 경우도 일시 오류로 보고 retryable로 취급한다.
     if rendered.contains("p2p request timeout after")
-        || err
-            .chain()
-            .any(|cause| cause.to_string().contains("p2p request timeout after"))
+        || rendered.contains("p2p peer sync timeout after")
+        || err.chain().any(|cause| {
+            let cause = cause.to_string();
+            cause.contains("p2p request timeout after")
+                || cause.contains("p2p peer sync timeout after")
+        })
     {
         return true;
     }
@@ -3599,6 +3654,97 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn p2p_peer_failure_does_not_block_later_healthy_peer() {
+        let psk = libp2p::pnet::PreSharedKey::new([0; 32]);
+        let dir = tempdir().unwrap();
+        let local_db = dir.path().join("local.db");
+        let remote = LocalStore::open(":memory:").unwrap();
+        remote
+            .insert_entries(&[entry("id-from-healthy-peer", 1, "echo healthy")])
+            .unwrap();
+
+        let stalled_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stalled_port = stalled_listener.local_addr().unwrap().port();
+        let stalled_peer = PeerId::random();
+        let stalled_addr = format!("/ip4/127.0.0.1/tcp/{stalled_port}/p2p/{stalled_peer}");
+
+        let mut healthy_server = build_rustory_swarm(psk).unwrap();
+        healthy_server
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        let healthy_peer = *healthy_server.local_peer_id();
+        let healthy_addr = loop {
+            let event = healthy_server.select_next_some().await;
+            if let SwarmEvent::NewListenAddr { address, .. } = event {
+                break format!("{address}/p2p/{healthy_peer}");
+            }
+        };
+
+        let cfg = SyncConfig {
+            identity: libp2p::identity::Keypair::generate_ed25519(),
+            psk,
+            relay_addr: None,
+            trackers: vec![],
+            tracker_token: None,
+            require_device_membership: false,
+            user_id: None,
+            device_id: Some("dev-local".to_string()),
+            request_retry_policy: RequestRetryPolicy {
+                attempts: 3,
+                timeout_base: Duration::from_millis(100),
+                timeout_cap: Duration::from_secs(1),
+                backoff_base: Duration::from_millis(10),
+            },
+            max_peers_per_tick: 0,
+        };
+        let peers = vec![stalled_addr, healthy_addr];
+        let local_db_path = local_db.to_str().unwrap();
+        let sync = sync_async(&peers, 100, local_db_path, cfg, false);
+        tokio::pin!(sync);
+
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    result = &mut sync => break result,
+                    event = healthy_server.select_next_some() => {
+                        if let SwarmEvent::Behaviour(RustoryBehaviourEvent::Sync(event)) = event
+                            && let libp2p_request_response::Event::Message { message, .. } = event
+                            && let libp2p_request_response::Message::Request { request, channel, .. } = message
+                        {
+                            let batch = remote
+                                .pull_sync_batch(request.cursor, request.delete_cursor, request.limit)
+                                .unwrap();
+                            let response = SyncBatch {
+                                entries: batch.entries,
+                                next_cursor: batch.next_cursor,
+                                deletions: batch.deletions,
+                                next_delete_cursor: batch.next_delete_cursor,
+                            };
+                            let _ = healthy_server
+                                .behaviour_mut()
+                                .sync
+                                .send_response(channel, response);
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("later healthy peer should be reached within the peer timeout budget");
+
+        assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("p2p peer sync timeout"));
+
+        let local = LocalStore::open(local_db_path).unwrap();
+        let got = local.list_recent(10).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].entry_id, "id-from-healthy-peer");
+        assert!(local.get_last_cursor(&healthy_peer.to_string()).unwrap() > 0);
+
+        drop(stalled_listener);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn p2p_request_response_roundtrip_on_loopback() {
         let psk = libp2p::pnet::PreSharedKey::new([0; 32]);
 
@@ -3944,6 +4090,10 @@ mod tests {
 
         let err = anyhow::anyhow!("p2p request timeout after 5s");
         assert!(is_retryable_p2p_request_error(&err));
+
+        let err = anyhow::anyhow!("p2p peer sync timeout after 30s");
+        assert!(is_retryable_p2p_request_error(&err));
+        assert_eq!(p2p_request_failure_log_level(&err), "info");
 
         let err = anyhow::anyhow!("dial timeout after 12s").context("p2p pull peer: peer-a");
         assert!(is_retryable_p2p_request_error(&err));

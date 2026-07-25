@@ -47,7 +47,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "[1/5] build rr"
+echo "[1/6] verify failed-peer isolation regression"
+cargo test --quiet p2p_peer_failure_does_not_block_later_healthy_peer
+
+echo "[2/6] build rr"
 cargo build --bin rr >/dev/null
 
 TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/rustory-smoke.XXXXXX")"
@@ -60,7 +63,7 @@ TRACKER_PORT="$(pick_port)"
 RELAY_PORT="$(pick_port)"
 TRACKER_URL="http://127.0.0.1:${TRACKER_PORT}"
 
-echo "[2/5] start tracker/relay"
+echo "[3/6] start tracker/relay"
 target/debug/rr tracker-serve --bind "127.0.0.1:${TRACKER_PORT}" --ttl-sec 60 >"$TMPDIR/tracker.log" 2>&1 &
 TRACKER_PID=$!
 
@@ -84,7 +87,7 @@ if [[ "$TRACKER_READY" != "1" ]]; then
   exit 1
 fi
 
-echo "[3/5] wait relay addr"
+echo "[4/6] wait relay addr"
 RELAY_ADDR=""
 for _ in $(seq 1 200); do
   if [[ -s "$TMPDIR/relay.log" ]]; then
@@ -101,7 +104,7 @@ if [[ -z "$RELAY_ADDR" ]]; then
   exit 1
 fi
 
-echo "[4/5] start p2p peers (serve)"
+echo "[5/6] start p2p peers (serve)"
 P2P_A_LOG="$TMPDIR/p2p-a.log"
 P2P_B_LOG="$TMPDIR/p2p-b.log"
 
@@ -119,7 +122,7 @@ RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=b target/debug/rr --db-path "$TMPDIR/b.d
   --relay "$RELAY_ADDR" >"$P2P_B_LOG" 2>&1 &
 P2P_B_PID=$!
 
-echo "[4/5] verify PeerId persists across restart (identity key persistence)"
+echo "[5/6] verify PeerId persists across restart (identity key persistence)"
 PEER_A_ID_1="$(wait_p2p_peer_id "$P2P_A_LOG" || true)"
 PEER_B_ID_1="$(wait_p2p_peer_id "$P2P_B_LOG" || true)"
 if [[ -z "$PEER_A_ID_1" || -z "$PEER_B_ID_1" ]]; then
@@ -172,7 +175,7 @@ if [[ "$PEER_B_ID_1" != "$PEER_B_ID_2" ]]; then
   exit 1
 fi
 
-echo "[5/5] wait tracker has peers"
+echo "[6/6] wait tracker has peers"
 READY=0
 for _ in $(seq 1 200); do
   if curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=smoke" 2>/dev/null | python3 -c 'import json,sys
@@ -206,7 +209,7 @@ if [[ "$READY" != "1" ]]; then
   exit 1
 fi
 
-echo "[5/5] record seed entries on peers (a/b)"
+echo "[6/6] record seed entries on peers (a/b)"
 A_ENTRY_ID="$(RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=a target/debug/rr --db-path "$TMPDIR/a.db" record \
   --cmd "echo smoke-a" \
   --cwd "/tmp" \
@@ -229,7 +232,7 @@ if [[ -z "$B_ENTRY_ID" ]]; then
   exit 1
 fi
 
-echo "[5/5] record one entry on client (c)"
+echo "[6/6] record one entry on client (c)"
 P2P_C_LOG="$TMPDIR/p2p-c.log"
 RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-serve \
   --swarm-key "$SWARM_KEY" \
@@ -279,7 +282,7 @@ if [[ -z "$ENTRY_ID" ]]; then
   exit 1
 fi
 
-echo "[5/5] run p2p-sync twice with --push (should not gossip a<->b)"
+echo "[6/6] run p2p-sync twice with --push (should not gossip a<->b)"
 for _ in 1 2; do
   RUSTORY_USER_ID=smoke RUSTORY_DEVICE_ID=c target/debug/rr --db-path "$TMPDIR/c.db" p2p-sync \
     --swarm-key "$SWARM_KEY" \
@@ -290,7 +293,7 @@ for _ in 1 2; do
     --limit 10
 done
 
-echo "[5/5] verify entry was pushed to at least one peer"
+echo "[6/6] verify entry was pushed to at least one peer"
 python3 - <<'PY' "$ENTRY_ID" "$TMPDIR/a.db" "$TMPDIR/b.db"
 import sqlite3
 import sys
@@ -314,7 +317,7 @@ if found == 0:
     sys.exit(1)
 PY
 
-echo "[5/5] verify no gossip between a and b (push is local-only)"
+echo "[6/6] verify no gossip between a and b (push is local-only)"
 python3 - <<'PY' "$A_ENTRY_ID" "$B_ENTRY_ID" "$TMPDIR/a.db" "$TMPDIR/b.db"
 import sqlite3
 import sys

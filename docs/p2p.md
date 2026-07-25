@@ -217,6 +217,11 @@ pull/push request-response도 timeout/connection closed 같은 일시 오류에 
 - config.toml: `p2p_request_attempts`, `p2p_request_timeout_base_sec`, `p2p_request_timeout_cap_sec`, `p2p_request_backoff_base_ms`
 - env: `RUSTORY_P2P_REQUEST_ATTEMPTS`, `RUSTORY_P2P_REQUEST_TIMEOUT_BASE_SEC`, `RUSTORY_P2P_REQUEST_TIMEOUT_CAP_SEC`, `RUSTORY_P2P_REQUEST_BACKOFF_BASE_MS`
 
+한 피어의 전체 pull/push 작업은 `req-timeout-cap-sec` 안에서만 진행한다. 피어가 응답하지 않거나
+relay reservation을 잃어도 이 시간이 지나면 다음 피어로 넘어가며, 이미 완료된 batch 커서는
+보존되어 다음 tick에서 이어진다. pull이 실패한 피어에는 같은 tick에서 push를 다시 시도하지 않아
+동일한 연결 실패가 두 번 증폭되지 않게 한다.
+
 주기적으로 동기화를 계속 돌리려면 `--watch --interval-sec 60` 옵션을 사용한다.
 여러 디바이스에서 같은 `--interval-sec`으로 동시에 데몬을 띄우면 요청이 몰릴 수 있으니,
 시작 시점을 흩뿌리려면 `--start-jitter-sec 10` 같은 옵션을 함께 쓰는 것을 권장한다.

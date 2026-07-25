@@ -184,7 +184,10 @@ enum Command {
         #[arg(long, help = "Initial request timeout in seconds before backoff")]
         req_timeout_base_sec: Option<u64>,
 
-        #[arg(long, help = "Maximum request timeout in seconds after backoff")]
+        #[arg(
+            long,
+            help = "Maximum request timeout and total sync time per peer in seconds"
+        )]
         req_timeout_cap_sec: Option<u64>,
 
         #[arg(long, help = "Base retry backoff in milliseconds")]
@@ -284,7 +287,10 @@ enum Command {
         #[arg(long, help = "Initial request timeout in seconds before backoff")]
         req_timeout_base_sec: Option<u64>,
 
-        #[arg(long, help = "Maximum request timeout in seconds after backoff")]
+        #[arg(
+            long,
+            help = "Maximum request timeout and total sync time per peer in seconds"
+        )]
         req_timeout_cap_sec: Option<u64>,
 
         #[arg(long, help = "Base retry backoff in milliseconds")]
