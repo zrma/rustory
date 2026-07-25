@@ -48,10 +48,43 @@ pub struct DedupeStats {
     pub deleted: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DedupeRequest<'a> {
+    pub group_by: DedupeGroup,
+    pub keep: DedupeKeep,
+    pub source_device_id: Option<&'a str>,
+    pub older_than_unix: Option<i64>,
+    pub tombstone_user_id: &'a str,
+    pub tombstone_device_id: &'a str,
+    pub dry_run: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DedupeKeep {
     Newest,
     Oldest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DedupeGroup {
+    Context,
+    Command,
+}
+
+impl DedupeGroup {
+    fn partition_sql(self) -> &'static str {
+        match self {
+            Self::Context => "device_id,hostname,cwd,cmd,exit_code,CAST(ts / 86400 AS INTEGER)",
+            Self::Command => "cmd",
+        }
+    }
+
+    pub fn key_label(self) -> &'static str {
+        match self {
+            Self::Context => "device_id,hostname,cwd,cmd,exit_code,utc_day",
+            Self::Command => "cmd",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1027,16 +1060,18 @@ WHERE deleted_at < ?
         })
     }
 
-    pub fn dedupe_entries_same_day(
-        &self,
-        keep: DedupeKeep,
-        source_device_id: Option<&str>,
-        older_than_unix: Option<i64>,
-        tombstone_user_id: &str,
-        tombstone_device_id: &str,
-        dry_run: bool,
-    ) -> Result<DedupeStats> {
+    pub fn dedupe_entries(&self, request: DedupeRequest<'_>) -> Result<DedupeStats> {
+        let DedupeRequest {
+            group_by,
+            keep,
+            source_device_id,
+            older_than_unix,
+            tombstone_user_id,
+            tombstone_device_id,
+            dry_run,
+        } = request;
         let pushed_floor_seq = self.prune_pushed_floor_seq()?;
+        let key_columns = group_by.partition_sql();
         let order_by = match keep {
             DedupeKeep::Newest => "ts DESC, ingest_seq DESC",
             DedupeKeep::Oldest => "ts ASC, ingest_seq ASC",
@@ -1047,11 +1082,11 @@ WITH ranked AS (
   SELECT
     entry_id,
     ROW_NUMBER() OVER (
-      PARTITION BY device_id, hostname, cwd, cmd, exit_code, CAST(ts / 86400 AS INTEGER)
+      PARTITION BY {key_columns}
       ORDER BY {order_by}
     ) AS rank_in_group,
     COUNT(*) OVER (
-      PARTITION BY device_id, hostname, cwd, cmd, exit_code, CAST(ts / 86400 AS INTEGER)
+      PARTITION BY {key_columns}
     ) AS group_count
   FROM entries
   WHERE (?1 IS NULL OR device_id = ?1)
@@ -1101,13 +1136,13 @@ WHERE group_count > 1
         let mut stmt = self
             .conn
             .prepare(select_sql.as_str())
-            .context("prepare duplicate same-day tombstones")?;
+            .context("prepare duplicate entry tombstones")?;
         let rows = stmt
             .query_map(
                 params![source_device_id, older_than_unix, pushed_floor_seq],
                 |row| row.get::<_, String>(0),
             )
-            .context("query duplicate same-day tombstones")?;
+            .context("query duplicate entry tombstones")?;
         let deleted_at = OffsetDateTime::now_utc().unix_timestamp();
         let mut deletions = Vec::new();
         for row in rows {
@@ -2536,7 +2571,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_entries_same_day_keeps_newest_by_default_scope() {
+    fn dedupe_entries_by_context_keeps_newest_by_default_scope() {
         let store = LocalStore::open(":memory:").unwrap();
 
         let e1 = entry("id-1", 86_400 + 10, "echo same");
@@ -2550,14 +2585,15 @@ mod tests {
         store.insert_entries(&[e1, e2, e3, e4, e5, e6]).unwrap();
 
         let dry = store
-            .dedupe_entries_same_day(
-                DedupeKeep::Newest,
-                Some("dev1"),
-                None,
-                "user1",
-                "dev1",
-                true,
-            )
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Context,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: true,
+            })
             .unwrap();
         assert_eq!(
             dry,
@@ -2570,14 +2606,15 @@ mod tests {
         assert_eq!(store.list_recent(10).unwrap().len(), 6);
 
         let applied = store
-            .dedupe_entries_same_day(
-                DedupeKeep::Newest,
-                Some("dev1"),
-                None,
-                "user1",
-                "dev1",
-                false,
-            )
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Context,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: false,
+            })
             .unwrap();
         assert_eq!(
             applied,
@@ -2597,7 +2634,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_entries_same_day_can_keep_oldest() {
+    fn dedupe_entries_by_context_can_keep_oldest() {
         let store = LocalStore::open(":memory:").unwrap();
 
         store
@@ -2609,14 +2646,15 @@ mod tests {
             .unwrap();
 
         let applied = store
-            .dedupe_entries_same_day(
-                DedupeKeep::Oldest,
-                Some("dev1"),
-                None,
-                "user1",
-                "dev1",
-                false,
-            )
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Context,
+                keep: DedupeKeep::Oldest,
+                source_device_id: Some("dev1"),
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: false,
+            })
             .unwrap();
         assert_eq!(
             applied,
@@ -2633,7 +2671,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_entries_same_day_respects_push_floor() {
+    fn dedupe_entries_by_context_respects_push_floor() {
         let store = LocalStore::open(":memory:").unwrap();
 
         store
@@ -2646,14 +2684,15 @@ mod tests {
 
         store.set_last_pushed_seq("peer-slow", 1).unwrap();
         let blocked = store
-            .dedupe_entries_same_day(
-                DedupeKeep::Newest,
-                Some("dev1"),
-                None,
-                "user1",
-                "dev1",
-                false,
-            )
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Context,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: false,
+            })
             .unwrap();
         assert_eq!(
             blocked,
@@ -2667,14 +2706,15 @@ mod tests {
 
         store.set_last_pushed_seq("peer-slow", 3).unwrap();
         let applied = store
-            .dedupe_entries_same_day(
-                DedupeKeep::Newest,
-                Some("dev1"),
-                None,
-                "user1",
-                "dev1",
-                false,
-            )
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Context,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: false,
+            })
             .unwrap();
         assert_eq!(
             applied,
@@ -2687,6 +2727,74 @@ mod tests {
         let remaining = store.list_recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].entry_id, "id-3");
+    }
+
+    #[test]
+    fn dedupe_entries_by_command_crosses_context_and_honors_device_scope() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        let mut e1 = entry("id-1", 86_400 + 10, "echo same");
+        e1.cwd = "/work/one".to_string();
+        e1.hostname = "host-one".to_string();
+
+        let mut e2 = entry("id-2", 172_800 + 20, "echo same");
+        e2.cwd = "/work/two".to_string();
+        e2.hostname = "host-two".to_string();
+        e2.exit_code = 1;
+
+        let e3 = entry("id-3", 259_200 + 30, "echo same ");
+
+        let mut e4 = entry("id-4", 259_200 + 40, "echo same");
+        e4.device_id = "dev2".to_string();
+
+        store
+            .insert_entries(&[e1, e2, e3, e4])
+            .expect("insert command dedupe fixtures");
+
+        let local_scope = store
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Command,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(
+            local_scope,
+            DedupeStats {
+                groups: 1,
+                matched: 1,
+                deleted: 0
+            }
+        );
+
+        let all_devices = store
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Command,
+                keep: DedupeKeep::Newest,
+                source_device_id: None,
+                older_than_unix: None,
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(
+            all_devices,
+            DedupeStats {
+                groups: 1,
+                matched: 2,
+                deleted: 2
+            }
+        );
+
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|entry| entry.entry_id == "id-3"));
+        assert!(remaining.iter().any(|entry| entry.entry_id == "id-4"));
     }
 
     #[test]

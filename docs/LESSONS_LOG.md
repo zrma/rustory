@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-23
+- Last Verified: 2026-07-25
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-07-25 | `todo-aggressive-command-dedupe`에서 동일 command가 날짜·CWD 차이로 남는 실사용 결과를 재현함 | 파괴적인 dedupe의 기본 키는 호환성을 위해 보수적으로 유지하되, 장기 히스토리를 정리할 때는 사용자가 결과를 예측할 수 있는 명시적 그룹 기준을 제공해야 한다. 적극적 기준도 셸 의미를 추정하지 않고 정확한 command 문자열만 묶어야 플래그·인자 차이를 보존할 수 있다. | `rr dedupe --group-by command`를 추가해 CWD·호스트·종료 코드·UTC 날짜를 넘는 동일 문자열 정리를 지원하고, device scope와 push floor 안전 경계를 그대로 적용했다. | `cargo test dedupe`, `cargo clippy --workspace --all-targets -- -D warnings`, 격리 DB dry-run/apply 시나리오, `scripts/check.sh --fast`, repository quick gate |
 | 2026-07-23 | `todo-logo-bottom-scroll-refinement`와 `todo-logo-bottom-scroll-fidelity`에서 승인 PNG와 SVG 밑단의 구조·이음매 차이를 재검증함 | 생성 시안의 일부만 수작업 SVG 경로로 덮으면 원본과 보정 경로 사이에 끊긴 외곽선·뾰족한 접합부·분리된 말림이 생길 수 있다. 승인된 래스터가 최종 시각 기준이면 전체를 같은 추적 조건으로 다시 벡터화하고 원본 크기와 실제 표시 크기에서 직접 비교해야 한다. | 부분 보정 레이어를 제거하고 승인 PNG 전체를 SVG로 다시 추적해 앞면 하단선·뒤쪽 띠·원형 말림을 하나의 일관된 벡터 결과로 교체했다. | `xmllint --noout docs/assets/rustory-mark.svg`, 1254px·360px 원본 대조 렌더링, `scripts/check-readme-policy.sh`, `scripts/check-doc-links.sh`, repository publication boundary, full release gate |
 | 2026-07-23 | `todo-readme-tagline-copy`에서 로고 아래 문구의 의미와 운율을 다듬음 | 짧은 태그라인은 유사어를 나란히 두기보다 제품의 두 축을 대구로 대비해야 기억하기 쉽다. Rustory에서는 local-first 저장을 `남기고`, P2P 연결을 `잇는다`로 대응시키면 의미와 리듬이 함께 선명해진다. | README 태그라인을 `로컬에 남기고, P2P로 잇는다.`로 교체했다. | `scripts/check-readme-policy.sh`, `scripts/check-doc-links.sh`, repository publication boundary, full release gate |
 | 2026-07-22 | `todo-readme-brand-mark`에서 승인된 래스터 시안을 README용 SVG로 옮김 | 승인된 시안을 단순 도형으로 재해석하면 비율·곡선·음영·매듭이 열화된다. 원본의 세부를 보존하는 저장소 소유 벡터 경로로 옮기고 원본 크기와 실제 표시 크기에서 나란히 검증해야 한다. | 두 기록과 세 연결 매듭을 고밀도 SVG 경로로 보존하고 README 상단에는 로고·짧은 가치 문장·핵심 특성만 추가해 랜딩 페이지 역할을 유지했다. | `xmllint --noout docs/assets/rustory-mark.svg`, 360px 원본 대조 렌더링, `scripts/check-readme-policy.sh`, `scripts/check-doc-links.sh`, full release gate |

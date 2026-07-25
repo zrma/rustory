@@ -237,6 +237,15 @@ rr dedupe --apply
 rr dedupe --keep oldest --older-than-days 14 --apply --vacuum
 ```
 
+날짜나 CWD가 달라도 정확히 같은 command 문자열을 하나만 남기려면 먼저 command 기준으로 범위를 확인한다. 기본 device scope는 유지되며, `--all-devices`를 함께 지정하면 이 로컬 DB에 동기화된 모든 device의 동일 command를 하나의 그룹으로 묶는다.
+
+```sh
+rr dedupe --group-by command --older-than-days 14
+rr dedupe --group-by command --older-than-days 14 --all-devices --apply --vacuum
+```
+
+command 기준은 문자열이 정확히 같은 경우만 묶는다. 대소문자, 공백, 인자나 플래그가 다르면 서로 다른 명령으로 보존한다.
+
 `rr dedupe --apply`는 삭제 tombstone을 남겨 peer로 전파된다. 아직 peer로 push되지 않은 row는 peer push cursor 기준으로 삭제 후보에서 제외되며, tombstone 자체도 각 peer의 delete cursor가 따라올 때까지 `rr sync-status --json`의 deletion pending으로 보일 수 있다.
 
 ### 2-8) (선택) 전파 완료된 삭제 tombstone 정리

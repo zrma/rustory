@@ -413,6 +413,14 @@ enum Command {
         )]
         keep: DedupeKeepArg,
 
+        #[arg(
+            long,
+            value_enum,
+            default_value_t = DedupeGroupArg::Context,
+            help = "Group by full execution context or exact command text"
+        )]
+        group_by: DedupeGroupArg,
+
         #[arg(long, help = "Only consider entries older than this many days")]
         older_than_days: Option<u64>,
 
@@ -936,6 +944,36 @@ impl From<DedupeKeepArg> for storage::DedupeKeep {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum DedupeGroupArg {
+    Context,
+    Command,
+}
+
+impl DedupeGroupArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Context => "context",
+            Self::Command => "command",
+        }
+    }
+}
+
+impl std::fmt::Display for DedupeGroupArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str((*self).as_str())
+    }
+}
+
+impl From<DedupeGroupArg> for storage::DedupeGroup {
+    fn from(value: DedupeGroupArg) -> Self {
+        match value {
+            DedupeGroupArg::Context => Self::Context,
+            DedupeGroupArg::Command => Self::Command,
+        }
+    }
+}
+
 pub fn run() -> Result<()> {
     let app = App::parse();
     // launchd/background redirection happens before rr starts. Clean managed logs before
@@ -1426,6 +1464,7 @@ pub fn run() -> Result<()> {
         Command::Dedupe {
             apply,
             keep,
+            group_by,
             older_than_days,
             all_devices,
             vacuum,
@@ -1442,14 +1481,16 @@ pub fn run() -> Result<()> {
                 .map(|days| compute_prune_cutoff_unix(now_unix, days))
                 .transpose()?;
             let user_id = resolve_user_id(&cfg);
-            let stats = store.dedupe_entries_same_day(
-                keep.into(),
+            let storage_group: storage::DedupeGroup = group_by.into();
+            let stats = store.dedupe_entries(storage::DedupeRequest {
+                group_by: storage_group,
+                keep: keep.into(),
                 source_device_id,
                 older_than_unix,
-                &user_id,
-                &local_device_id,
-                !apply,
-            )?;
+                tombstone_user_id: &user_id,
+                tombstone_device_id: &local_device_id,
+                dry_run: !apply,
+            })?;
 
             let mut compacted = false;
             if apply && vacuum && stats.deleted > 0 {
@@ -1458,14 +1499,15 @@ pub fn run() -> Result<()> {
             }
 
             let scope = source_device_id.unwrap_or("all-devices");
-            let exact_key = "device_id,hostname,cwd,cmd,exit_code,utc_day";
+            let exact_key = storage_group.key_label();
             let older_than_label = older_than_days
                 .map(|days| days.to_string())
                 .unwrap_or_else(|| "none".to_string());
             if apply {
                 println!(
-                    "dedupe: scope={} exact_key={} keep={} older_than_days={} groups={} matched={} deleted={} compacted={}",
+                    "dedupe: scope={} group_by={} exact_key={} keep={} older_than_days={} groups={} matched={} deleted={} compacted={}",
                     scope,
+                    group_by.as_str(),
                     exact_key,
                     keep.as_str(),
                     older_than_label,
@@ -1476,8 +1518,9 @@ pub fn run() -> Result<()> {
                 );
             } else {
                 println!(
-                    "dedupe dry-run: scope={} exact_key={} keep={} older_than_days={} groups={} matched={} deleted=0",
+                    "dedupe dry-run: scope={} group_by={} exact_key={} keep={} older_than_days={} groups={} matched={} deleted=0",
                     scope,
+                    group_by.as_str(),
                     exact_key,
                     keep.as_str(),
                     older_than_label,
@@ -6586,6 +6629,8 @@ mod tests {
             "--apply",
             "--keep",
             "oldest",
+            "--group-by",
+            "command",
             "--older-than-days",
             "14",
             "--all-devices",
@@ -6595,15 +6640,28 @@ mod tests {
             Command::Dedupe {
                 apply,
                 keep,
+                group_by,
                 older_than_days,
                 all_devices,
                 vacuum,
             } => {
                 assert!(apply);
                 assert_eq!(keep, DedupeKeepArg::Oldest);
+                assert_eq!(group_by, DedupeGroupArg::Command);
                 assert_eq!(older_than_days, Some(14));
                 assert!(all_devices);
                 assert!(vacuum);
+            }
+            _ => panic!("expected dedupe"),
+        }
+    }
+
+    #[test]
+    fn dedupe_defaults_to_context_grouping() {
+        let app = App::parse_from(["rr", "dedupe"]);
+        match app.cmd {
+            Command::Dedupe { group_by, .. } => {
+                assert_eq!(group_by, DedupeGroupArg::Context);
             }
             _ => panic!("expected dedupe"),
         }
