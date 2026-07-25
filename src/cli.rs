@@ -422,12 +422,12 @@ enum Command {
         #[arg(
             long,
             value_enum,
-            default_value_t = DedupeGroupArg::Context,
-            help = "Group by full execution context or exact command text"
+            default_value_t = DedupeGroupArg::Command,
+            help = "Group by exact command text (default) or full execution context"
         )]
         group_by: DedupeGroupArg,
 
-        #[arg(long, help = "Only consider entries older than this many days")]
+        #[arg(long, help = "Only delete duplicate rows older than this many days")]
         older_than_days: Option<u64>,
 
         #[arg(
@@ -6663,11 +6663,11 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_defaults_to_context_grouping() {
+    fn dedupe_defaults_to_command_grouping() {
         let app = App::parse_from(["rr", "dedupe"]);
         match app.cmd {
             Command::Dedupe { group_by, .. } => {
-                assert_eq!(group_by, DedupeGroupArg::Context);
+                assert_eq!(group_by, DedupeGroupArg::Command);
             }
             _ => panic!("expected dedupe"),
         }

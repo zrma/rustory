@@ -1081,15 +1081,23 @@ WHERE deleted_at < ?
 WITH ranked AS (
   SELECT
     entry_id,
+    ts,
+    ingest_seq,
     ROW_NUMBER() OVER (
       PARTITION BY {key_columns}
       ORDER BY {order_by}
     ) AS rank_in_group,
-    COUNT(*) OVER (
+    FIRST_VALUE(entry_id) OVER (
       PARTITION BY {key_columns}
-    ) AS group_count
+      ORDER BY {order_by}
+    ) AS keeper_entry_id
   FROM entries
   WHERE (?1 IS NULL OR device_id = ?1)
+),
+candidates AS (
+  SELECT entry_id, keeper_entry_id
+  FROM ranked
+  WHERE rank_in_group > 1
     AND (?2 IS NULL OR ts < ?2)
     AND (?3 IS NULL OR ingest_seq <= ?3)
 )
@@ -1099,9 +1107,9 @@ WITH ranked AS (
             r#"
 {ranked_cte}
 SELECT
-  COALESCE(SUM(CASE WHEN group_count > 1 AND rank_in_group = 1 THEN 1 ELSE 0 END), 0),
-  COALESCE(SUM(CASE WHEN group_count > 1 AND rank_in_group > 1 THEN 1 ELSE 0 END), 0)
-FROM ranked
+  COUNT(DISTINCT keeper_entry_id),
+  COUNT(*)
+FROM candidates
 "#
         );
 
@@ -1128,9 +1136,7 @@ FROM ranked
             r#"
 {ranked_cte}
 SELECT entry_id
-FROM ranked
-WHERE group_count > 1
-  AND rank_in_group > 1
+FROM candidates
 "#
         );
         let mut stmt = self
@@ -2671,7 +2677,7 @@ mod tests {
     }
 
     #[test]
-    fn dedupe_entries_by_context_respects_push_floor() {
+    fn dedupe_entries_by_context_only_deletes_pushed_candidates() {
         let store = LocalStore::open(":memory:").unwrap();
 
         store
@@ -2683,7 +2689,7 @@ mod tests {
             .unwrap();
 
         store.set_last_pushed_seq("peer-slow", 1).unwrap();
-        let blocked = store
+        let first_pass = store
             .dedupe_entries(DedupeRequest {
                 group_by: DedupeGroup::Context,
                 keep: DedupeKeep::Newest,
@@ -2695,14 +2701,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            blocked,
+            first_pass,
             DedupeStats {
-                groups: 0,
-                matched: 0,
-                deleted: 0
+                groups: 1,
+                matched: 1,
+                deleted: 1
             }
         );
-        assert_eq!(store.list_recent(10).unwrap().len(), 3);
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|entry| entry.entry_id == "id-2"));
+        assert!(remaining.iter().any(|entry| entry.entry_id == "id-3"));
 
         store.set_last_pushed_seq("peer-slow", 3).unwrap();
         let applied = store
@@ -2720,10 +2729,67 @@ mod tests {
             applied,
             DedupeStats {
                 groups: 1,
+                matched: 1,
+                deleted: 1
+            }
+        );
+        let remaining = store.list_recent(10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].entry_id, "id-3");
+    }
+
+    #[test]
+    fn dedupe_entries_age_cutoff_keeps_newer_row_and_deletes_all_old_duplicates() {
+        let store = LocalStore::open(":memory:").unwrap();
+
+        store
+            .insert_entries(&[
+                entry("id-1", 10, "echo same"),
+                entry("id-2", 20, "echo same"),
+                entry("id-3", 100, "echo same"),
+            ])
+            .unwrap();
+
+        let dry_run = store
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Command,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: Some(50),
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: true,
+            })
+            .unwrap();
+        assert_eq!(
+            dry_run,
+            DedupeStats {
+                groups: 1,
+                matched: 2,
+                deleted: 0
+            }
+        );
+
+        let applied = store
+            .dedupe_entries(DedupeRequest {
+                group_by: DedupeGroup::Command,
+                keep: DedupeKeep::Newest,
+                source_device_id: Some("dev1"),
+                older_than_unix: Some(50),
+                tombstone_user_id: "user1",
+                tombstone_device_id: "dev1",
+                dry_run: false,
+            })
+            .unwrap();
+        assert_eq!(
+            applied,
+            DedupeStats {
+                groups: 1,
                 matched: 2,
                 deleted: 2
             }
         );
+
         let remaining = store.list_recent(10).unwrap();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].entry_id, "id-3");
