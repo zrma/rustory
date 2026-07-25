@@ -70,8 +70,12 @@ pub fn run_update(request: UpdateRequest) -> Result<()> {
         return Ok(());
     }
 
-    let bytes = download_bytes(&plan.asset_url, MAX_ASSET_BYTES)
-        .with_context(|| format!("download release asset: {}", plan.asset_url))?;
+    let bytes = download_bytes(
+        &plan.asset_url,
+        MAX_ASSET_BYTES,
+        request.allow_insecure_download,
+    )
+    .with_context(|| format!("download release asset: {}", plan.asset_url))?;
     let expected = resolve_expected_sha256(&request, &plan)?;
     verify_sha256(&bytes, &expected)?;
 
@@ -293,12 +297,24 @@ fn current_release_target() -> Result<&'static str> {
     }
 }
 
-fn download_bytes(url: &str, limit: u64) -> Result<Vec<u8>> {
-    let agent: ureq::Agent = ureq::Agent::config_builder()
+fn release_download_agent(url: &str, allow_insecure_download: bool) -> ureq::Agent {
+    let mut config = ureq::Agent::config_builder()
         .timeout_global(Some(Duration::from_secs(60)))
-        .timeout_connect(Some(Duration::from_secs(10)))
-        .build()
-        .into();
+        .timeout_connect(Some(Duration::from_secs(10)));
+    if !allow_insecure_download {
+        if url.trim().starts_with("https://") {
+            config = config.https_only(true);
+        } else {
+            // Loopback HTTP is allowed for local testing, but must not escape
+            // that trust decision through an automatic redirect.
+            config = config.max_redirects(0).max_redirects_will_error(true);
+        }
+    }
+    config.build().into()
+}
+
+fn download_bytes(url: &str, limit: u64, allow_insecure_download: bool) -> Result<Vec<u8>> {
+    let agent = release_download_agent(url, allow_insecure_download);
     let mut response = agent
         .get(url)
         .header("User-Agent", concat!("rustory/", env!("CARGO_PKG_VERSION")))
@@ -320,8 +336,12 @@ fn resolve_expected_sha256(request: &UpdateRequest, plan: &UpdatePlan) -> Result
         .checksum_url
         .as_deref()
         .context("checksum URL unavailable; pass --sha256 explicitly")?;
-    let bytes = download_bytes(checksum_url, MAX_CHECKSUM_BYTES)
-        .with_context(|| format!("download checksum: {checksum_url}"))?;
+    let bytes = download_bytes(
+        checksum_url,
+        MAX_CHECKSUM_BYTES,
+        request.allow_insecure_download,
+    )
+    .with_context(|| format!("download checksum: {checksum_url}"))?;
     let text = String::from_utf8(bytes).context("checksum response is not utf-8")?;
     parse_sha256_checksum(&text, &plan.asset_name)
 }
@@ -1029,13 +1049,37 @@ fn restart_background_daemon(install_path: &Path) -> DaemonRestartStatus {
             state_dir.display()
         ));
     }
+    #[cfg(unix)]
+    if let Err(err) = {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+    } {
+        return DaemonRestartStatus::Failed(format!(
+            "secure state dir {}: {err}",
+            state_dir.display()
+        ));
+    }
 
-    let log_file = match OpenOptions::new().create(true).append(true).open(&log_path) {
+    let mut log_options = OpenOptions::new();
+    log_options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        log_options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let log_file = match log_options.open(&log_path) {
         Ok(file) => file,
         Err(err) => {
             return DaemonRestartStatus::Failed(format!("open log {}: {err}", log_path.display()));
         }
     };
+    #[cfg(unix)]
+    if let Err(err) = {
+        use std::os::unix::fs::PermissionsExt;
+        log_file.set_permissions(std::fs::Permissions::from_mode(0o600))
+    } {
+        return DaemonRestartStatus::Failed(format!("secure log {}: {err}", log_path.display()));
+    }
     let stderr = match log_file.try_clone() {
         Ok(file) => file,
         Err(err) => return DaemonRestartStatus::Failed(format!("clone daemon log: {err}")),
@@ -1768,6 +1812,18 @@ mod tests {
                 .unwrap()
                 .starts_with("http://127.0.0.1:8080/")
         );
+    }
+
+    #[test]
+    fn release_download_agent_prevents_transport_downgrade() {
+        let https = release_download_agent("https://example.test/rr", false);
+        assert!(https.config().https_only());
+
+        let loopback = release_download_agent("http://127.0.0.1:8080/rr", false);
+        assert_eq!(loopback.config().max_redirects(), 0);
+
+        let explicit_insecure = release_download_agent("http://example.test/rr", true);
+        assert!(explicit_insecure.config().max_redirects() > 0);
     }
 
     #[test]

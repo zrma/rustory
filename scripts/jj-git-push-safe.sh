@@ -66,6 +66,7 @@ run_conflict_gate() {
 }
 
 REMOTE="origin"
+DRY_RUN=0
 declare -a TARGET_BOOKMARKS=()
 if [[ "$#" -eq 0 ]]; then
   TARGET_BOOKMARKS=("main")
@@ -91,6 +92,13 @@ else
         fi
         add_target_bookmark "${args[$idx]}"
         ;;
+      --dry-run)
+        DRY_RUN=1
+        ;;
+      *)
+        echo "[FAIL] unsupported push option: $token" >&2
+        exit 1
+        ;;
     esac
     ((idx += 1))
   done
@@ -107,6 +115,7 @@ if [[ -n "$PUSH_GATES_WORK_ID" ]]; then
 elif [[ "$ALLOW_MISSING_WORK_ID" == "1" ]]; then
   release_gate_cmd+=(--allow-missing-work-id)
 fi
+declare -a VALIDATED_TARGET_SHAS=()
 for bookmark in "${TARGET_BOOKMARKS[@]}"; do
   target_sha="$(jj log -r "$bookmark" --no-graph -T 'commit_id' | tr -d '\r\n')"
   if [[ -z "$target_sha" ]]; then
@@ -116,6 +125,7 @@ for bookmark in "${TARGET_BOOKMARKS[@]}"; do
   TODO_UNPUBLISHED_BASE_REF="refs/remotes/$REMOTE/$bookmark" \
     TODO_UNPUBLISHED_TARGET_REV="$target_sha" \
     "${release_gate_cmd[@]}"
+  VALIDATED_TARGET_SHAS+=("$target_sha")
 done
 
 run_conflict_gate
@@ -124,8 +134,25 @@ for bookmark in "${TARGET_BOOKMARKS[@]}"; do
   scripts/check-lessons-log-range.sh --remote "$REMOTE" --bookmark "$bookmark"
 done
 
-if [[ "$#" -eq 0 ]]; then
-  jj git push --bookmark main
+declare -a refspecs=()
+for idx in "${!TARGET_BOOKMARKS[@]}"; do
+  bookmark="${TARGET_BOOKMARKS[$idx]}"
+  validated_sha="${VALIDATED_TARGET_SHAS[$idx]}"
+  current_sha="$(jj log -r "$bookmark" --no-graph -T 'commit_id' | tr -d '\r\n')"
+  if [[ "$current_sha" != "$validated_sha" ]]; then
+    echo "[FAIL] bookmark moved after validation: $bookmark validated=$validated_sha current=$current_sha" >&2
+    exit 1
+  fi
+  refspecs+=("$validated_sha:refs/heads/$bookmark")
+done
+
+if (( DRY_RUN == 1 )); then
+  printf '[DRY] git push %q' "$REMOTE"
+  printf ' %q' "${refspecs[@]}"
+  printf '\n'
 else
-  jj git push "$@"
+  # Push immutable validated objects, not mutable bookmark names. Git's normal
+  # non-fast-forward protection remains in force.
+  git push "$REMOTE" "${refspecs[@]}"
+  jj git fetch --remote "$REMOTE"
 fi

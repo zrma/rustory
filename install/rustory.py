@@ -4,7 +4,7 @@
 Designed for:
 
   curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-    python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "$RUSTORY_TRACKERS" \
+    python3 - --tracker "$RUSTORY_TRACKERS" \
       --relay "$RUSTORY_RELAY_ADDR" --user-id "$RUSTORY_USER_ID" \
       --swarm-key-b64 "$RUSTORY_SWARM_KEY_B64" --install-hook --import-hishtory
 """
@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -81,8 +82,18 @@ def main() -> int:
     print(f"install_path={install_path}")
     print(f"asset_url={asset_url}")
 
-    data = download_bytes(asset_url, MAX_ASSET_BYTES)
-    expected = normalize_sha256(args.sha256) if args.sha256 else fetch_checksum(checksum_url, asset_name)
+    data = download_bytes(
+        asset_url, MAX_ASSET_BYTES, allow_insecure_download=args.allow_insecure_download
+    )
+    expected = (
+        normalize_sha256(args.sha256)
+        if args.sha256
+        else fetch_checksum(
+            checksum_url,
+            asset_name,
+            allow_insecure_download=args.allow_insecure_download,
+        )
+    )
     actual = hashlib.sha256(data).hexdigest()
     if actual != expected:
         raise SystemExit(f"checksum mismatch: expected {expected}, actual {actual}")
@@ -125,7 +136,11 @@ def parse_args() -> argparse.Namespace:
         help="Allow non-HTTPS asset/checksum URLs for a trusted private mirror",
     )
     parser.add_argument("--bin-dir", default="~/.local/bin", help="Directory to install rr into")
-    parser.add_argument("--token", help="Tracker bearer token to write via rr init")
+    parser.add_argument(
+        "--token",
+        default=os.environ.get("RUSTORY_TRACKER_TOKEN"),
+        help="Tracker bearer token to write via rr init; prefer RUSTORY_TRACKER_TOKEN to avoid argv exposure",
+    )
     parser.add_argument(
         "--tracker",
         dest="trackers",
@@ -219,7 +234,7 @@ def parse_args() -> argparse.Namespace:
     if args.token and token_has_literal_quote_wrapper(args.token):
         parser.error(
             "--token appears to include literal quote characters; pass the raw token value, "
-            'for example --token "$RUSTORY_TRACKER_TOKEN"'
+            "or prefer the RUSTORY_TRACKER_TOKEN environment variable"
         )
     if args.allow_remote_retirement and not args.require_device_membership:
         parser.error("--allow-remote-retirement requires --require-device-membership")
@@ -326,18 +341,48 @@ def is_trusted_download_url(raw: str) -> bool:
         return False
 
 
-def download_bytes(url: str, limit: int) -> bytes:
+class SecureRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, allow_insecure_download: bool) -> None:
+        super().__init__()
+        self.allow_insecure_download = allow_insecure_download
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not self.allow_insecure_download:
+            source = urllib.parse.urlparse(req.full_url)
+            destination = urllib.parse.urlparse(newurl)
+            if source.scheme == "https" and destination.scheme != "https":
+                raise urllib.error.URLError("refusing HTTPS download redirect to non-HTTPS URL")
+            if source.scheme == "http" and (
+                not is_trusted_download_url(req.full_url)
+                or not is_trusted_download_url(newurl)
+            ):
+                raise urllib.error.URLError(
+                    "refusing loopback HTTP download redirect outside trusted transport"
+                )
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_bytes(
+    url: str, limit: int, *, allow_insecure_download: bool = False
+) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "rustory-installer"})
-    with urllib.request.urlopen(req, timeout=60) as response:
+    opener = urllib.request.build_opener(SecureRedirectHandler(allow_insecure_download))
+    with opener.open(req, timeout=60) as response:
         data = response.read(limit + 1)
     if len(data) > limit:
         raise SystemExit(f"download too large: {url}")
     return data
 
 
-def fetch_checksum(url: str, asset_name: str) -> str:
+def fetch_checksum(
+    url: str, asset_name: str, *, allow_insecure_download: bool = False
+) -> str:
     print(f"checksum_url={url}")
-    text = download_bytes(url, MAX_CHECKSUM_BYTES).decode("utf-8")
+    text = download_bytes(
+        url,
+        MAX_CHECKSUM_BYTES,
+        allow_insecure_download=allow_insecure_download,
+    ).decode("utf-8")
     return parse_checksum(text, asset_name)
 
 
@@ -594,8 +639,6 @@ def run_init(install_path: Path, args: argparse.Namespace) -> None:
         cmd += ["--tracker", tracker]
     if args.relay:
         cmd += ["--relay", args.relay]
-    if args.token:
-        cmd += ["--token", args.token]
     if args.require_device_membership:
         cmd.append("--require-device-membership")
     if args.allow_remote_retirement:
@@ -609,7 +652,10 @@ def run_init(install_path: Path, args: argparse.Namespace) -> None:
             print(f"relay_warning={warning}")
 
     print("init=running token_configured={} trackers={}".format(bool(args.token), len(split_tracker_values(args.trackers))))
-    subprocess.run(cmd, check=True)
+    child_env = os.environ.copy()
+    if args.token:
+        child_env["RUSTORY_TRACKER_TOKEN"] = args.token
+    subprocess.run(cmd, check=True, env=child_env)
 
 
 def relay_addr_reachability_warning(relay: str) -> str | None:
@@ -819,6 +865,9 @@ def start_background_daemon(
 ) -> None:
     state_dir = state_home / "rustory"
     state_dir.mkdir(parents=True, exist_ok=True)
+    if state_dir.is_symlink() or not state_dir.is_dir():
+        raise SystemExit(f"daemon state dir must be a regular directory: {state_dir}")
+    os.chmod(state_dir, 0o700)
     pid_path = state_dir / "daemon.pid"
     log_path = state_dir / "daemon.log"
 
@@ -834,7 +883,12 @@ def start_background_daemon(
         if stopped:
             print(f"daemon=stale_processes_stopped manager=background count={stopped}")
 
-    with log_path.open("ab") as log_file:
+    log_flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_NOFOLLOW"):
+        log_flags |= os.O_NOFOLLOW
+    log_fd = os.open(log_path, log_flags, 0o600)
+    os.fchmod(log_fd, 0o600)
+    with os.fdopen(log_fd, "ab") as log_file:
         proc = subprocess.Popen(
             daemon_args,
             cwd=str(Path.home()),

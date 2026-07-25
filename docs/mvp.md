@@ -166,7 +166,7 @@ P2P 개발/디버깅이 어려운 환경을 대비하여, HTTP transport를 보�
   - `db_path`
   - `device_id`
   - `user_id`
-  - `trackers = ["http://<host>:<port>", ...]`
+  - `trackers = ["https://<host>", ...]` (개발용 loopback만 `http://127.0.0.1:<port>` 허용)
   - `relay_addr = "/ip4/<ip>/tcp/<port>/p2p/<relay_peer_id>"`
   - `swarm_key_path` (private network 사용 시)
   - `search_limit_default`

@@ -541,7 +541,7 @@ __rustory_precmd() {
   __rustory_last_start_sec=""
   __rustory_in_hook=""
 
-  ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "bash" --hostname "${HOSTNAME:-}" >/dev/null 2>&1 ) &
+  ( printf '%s' "$cmd" | rr record --cmd-stdin --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "bash" --hostname "${HOSTNAME:-}" >/dev/null 2>&1 ) &
   disown "$!" 2>/dev/null || true
 }
 
@@ -647,7 +647,7 @@ __rustory_precmd() {
   __rustory_last_cmd=""
   __rustory_last_start_ms=""
 
-  ( rr record --cmd "$cmd" --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "zsh" --hostname "${HOST:-}" >/dev/null 2>&1 ) &!
+  ( printf '%s' "$cmd" | rr record --cmd-stdin --cwd "$PWD" --exit-code "$exit_code" --duration-ms "$duration_ms" --shell "zsh" --hostname "${HOST:-}" >/dev/null 2>&1 ) &!
 }
 
 add-zsh-hook -d preexec __rustory_preexec 2>/dev/null || true
@@ -754,8 +754,10 @@ rr() {{
   [[ "$1" == "record" ]] || return 0
   shift
   while (( $# > 0 )); do
-    if [[ "$1" == "--cmd" ]]; then
-      printf '%s\n' "$2" >> "$RUSTORY_TEST_RECORD_LOG"
+    if [[ "$1" == "--cmd-stdin" ]]; then
+      local recorded
+      recorded="$(cat)"
+      printf '%s\n' "$recorded" >> "$RUSTORY_TEST_RECORD_LOG"
       return 0
     fi
     shift

@@ -12,8 +12,9 @@
 신규 머신 온보딩에서는 installer의 `--install-daemon`을 기본 경로로 사용한다.
 
 ```sh
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+  python3 - --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
     --swarm-key-b64 "<base64-swarm-key>" \
     --install-hook --install-daemon --import-hishtory
@@ -31,6 +32,8 @@ bus가 없는 상태에서는 installer가 unit 파일을 설치한 뒤 `daemon=
 shell에서 죽은 daemon을 다시 띄운다. 이 autostart block을 원하지 않으면
 `--no-daemon-shell-autostart`를 함께 넘긴다. 장기 운영 서버에서는 가능하면 같은 사용자
 로그인 세션에서 아래 `systemctl --user` 명령을 직접 실행해 systemd-user 관리로 전환한다.
+fallback state 디렉터리는 `0700`, log와 pid 파일은 `0600`으로 유지한다. state 디렉터리나
+log 대상이 symlink 또는 일반 디렉터리/파일이 아니면 기존 대상을 따라가지 않고 시작을 거부한다.
 
 ```sh
 systemctl --user daemon-reload
@@ -226,7 +229,7 @@ rr --db-path "$HOME/.rustory/history.db" daemon \
   --start-jitter-sec 10 \
   --max-peers-per-tick 0 \
   --swarm-key "$HOME/.config/rustory/swarm.key" \
-  --trackers "http://<tracker-host>:8850" \
+  --trackers "https://<tracker-host>" \
   --relay "/dns4/<relay-host>/tcp/<port>/p2p/<relay_peer_id>"
 ```
 

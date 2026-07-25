@@ -152,9 +152,14 @@ deadline과 64개 동시 요청 상한을 두므로 느린 unauthenticated body 
 `X-Rustory-Device-Request`와 해당 request body에는 signed proof 및 completion capability가 포함될 수
 있으므로 access log에서 header/body를 반드시 redact하거나 기록하지 않는다. tracker 응답은
 `Cache-Control: no-store, private`이므로 proxy에서 cache하지 않는다. client도 tracker JSON 응답을
-512 KiB로 제한한다. strict P2P inbound membership 조회는 전체 64개·peer별 4개의 background check로 제한하고,
-큰 decoded payload를 보유하는 push는 동시에 1개만 대기시킨다. local revocation deny cache를 먼저 확인하고
-tracker가 실패하면 요청을 fail-closed하되 swarm event loop를 동기 HTTP timeout 동안 멈추지 않는다.
+512 KiB로 제한한다. inbound pull/push codec은 process 전체에서 16개의 shared request admission과 10초
+read deadline을 사용해 여러 connection의 wire read/decode를 함께 제한한다. strict P2P inbound membership
+조회는 전체 64개·peer별 4개의 background check로 제한하고, 아직 승인 cache에 없는 unknown peer는 전체
+16개까지만 점유할 수 있다. 큰 decoded payload를 보유하는 pending push는 전체 4개·peer별 1개로 제한하며
+unknown peer는 push slot 1개까지만 사용해 known/non-revoked peer의 진행 용량을 남긴다. local peer cache는
+admission 우선순위에만 사용하고 tracker가 계속 authoritative membership을 판정한다. local revocation deny
+cache를 먼저 확인하고 tracker가 실패하면 요청을 fail-closed하되 swarm event loop를 동기 HTTP timeout 동안
+멈추지 않는다.
 
 ### Strict mode rollback 경계
 

@@ -40,7 +40,7 @@ use crate::{
     config, hishtory_cleanup, history_import, hook, managed_logs, p2p, search, storage, tracker,
     transport, uninstall,
 };
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -304,7 +304,13 @@ enum Command {
     #[command(about = "Record one shell command into the local history store")]
     Record {
         #[arg(long, help = "Shell command line to record")]
-        cmd: String,
+        cmd: Option<String>,
+
+        #[arg(
+            long,
+            help = "Read the shell command from stdin so it is not exposed in the process argument vector"
+        )]
+        cmd_stdin: bool,
 
         #[arg(long, help = "Working directory where the command ran")]
         cwd: Option<String>,
@@ -1016,7 +1022,14 @@ pub fn run() -> Result<()> {
                 allow_unauthenticated,
                 allow_insecure_http,
             )?;
-            transport::serve(&bind, &db_path, transport::ServeConfig { token })?;
+            transport::serve(
+                &bind,
+                &db_path,
+                transport::ServeConfig {
+                    token,
+                    allow_unauthenticated,
+                },
+            )?;
         }
         Command::Sync {
             peers,
@@ -1255,6 +1268,7 @@ pub fn run() -> Result<()> {
         }
         Command::Record {
             cmd,
+            cmd_stdin,
             cwd,
             exit_code,
             duration_ms,
@@ -1264,6 +1278,7 @@ pub fn run() -> Result<()> {
             device_id,
             print_id,
         } => {
+            let cmd = resolve_record_command(cmd, cmd_stdin)?;
             let cmd = cmd.trim();
             if cmd.is_empty() {
                 return Ok(());
@@ -5252,21 +5267,18 @@ fn validate_http_sync_serve_security(
     allow_unauthenticated: bool,
     allow_insecure_http: bool,
 ) -> Result<()> {
+    if token.is_none() && !allow_unauthenticated {
+        anyhow::bail!(
+            "refusing to serve unauthenticated HTTP sync API on {bind}; pass --token or explicitly opt in with --allow-unauthenticated"
+        );
+    }
     if is_loopback_bind(bind) {
         return Ok(());
     }
 
-    // `--allow-unauthenticated` was already the legacy explicit unsafe opt-in.
-    // Keep it working while requiring the new transport-specific opt-in for
-    // token-authenticated non-loopback plaintext HTTP.
     if !allow_insecure_http && !allow_unauthenticated {
         anyhow::bail!(
             "refusing to serve plaintext debug HTTP sync API on non-loopback bind address {bind}; bind to loopback behind TLS or pass --allow-insecure-http"
-        );
-    }
-    if token.is_none() && !allow_unauthenticated {
-        anyhow::bail!(
-            "refusing to serve unauthenticated HTTP sync API on non-loopback bind address {bind}; pass --token or --allow-unauthenticated"
         );
     }
 
@@ -5301,6 +5313,27 @@ fn should_ignore_record_command(
 ) -> std::result::Result<bool, regex::Error> {
     let re = regex::Regex::new(pattern)?;
     Ok(re.is_match(cmd))
+}
+
+fn resolve_record_command(cmd: Option<String>, cmd_stdin: bool) -> Result<String> {
+    match (cmd, cmd_stdin) {
+        (Some(_), true) => anyhow::bail!("record accepts only one of --cmd or --cmd-stdin"),
+        (Some(cmd), false) => Ok(cmd),
+        (None, false) => anyhow::bail!("record requires --cmd or --cmd-stdin"),
+        (None, true) => {
+            const MAX_RECORD_STDIN_BYTES: u64 = 16 * 1024 * 1024;
+            let mut bytes = Vec::new();
+            io::stdin()
+                .take(MAX_RECORD_STDIN_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .context("read record command from stdin")?;
+            anyhow::ensure!(
+                bytes.len() as u64 <= MAX_RECORD_STDIN_BYTES,
+                "record command from stdin exceeds {MAX_RECORD_STDIN_BYTES} bytes"
+            );
+            String::from_utf8(bytes).context("record command from stdin is not UTF-8")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5384,6 +5417,7 @@ mod tests {
             .expect("record subcommand");
         let record_help = record.render_help().to_string();
         assert!(record_help.contains("Shell command line to record"));
+        assert!(record_help.contains("Read the shell command from stdin"));
         assert!(record_help.contains("Print the inserted entry id"));
 
         let relay_serve = cmd
@@ -5435,9 +5469,14 @@ mod tests {
 
     #[test]
     fn debug_http_server_guard_preserves_safe_and_explicit_legacy_paths() {
-        validate_http_sync_serve_security("127.0.0.1:8844", None, false, false).unwrap();
+        validate_http_sync_serve_security("127.0.0.1:8844", Some("secret"), false, false).unwrap();
+        validate_http_sync_serve_security("127.0.0.1:8844", None, true, false).unwrap();
         validate_http_sync_serve_security("0.0.0.0:8844", Some("secret"), false, true).unwrap();
         validate_http_sync_serve_security("0.0.0.0:8844", None, true, false).unwrap();
+
+        let loopback =
+            validate_http_sync_serve_security("127.0.0.1:8844", None, false, false).unwrap_err();
+        assert!(format!("{loopback:#}").contains("--token"));
 
         let plaintext =
             validate_http_sync_serve_security("0.0.0.0:8844", Some("secret"), false, false)

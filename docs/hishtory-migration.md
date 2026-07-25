@@ -17,12 +17,12 @@
 각 머신에서 먼저 Rustory 설정과 P2P 키를 고정한다.
 
 ```sh
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
 rr init \
   --user-id "<same-user-id>" \
   --device-id "<unique-device-id>" \
-  --trackers "http://<tracker-host>:8850" \
-  --relay "/ip4/<relay-ip>/tcp/4001/p2p/<relay_peer_id>" \
-  --tracker-token "secret"
+  --trackers "https://<tracker-host>" \
+  --relay "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>"
 
 rr doctor
 rr swarm-key
@@ -159,8 +159,9 @@ grep -RIn "hishtory" ~/.zshrc ~/.zprofile ~/.zshenv ~/.zlogin ~/.bashrc ~/.bash_
 installer 기반 전환에서는 아래 옵션이 같은 정책을 자동화한다.
 
 ```sh
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+  python3 - --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
     --swarm-key-b64 "<base64-swarm-key>" \
     --install-hook --install-daemon --import-hishtory
@@ -193,8 +194,12 @@ rr cleanup-hishtory
 rr cleanup-hishtory --apply --archive-dir ~/SynologyDrive/rustory/hishtory-backups
 ```
 
-`--archive-dir`를 쓰면 삭제 전에 영향을 받는 Hishtory 디렉터리와 startup file을 `hishtory-backup-<unix>` 디렉터리 아래에 복사한다.
+`--archive-dir`를 쓰면 삭제 전에 영향을 받는 Hishtory 디렉터리와 startup file을
+권한이 `0700`인 `hishtory-backup-<unix>-<uuid>` 디렉터리 아래에 복사한다.
+동일한 `--backup-name` 경로가 이미 있으면 symlink나 기존 파일을 덮어쓰지 않고 실패한다.
 archive 경로는 삭제 대상과 같거나 그 내부여서는 안 되며, 삭제 대상의 상위 경로를 archive로 지정하는 것도 거부한다. 이 검사는 archive 안으로 자기 자신을 재귀 복사하거나 archive까지 함께 삭제하는 구성을 막는다.
+archive 경로의 조상 중 group/world-writable이면서 sticky bit가 없는 디렉터리가 있으면 다른 local user가
+경로 구성 요소를 바꿀 수 있으므로 archive와 삭제를 시작하기 전에 실패한다.
 startup file은 알려진 Hishtory `source`/hook/PATH 설정 라인만 제거한다. 주석이나 일반 명령처럼 단순히 `hishtory` 문자열만 언급한 라인은 보존한다.
 startup file이 symlink이고 제거 대상 라인이 있으면 링크 밖의 실제 파일을 우발적으로 수정하지 않도록 적용을 거부한다. 실제 파일을 직접 검토·수정한 뒤 다시 실행한다.
 제거 후 공백만 남는 일반 파일은 삭제한다.

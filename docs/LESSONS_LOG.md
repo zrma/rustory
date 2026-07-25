@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-25
+- Last Verified: 2026-07-26
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-07-26 | `todo-security-boundary-hardening`에서 P2P 신뢰 모델과 local-user·가입 전 자원·transport·filesystem·publication 경계를 분리해 finding을 재검토함 | 보안 finding은 심각도만으로 수정하지 말고 제품이 의도한 신뢰 권한과 그 권한 밖의 입력·자원·로컬 상태 경계를 대조해야 한다. 의도된 peer 권한은 유지하되 인증 전 처리량, plaintext 전송, 심볼릭 링크·권한, 공개 대상 revision처럼 별도 경계를 넘는 경로는 독립적으로 제한해야 호환성과 방어가 함께 유지된다. | tracker membership과 P2P 삭제 전파 의미는 유지하면서 가입 전 work와 decode 동시성에 상한을 두고, debug HTTP·tracker·release transport와 로컬 파일·hook·publication 검사를 fail-closed로 강화했다. | Rust 전체·no-default·feature 조합 테스트, installer 테스트, local P2P 및 Docker acceptance, script smoke, publication boundary 검사 |
 | 2026-07-25 | `todo-release-v1-0-60`에서 dedupe 변경의 source 출고와 daily-driver 갱신을 연속 검증함 | 동기화 관련 변경의 배포 완료는 새 버전 표시만으로 닫으면 안 된다. daemon 재시작 뒤 tracker 접근과 peer별 pending queue가 함께 정상이어야 새 binary가 실제 데이터 흐름에서도 안정적으로 동작한다고 판단할 수 있다. | 동일 SHA CI와 원격 asset identity를 확인한 뒤 일반 대상부터 순차 갱신하고, 각 단계에서 build identity·daemon·tracker·pending queue를 확인한 후 다음 대상으로 진행했다. | full release gate, publication boundary `all`, 동일 SHA CI, 원격 tag·asset checksum·glibc·build identity 검증, 배포 후 version·service·sync·cluster health 확인 |
 | 2026-07-25 | `todo-dedupe-candidate-semantics`에서 age와 peer push 조건을 keeper 선정 전에 적용하면 최신 동일 command와 오래된 keeper가 함께 남는 경계를 확인함 | dedupe의 그룹·keeper 선정 범위와 실제 삭제 가능 범위를 분리해야 한다. retention age와 전파 cursor는 보호 조건이지 중복 판단 기준이 아니며, 기본 키를 강화하더라도 문자열을 정규화하거나 셸 의미를 추정하지 않아야 결과를 예측할 수 있다. | 전체 device scope에서 exact command keeper를 먼저 고르고 age·push floor는 나머지 삭제 후보에만 적용하도록 SQL을 분리했으며, exact command를 기본값으로 하고 context 기준을 보수적 opt-in으로 남겼다. | `cargo test dedupe`, `cargo clippy --workspace --all-targets -- -D warnings`, `scripts/check.sh --fast`, repository quick gate |
 | 2026-07-25 | `todo-release-v1-0-59`에서 source push, release asset 발행, 순차 런타임 갱신을 하나의 출고 단위로 검증함 | 릴리즈 완료는 태그나 updater의 성공 메시지 하나로 판단할 수 없다. source revision, 원격 tag, 다운로드한 asset checksum과 build identity, 재시작된 실제 프로세스, 배포 후 운영 health를 각각 확인해야 부분 출고를 잡을 수 있다. | full release gate와 동일 SHA CI 이후 태그를 발행하고, 원격 자산을 다시 내려받아 checksum을 검증한 뒤 일반 대상부터 순차 갱신하며 서비스와 운영 health를 단계별로 확인했다. | `scripts/check-release-gates.sh --manifest-mode full`, publication boundary `all`, 원격 tag·asset checksum 검증, `rr --version`, 서비스 상태 및 배포 후 healthcheck |

@@ -12,7 +12,10 @@ use libp2p_request_response::ProtocolSupport;
 use multiaddr::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::time::Duration;
 use time::OffsetDateTime;
 
@@ -47,11 +50,23 @@ pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
 // 사용자가 `--req-timeout-cap-sec` 등을 크게 잡았을 때 내부 Timeout이 먼저 터질 수 있다.
 // 따라서 "충분히 큰 값"으로 두고, 실제 attempt timeout은 클라이언트 로직에서 결정한다.
 const REQUEST_RESPONSE_INTERNAL_TIMEOUT: Duration = Duration::from_secs(60 * 60);
+const INBOUND_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_INBOUND_REQUEST_DECODES: usize = 16;
 const RELAY_RELISTEN_MIN_DELAY: Duration = Duration::from_secs(5);
 const RELAY_RELISTEN_MAX_DELAY: Duration = Duration::from_secs(60);
 const MAX_PENDING_MEMBERSHIP_CHECKS: usize = 64;
 const MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER: usize = 4;
-const MAX_PENDING_PUSH_MEMBERSHIP_CHECKS: usize = 1;
+const MAX_PENDING_UNKNOWN_MEMBERSHIP_CHECKS: usize = 16;
+const MAX_PENDING_PUSH_MEMBERSHIP_CHECKS: usize = 4;
+const MAX_PENDING_PUSH_MEMBERSHIP_CHECKS_PER_PEER: usize = 1;
+const MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS: usize = 1;
+const MAX_TRACKER_ANNOUNCE_ADDRS: usize = 64;
+const _: () = assert!(MAX_PENDING_PUSH_MEMBERSHIP_CHECKS > 1);
+const _: () = assert!(MAX_PENDING_PUSH_MEMBERSHIP_CHECKS <= MAX_PENDING_MEMBERSHIP_CHECKS);
+const _: () = assert!(MAX_PENDING_PUSH_MEMBERSHIP_CHECKS_PER_PEER == 1);
+const _: () = assert!(MAX_PENDING_UNKNOWN_MEMBERSHIP_CHECKS < MAX_PENDING_MEMBERSHIP_CHECKS);
+const _: () =
+    assert!(MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS < MAX_PENDING_PUSH_MEMBERSHIP_CHECKS);
 static NEXT_TARGET_OFFSET: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone)]
@@ -210,11 +225,13 @@ struct AuthorizedPeer {
 enum PendingInboundMembershipRequest {
     Pull {
         peer: PeerId,
+        known_peer: bool,
         request: SyncPull,
         channel: libp2p_request_response::ResponseChannel<SyncBatch>,
     },
     Push {
         peer: PeerId,
+        known_peer: bool,
         request: EntriesPush,
         channel: libp2p_request_response::ResponseChannel<PushAck>,
     },
@@ -226,6 +243,81 @@ impl PendingInboundMembershipRequest {
             Self::Pull { peer, .. } | Self::Push { peer, .. } => *peer,
         }
     }
+
+    fn is_known_peer(&self) -> bool {
+        match self {
+            Self::Pull { known_peer, .. } | Self::Push { known_peer, .. } => *known_peer,
+        }
+    }
+
+    fn is_push(&self) -> bool {
+        matches!(self, Self::Push { .. })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingMembershipCounts {
+    total: usize,
+    peer: usize,
+    pushes: usize,
+    peer_pushes: usize,
+    unknown: usize,
+    unknown_pushes: usize,
+}
+
+fn strict_membership_counts_limit_reached(
+    counts: PendingMembershipCounts,
+    known_peer: bool,
+    push: bool,
+) -> bool {
+    if counts.total >= MAX_PENDING_MEMBERSHIP_CHECKS
+        || counts.peer >= MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER
+    {
+        return true;
+    }
+
+    if push
+        && (counts.pushes >= MAX_PENDING_PUSH_MEMBERSHIP_CHECKS
+            || counts.peer_pushes >= MAX_PENDING_PUSH_MEMBERSHIP_CHECKS_PER_PEER)
+    {
+        return true;
+    }
+
+    if known_peer {
+        return false;
+    }
+
+    counts.unknown >= MAX_PENDING_UNKNOWN_MEMBERSHIP_CHECKS
+        || (push && counts.unknown_pushes >= MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS)
+}
+
+fn strict_membership_limit_reached(
+    pending: &HashMap<u64, PendingInboundMembershipRequest>,
+    peer: PeerId,
+    known_peer: bool,
+    push: bool,
+) -> bool {
+    let counts = PendingMembershipCounts {
+        total: pending.len(),
+        peer: pending
+            .values()
+            .filter(|request| request.peer() == peer)
+            .count(),
+        pushes: pending.values().filter(|request| request.is_push()).count(),
+        peer_pushes: pending
+            .values()
+            .filter(|request| request.is_push() && request.peer() == peer)
+            .count(),
+        unknown: pending
+            .values()
+            .filter(|request| !request.is_known_peer())
+            .count(),
+        unknown_pushes: pending
+            .values()
+            .filter(|request| request.is_push() && !request.is_known_peer())
+            .count(),
+    };
+    strict_membership_counts_limit_reached(counts, known_peer, push)
 }
 
 struct CompletedMembershipCheck {
@@ -279,11 +371,17 @@ fn build_rustory_swarm_with_identity(
 
     let rr_cfg = libp2p_request_response::Config::default()
         .with_request_timeout(REQUEST_RESPONSE_INTERNAL_TIMEOUT);
+    let inbound_request_admission =
+        Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_REQUEST_DECODES));
     let rr_codec = crate::p2p_codec::JsonCodec::<SyncPull, SyncBatch>::new(
         PULL_REQ_MAX_BYTES,
         PULL_RESP_MAX_BYTES,
     )
-    .with_decoded_maximum(PULL_REQ_DECODED_MAX_BYTES, PULL_RESP_DECODED_MAX_BYTES);
+    .with_decoded_maximum(PULL_REQ_DECODED_MAX_BYTES, PULL_RESP_DECODED_MAX_BYTES)
+    .with_request_admission(
+        inbound_request_admission.clone(),
+        INBOUND_REQUEST_READ_TIMEOUT,
+    );
     let rr = libp2p_request_response::Behaviour::with_codec(rr_codec, protocols, rr_cfg);
 
     // 양쪽이 지원하면 zstd(1.0.1)를 우선 선택한다. 구버전은 plain(1.0.0)으로 폴백.
@@ -303,7 +401,8 @@ fn build_rustory_swarm_with_identity(
         PUSH_REQ_MAX_BYTES,
         PUSH_RESP_MAX_BYTES,
     )
-    .with_decoded_maximum(PUSH_REQ_DECODED_MAX_BYTES, PUSH_RESP_DECODED_MAX_BYTES);
+    .with_decoded_maximum(PUSH_REQ_DECODED_MAX_BYTES, PUSH_RESP_DECODED_MAX_BYTES)
+    .with_request_admission(inbound_request_admission, INBOUND_REQUEST_READ_TIMEOUT);
     let push_rr =
         libp2p_request_response::Behaviour::with_codec(push_codec, push_protocols, push_cfg);
 
@@ -513,7 +612,12 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                     continue;
                 };
                 match pending {
-                    PendingInboundMembershipRequest::Pull { peer, request, channel } => {
+                    PendingInboundMembershipRequest::Pull {
+                        peer,
+                        request,
+                        channel,
+                        ..
+                    } => {
                         let response = completed
                             .result
                             .map_err(anyhow::Error::msg)
@@ -530,7 +634,12 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             }
                         }
                     }
-                    PendingInboundMembershipRequest::Push { peer, request, channel } => {
+                    PendingInboundMembershipRequest::Push {
+                        peer,
+                        request,
+                        channel,
+                        ..
+                    } => {
                         let response = completed
                             .result
                             .map_err(anyhow::Error::msg)
@@ -602,7 +711,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                             continue;
                         };
                         println!("p2p listen: {}", full);
-                        known_addrs.insert(full);
+                        insert_bounded_known_addr(&mut known_addrs, full);
 
                         // 주소를 1개 이상 확보한 시점에 tracker에 즉시 등록한다.
                         if !trackers.is_empty() {
@@ -615,22 +724,8 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         else {
                             continue;
                         };
-                        if !known_addrs.insert(full.clone()) {
-                            continue;
-                        }
-
                         if verbose_event_logs {
                             eprintln!("p2p external addr candidate: {full}");
-                        }
-                        if !trackers.is_empty() {
-                            spawn_register_all(
-                                trackers.clone(),
-                                registration_identity.clone(),
-                                known_addrs.iter().cloned().collect(),
-                                meta.clone(),
-                                require_device_membership,
-                                retirement_protocol,
-                            );
                         }
                     }
                     SwarmEvent::ExternalAddrConfirmed { address } => {
@@ -639,7 +734,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         else {
                             continue;
                         };
-                        if !known_addrs.insert(full.clone()) {
+                        if !insert_bounded_known_addr(&mut known_addrs, full.clone()) {
                             continue;
                         }
 
@@ -671,14 +766,14 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                         );
                                         continue;
                                     }
-                                    if pending_membership_checks.len()
-                                        >= MAX_PENDING_MEMBERSHIP_CHECKS
-                                        || pending_membership_checks
-                                            .values()
-                                            .filter(|pending| pending.peer() == peer)
-                                            .count()
-                                            >= MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER
-                                    {
+                                    let known_peer =
+                                        store.get_peer_book_peer(&peer.to_string())?.is_some();
+                                    if strict_membership_limit_reached(
+                                        &pending_membership_checks,
+                                        peer,
+                                        known_peer,
+                                        false,
+                                    ) {
                                         eprintln!(
                                             "warn: p2p pull rejected: peer={peer} error=strict membership check limit reached"
                                         );
@@ -695,6 +790,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                         check_id,
                                         PendingInboundMembershipRequest::Pull {
                                             peer,
+                                            known_peer,
                                             request,
                                             channel,
                                         },
@@ -742,24 +838,14 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                             .send_response(channel, rejected_push_ack());
                                         continue;
                                     }
-                                    if pending_membership_checks.len()
-                                        >= MAX_PENDING_MEMBERSHIP_CHECKS
-                                        || pending_membership_checks
-                                            .values()
-                                            .filter(|pending| {
-                                                matches!(
-                                                    pending,
-                                                    PendingInboundMembershipRequest::Push { .. }
-                                                )
-                                            })
-                                            .count()
-                                            >= MAX_PENDING_PUSH_MEMBERSHIP_CHECKS
-                                        || pending_membership_checks
-                                            .values()
-                                            .filter(|pending| pending.peer() == peer)
-                                            .count()
-                                            >= MAX_PENDING_MEMBERSHIP_CHECKS_PER_PEER
-                                    {
+                                    let known_peer =
+                                        store.get_peer_book_peer(&peer.to_string())?.is_some();
+                                    if strict_membership_limit_reached(
+                                        &pending_membership_checks,
+                                        peer,
+                                        known_peer,
+                                        true,
+                                    ) {
                                         eprintln!(
                                             "warn: p2p push rejected: peer={peer} error=strict membership check limit reached"
                                         );
@@ -780,6 +866,7 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                                         check_id,
                                         PendingInboundMembershipRequest::Push {
                                             peer,
+                                            known_peer,
                                             request,
                                             channel,
                                         },
@@ -921,6 +1008,19 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         eprintln!("warn: p2p listener error: {error}");
                     }
                     SwarmEvent::ExpiredListenAddr { address, .. } => {
+                        let full = ensure_p2p_suffix(address, local_peer_id);
+                        if known_addrs.remove(&full.to_string()) && !trackers.is_empty() {
+                            spawn_register_all(
+                                trackers.clone(),
+                                registration_identity.clone(),
+                                known_addrs.iter().cloned().collect(),
+                                meta.clone(),
+                                require_device_membership,
+                                retirement_protocol,
+                            );
+                        }
+                    }
+                    SwarmEvent::ExternalAddrExpired { address } => {
                         let full = ensure_p2p_suffix(address, local_peer_id);
                         if known_addrs.remove(&full.to_string()) && !trackers.is_empty() {
                             spawn_register_all(
@@ -1108,17 +1208,21 @@ fn authorize_inbound_membership_response(
         "peer is revoked: {peer_id}"
     );
     let membership = validate_authoritative_membership(store, &peer_id, membership)?;
-    validate_authorized_peer_record(
-        PeerBookPeer {
-            peer_id,
-            addrs: Vec::new(),
-            user_id: membership.user_id,
-            device_id: membership.device_id,
-            rr_version: None,
-            last_seen_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
-        },
-        local_meta,
-    )
+    let existing = store.get_peer_book_peer(&peer_id)?;
+    let peer = PeerBookPeer {
+        peer_id,
+        addrs: existing
+            .as_ref()
+            .map(|peer| peer.addrs.clone())
+            .unwrap_or_default(),
+        user_id: membership.user_id,
+        device_id: membership.device_id,
+        rr_version: existing.and_then(|peer| peer.rr_version),
+        last_seen_unix: time::OffsetDateTime::now_utc().unix_timestamp(),
+    };
+    let authorized = validate_authorized_peer_record(peer.clone(), local_meta)?;
+    store.upsert_peer_book(&peer)?;
+    Ok(authorized)
 }
 
 fn spawn_membership_check(
@@ -1371,6 +1475,16 @@ fn remove_known_listen_addrs(
         removed |= known_addrs.remove(&ensure_p2p_suffix(addr.clone(), peer_id).to_string());
     }
     removed
+}
+
+fn insert_bounded_known_addr(known_addrs: &mut HashSet<String>, addr: String) -> bool {
+    if known_addrs.contains(&addr) {
+        return false;
+    }
+    if known_addrs.len() >= MAX_TRACKER_ANNOUNCE_ADDRS {
+        return false;
+    }
+    known_addrs.insert(addr)
 }
 
 fn dialable_tracker_addr_from_external_candidate(
@@ -2834,6 +2948,32 @@ mod tests {
     }
 
     #[test]
+    fn unknown_membership_checks_leave_capacity_reserved_for_known_peers() {
+        let counts = PendingMembershipCounts {
+            total: MAX_PENDING_UNKNOWN_MEMBERSHIP_CHECKS,
+            unknown: MAX_PENDING_UNKNOWN_MEMBERSHIP_CHECKS,
+            ..PendingMembershipCounts::default()
+        };
+
+        assert!(strict_membership_counts_limit_reached(counts, false, false));
+        assert!(!strict_membership_counts_limit_reached(counts, true, false));
+    }
+
+    #[test]
+    fn unknown_push_checks_leave_push_capacity_reserved_for_known_peers() {
+        let counts = PendingMembershipCounts {
+            total: MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS,
+            pushes: MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS,
+            unknown: MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS,
+            unknown_pushes: MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS,
+            ..PendingMembershipCounts::default()
+        };
+
+        assert!(strict_membership_counts_limit_reached(counts, false, true));
+        assert!(!strict_membership_counts_limit_reached(counts, true, true));
+    }
+
+    #[test]
     fn strict_membership_lookup_does_not_block_current_thread_runtime() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2940,6 +3080,22 @@ mod tests {
 
         let got = direct_candidate_addrs_from_tracker(&[direct, relay, invalid]);
         assert_eq!(got, vec!["/ip4/198.51.100.10/tcp/1234".parse().unwrap()]);
+    }
+
+    #[test]
+    fn tracker_announce_addrs_are_bounded() {
+        let mut addrs = HashSet::new();
+        for index in 0..MAX_TRACKER_ANNOUNCE_ADDRS {
+            assert!(insert_bounded_known_addr(
+                &mut addrs,
+                format!("/ip4/198.51.100.1/tcp/{index}")
+            ));
+        }
+        assert!(!insert_bounded_known_addr(
+            &mut addrs,
+            "/ip4/198.51.100.2/tcp/9999".to_string()
+        ));
+        assert_eq!(addrs.len(), MAX_TRACKER_ANNOUNCE_ADDRS);
     }
 
     #[test]
@@ -3496,6 +3652,92 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("peer is revoked"));
+    }
+
+    #[test]
+    fn authoritative_membership_promotes_peer_for_admission_priority() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer = PeerId::random();
+        let meta = crate::tracker::PeerMeta {
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            hostname: None,
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        };
+
+        authorize_inbound_membership_response(
+            &store,
+            peer,
+            &meta,
+            crate::tracker::MembershipResponse {
+                peer_id: peer.to_string(),
+                active: true,
+                enrolled: true,
+                revoked: false,
+                strict: true,
+                device_id: Some("dev-remote".to_string()),
+                user_id: Some("u1".to_string()),
+                revocation: None,
+            },
+        )
+        .unwrap();
+
+        let cached = store
+            .get_peer_book_peer(&peer.to_string())
+            .unwrap()
+            .expect("authorized peer should be cached for admission priority");
+        assert_eq!(cached.user_id.as_deref(), Some("u1"));
+        assert_eq!(cached.device_id.as_deref(), Some("dev-remote"));
+    }
+
+    #[test]
+    fn authoritative_membership_refresh_preserves_discovery_metadata() {
+        let store = LocalStore::open(":memory:").unwrap();
+        let peer = PeerId::random();
+        store
+            .upsert_peer_book(&PeerBookPeer {
+                peer_id: peer.to_string(),
+                addrs: vec!["/ip4/127.0.0.1/tcp/4040".to_string()],
+                user_id: Some("u1".to_string()),
+                device_id: Some("dev-remote".to_string()),
+                rr_version: Some("1.0.60".to_string()),
+                last_seen_unix: 1,
+            })
+            .unwrap();
+        let meta = crate::tracker::PeerMeta {
+            user_id: Some("u1".to_string()),
+            device_id: Some("dev-local".to_string()),
+            hostname: None,
+            version: None,
+            build_revision: None,
+            build_dirty: None,
+        };
+
+        authorize_inbound_membership_response(
+            &store,
+            peer,
+            &meta,
+            crate::tracker::MembershipResponse {
+                peer_id: peer.to_string(),
+                active: true,
+                enrolled: true,
+                revoked: false,
+                strict: true,
+                device_id: Some("dev-remote".to_string()),
+                user_id: Some("u1".to_string()),
+                revocation: None,
+            },
+        )
+        .unwrap();
+
+        let cached = store
+            .get_peer_book_peer(&peer.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cached.addrs, vec!["/ip4/127.0.0.1/tcp/4040"]);
+        assert_eq!(cached.rr_version.as_deref(), Some("1.0.60"));
     }
 
     #[test]

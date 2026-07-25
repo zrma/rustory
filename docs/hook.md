@@ -68,7 +68,7 @@ auto_tombstone_gc_marker_path = "~/.config/rustory/auto-tombstone-gc.last"
 `RUSTORY_SEARCH_LIMIT`, `RUSTORY_ASYNC_UPLOAD*`, `RUSTORY_AUTO_PRUNE*`, `RUSTORY_AUTO_TOMBSTONE_GC*` 환경 변수는 config 값보다 우선한다. 임시로 끄고 싶으면 예를 들어 `RUSTORY_ASYNC_UPLOAD=0`처럼 환경 변수로 override한다.
 
 ## 동작 개요
-- 기록: 커맨드 종료 시 `rr record`를 백그라운드로 호출해 SQLite에 append-only 저장
+- 기록: 커맨드 종료 시 generated hook이 원문 command를 stdin으로 전달해 `rr record --cmd-stdin`을 백그라운드로 호출하고 SQLite에 append-only 저장한다. 이 경로는 command 원문을 process argv에 중복 노출하지 않는다. 수동 호출과 기존 자동화의 호환을 위해 `rr record --cmd`도 유지한다.
 - 업로드(선택): `RUSTORY_ASYNC_UPLOAD=1`이면 `rr record`가 주기 제한(`RUSTORY_ASYNC_UPLOAD_INTERVAL_SEC`)을 적용해 백그라운드 push를 트리거한다.
 - 보관(선택): `RUSTORY_AUTO_PRUNE=1`이면 `rr record`가 주기 제한(`RUSTORY_AUTO_PRUNE_INTERVAL_SEC`)을 적용해 오래된 로컬 엔트리를 정리하고, 필요 시 최신 N개(`RUSTORY_AUTO_PRUNE_KEEP_RECENT`)를 보존한다.
 - tombstone GC(선택): `RUSTORY_AUTO_TOMBSTONE_GC=1`이면 `rr record`가 주기 제한(`RUSTORY_AUTO_TOMBSTONE_GC_INTERVAL_SEC`)을 적용해 오래되고 알려진 peer로 delete cursor가 전파된 삭제 tombstone만 정리한다.

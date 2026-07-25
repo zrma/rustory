@@ -10,8 +10,7 @@ services:
       - 0.0.0.0:8850
       - --ttl-sec
       - "60"
-      - --token
-      - ${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}
+      - --allow-unauthenticated
     ports:
       - "${RUSTORY_ACCEPTANCE_TRACKER_PORT:-8850}:8850"
 
@@ -43,7 +42,6 @@ services:
     environment:
       RUSTORY_USER_ID: ${RUSTORY_ACCEPTANCE_USER_ID:-acceptance}
       RUSTORY_DEVICE_ID: ${RUSTORY_ACCEPTANCE_LINUX_DEVICE_ID:-linux}
-      RUSTORY_TRACKER_TOKEN: ${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}
     volumes:
       - ${RUSTORY_ACCEPTANCE_DIR:-./data}:/data
     command:

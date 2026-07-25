@@ -1,6 +1,6 @@
 # Security and Privacy Model
 
-Last Verified: 2026-07-12
+Last Verified: 2026-07-26
 
 이 문서는 Rustory가 보호하는 경계와 보호하지 않는 경계를 명시한다. 암호화 구현의 source of truth는 `src/p2p.rs`, `src/transport.rs`, `src/storage.rs`, `src/tracker.rs`, `src/config.rs`다.
 
@@ -30,7 +30,7 @@ Rustory daily-driver grid는 **같은 grid에 가입한 모든 peer를 신뢰하
 
 `rr serve`/`rr sync`는 P2P 이전의 debug/compatibility 경로이며 entry JSON을 application-level encryption 없이 전송한다.
 
-- loopback HTTP는 기본 허용한다.
+- loopback HTTP transport는 허용하지만 server API는 기본적으로 bearer token을 요구한다.
 - HTTPS peer는 허용한다.
 - non-loopback plaintext HTTP client/server는 `--allow-insecure-http` 같은 명시적 opt-in 없이는 거부한다.
 - `--allow-unauthenticated`는 이미 명시적인 unsafe server opt-in이므로 legacy 호환을 위해 insecure HTTP opt-in도 겸한다.
@@ -57,7 +57,7 @@ Rustory daily-driver grid는 **같은 grid에 가입한 모든 peer를 신뢰하
 - `rr device retire`는 revoke와 함께 대상 daemon에 fixed `full_uninstall` ticket을 남긴다. 대상이 `allow_remote_retirement=true`로 명시적으로 허용했고 launchd/systemd-user 관리 daemon으로 실행 중일 때만 별도 recovery helper가 로컬 uninstall을 수행한다. ticket에는 shell command나 경로가 들어가지 않으며 Linux background fallback은 crash/reboot 복구를 보장할 수 없어 revoke-only로 동작한다.
 - admin API는 fleet tracker token과 별도 admin token을 모두 요구하고, production admin/retirement 제어면은 HTTPS에서만 동작한다. admin token은 process argv 노출을 막기 위해 `RUSTORY_TRACKER_ADMIN_TOKEN`으로만 전달하며 CLI flag로 받지 않는다. loopback HTTP는 test build 전용이다. tracker security-state 파일은 absolute path의 private regular file이어야 한다.
 - proof/capability endpoint는 bounded authenticated header를 body보다 먼저 처리한다. 인증되지 않은 legacy body는 읽지 않고, body가 필요한 요청도 async ingress의 10초 deadline과 64-request 동시 상한 안에서만 읽는다. TLS reverse proxy의 read/write/body/header limit도 이보다 느슨하게 두지 않고 admin, register, signed unregister, retirement poll/ack/complete endpoint를 정상 poll/retry cadence보다 여유 있는 peer/IP별 한도로 rate-limit한다. `X-Rustory-Device-Request`와 request body는 access log에서 redact/미기록하고 tracker 응답은 cache하지 않는다.
-- tracker JSON 응답은 client에서도 512 KiB로 제한한다. strict inbound membership 조회는 전체 64개·peer별 4개의 background check로 격리하고 큰 decoded payload를 보유하는 pending push는 1개로 제한한다. tracker timeout이 P2P event loop를 정지시키지 않게 하면서 local revocation cache를 먼저 평가하고 조회 실패는 계속 fail-closed한다.
+- tracker JSON 응답은 client에서도 512 KiB로 제한한다. inbound pull/push codec은 process 전체에서 16개의 shared admission과 10초 read deadline을 사용한다. strict inbound membership 조회는 전체 64개·peer별 4개의 background check로 격리하고 unknown peer는 전체 16개까지만 점유하게 한다. 큰 decoded payload를 보유하는 pending push는 전체 4개·peer별 1개로 제한하며 unknown peer는 push slot 1개까지만 사용해 known/non-revoked peer의 진행 용량을 남긴다. local peer cache는 scheduling 우선순위에만 사용하고 tracker가 계속 authoritative membership을 판정한다. tracker timeout이 P2P event loop를 정지시키지 않게 하면서 local revocation cache를 먼저 평가하고 조회 실패는 계속 fail-closed한다.
 - tracker security state는 process-lifetime exclusive lock으로 단일 writer만 허용한다. transactional shared store가 도입되기 전에는 같은 state path를 공유하는 여러 replica로 tracker를 실행하지 않는다.
 - destructive cleanup을 시작하기 전에 daemon 시작 시 검증한 exact cleanup path plan과 ticket별 256-bit completion capability를 private receipt에 저장하고 tracker에는 capability의 SHA-256 hash만 보낸다. helper는 이후 config path가 바뀌어도 receipt의 불변 plan만 사용한다. receipt에는 fleet token이나 identity private key를 복제하지 않는다. config/identity/binary 삭제 뒤에는 이 capability가 `Running → Completed` 전이에만 쓰이고, 응답이 유실되면 독립 helper가 확인될 때까지 재시도한 뒤 receipt와 helper copy를 삭제한다.
 - `Failed`/`Refused` ticket을 재큐잉할 때 durable attempt를 증가시키고 ACK 서명에 결합하므로 tracker 재시작 뒤의 stale signed ACK가 새 `Pending` 시도를 되돌릴 수 없다. 최초 attempt는 wire에서 생략해 기존 attempt-1 payload 형식을 유지한다.

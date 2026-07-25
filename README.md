@@ -32,9 +32,9 @@ Rustory가 지키려는 경계는 단순하다.
 기존 rr grid에 새 디바이스를 붙이는 설치 형태:
 
 ```sh
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" \
-    --tracker "<https://tracker.example.com>" \
+  python3 - --tracker "<https://tracker.example.com>" \
     --relay "/dns4/<relay.example.com>/tcp/4001/p2p/<relay_peer_id>" \
     --user-id "<shared-user-id>" \
     --swarm-key-b64 "<base64-swarm-key>" \

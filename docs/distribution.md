@@ -2,7 +2,7 @@
 
 - Audience: Rustory 운영자, release 관리자
 - Owner: Rustory
-- Last Verified: 2026-06-30
+- Last Verified: 2026-07-26
 
 이 문서는 Rustory binary 배포, 신규 디바이스 온보딩, self-update 경로를 정리한다.
 private tracker 주소, token, registry, k8s/NAS 경로는 public repo에 기록하지 않는다.
@@ -89,11 +89,7 @@ target architecture, GLIBC, checksum을 다시 검사하지만 binary provenance
 공식 배포 URL이 GitHub raw installer를 가리키면 신규 머신은 아래처럼 시작한다.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
-    --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
-    --swarm-key-b64 "<base64-swarm-key>" \
-    --install-hook --install-daemon --import-hishtory
+curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | RUSTORY_TRACKER_TOKEN="<fleet-token>" python3 - --tracker "<tracker-url>" --relay "<relay-multiaddr>" --user-id "<shared-user-id>" --swarm-key-b64 "<base64-swarm-key>" --install-hook --install-daemon --import-hishtory
 ```
 
 `--tracker`는 반복 지정하거나 comma-separated 값으로 지정할 수 있다.
@@ -102,7 +98,12 @@ relay 주소까지 config에 쓰려면 `--relay "<relay-multiaddr>"`를 같이 �
 예: `/dns4/rustory-relay.example.com/tcp/4001/p2p/<relay_peer_id>`.
 `/ip4/100.64.0.0/10`, RFC1918 private IP, loopback 같은 literal relay 주소를 넘기면 installer와
 `rr doctor`가 경고한다. 이런 주소는 같은 tailnet/LAN에 없는 신규 머신에서는 relay circuit을 열 수 없다.
-`--token`에는 raw token 값만 전달한다. shell quoting은 명령줄 문법일 뿐이고,
+기본 경로는 `RUSTORY_TRACKER_TOKEN` 환경변수다. 위처럼 pipe 오른쪽 command의 환경에 literal token을
+할당하면 한 물리적 줄을 그대로 복사해 실행하면서도 token을 process argv에 남기지 않는다. 공개 문서에는
+placeholder만 두고, 접근 제어된 private one-paste archive에는 실제 값을 이 위치에 보관할 수 있다.
+installer는 token을 child argv에 넣지 않고 환경으로 전달한다. 호환용 `--token`에 직접 값을 넘길 때는
+raw token 값만 전달한다.
+shell quoting은 명령줄 문법일 뿐이고,
 token 값 자체에 앞뒤 `'` 또는 `"` 문자를 포함하면 tracker 인증이 실패한다.
 기존 P2P grid에 합류시키는 설치라면 `--user-id`를 기존 grid 값으로 맞추고,
 `--swarm-key-b64`로 기존 공유 `swarm.key`의 base64 값을 전달한다. 파일을 이미 배치한 운영 경로에서는
@@ -148,8 +149,8 @@ installer는 다음 순서로 동작한다.
 3. checksum을 검증한 뒤 `~/.local/bin/rr`에 설치한다.
 4. `--swarm-key-b64` 또는 `--swarm-key-source`가 있으면 공유 swarm key를
    `~/.config/rustory/swarm.key`로 쓰고 fingerprint만 출력한다.
-5. `--token`, `--tracker`, `--relay`, `--user-id`, `--device-id`, device membership/retirement flag 중
-   지정된 값이 있으면 `rr init`을 실행한다.
+5. `RUSTORY_TRACKER_TOKEN`(호환 경로는 `--token`), `--tracker`, `--relay`, `--user-id`, `--device-id`,
+   device membership/retirement flag 중 지정된 값이 있으면 `rr init`을 실행한다.
 6. `--install-hook`이 있으면 shell rc 파일에 Rustory hook block을 설치한다.
 7. `--import-hishtory`가 있으면 Hishtory DB를 import하고 Hishtory hook 라인을 제거한다.
 8. `--install-daemon`이 있으면 user service를 설치하고, `--no-start-daemon`이 없으면 즉시 시작한다.
@@ -157,8 +158,8 @@ installer는 다음 순서로 동작한다.
    fallback으로 시작하고, shell rc 파일에 idempotent autostart block을 설치한다.
 
 token 값은 installer 로그에 출력하지 않는다.
-swarm key 값도 installer 로그에 출력하지 않는다. true one-paste onboarding이 필요하면 private archive에
-token과 `base64 <swarm.key>` 결과를 literal argument로 넣은 명령을 보관한다. public repo에는 실제 값을 기록하지 않는다.
+swarm key 값도 installer 로그에 출력하지 않는다. 자동화에서는 token을 literal argument로 넣지 말고
+private secret source에서 `RUSTORY_TRACKER_TOKEN`으로 주입한다. public repo에는 실제 값을 기록하지 않는다.
 
 ## Init Alias
 
@@ -166,14 +167,12 @@ Rustory CLI binary 이름은 `rr`이지만, 프로젝트/패키지 이름은 Rus
 신규 peer는 아래 형태를 기본으로 쓴다.
 
 ```sh
-rr init --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>"
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
+rr init --tracker "<tracker-url>"
 ```
 
-기존 long option도 유지한다.
-
-```sh
-rr init --tracker-token "$RUSTORY_TRACKER_TOKEN" --trackers "<tracker-url>"
-```
+기존 `--tracker-token`/`--trackers` long option도 명시적 호환 경로로 유지하지만,
+token이 process argv에 남을 수 있으므로 새 자동화에서는 환경변수 경로를 사용한다.
 
 ## Self Update
 

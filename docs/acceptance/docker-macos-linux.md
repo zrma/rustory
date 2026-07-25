@@ -1,8 +1,12 @@
 # Acceptance Test: Docker (macOS host + Linux container)
 
 목표: k8s/VPS 없이도 `tracker + relay + linux peer` 구성을 docker로 띄우고, macOS host가 `rr p2p-sync`로 동기화하며 **relay fallback**이 실제로 사용되는지 확인한다.
-정확한 컨테이너 구성, 토큰, DB 경로, 검증 문자열은 `scripts/acceptance_docker_macos_linux.sh`와 `contrib/docker/acceptance/*`를 직접 확인한다.
+정확한 컨테이너 구성, DB 경로, 검증 문자열은 `scripts/acceptance_docker_macos_linux.sh`와 `contrib/docker/acceptance/*`를 직접 확인한다.
 이 문서는 수동 디버깅을 위한 경로와 관찰 지점을 제공한다.
+
+이 격리 acceptance tracker는 container DNS의 plaintext HTTP를 production bearer 경로로 오인하지 않도록
+명시적인 `--allow-unauthenticated` test mode로만 실행한다. bearer tracker의 HTTPS/loopback 강제와 인증
+동작은 Rust 단위·통합 테스트가 별도로 검증한다.
 
 ## 빠른 실행(권장)
 ```sh
@@ -52,7 +56,6 @@ target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" rec
 RUSTORY_USER_ID=acceptance \
 RUSTORY_DEVICE_ID=mac \
 RUSTORY_SWARM_KEY_PATH="$PWD/target/acceptance/docker-macos-linux/swarm.key" \
-RUSTORY_TRACKER_TOKEN="acceptance-token" \
 target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" p2p-serve \
   --identity-key "$PWD/target/acceptance/docker-macos-linux/mac.identity.key" \
   --trackers "http://127.0.0.1:8850" \
@@ -63,7 +66,6 @@ target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" p2p
 RUSTORY_USER_ID=acceptance \
 RUSTORY_DEVICE_ID=mac \
 RUSTORY_SWARM_KEY_PATH="$PWD/target/acceptance/docker-macos-linux/swarm.key" \
-RUSTORY_TRACKER_TOKEN="acceptance-token" \
 target/debug/rr --db-path "$PWD/target/acceptance/docker-macos-linux/mac.db" p2p-sync \
   --identity-key "$PWD/target/acceptance/docker-macos-linux/mac.identity.key" \
   --trackers "http://127.0.0.1:8850" \

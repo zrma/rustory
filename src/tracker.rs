@@ -2745,6 +2745,7 @@ impl TrackerClient {
     }
 
     pub fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse> {
+        self.validate_bearer_transport()?;
         let url = format!("{}/api/v1/peers/register", self.base_url);
         let body = serde_json::to_vec(req).context("serialize register request")?;
 
@@ -2764,6 +2765,7 @@ impl TrackerClient {
     }
 
     pub fn unregister(&self, req: &UnregisterRequest) -> Result<UnregisterResponse> {
+        self.validate_bearer_transport()?;
         let url = format!("{}/api/v1/peers/unregister", self.base_url);
         let (body, encoded_header) = encode_device_request(req, "unregister request")?;
 
@@ -2786,6 +2788,7 @@ impl TrackerClient {
     }
 
     pub fn list(&self, user_id: Option<&str>) -> Result<ListResponse> {
+        self.validate_bearer_transport()?;
         let mut url = format!("{}/api/v1/peers", self.base_url);
         if let Some(user_id) = user_id {
             let encoded = urlencoding::encode(user_id);
@@ -2808,6 +2811,7 @@ impl TrackerClient {
     }
 
     pub fn authorize_peer(&self, peer_id: &str) -> Result<MembershipResponse> {
+        self.validate_bearer_transport()?;
         let url = format!(
             "{}/api/v1/devices/authorize?peer_id={}",
             self.base_url,
@@ -2948,6 +2952,7 @@ impl TrackerClient {
         request: &Req,
         response_label: &str,
     ) -> Result<Resp> {
+        self.validate_bearer_transport()?;
         let url = format!("{}{path}", self.base_url);
         let (body, encoded_header) = encode_device_request(request, "device tracker request")?;
         let token = self.token.clone();
@@ -2998,6 +3003,42 @@ impl TrackerClient {
         .with_context(|| format!("POST {url}"))?;
         parse_json_response(resp, response_label)
     }
+
+    fn validate_bearer_transport(&self) -> Result<()> {
+        if self.token.is_none() && self.admin_token.is_none() {
+            return Ok(());
+        }
+        validate_tracker_bearer_url(&self.base_url)
+    }
+}
+
+fn validate_tracker_bearer_url(base_url: &str) -> Result<()> {
+    let uri: ureq::http::Uri = base_url
+        .trim()
+        .parse()
+        .context("parse tracker URL for bearer transport")?;
+    let scheme = uri
+        .scheme_str()
+        .context("tracker URL must include http:// or https://")?;
+    let host = uri.host().context("tracker URL must include a host")?;
+    if scheme.eq_ignore_ascii_case("https") {
+        return Ok(());
+    }
+    if scheme.eq_ignore_ascii_case("http") && tracker_host_is_loopback(host) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "refusing to send tracker bearer token over plaintext non-loopback URL: {base_url}"
+    )
+}
+
+fn tracker_host_is_loopback(host: &str) -> bool {
+    let host = host.trim_matches(['[', ']']);
+    host.eq_ignore_ascii_case("localhost")
+        || host.eq_ignore_ascii_case("localhost.")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|addr| addr.is_loopback())
 }
 
 fn encode_device_request<T: Serialize>(request: &T, label: &str) -> Result<(Vec<u8>, String)> {
@@ -3859,6 +3900,28 @@ mod tests {
         let err = client.register(&req).unwrap_err();
         assert_ureq_status(&err, 400);
         server.shutdown();
+    }
+
+    #[test]
+    fn bearer_tracker_transport_requires_https_or_loopback() {
+        for allowed in [
+            "https://tracker.example",
+            "http://localhost:8850",
+            "http://localhost.:8850",
+            "http://127.0.0.1:8850",
+            "http://[::1]:8850",
+        ] {
+            validate_tracker_bearer_url(allowed).unwrap();
+        }
+
+        for rejected in [
+            "http://tracker.example:8850",
+            "http://192.0.2.1:8850",
+            "ftp://tracker.example",
+            "tracker.example",
+        ] {
+            assert!(validate_tracker_bearer_url(rejected).is_err(), "{rejected}");
+        }
     }
 
     #[test]

@@ -38,7 +38,6 @@ KEEP="${RUSTORY_ACCEPTANCE_KEEP:-0}"
 TRACKER_PORT="${RUSTORY_ACCEPTANCE_TRACKER_PORT:-$(pick_port)}"
 TRACKER_URL="http://127.0.0.1:${TRACKER_PORT}"
 USER_ID="${RUSTORY_ACCEPTANCE_USER_ID:-acceptance}"
-TOKEN="${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}"
 
 NET_A="${PROJECT}-a-net"
 NET_B="${PROJECT}-b-net"
@@ -62,8 +61,7 @@ cleanup() {
 trap cleanup EXIT
 
 fetch_peer_json() {
-  curl -fsS -H "Authorization: Bearer ${TOKEN}" \
-    "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}"
+  curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}"
 }
 
 peer_id_for_device() {
@@ -131,7 +129,6 @@ start_peer() {
     -e "RELAY_PEER_ID=$RELAY_PEER_ID" \
     -e "RUSTORY_USER_ID=$USER_ID" \
     -e "RUSTORY_DEVICE_ID=$device" \
-    -e "RUSTORY_TRACKER_TOKEN=$TOKEN" \
     -v "$ACC_DIR:/data" \
     "$IMAGE" \
     sh -lc '
@@ -173,7 +170,6 @@ run_sync() {
   docker exec \
     -e "RUSTORY_USER_ID=$USER_ID" \
     -e "RUSTORY_DEVICE_ID=$device" \
-    -e "RUSTORY_TRACKER_TOKEN=$TOKEN" \
     -e "RUSTORY_SWARM_KEY_PATH=/data/swarm.key" \
     "$container" \
     sh -lc '
@@ -208,7 +204,7 @@ docker run -d \
   --network-alias tracker \
   -p "127.0.0.1:${TRACKER_PORT}:8850" \
   "$IMAGE" \
-  rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 120 --token "$TOKEN" >/dev/null
+  rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 120 --allow-unauthenticated >/dev/null
 docker network connect --alias tracker "$NET_B" "$TRACKER" >/dev/null
 
 ENC_USER_ID="$(python3 - <<'PY' "$USER_ID"
@@ -220,7 +216,7 @@ PY
 
 TRACKER_READY=0
 for _ in $(seq 1 300); do
-  if curl -fsS -H "Authorization: Bearer ${TOKEN}" "${TRACKER_URL}/api/v1/ping" >/dev/null 2>&1; then
+  if curl -fsS "${TRACKER_URL}/api/v1/ping" >/dev/null 2>&1; then
     TRACKER_READY=1
     break
   fi

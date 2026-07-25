@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -105,11 +105,11 @@ pub fn cleanup_hishtory(opts: CleanupOptions) -> Result<CleanupReport> {
     let archive_root = if opts.apply {
         match opts.archive_dir.as_deref() {
             Some(archive_dir) if !planned.is_empty() => {
-                let root = archive_dir.join(
-                    opts.backup_name
-                        .unwrap_or_else(|| format!("hishtory-backup-{}", unix_now())),
-                );
+                let root = archive_dir.join(opts.backup_name.unwrap_or_else(|| {
+                    format!("hishtory-backup-{}-{}", unix_now(), uuid::Uuid::new_v4())
+                }));
                 validate_archive_root(&planned, &root)?;
+                create_private_archive_root(archive_dir, &root)?;
                 archive_planned_paths(&planned, &home_dir, &root, &mut actions)?;
                 Some(root)
             }
@@ -420,12 +420,12 @@ fn copy_path_no_follow(source: &Path, dest: &Path) -> Result<()> {
             fs::read_link(source).with_context(|| format!("read symlink: {}", source.display()))?;
         let symlink_note = dest.with_extension("symlink-target");
         ensure_parent_dir(&symlink_note)?;
-        fs::write(&symlink_note, target.to_string_lossy().as_ref())
+        write_new_archive_file(&symlink_note, target.to_string_lossy().as_bytes())
             .with_context(|| format!("archive symlink target: {}", symlink_note.display()))?;
         return Ok(());
     }
     if meta.is_dir() {
-        fs::create_dir_all(dest)
+        create_private_dir(dest)
             .with_context(|| format!("create archive dir: {}", dest.display()))?;
         for entry in fs::read_dir(source)
             .with_context(|| format!("read archive source dir: {}", source.display()))?
@@ -437,7 +437,11 @@ fn copy_path_no_follow(source: &Path, dest: &Path) -> Result<()> {
     }
 
     ensure_parent_dir(dest)?;
-    fs::copy(source, dest).with_context(|| {
+    let mut source_file = fs::File::open(source)
+        .with_context(|| format!("open archive source: {}", source.display()))?;
+    let mut dest_file = open_new_archive_file(dest)
+        .with_context(|| format!("create archive destination: {}", dest.display()))?;
+    io::copy(&mut source_file, &mut dest_file).with_context(|| {
         format!(
             "copy archive path: {} -> {}",
             source.display(),
@@ -467,6 +471,81 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
         fs::create_dir_all(parent).with_context(|| format!("create dir: {}", parent.display()))?;
     }
     Ok(())
+}
+
+fn create_private_archive_root(archive_dir: &Path, root: &Path) -> Result<()> {
+    fs::create_dir_all(archive_dir)
+        .with_context(|| format!("create archive parent: {}", archive_dir.display()))?;
+    validate_archive_ancestor_permissions(archive_dir)?;
+    create_private_dir(root).with_context(|| {
+        format!(
+            "create exclusive archive root (must not already exist): {}",
+            root.display()
+        )
+    })
+}
+
+fn validate_archive_ancestor_permissions(archive_dir: &Path) -> Result<()> {
+    let absolute = if archive_dir.is_absolute() {
+        archive_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve current directory for archive parent")?
+            .join(archive_dir)
+    };
+    let archive_dir = normalize_lexical_path(&absolute)?;
+
+    for ancestor in archive_dir.ancestors() {
+        if ancestor.as_os_str().is_empty() {
+            continue;
+        }
+        let metadata = fs::metadata(ancestor)
+            .with_context(|| format!("inspect archive ancestor: {}", ancestor.display()))?;
+        anyhow::ensure!(
+            metadata.is_dir(),
+            "archive ancestor must be a directory: {}",
+            ancestor.display()
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = metadata.permissions().mode();
+            let shared_writable = mode & 0o022 != 0;
+            let sticky = mode & libc::S_ISVTX as u32 != 0;
+            anyhow::ensure!(
+                !shared_writable || sticky,
+                "archive ancestor is writable by another local user without sticky-bit protection: {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+fn create_private_dir(path: &Path) -> Result<()> {
+    fs::create_dir(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn open_new_archive_file(path: &Path) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    options.open(path)
+}
+
+fn write_new_archive_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut file = open_new_archive_file(path)?;
+    file.write_all(bytes)
 }
 
 fn unix_now() -> u64 {
@@ -564,6 +643,61 @@ mod tests {
         assert!(archive_dir.join("backup/.hishtory/.hishtory.db").exists());
         assert!(archive_dir.join("backup/.zshrc").exists());
         assert_eq!(report.archive_root, Some(archive_dir.join("backup")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_hishtory_rejects_precreated_archive_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let archive_dir = dir.path().join("archive");
+        let victim = dir.path().join("victim");
+        fs::create_dir_all(home.join(".hishtory")).unwrap();
+        fs::create_dir_all(&archive_dir).unwrap();
+        fs::write(home.join(".hishtory/.hishtory.db"), "sqlite").unwrap();
+        fs::write(&victim, "preserve").unwrap();
+        symlink(&victim, archive_dir.join("backup")).unwrap();
+
+        let err = cleanup_hishtory(CleanupOptions {
+            home_dir: home,
+            apply: true,
+            archive_dir: Some(archive_dir),
+            no_archive: false,
+            backup_name: Some("backup".to_string()),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("must not already exist"));
+        assert_eq!(fs::read_to_string(victim).unwrap(), "preserve");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_hishtory_rejects_shared_writable_archive_ancestor() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let shared = dir.path().join("shared");
+        let archive_dir = shared.join("archive");
+        fs::create_dir_all(home.join(".hishtory")).unwrap();
+        fs::create_dir_all(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o0777)).unwrap();
+        fs::write(home.join(".hishtory/.hishtory.db"), "sqlite").unwrap();
+
+        let err = cleanup_hishtory(CleanupOptions {
+            home_dir: home.clone(),
+            apply: true,
+            archive_dir: Some(archive_dir),
+            no_archive: false,
+            backup_name: Some("backup".to_string()),
+        })
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("writable by another local user"));
+        assert!(home.join(".hishtory/.hishtory.db").exists());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-12
+- Last Verified: 2026-07-26
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
@@ -70,7 +70,7 @@
 
 추가 강제:
 - `lefthook` `pre-push`에서 `scripts/check-release-gates.sh --manifest-mode full`와 `scripts/check-lessons-log-range.sh --remote origin --bookmark main`를 실행해 release/push 게이트 및 교훈 로그 range coupling을 재확인한다.
-- `scripts/jj-git-push-safe.sh`도 push 직전에 `check-release-gates -> check-jj-conflicts --bookmark <target> -> check-lessons-log-range` 순서의 동일 강제를 수행한다.
+- `scripts/jj-git-push-safe.sh`도 push 직전에 `check-release-gates -> check-jj-conflicts --bookmark <target> -> check-lessons-log-range` 순서의 동일 강제를 수행하고, 검사한 immutable commit SHA를 refspec으로 push한다.
 - `scripts/jj-git-push-safe.sh` 기본 모드는 `PUSH_GATES_MODE=strict`이며, non-strict 우회는 `ALLOW_NON_STRICT_PUSH_GATES=1` + `DEBUG_GATES_OVERRIDE=1` + non-CI 조합이 아니면 차단된다.
 
 4. 사후 점검(조건부)

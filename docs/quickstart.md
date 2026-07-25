@@ -10,8 +10,9 @@ Release asset이 준비된 버전은 아래처럼 설치하고 바로 tracker gr
 tracker URL/token은 private 값이므로 public 문서에는 실제 값을 두지 않는다.
 
 ```sh
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
 curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.py | \
-  python3 - --token "$RUSTORY_TRACKER_TOKEN" --tracker "<tracker-url>" \
+  python3 - --tracker "<tracker-url>" \
     --relay "<relay-multiaddr>" --user-id "<shared-user-id>" \
     --swarm-key-b64 "<base64-swarm-key>" \
     --install-hook --install-daemon --import-hishtory
@@ -21,7 +22,8 @@ curl -fsSL https://raw.githubusercontent.com/zrma/rustory/main/install/rustory.p
 `--install-daemon`은 `rr daemon`을 user service로 등록해 이 머신을 tracker/relay grid의 상시 멤버로 유지한다.
 `--import-hishtory`는 `~/.hishtory/.hishtory.db`를 가져온 뒤 user startup files의 Hishtory hook 라인을 제거한다.
 Hishtory DB/디렉터리는 fallback source로 남긴다.
-`--token`에는 raw token만 전달한다. token 값 앞뒤에 literal `'` 또는 `"`가 들어가면 `rr doctor`에서
+installer와 `rr init`은 `RUSTORY_TRACKER_TOKEN`을 우선 사용해 token이 process argv에 남지 않게 한다.
+호환용 `--token`에 값을 직접 넘길 때는 raw token만 전달한다. token 값 앞뒤에 literal `'` 또는 `"`가 들어가면 `rr doctor`에서
 `length`가 예상보다 길어지고 tracker ping이 401로 실패한다.
 기존 P2P grid에 합류시키려면 같은 `user_id`, 같은 relay 주소, 같은 공유 `swarm.key`가 필요하다.
 신규 머신에 파일을 미리 둘 필요가 없게 하려면 `swarm.key` 내용을 base64로 인코딩해 `--swarm-key-b64`에 넣는다.
@@ -83,7 +85,8 @@ rr relay-serve --listen /ip4/0.0.0.0/tcp/4001
 
 #### Tracker 서버
 ```sh
-rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --token "secret"
+export RUSTORY_TRACKER_TOKEN="<fleet-token>"
+rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60
 ```
 
 ### 2-2) 각 디바이스에서 init
@@ -92,9 +95,8 @@ rr tracker-serve --bind 0.0.0.0:8850 --ttl-sec 60 --token "secret"
 rr init \
   --user-id "<user>" \
   --device-id "<device>" \
-  --tracker "http://<tracker-host>:8850" \
-  --relay "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>" \
-  --token "secret"
+  --tracker "https://<tracker-host>" \
+  --relay "/dns4/<relay-host>/tcp/4001/p2p/<relay_peer_id>"
 
 rr doctor
 rr doctor --json

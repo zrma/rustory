@@ -45,7 +45,6 @@ RELAY_PORT="${RUSTORY_ACCEPTANCE_RELAY_PORT:-$(pick_port)}"
 TRACKER_URL="http://127.0.0.1:${TRACKER_PORT}"
 
 USER_ID="${RUSTORY_ACCEPTANCE_USER_ID:-acceptance}"
-TOKEN="${RUSTORY_ACCEPTANCE_TRACKER_TOKEN:-acceptance-token}"
 
 cleanup() {
   set +e
@@ -68,22 +67,14 @@ echo "[2/8] start tracker/relay (docker)"
 RUSTORY_ACCEPTANCE_DIR="$ACC_DIR" \
 RUSTORY_ACCEPTANCE_TRACKER_PORT="$TRACKER_PORT" \
 RUSTORY_ACCEPTANCE_RELAY_PORT="$RELAY_PORT" \
-RUSTORY_ACCEPTANCE_TRACKER_TOKEN="$TOKEN" \
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --build tracker relay >/dev/null
 
 echo "[3/8] wait tracker ready"
 TRACKER_READY=0
 for _ in $(seq 1 200); do
-  if [[ -n "$TOKEN" ]]; then
-    if curl -fsS -H "Authorization: Bearer ${TOKEN}" "${TRACKER_URL}/api/v1/ping" >/dev/null 2>&1; then
-      TRACKER_READY=1
-      break
-    fi
-  else
-    if curl -fsS "${TRACKER_URL}/api/v1/ping" >/dev/null 2>&1; then
-      TRACKER_READY=1
-      break
-    fi
+  if curl -fsS "${TRACKER_URL}/api/v1/ping" >/dev/null 2>&1; then
+    TRACKER_READY=1
+    break
   fi
   sleep 0.05
 done
@@ -123,7 +114,6 @@ RUSTORY_ACCEPTANCE_DIR="$ACC_DIR" \
 RUSTORY_ACCEPTANCE_TRACKER_PORT="$TRACKER_PORT" \
 RUSTORY_ACCEPTANCE_RELAY_PORT="$RELAY_PORT" \
 RUSTORY_ACCEPTANCE_USER_ID="$USER_ID" \
-RUSTORY_ACCEPTANCE_TRACKER_TOKEN="$TOKEN" \
 docker compose -f "$COMPOSE_FILE" -p "$PROJECT" up -d --no-deps linux-peer >/dev/null
 
 echo "[6/8] wait tracker has peers (linux peer registered)"
@@ -136,28 +126,15 @@ PY
 
 READY=0
 for _ in $(seq 1 200); do
-  if [[ -n "$TOKEN" ]]; then
-    if curl -fsS -H "Authorization: Bearer ${TOKEN}" "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null \
-      | python3 -c 'import json,sys
+  if curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null \
+    | python3 -c 'import json,sys
 try:
   data = json.load(sys.stdin)
 except Exception:
   sys.exit(1)
 sys.exit(0 if len(data.get("peers", [])) >= 1 else 1)'; then
-      READY=1
-      break
-    fi
-  else
-    if curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null \
-      | python3 -c 'import json,sys
-try:
-  data = json.load(sys.stdin)
-except Exception:
-  sys.exit(1)
-sys.exit(0 if len(data.get("peers", [])) >= 1 else 1)'; then
-      READY=1
-      break
-    fi
+    READY=1
+    break
   fi
   sleep 0.05
 done
@@ -169,20 +146,11 @@ if [[ "$READY" != "1" ]]; then
 fi
 
 echo "[7/8] wait relay reservation accepted (linux peer is dialable via relay)"
-LINUX_PEER_ID=""
-if [[ -n "$TOKEN" ]]; then
-  LINUX_PEER_ID="$(curl -fsS -H "Authorization: Bearer ${TOKEN}" "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null \
-    | python3 -c 'import json,sys
+LINUX_PEER_ID="$(curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null \
+  | python3 -c 'import json,sys
 data = json.load(sys.stdin)
 peers = data.get("peers", [])
 print(peers[0]["peer_id"] if peers else "")' || true)"
-else
-  LINUX_PEER_ID="$(curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null \
-    | python3 -c 'import json,sys
-data = json.load(sys.stdin)
-peers = data.get("peers", [])
-print(peers[0]["peer_id"] if peers else "")' || true)"
-fi
 if [[ -z "$LINUX_PEER_ID" ]]; then
   echo "error: failed to resolve linux peer id from tracker" >&2
   exit 1
@@ -227,7 +195,6 @@ HOME="$MAC_HOME" \
 RUSTORY_USER_ID="$USER_ID" \
 RUSTORY_DEVICE_ID="mac" \
 RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
-RUSTORY_TRACKER_TOKEN="$TOKEN" \
 target/debug/rr --db-path "$MAC_DB" p2p-serve \
   --identity-key "$ACC_DIR/mac.identity.key" \
   --trackers "$TRACKER_URL" \
@@ -236,7 +203,7 @@ MAC_P2P_PID=$!
 
 MAC_REGISTERED=0
 for _ in $(seq 1 200); do
-  if curl -fsS -H "Authorization: Bearer ${TOKEN}" "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null | python3 -c 'import json,sys
+  if curl -fsS "${TRACKER_URL}/api/v1/peers?user_id=${ENC_USER_ID}" 2>/dev/null | python3 -c 'import json,sys
 try:
     data = json.load(sys.stdin)
 except Exception:
@@ -259,7 +226,6 @@ HOME="$MAC_HOME" \
 RUSTORY_USER_ID="$USER_ID" \
 RUSTORY_DEVICE_ID="mac" \
 RUSTORY_SWARM_KEY_PATH="$ACC_DIR/swarm.key" \
-RUSTORY_TRACKER_TOKEN="$TOKEN" \
 target/debug/rr --db-path "$MAC_DB" p2p-sync \
   --identity-key "$ACC_DIR/mac.identity.key" \
   --trackers "$TRACKER_URL" \

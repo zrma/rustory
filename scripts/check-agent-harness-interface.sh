@@ -91,6 +91,18 @@ if grep -Eiq '[0-9]+개 저장소|[0-9]+ repositories|all[[:space:]]+repositorie
   fail "harness docs must not expose a repository portfolio"
 fi
 
-scripts/check-publication-boundary.py
+publication_target=${TODO_UNPUBLISHED_TARGET_REV:-}
+publication_base=${TODO_UNPUBLISHED_BASE_REF:-}
+if [ -n "$publication_target" ]; then
+  if [ -n "$publication_base" ] && git rev-parse --verify "$publication_base^{commit}" >/dev/null 2>&1; then
+    scripts/check-publication-boundary.py \
+      --target-rev "$publication_target" \
+      --base-rev "$publication_base"
+  else
+    scripts/check-publication-boundary.py --target-rev "$publication_target"
+  fi
+else
+  scripts/check-publication-boundary.py
+fi
 
 printf 'agent harness interface is valid: agent-harness-v1 / openai-gpt-5.6-2026-07-11\n'

@@ -2,7 +2,8 @@ use crate::libp2p::StreamProtocol;
 use async_trait::async_trait;
 use futures::prelude::*;
 use serde::{Serialize, de::DeserializeOwned};
-use std::{io, marker::PhantomData};
+use std::{io, marker::PhantomData, sync::Arc, time::Duration};
+use tokio::sync::Semaphore;
 
 #[derive(Clone)]
 pub struct JsonCodec<Req, Resp> {
@@ -12,6 +13,8 @@ pub struct JsonCodec<Req, Resp> {
     // 압축 프로토콜인 경우, decode(압축 해제 후 JSON bytes) 최대 크기를 별도로 제한한다.
     request_decoded_maximum: u64,
     response_decoded_maximum: u64,
+    request_admission: Option<Arc<Semaphore>>,
+    request_read_timeout: Option<Duration>,
     phantom: PhantomData<(Req, Resp)>,
 }
 
@@ -22,6 +25,8 @@ impl<Req, Resp> JsonCodec<Req, Resp> {
             response_wire_maximum,
             request_decoded_maximum: request_wire_maximum,
             response_decoded_maximum: response_wire_maximum,
+            request_admission: None,
+            request_read_timeout: None,
             phantom: PhantomData,
         }
     }
@@ -33,6 +38,16 @@ impl<Req, Resp> JsonCodec<Req, Resp> {
     ) -> Self {
         self.request_decoded_maximum = request_decoded_maximum;
         self.response_decoded_maximum = response_decoded_maximum;
+        self
+    }
+
+    pub fn with_request_admission(
+        mut self,
+        admission: Arc<Semaphore>,
+        read_timeout: Duration,
+    ) -> Self {
+        self.request_admission = Some(admission);
+        self.request_read_timeout = Some(read_timeout);
         self
     }
 }
@@ -51,7 +66,25 @@ where
     where
         T: AsyncRead + Unpin + Send,
     {
-        let data = read_limited_bytes(io, self.request_wire_maximum).await?;
+        let _permit = match self.request_admission.as_ref() {
+            Some(admission) => Some(admission.clone().try_acquire_owned().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "inbound request admission limit reached",
+                )
+            })?),
+            None => None,
+        };
+        let data = match self.request_read_timeout {
+            Some(timeout) => {
+                tokio::time::timeout(timeout, read_limited_bytes(io, self.request_wire_maximum))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "inbound request read timed out")
+                    })??
+            }
+            None => read_limited_bytes(io, self.request_wire_maximum).await?,
+        };
         let data = if is_zstd_protocol(protocol) {
             decompress_zstd_limited(&data, self.request_decoded_maximum)?
         } else {
@@ -264,5 +297,27 @@ mod tests {
         let err = executor::block_on(codec.read_request(&protocol, &mut io)).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("too large"));
+    }
+
+    #[tokio::test]
+    async fn request_admission_is_shared_across_codec_clones() {
+        let protocol = StreamProtocol::new("/test/1.0.0");
+        let admission = Arc::new(Semaphore::new(1));
+        let mut first = JsonCodec::<TestReq, TestResp>::new(10_000, 10_000)
+            .with_request_admission(admission.clone(), Duration::from_secs(1));
+        let mut second = first.clone();
+        let held = admission.clone().acquire_owned().await.unwrap();
+
+        let mut blocked = futures::io::Cursor::new(br#"{"payload":"blocked"}"#.to_vec());
+        let err = second
+            .read_request(&protocol, &mut blocked)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+
+        drop(held);
+        let mut allowed = futures::io::Cursor::new(br#"{"payload":"allowed"}"#.to_vec());
+        let request = first.read_request(&protocol, &mut allowed).await.unwrap();
+        assert_eq!(request.payload, "allowed");
     }
 }

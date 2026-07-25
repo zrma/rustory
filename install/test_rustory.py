@@ -16,6 +16,37 @@ rustory = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(rustory)
 
 
+class DownloadTransportTests(unittest.TestCase):
+    def test_secure_redirect_handler_rejects_https_downgrade(self) -> None:
+        handler = rustory.SecureRedirectHandler(False)
+        request = rustory.urllib.request.Request("https://example.test/rr")
+
+        with self.assertRaisesRegex(Exception, "HTTPS download redirect"):
+            handler.redirect_request(
+                request,
+                None,
+                302,
+                "Found",
+                {},
+                "http://example.test/rr",
+            )
+
+    def test_secure_redirect_handler_allows_explicit_insecure_override(self) -> None:
+        handler = rustory.SecureRedirectHandler(True)
+        request = rustory.urllib.request.Request("https://example.test/rr")
+
+        redirected = handler.redirect_request(
+            request,
+            None,
+            302,
+            "Found",
+            {},
+            "http://example.test/rr",
+        )
+
+        self.assertEqual(redirected.full_url, "http://example.test/rr")
+
+
 class HishtoryCleanupTests(unittest.TestCase):
     def test_remove_hishtory_lines_preserves_unrelated_mentions(self) -> None:
         lines = [
@@ -133,6 +164,11 @@ class RetirementInstallerTests(unittest.TestCase):
             child_env = popen.call_args.kwargs["env"]
             self.assertEqual(child_env["XDG_STATE_HOME"], str(state_home))
             self.assertEqual(child_env["RUSTORY_DAEMON_MANAGER"], "background")
+            self.assertEqual((state_home / "rustory").stat().st_mode & 0o777, 0o700)
+            self.assertEqual(
+                (state_home / "rustory" / "daemon.log").stat().st_mode & 0o777,
+                0o600,
+            )
 
     def test_background_pid_write_failure_terminates_spawned_child(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -326,6 +362,24 @@ class RetirementInstallerTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertIn("--force", command)
         self.assertNotIn("--update-existing-security", command)
+
+    def test_tracker_token_is_forwarded_via_environment_not_argv(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["rustory.py", "--token", "fleet-secret", "--tracker", "https://tracker.example"],
+        ):
+            args = rustory.parse_args()
+
+        with mock.patch.object(rustory.subprocess, "run") as run:
+            rustory.run_init(Path("/tmp/rr"), args)
+
+        command = run.call_args.args[0]
+        self.assertNotIn("fleet-secret", command)
+        self.assertEqual(
+            run.call_args.kwargs["env"]["RUSTORY_TRACKER_TOKEN"],
+            "fleet-secret",
+        )
 
     def test_user_or_device_only_install_still_requests_rr_init(self) -> None:
         with mock.patch.object(sys, "argv", ["rustory.py", "--user-id", "u1"]):

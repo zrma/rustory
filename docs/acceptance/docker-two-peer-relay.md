@@ -1,7 +1,11 @@
 # Acceptance Test: Docker Two-Peer Relay-Only
 
 목표: 두 peer를 서로 다른 Docker bridge network에 분리하고, tracker/relay만 양쪽 network에 붙여 **peer 간 direct 경로 없이** `tracker + relay` 동기화가 수렴하는지 확인한다.
-정확한 컨테이너 이름, 토큰, DB 경로, 검증 문자열은 `scripts/acceptance_docker_two_peer_relay.sh`가 소유한다.
+정확한 컨테이너 이름, DB 경로, 검증 문자열은 `scripts/acceptance_docker_two_peer_relay.sh`가 소유한다.
+
+이 격리 acceptance tracker는 container DNS의 plaintext HTTP를 production bearer 경로로 오인하지 않도록
+명시적인 `--allow-unauthenticated` test mode로만 실행한다. bearer tracker의 HTTPS/loopback 강제와 인증
+동작은 Rust 단위·통합 테스트가 별도로 검증한다.
 
 ## 빠른 실행
 ```sh

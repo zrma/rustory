@@ -15,6 +15,7 @@ const HTTP_PUSH_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
 
 pub struct ServeConfig {
     pub token: Option<String>,
+    pub allow_unauthenticated: bool,
 }
 
 pub struct SyncConfig {
@@ -25,7 +26,14 @@ pub struct SyncConfig {
 pub fn serve(bind: &str, db_path: &str, cfg: ServeConfig) -> Result<()> {
     let token = normalize_configured_token(cfg.token, "HTTP sync token")?;
     let store = LocalStore::open(db_path)?;
-    serve_http(bind, store, ServeConfig { token })
+    serve_http(
+        bind,
+        store,
+        ServeConfig {
+            token,
+            allow_unauthenticated: cfg.allow_unauthenticated,
+        },
+    )
 }
 
 pub fn sync(
@@ -128,9 +136,10 @@ fn serve_http(bind: &str, store: LocalStore, cfg: ServeConfig) -> Result<()> {
     let server =
         tiny_http::Server::http(bind).map_err(|e| anyhow::anyhow!("listen {bind}: {e}"))?;
     let token = cfg.token;
+    let allow_unauthenticated = cfg.allow_unauthenticated;
 
     for mut req in server.incoming_requests() {
-        let res = route_http_request(&store, token.as_deref(), &mut req)
+        let res = route_http_request(&store, token.as_deref(), allow_unauthenticated, &mut req)
             .unwrap_or_else(|err| respond_text(500, &format!("error: {err:#}\n")));
         let _ = req.respond(res);
     }
@@ -321,6 +330,7 @@ fn ensure_http_sync_success_status(
 fn route_http_request(
     store: &LocalStore,
     token: Option<&str>,
+    allow_unauthenticated: bool,
     req: &mut tiny_http::Request,
 ) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
     let url = req.url().to_string();
@@ -334,7 +344,7 @@ fn route_http_request(
     match (method, path) {
         ("GET", "/api/v1/ping") => Ok(respond_text(200, "ok\n")),
         ("GET", "/api/v1/entries") => {
-            if !is_authorized(req, token) {
+            if !is_authorized(req, token, allow_unauthenticated) {
                 return Ok(respond_text(401, "unauthorized\n"));
             }
             let (cursor, delete_cursor, limit) = parse_cursor_limit(query)?;
@@ -350,7 +360,7 @@ fn route_http_request(
             )
         }
         ("POST", "/api/v1/entries") => {
-            if !is_authorized(req, token) {
+            if !is_authorized(req, token, allow_unauthenticated) {
                 return Ok(respond_text(401, "unauthorized\n"));
             }
             let mut buf = Vec::new();
@@ -387,9 +397,13 @@ fn route_http_request(
     }
 }
 
-fn is_authorized(req: &tiny_http::Request, token: Option<&str>) -> bool {
+fn is_authorized(
+    req: &tiny_http::Request,
+    token: Option<&str>,
+    allow_unauthenticated: bool,
+) -> bool {
     let Some(token) = token else {
-        return true;
+        return allow_unauthenticated;
     };
     let token = token.trim();
     if token.is_empty() {
@@ -498,10 +512,18 @@ mod tests {
     }
 
     fn start_test_server(db_path: String) -> TestServer {
-        start_test_server_with_token(db_path, None)
+        start_test_server_with_security(db_path, None, true)
     }
 
     fn start_test_server_with_token(db_path: String, token: Option<String>) -> TestServer {
+        start_test_server_with_security(db_path, token, true)
+    }
+
+    fn start_test_server_with_security(
+        db_path: String,
+        token: Option<String>,
+        allow_unauthenticated: bool,
+    ) -> TestServer {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -518,8 +540,13 @@ mod tests {
             while !shutdown2.load(Ordering::SeqCst) {
                 match server.recv_timeout(Duration::from_millis(50)) {
                     Ok(Some(mut req)) => {
-                        let res = route_http_request(&store, token2.as_deref(), &mut req)
-                            .unwrap_or_else(|e| respond_text(500, &format!("error: {e:#}\n")));
+                        let res = route_http_request(
+                            &store,
+                            token2.as_deref(),
+                            allow_unauthenticated,
+                            &mut req,
+                        )
+                        .unwrap_or_else(|e| respond_text(500, &format!("error: {e:#}\n")));
                         let _ = req.respond(res);
                     }
                     Ok(None) => {}
@@ -841,6 +868,23 @@ mod tests {
             .call()
             .unwrap();
         assert_eq!(resp.status().as_u16(), 200);
+
+        server.shutdown();
+    }
+
+    #[test]
+    fn http_entries_require_explicit_unauthenticated_opt_in_without_token() {
+        let dir = tempdir().unwrap();
+        let remote_db = dir.path().join("remote.db");
+        let server =
+            start_test_server_with_security(remote_db.to_str().unwrap().to_string(), None, false);
+
+        let url = format!("{}/api/v1/entries?cursor=0&limit=1", server.base_url);
+        let err = ureq::get(&url).call().unwrap_err();
+        let ureq::Error::StatusCode(status) = err else {
+            panic!("expected status error");
+        };
+        assert_eq!(status, 401);
 
         server.shutdown();
     }
