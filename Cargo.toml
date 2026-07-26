@@ -1,6 +1,6 @@
 [package]
 name = "rustory"
-version = "1.0.60"
+version = "1.0.61"
 edition = "2024"
 autobins = false
 
