@@ -509,9 +509,11 @@ fn validate_archive_ancestor_permissions(archive_dir: &Path) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            const STICKY_BIT: u32 = 0o1000;
+
             let mode = metadata.permissions().mode();
             let shared_writable = mode & 0o022 != 0;
-            let sticky = mode & libc::S_ISVTX as u32 != 0;
+            let sticky = mode & STICKY_BIT != 0;
             anyhow::ensure!(
                 !shared_writable || sticky,
                 "archive ancestor is writable by another local user without sticky-bit protection: {}",
