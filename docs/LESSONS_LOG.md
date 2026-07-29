@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-26
+- Last Verified: 2026-07-29
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-07-29 | `todo-toolchain-dependency-refresh`에서 toolchain·CI pin·호환 의존성·문서 freshness를 함께 갱신함 | toolchain 유지보수는 로컬 선언과 CI action을 같은 patch로 맞추고, lockfile update 잔여와 full feature 조합을 함께 확인해야 환경 간 drift를 막을 수 있다. 최신 전이 의존성의 대체 불가능한 unmaintained 경고는 vulnerability와 구분해 잔여 위험으로 명시한다. | Rust toolchain과 CI pin을 1.97.1로 동기화하고 호환 범위의 lockfile을 갱신했으며, strict 출고 시점에 만료된 core 운영 문서를 현재 harness와 재검토했다. | `cargo update --dry-run --locked`, `cargo audit`, full release gate, no-default/import feature checks, local P2P smoke, 동일 SHA CI |
 | 2026-07-26 | `todo-release-v1-0-61`에서 client와 tracker/relay 보안 경계 변경을 하나의 출고 revision으로 승격함 | client와 server가 함께 바뀌는 릴리스는 source·asset·container identity뿐 아니라 실제 daemon 재시작, tracker 접근, relay listen, peer pending 수렴, GitOps health까지 같은 출고 단위로 확인해야 부분 배포를 방지할 수 있다. | 동일 SHA CI 이후 daily-driver 자산과 container image를 발행하고, 일반 런타임을 순차 갱신한 뒤 GitOps-managed tracker/relay를 같은 release identity로 승격했다. | full release gate, publication boundary `all`, 원격 tag·asset·image build identity, 서비스 재시작, tracker·relay 실행 확인, peer pending queue와 cluster health 검증 |
 | 2026-07-26 | `todo-security-boundary-hardening`에서 P2P 신뢰 모델과 local-user·가입 전 자원·transport·filesystem·publication 경계를 분리해 finding을 재검토함 | 보안 finding은 심각도만으로 수정하지 말고 제품이 의도한 신뢰 권한과 그 권한 밖의 입력·자원·로컬 상태 경계를 대조해야 한다. 의도된 peer 권한은 유지하되 인증 전 처리량, plaintext 전송, 심볼릭 링크·권한, 공개 대상 revision처럼 별도 경계를 넘는 경로는 독립적으로 제한해야 호환성과 방어가 함께 유지된다. | tracker membership과 P2P 삭제 전파 의미는 유지하면서 가입 전 work와 decode 동시성에 상한을 두고, debug HTTP·tracker·release transport와 로컬 파일·hook·publication 검사를 fail-closed로 강화했다. | Rust 전체·no-default·feature 조합 테스트, installer 테스트, local P2P 및 Docker acceptance, script smoke, publication boundary 검사 |
 | 2026-07-25 | `todo-release-v1-0-60`에서 dedupe 변경의 source 출고와 daily-driver 갱신을 연속 검증함 | 동기화 관련 변경의 배포 완료는 새 버전 표시만으로 닫으면 안 된다. daemon 재시작 뒤 tracker 접근과 peer별 pending queue가 함께 정상이어야 새 binary가 실제 데이터 흐름에서도 안정적으로 동작한다고 판단할 수 있다. | 동일 SHA CI와 원격 asset identity를 확인한 뒤 일반 대상부터 순차 갱신하고, 각 단계에서 build identity·daemon·tracker·pending queue를 확인한 후 다음 대상으로 진행했다. | full release gate, publication boundary `all`, 동일 SHA CI, 원격 tag·asset checksum·glibc·build identity 검증, 배포 후 version·service·sync·cluster health 확인 |
