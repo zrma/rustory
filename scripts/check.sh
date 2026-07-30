@@ -58,6 +58,7 @@ source "$ROOT/scripts/lib/rust-toolchain.sh"
 
 rustory_require_cargo
 
+python3 .ai-first/check.py
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings

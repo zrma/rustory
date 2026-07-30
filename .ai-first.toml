@@ -1,0 +1,28 @@
+schema_version = 1
+framework_version = "0.1.0-dev"
+source_kind = "commit"
+source_revision = "24d8bff1d4da82b063fcc539c818b33a98fccfe1"
+profiles = ["vcs-jj", "public-repository", "openai-agent-guidance"]
+
+[project]
+name = "rustory"
+objective = """
+Rustory를 local-first 셸 히스토리 daily driver로 유지한다. 기록은 각 디바이스의
+SQLite에 먼저 남고 tracker와 relay를 통한 P2P grid 동기화가 서로 다른 NAT 환경에서도
+검증 가능해야 한다.
+"""
+publication_class = "public"
+
+[overlay]
+agents_first_read = ".ai-first/overlays/agents-first-read.md"
+agents_project = ".ai-first/overlays/agents-project.md"
+harness_project = ".ai-first/overlays/harness-project.md"
+
+[output]
+agents = "AGENTS.md"
+harness = "docs/agent-harness.md"
+standalone_check = ".ai-first/check.py"
+lock = ".ai-first.lock"
+
+[checks]
+publication = "scripts/check-publication-boundary.py"
