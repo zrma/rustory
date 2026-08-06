@@ -34,12 +34,17 @@ use crate::sync_status::{
 use crate::sync_status::{build_sync_status_report, compute_last_seen_age_sec};
 use crate::terminal::sanitize_one_line;
 use crate::watch_tui::{
-    SyncStatusWatchState, render_mesh_watch_frame, render_sync_status_watch_frame,
+    SyncStatusWatchState, draw_mesh_watch_frame, draw_sync_status_watch_frame,
+    render_mesh_watch_frame,
 };
 use crate::{
     config, hishtory_cleanup, history_import, hook, managed_logs, p2p, search, storage, tracker,
     transport, uninstall,
 };
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+use ratatui::{Terminal, TerminalOptions, Viewport};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -4729,12 +4734,10 @@ fn run_sync_status_watch(
     }
 
     let mut state = SyncStatusWatchState::default();
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b[?1049h\x1b[?25l")?;
-    stdout.flush()?;
+    let mut terminal = WatchTerminal::new()?;
 
     while !stop.load(Ordering::SeqCst) {
-        let report = match build_sync_status_report_for_cli(
+        let report = build_sync_status_report_for_cli(
             store,
             cfg.local_device_id,
             cfg.local_peer_id,
@@ -4742,25 +4745,14 @@ fn run_sync_status_watch(
             cfg.trackers,
             cfg.tracker_token,
             cfg.user_id,
-        ) {
-            Ok(report) => report,
-            Err(err) => {
-                restore_sync_status_watch_terminal(&mut stdout)?;
-                return Err(err);
-            }
-        };
-        let frame_width = sync_status_watch_terminal_size(stdout.as_raw_fd())
-            .map(|(width, _height)| width.saturating_sub(1))
-            .unwrap_or(150)
-            .max(80);
-        let frame =
-            render_sync_status_watch_frame(&mut state, &report, Instant::now(), frame_width);
-        write!(stdout, "\x1b[H\x1b[2J{frame}")?;
-        stdout.flush()?;
+        )?;
+        terminal.draw(|frame| {
+            draw_sync_status_watch_frame(frame, &mut state, &report, Instant::now());
+        })?;
         sleep_with_stop(Duration::from_secs(cfg.interval_sec.max(1)), stop.as_ref());
     }
 
-    restore_sync_status_watch_terminal(&mut stdout)?;
+    terminal.restore()?;
     Ok(())
 }
 
@@ -4783,12 +4775,10 @@ fn run_mesh_watch(
     }
 
     let mut state = SyncStatusWatchState::default();
-    let mut stdout = io::stdout();
-    write!(stdout, "\x1b[?1049h\x1b[?25l")?;
-    stdout.flush()?;
+    let mut terminal = WatchTerminal::new()?;
 
     while !stop.load(Ordering::SeqCst) {
-        let report = match build_sync_status_report_for_cli(
+        let report = build_sync_status_report_for_cli(
             store,
             local_device_id,
             local_peer_id,
@@ -4796,36 +4786,78 @@ fn run_mesh_watch(
             trackers,
             tracker_token,
             user_id,
-        ) {
-            Ok(report) => report,
-            Err(err) => {
-                restore_sync_status_watch_terminal(&mut stdout)?;
-                return Err(err);
-            }
-        };
-        let (frame_width, frame_height) = sync_status_watch_terminal_size(stdout.as_raw_fd())
-            .map(|(width, height)| (width.saturating_sub(1), height))
-            .unwrap_or((150, 40));
-        let frame = render_mesh_watch_frame(
-            &mut state,
-            &report,
-            Instant::now(),
-            frame_width,
-            frame_height,
-        );
-        write!(stdout, "\x1b[H\x1b[2J{frame}")?;
-        stdout.flush()?;
+        )?;
+        terminal.draw(|frame| {
+            draw_mesh_watch_frame(frame, &mut state, &report, Instant::now());
+        })?;
         sleep_with_stop(Duration::from_secs(interval_sec.max(1)), stop.as_ref());
     }
 
-    restore_sync_status_watch_terminal(&mut stdout)?;
+    terminal.restore()?;
     Ok(())
 }
 
-fn restore_sync_status_watch_terminal(stdout: &mut impl Write) -> Result<()> {
-    write!(stdout, "\x1b[?25h\x1b[?1049l")?;
-    stdout.flush()?;
-    Ok(())
+struct WatchTerminal {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    restored: bool,
+}
+
+impl WatchTerminal {
+    fn new() -> Result<Self> {
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen).context("enter watch alternate screen")?;
+        let backend = CrosstermBackend::new(stdout);
+        let terminal = match Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        ) {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                return Err(error).context("initialize watch terminal");
+            }
+        };
+        let mut watch_terminal = Self {
+            terminal,
+            restored: false,
+        };
+        if let Err(error) = watch_terminal.terminal.hide_cursor() {
+            let _ = watch_terminal.restore();
+            return Err(error).context("hide watch cursor");
+        }
+        Ok(watch_terminal)
+    }
+
+    fn draw(&mut self, render: impl FnOnce(&mut ratatui::Frame<'_>)) -> Result<()> {
+        self.terminal
+            .draw(render)
+            .context("draw watch terminal frame")?;
+        Ok(())
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        let show_cursor = self.terminal.show_cursor();
+        let leave_screen = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        let flush = self.terminal.backend_mut().flush();
+        if leave_screen.is_ok() {
+            self.restored = true;
+        }
+        show_cursor.context("show watch cursor")?;
+        leave_screen.context("leave watch alternate screen")?;
+        flush.context("flush restored watch terminal")?;
+        Ok(())
+    }
+}
+
+impl Drop for WatchTerminal {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
 }
 
 fn sync_status_watch_terminal_size(fd: RawFd) -> Option<(usize, usize)> {

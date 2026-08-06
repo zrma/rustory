@@ -22,6 +22,7 @@ mod sync_status;
 mod terminal;
 mod tracker;
 mod transport;
+mod tui;
 mod uninstall;
 mod watch_tui;
 

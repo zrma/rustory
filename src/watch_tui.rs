@@ -1,8 +1,14 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use ratatui::backend::TestBackend;
+use ratatui::layout::Rect;
+use ratatui::widgets::Paragraph;
+use ratatui::{Frame, Terminal};
+
 use crate::sync_status::{SyncStatusPeerReport, SyncStatusReport, SyncStatusTrackerReport};
 use crate::terminal::sanitize_one_line;
+use crate::tui::buffer_to_plain_text;
 
 #[derive(Default)]
 pub(crate) struct SyncStatusWatchState {
@@ -425,7 +431,30 @@ fn sync_status_watch_peer_state(view: &SyncStatusWatchPeerView<'_>) -> SyncStatu
     view.state()
 }
 
+pub(crate) fn draw_sync_status_watch_frame(
+    frame: &mut Frame<'_>,
+    state: &mut SyncStatusWatchState,
+    report: &SyncStatusReport,
+    now: Instant,
+) {
+    let area = watch_frame_area(frame.area());
+    let text = build_sync_status_watch_text(state, report, now, usize::from(area.width));
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+#[cfg(test)]
 pub(crate) fn render_sync_status_watch_frame(
+    state: &mut SyncStatusWatchState,
+    report: &SyncStatusReport,
+    now: Instant,
+    frame_width: usize,
+) -> String {
+    render_with_test_backend(frame_width, 96, |frame| {
+        draw_sync_status_watch_frame(frame, state, report, now);
+    })
+}
+
+fn build_sync_status_watch_text(
     state: &mut SyncStatusWatchState,
     report: &SyncStatusReport,
     now: Instant,
@@ -518,7 +547,36 @@ fn build_sync_status_watch_peer_views<'a>(
     peer_views
 }
 
+pub(crate) fn draw_mesh_watch_frame(
+    frame: &mut Frame<'_>,
+    state: &mut SyncStatusWatchState,
+    report: &SyncStatusReport,
+    now: Instant,
+) {
+    let area = watch_frame_area(frame.area());
+    let text = build_mesh_watch_text(
+        state,
+        report,
+        now,
+        usize::from(area.width),
+        usize::from(area.height),
+    );
+    frame.render_widget(Paragraph::new(text), area);
+}
+
 pub(crate) fn render_mesh_watch_frame(
+    state: &mut SyncStatusWatchState,
+    report: &SyncStatusReport,
+    now: Instant,
+    frame_width: usize,
+    frame_height: usize,
+) -> String {
+    render_with_test_backend(frame_width, frame_height, |frame| {
+        draw_mesh_watch_frame(frame, state, report, now);
+    })
+}
+
+fn build_mesh_watch_text(
     state: &mut SyncStatusWatchState,
     report: &SyncStatusReport,
     now: Instant,
@@ -601,6 +659,32 @@ pub(crate) fn render_mesh_watch_frame(
         "ctrl+c to exit  •  to_send R=row D=delete  •  global peer ↔ peer flow needs future daemon telemetry; local view only",
     );
     out
+}
+
+fn watch_frame_area(area: Rect) -> Rect {
+    Rect {
+        width: area.width.max(1),
+        ..area
+    }
+}
+
+fn render_with_test_backend(
+    frame_width: usize,
+    frame_height: usize,
+    render: impl FnOnce(&mut Frame<'_>),
+) -> String {
+    let width = u16::try_from(frame_width.max(1)).unwrap_or(u16::MAX);
+    let height = u16::try_from(frame_height.max(1)).unwrap_or(u16::MAX);
+    let backend = TestBackend::new(width, height);
+    let mut terminal = Terminal::new(backend).expect("test backend terminal");
+    terminal.draw(render).expect("render watch frame");
+    let text = buffer_to_plain_text(terminal.backend().buffer(), "\n");
+    let trimmed = text.trim_end_matches([' ', '\r', '\n']);
+    if trimmed.is_empty() {
+        String::new()
+    } else {
+        format!("{trimmed}\n")
+    }
 }
 
 fn record_mesh_watch_sample(

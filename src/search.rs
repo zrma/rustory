@@ -1,6 +1,12 @@
 use crate::core::Entry;
 use crate::terminal::sanitize_one_line;
+use crate::tui::buffer_to_ansi_text;
 use anyhow::{Context, Result};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -508,22 +514,19 @@ impl<'a> SearchTui<'a> {
         ));
 
         let mut lines = vec![
-            format!(
-                "Search Query: {}",
-                render_query(&self.query, self.query_cursor)
-            ),
-            String::new(),
-            top_border(frame_width),
-            table_line(
-                &render_cells(
+            render_query_line(&self.query, self.query_cursor),
+            Line::default(),
+            Line::raw(top_border(frame_width)),
+            framed_table_line(
+                render_cells(
                     COLUMNS.map(|col| col.title.to_string()).as_ref(),
                     &column_widths,
                     inside_width,
                     0,
                 ),
-                false,
+                Style::default().add_modifier(Modifier::BOLD),
             ),
-            separator_border(frame_width),
+            Line::raw(separator_border(frame_width)),
         ];
 
         for display_row in 0..self.visible_rows {
@@ -536,23 +539,38 @@ impl<'a> SearchTui<'a> {
                     inside_width,
                     self.hscroll,
                 );
-                lines.push(table_line(&content, selected));
+                let style = if selected {
+                    Style::default().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::default()
+                };
+                lines.push(framed_table_line(content, style));
             } else {
-                lines.push(table_line(&" ".repeat(inside_width), false));
+                lines.push(framed_table_line(
+                    " ".repeat(inside_width),
+                    Style::default(),
+                ));
             }
         }
 
-        lines.push(bottom_border(frame_width));
-        lines.push(FOOTER.to_string());
+        lines.push(Line::raw(bottom_border(frame_width)));
+        lines.push(Line::raw(FOOTER));
         if self.show_help {
-            lines.push(
+            lines.push(Line::raw(
                 "↑/↓ or mouse wheel scroll  pgup/pgdn page  enter select  ctrl+k delete  esc exit"
                     .to_string(),
-            );
-            lines.push("←/→ edit query  ctrl+←/→ jump word  shift+←/→ scroll table".to_string());
+            ));
+            lines.push(Line::raw(
+                "←/→ edit query  ctrl+←/→ jump word  shift+←/→ scroll table",
+            ));
         }
 
-        render_frame_lines(&lines)
+        let frame_height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let frame_width = u16::try_from(frame_width).unwrap_or(u16::MAX);
+        let area = Rect::new(0, 0, frame_width, frame_height);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines).render(area, &mut buffer);
+        buffer_to_ansi_text(&buffer, TTY_LINE_ENDING)
     }
 }
 
@@ -566,6 +584,7 @@ fn redraw_prefix(last_rendered_lines: usize) -> String {
     }
 }
 
+#[cfg(test)]
 fn render_frame_lines(lines: &[String]) -> String {
     let mut frame = lines.join(TTY_LINE_ENDING);
     frame.push_str(TTY_LINE_ENDING);
@@ -1409,23 +1428,27 @@ fn selected_entry<'a>(
     entries.get(entry_index)
 }
 
-fn render_query(query: &[char], cursor: usize) -> String {
-    let mut out = String::from("\x1b[90m> \x1b[0m");
+fn render_query_line(query: &[char], cursor: usize) -> Line<'static> {
+    let mut spans = vec![Span::raw("Search Query: "), Span::raw("> ")];
     for idx in 0..=query.len() {
         if idx == cursor {
             if let Some(ch) = query.get(idx) {
-                out.push_str("\x1b[7m");
-                out.push(*ch);
-                out.push_str("\x1b[0m");
+                spans.push(Span::styled(
+                    ch.to_string(),
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
             } else {
-                out.push_str("\x1b[7m \x1b[0m");
+                spans.push(Span::styled(
+                    " ",
+                    Style::default().add_modifier(Modifier::REVERSED),
+                ));
             }
         }
         if idx < query.len() && idx != cursor {
-            out.push(query[idx]);
+            spans.push(Span::raw(query[idx].to_string()));
         }
     }
-    out
+    Line::from(spans)
 }
 
 fn table_visible_rows(term_height: usize, show_help: bool) -> usize {
@@ -1624,12 +1647,12 @@ fn skip_display_width(value: &str, columns: usize) -> String {
     String::new()
 }
 
-fn table_line(content: &str, selected: bool) -> String {
-    if selected {
-        format!("│\x1b[7m{content}\x1b[0m│")
-    } else {
-        format!("│{content}│")
-    }
+fn framed_table_line(content: String, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::raw("│"),
+        Span::styled(content, style),
+        Span::raw("│"),
+    ])
 }
 
 fn top_border(width: usize) -> String {
@@ -2529,6 +2552,36 @@ mod tests {
         let frame = render_frame_lines(&["Search Query: > ".to_string(), "table".to_string()]);
         assert_eq!(frame, "Search Query: > \r\ntable\r\n");
         assert!(!frame.contains(" \ntable"));
+    }
+
+    #[test]
+    fn ratatui_query_line_preserves_inline_cursor_style_and_wide_text() {
+        let query = "한글".chars().collect::<Vec<_>>();
+        let area = Rect::new(0, 0, 24, 1);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(vec![render_query_line(&query, 1)]).render(area, &mut buffer);
+
+        let rendered = buffer_to_ansi_text(&buffer, TTY_LINE_ENDING);
+        assert!(rendered.starts_with("Search Query: > 한"), "{rendered:?}");
+        assert!(rendered.contains("\x1b[7m글\x1b[0m"), "{rendered:?}");
+        assert!(rendered.ends_with(TTY_LINE_ENDING), "{rendered:?}");
+    }
+
+    #[test]
+    fn ratatui_selected_row_reverses_content_but_not_border() {
+        let area = Rect::new(0, 0, 8, 1);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(vec![framed_table_line(
+            "picked".to_string(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        )])
+        .render(area, &mut buffer);
+
+        let rendered = buffer_to_ansi_text(&buffer, TTY_LINE_ENDING);
+        assert!(
+            rendered.starts_with("│\x1b[7mpicked\x1b[0m│"),
+            "{rendered:?}"
+        );
     }
 
     #[test]
