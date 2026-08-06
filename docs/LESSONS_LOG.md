@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-30
+- Last Verified: 2026-08-06
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-08-06 | `todo-ratatui-tui-migration`에서 수작업 terminal 렌더링을 Ratatui로 전환하고 출고 증거를 재현함 | terminal UI는 widget buffer 검증만으로 완료할 수 없다. 고정 크기 `TestBackend`로 레이아웃·스타일을 확인하고 실제 PTY에서 raw mode, cursor와 alternate screen 복원을 함께 검증해야 shell 표면 회귀를 잡을 수 있다. push webhook이 지연될 때도 동일 source SHA를 수동 실행할 수 있어야 CI 증거가 전달 경로 하나에 종속되지 않는다. | inline search는 Ratatui buffer를 기존 `/dev/tty` 수명에 연결하고 watch 화면은 fullscreen `Terminal`이 소유하도록 바꿨으며, 필수 workflow에 수동 dispatch 경로를 추가했다. | search·watch 집중 테스트, 설치된 release의 실제 PTY 종료/복원 smoke, full release gate, 동일 SHA의 CI·Docs Integrity·Release Gates |
 | 2026-07-30 | `todo-ai-first-v1-release`에서 pre-release commit pin을 정식 framework release로 승격함 | 여러 저장소가 공유하는 agent contract는 개발 커밋이 아니라 검증된 annotated release와 content-addressed source commit을 함께 고정해야 재현 가능한 fleet 기준이 된다. 저장소별 overlay는 재생성 과정에서도 repository-owned 정책으로 보존해야 한다. | AI-first 선언·lock·생성 산출물·독립 interface checker를 `v1.0.0` release pin으로 맞추고 기존 Rustory overlay를 유지했다. | `scripts/check-agent-harness-interface.sh`, `scripts/check-release-gates.sh --manifest-mode full --work-id ai-first-v1-release` |
 | 2026-07-30 | `todo-ai-first-adoption`에서 공통 agent contract와 저장소별 운영 규칙을 분리함 | 공통 자율성·검증·privacy 규칙은 immutable framework revision으로 고정하고, 제품·운영 예외만 repository-owned overlay로 유지해야 중앙 갱신과 저장소 독립성을 함께 보존할 수 있다. 저장소의 native gate가 Git metadata를 요구하면 격리 방식도 그 계약을 충족해야 한다. | versioned core/profile, repository overlay, content-addressed lock와 standalone drift check를 canonical gate에 연결했다. | framework source/digest 검증, generated interface check, repository quick gate, `scripts/check.sh --fast` |
 | 2026-07-29 | `todo-toolchain-dependency-refresh`에서 toolchain·CI pin·호환 의존성·문서 freshness를 함께 갱신함 | toolchain 유지보수는 로컬 선언과 CI action을 같은 patch로 맞추고, lockfile update 잔여와 full feature 조합을 함께 확인해야 환경 간 drift를 막을 수 있다. 최신 전이 의존성의 대체 불가능한 unmaintained 경고는 vulnerability와 구분해 잔여 위험으로 명시한다. | Rust toolchain과 CI pin을 1.97.1로 동기화하고 호환 범위의 lockfile을 갱신했으며, strict 출고 시점에 만료된 core 운영 문서를 현재 harness와 재검토했다. | `cargo update --dry-run --locked`, `cargo audit`, full release gate, no-default/import feature checks, local P2P smoke, 동일 SHA CI |
