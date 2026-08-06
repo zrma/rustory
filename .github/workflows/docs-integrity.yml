@@ -36,6 +36,7 @@ on:
       - "scripts/check-push-gates.sh"
       - ".github/workflows/docs-integrity.yml"
       - ".github/workflows/release-gates.yml"
+  workflow_dispatch:
 
 jobs:
   docs-integrity:

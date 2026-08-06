@@ -23,6 +23,7 @@
 - 전체 화면 watch는 Ratatui `Terminal`과 fullscreen viewport가 terminal diff와 restore를 소유한다.
 - inline search는 기존 `/dev/tty` raw input과 prompt 보존 수명을 유지하고 Ratatui buffer/widget을 ANSI 출력으로 연결한다.
 - 사용자 표면 회귀는 고정 크기 `TestBackend`와 실제 PTY 종료/복원 증거를 함께 사용한다.
+- push webhook이 지연되는 동안에도 동일 source SHA의 terminal CI를 재현할 수 있도록 필수 workflow는 `workflow_dispatch`를 지원한다.
 
 ## C-체크리스트
 
