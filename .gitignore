@@ -429,3 +429,7 @@ target
 *.sqlite3
 *.key
 *.pem
+
+# Repository gate smoke workspaces must never enter a jj working-copy snapshot.
+/.tmp-script-smoke.*/
+/docs/todo-script-smoke-*/

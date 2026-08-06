@@ -504,6 +504,9 @@ cleanup() {
 
 trap cleanup EXIT
 
+run_cmd "git check-ignore -q .tmp-script-smoke.fixture/probe"
+run_cmd "git check-ignore -q docs/todo-script-smoke-fixture/spec.md"
+
 acquire_smoke_lock() {
   local git_dir=""
   local lock_owner=""
