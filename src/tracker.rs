@@ -1114,446 +1114,458 @@ fn route_http_request<R: TrackerHttpRequest + ?Sized>(
 
     match (method.as_str(), path) {
         ("GET", "/api/v1/ping") => Ok(respond_text(200, "ok\n")),
-        ("POST", "/api/v1/peers/register") => {
-            let mut buf = Vec::new();
-            let max = max_request_body_bytes();
-            req.body_reader()
-                .take((max as u64).saturating_add(1))
-                .read_to_end(&mut buf)
-                .context("read request body")?;
-            if buf.len() > max {
-                return Ok(respond_text(413, "payload too large\n"));
-            }
-
-            let reg: RegisterRequest =
-                serde_json::from_slice(&buf).context("parse register request json")?;
-            let proof_payload = register_proof_payload(&reg)?;
-            let peer_id = reg.peer_id.trim();
-            if peer_id.is_empty() {
-                return Ok(respond_text(400, "peer_id required\n"));
-            }
-            let peer_id: PeerId = match peer_id.parse() {
-                Ok(peer_id) => peer_id,
-                Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
-            };
-            let peer_id = peer_id.to_string();
-
-            let addrs = match normalize_register_addrs(reg.addrs) {
-                Ok(addrs) => addrs,
-                Err(message) => return Ok(respond_text(400, message)),
-            };
-            if let Err(message) = validate_register_meta(&reg.meta) {
-                return Ok(respond_text(400, message));
-            }
-
-            let now = OffsetDateTime::now_utc();
-            {
-                let mut locked = state.lock().unwrap();
-                prune_expired(&mut locked, now, config.ttl_sec);
-                let now_unix = now.unix_timestamp();
-                if effective_revocation(
-                    &locked,
-                    &peer_id,
-                    reg.meta.as_ref().and_then(|meta| meta.device_id.as_deref()),
-                    reg.meta.as_ref().and_then(|meta| meta.user_id.as_deref()),
-                )
-                .is_some()
-                {
-                    return Ok(respond_text(403, "device is revoked\n"));
-                }
-                let verified_device = match reg.device_proof.as_ref() {
-                    Some(proof) => match locked.verify_and_record_device_proof(
-                        proof,
-                        ACTION_REGISTER,
-                        &proof_payload,
-                        &peer_id,
-                        now_unix,
-                    ) {
-                        Ok((public_key, _)) => Some(public_key),
-                        Err(err) => {
-                            return Ok(respond_text(
-                                403,
-                                &format!("invalid device proof: {err}\n"),
-                            ));
-                        }
-                    },
-                    None if config.require_device_enrollment => {
-                        return Ok(respond_text(403, "signed device proof required\n"));
-                    }
-                    None => None,
-                };
-                let verified_public_key = verified_device.as_ref();
-
-                if let Some(public_key) = verified_public_key {
-                    record_observed_device(
-                        &mut locked,
-                        peer_id.clone(),
-                        ObservedDevice {
-                            public_key: public_key.clone(),
-                            device_id: reg.meta.as_ref().and_then(|meta| meta.device_id.clone()),
-                            user_id: reg.meta.as_ref().and_then(|meta| meta.user_id.clone()),
-                            retirement_protocol: reg.retirement_protocol,
-                            membership_protocol: reg.membership_protocol,
-                            membership_enforced: reg.membership_enforced,
-                            last_seen_unix: now_unix,
-                        },
-                    );
-                }
-
-                if config.require_device_enrollment {
-                    let Some(enrolled) = locked.enrolled_devices.get(&peer_id) else {
-                        if let Some(proof) = reg.device_proof.as_ref() {
-                            locked.mark_device_proof_completed(proof);
-                        }
-                        return Ok(respond_text(403, "device is not enrolled\n"));
-                    };
-                    if verified_public_key.map(Vec::as_slice)
-                        != Some(enrolled.public_key.as_slice())
-                        || enrolled.device_id
-                            != reg.meta.as_ref().and_then(|meta| meta.device_id.clone())
-                        || enrolled.user_id
-                            != reg.meta.as_ref().and_then(|meta| meta.user_id.clone())
-                    {
-                        return Ok(respond_text(403, "device enrollment binding mismatch\n"));
-                    }
-                }
-
-                if !locked.peers.contains_key(&peer_id) && locked.peers.len() >= max_tracker_peers()
-                {
-                    return Ok(respond_text(429, "too many registered peers\n"));
-                }
-                let mut previous_capabilities = None;
-                if let Some(enrolled) = locked.enrolled_devices.get_mut(&peer_id)
-                    && verified_public_key.map(Vec::as_slice)
-                        == Some(enrolled.public_key.as_slice())
-                    && enrolled.device_id
-                        == reg.meta.as_ref().and_then(|meta| meta.device_id.clone())
-                    && enrolled.user_id == reg.meta.as_ref().and_then(|meta| meta.user_id.clone())
-                {
-                    let enrollment_changed = enrolled.retirement_protocol
-                        != reg.retirement_protocol
-                        || enrolled.membership_protocol != reg.membership_protocol
-                        || enrolled.membership_enforced != reg.membership_enforced;
-                    if enrollment_changed {
-                        previous_capabilities = Some((
-                            enrolled.retirement_protocol,
-                            enrolled.membership_protocol,
-                            enrolled.membership_enforced,
-                        ));
-                    }
-                    enrolled.retirement_protocol = reg.retirement_protocol;
-                    enrolled.membership_protocol = reg.membership_protocol;
-                    enrolled.membership_enforced = reg.membership_enforced;
-                }
-                if let Some(previous) = previous_capabilities
-                    && let Err(error) = locked.persist_security()
-                {
-                    if let Some(enrolled) = locked.enrolled_devices.get_mut(&peer_id) {
-                        enrolled.retirement_protocol = previous.0;
-                        enrolled.membership_protocol = previous.1;
-                        enrolled.membership_enforced = previous.2;
-                    }
-                    return Err(error);
-                }
-                locked.peers.insert(
-                    peer_id.clone(),
-                    PeerRecord {
-                        addrs,
-                        meta: reg.meta,
-                        last_seen_unix: now.unix_timestamp(),
-                    },
-                );
-                if let Some(proof) = reg.device_proof.as_ref() {
-                    locked.mark_device_proof_completed(proof);
-                }
-            }
-
-            respond_json(
-                200,
-                &RegisterResponse {
-                    ok: true,
-                    ttl_sec: config.ttl_sec,
-                },
-            )
-        }
-        ("POST", "/api/v1/peers/unregister") => {
-            let unregister: UnregisterRequest = match read_device_json_request(
-                req,
-                "unregister request",
-                MAX_RETIREMENT_DEVICE_BODY_BYTES,
-            )? {
-                Ok(request) => request,
-                Err(response) => return Ok(response),
-            };
-            if unregister.device_proof.is_none()
-                && let Some(token) = config.token.as_deref()
-                && !is_authorized(req, token)
-            {
-                return Ok(respond_text(401, "unauthorized\n"));
-            }
-            let peer_id = unregister.peer_id.trim();
-            if peer_id.is_empty() {
-                return Ok(respond_text(400, "peer_id required\n"));
-            }
-            let peer_id: PeerId = match peer_id.parse() {
-                Ok(peer_id) => peer_id,
-                Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
-            };
-            let peer_id = peer_id.to_string();
-
-            let now = OffsetDateTime::now_utc();
-            let removed = {
-                let mut locked = state.lock().unwrap();
-                prune_expired(&mut locked, now, config.ttl_sec);
-                if let Some(proof) = unregister.device_proof.as_ref()
-                    && locked
-                        .completed_unregister_signatures
-                        .get(&peer_id)
-                        .is_some_and(|signature| {
-                            constant_time_eq(signature, proof.signature.as_slice())
-                        })
-                {
-                    return respond_json(
-                        200,
-                        &UnregisterResponse {
-                            ok: true,
-                            removed: false,
-                        },
-                    );
-                }
-                let payload = unregister_proof_payload(&peer_id)?;
-                let mut completed_replay = false;
-                let verified_public_key = match unregister.device_proof.as_ref() {
-                    Some(proof) => match locked.verify_and_record_device_proof(
-                        proof,
-                        ACTION_UNREGISTER,
-                        &payload,
-                        &peer_id,
-                        now.unix_timestamp(),
-                    ) {
-                        Ok((public_key, replay)) => {
-                            completed_replay = replay == DeviceProofReplay::CompletedReplay;
-                            Some(public_key)
-                        }
-                        Err(error) => {
-                            return Ok(respond_text(
-                                403,
-                                &format!("invalid device proof: {error}\n"),
-                            ));
-                        }
-                    },
-                    None if config.require_device_enrollment => {
-                        return Ok(respond_text(403, "signed device proof required\n"));
-                    }
-                    None => None,
-                };
-                if let Some(enrolled) = locked.enrolled_devices.get(&peer_id)
-                    && verified_public_key.is_some()
-                    && verified_public_key.as_deref() != Some(enrolled.public_key.as_slice())
-                {
-                    return Ok(respond_text(403, "device enrollment key mismatch\n"));
-                }
-                if completed_replay {
-                    return respond_json(
-                        200,
-                        &UnregisterResponse {
-                            ok: true,
-                            removed: false,
-                        },
-                    );
-                }
-                if locked.revocations.contains_key(&peer_id) {
-                    let Some(proof) = unregister.device_proof.as_ref() else {
-                        return Ok(respond_text(403, "device is revoked\n"));
-                    };
-                    locked.mark_device_proof_completed(proof);
-                    return respond_json(
-                        200,
-                        &UnregisterResponse {
-                            ok: true,
-                            removed: false,
-                        },
-                    );
-                }
-
-                let previous_peer = locked.peers.remove(&peer_id);
-                let should_remove_enrollment =
-                    verified_public_key.is_some() && locked.enrolled_devices.contains_key(&peer_id);
-                let previous_enrollment = should_remove_enrollment
-                    .then(|| locked.enrolled_devices.remove(&peer_id))
-                    .flatten();
-                let previous_observation = verified_public_key
-                    .as_ref()
-                    .and_then(|_| locked.observed_devices.remove(&peer_id));
-                let completed_signature_changed = previous_enrollment.is_some();
-                let previous_completed_signature = if completed_signature_changed {
-                    Some(
-                        locked.completed_unregister_signatures.insert(
-                            peer_id.clone(),
-                            unregister
-                                .device_proof
-                                .as_ref()
-                                .context("signed enrollment unregister proof disappeared")?
-                                .signature
-                                .clone(),
-                        ),
-                    )
-                } else {
-                    None
-                };
-                if previous_enrollment.is_some()
-                    && let Err(error) = locked.persist_security()
-                {
-                    if let Some(previous_peer) = previous_peer.clone() {
-                        locked.peers.insert(peer_id.clone(), previous_peer);
-                    }
-                    if let Some(previous_enrollment) = previous_enrollment.clone() {
-                        locked
-                            .enrolled_devices
-                            .insert(peer_id.clone(), previous_enrollment);
-                    }
-                    if let Some(previous_observation) = previous_observation.clone() {
-                        locked
-                            .observed_devices
-                            .insert(peer_id.clone(), previous_observation);
-                    }
-                    if completed_signature_changed {
-                        match previous_completed_signature.flatten() {
-                            Some(previous) => {
-                                locked
-                                    .completed_unregister_signatures
-                                    .insert(peer_id.clone(), previous);
-                            }
-                            None => {
-                                locked.completed_unregister_signatures.remove(&peer_id);
-                            }
-                        }
-                    }
-                    return Err(error);
-                }
-                if previous_observation.is_some() {
-                    clear_pending_observation(&mut locked, &peer_id);
-                }
-                let removed = previous_peer.is_some()
-                    || previous_enrollment.is_some()
-                    || previous_observation.is_some();
-                if let Some(proof) = unregister.device_proof.as_ref() {
-                    locked.mark_device_proof_completed(proof);
-                }
-                removed
-            };
-
-            respond_json(200, &UnregisterResponse { ok: true, removed })
-        }
+        ("POST", "/api/v1/peers/register") => handle_peer_register(state, config, req),
+        ("POST", "/api/v1/peers/unregister") => handle_peer_unregister(state, config, req),
         ("POST", "/api/v1/admin/devices/enroll") => handle_admin_enroll(state, config, req),
         ("POST", "/api/v1/admin/devices/retire") => handle_admin_retire(state, config, req),
         ("GET", "/api/v1/admin/devices") => handle_admin_device_list(state, config, req),
-        ("GET", "/api/v1/devices/authorize") => {
-            let peer_id = match query.and_then(|query| query_get(query, "peer_id")) {
-                Some(peer_id) => urlencoding::decode(peer_id)
-                    .context("decode membership peer_id")?
-                    .into_owned(),
-                None => return Ok(respond_text(400, "peer_id required\n")),
-            };
-            let peer_id: PeerId = match peer_id.parse() {
-                Ok(peer_id) => peer_id,
-                Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
-            };
-            let peer_id = peer_id.to_string();
-            let locked = state.lock().unwrap();
-            let enrolled_device = locked.enrolled_devices.get(&peer_id);
-            let enrolled = enrolled_device.is_some();
-            let observed_device = locked.observed_devices.get(&peer_id);
-            let device_id = enrolled_device
-                .and_then(|device| device.device_id.clone())
-                .or_else(|| observed_device.and_then(|device| device.device_id.clone()));
-            let user_id = enrolled_device
-                .and_then(|device| device.user_id.clone())
-                .or_else(|| observed_device.and_then(|device| device.user_id.clone()));
-            let revocation =
-                effective_revocation(&locked, &peer_id, device_id.as_deref(), user_id.as_deref());
-            let revoked = revocation.is_some();
-            let active = !revoked && (!config.require_device_enrollment || enrolled);
-            respond_json(
-                200,
-                &MembershipResponse {
-                    peer_id,
-                    active,
-                    enrolled,
-                    revoked,
-                    strict: config.require_device_enrollment,
-                    device_id,
-                    user_id,
-                    revocation,
-                },
-            )
-        }
+        ("GET", "/api/v1/devices/authorize") => handle_peer_authorize(state, config, query),
         ("POST", "/api/v1/devices/retirement/poll") => handle_retirement_poll(state, req),
         ("POST", "/api/v1/devices/retirement/ack") => handle_retirement_ack(state, req),
         ("POST", "/api/v1/devices/retirement/complete") => handle_retirement_complete(state, req),
-        ("GET", "/api/v1/peers") => {
-            let user_id = match query.and_then(|q| query_get(q, "user_id")) {
-                Some(v) => Some(
-                    urlencoding::decode(v)
-                        .context("decode user_id query")?
-                        .into_owned(),
-                ),
-                None => None,
-            };
-            let now = OffsetDateTime::now_utc();
-
-            let (peers, revocations) = {
-                let mut locked = state.lock().unwrap();
-                prune_expired(&mut locked, now, config.ttl_sec);
-                let mut estimated_bytes = 0usize;
-                let mut peers = Vec::new();
-                for (peer_id, rec) in locked.peers.iter().filter(|(peer_id, rec)| {
-                    effective_revocation_for_peer(&locked, peer_id).is_none()
-                        && match (user_id.as_deref(), &rec.meta) {
-                            (None, _) => true,
-                            (Some(want), Some(meta)) => meta.user_id.as_deref() == Some(want),
-                            (Some(_), None) => false,
-                        }
-                }) {
-                    estimated_bytes = estimated_bytes
-                        .saturating_add(peer_id.len())
-                        .saturating_add(rec.addrs.iter().map(String::len).sum::<usize>())
-                        .saturating_add(
-                            rec.meta
-                                .as_ref()
-                                .map(estimated_peer_meta_bytes)
-                                .unwrap_or_default(),
-                        )
-                        .saturating_add(128);
-                    if estimated_bytes > MAX_TRACKER_RESPONSE_BODY_BYTES {
-                        return Ok(respond_text(
-                            413,
-                            "tracker peer list exceeds the bounded response size; narrow user_id or reduce stale registrations\n",
-                        ));
-                    }
-                    peers.push(PeerInfo {
-                        peer_id: peer_id.clone(),
-                        addrs: rec.addrs.clone(),
-                        meta: rec.meta.clone(),
-                        last_seen_unix: rec.last_seen_unix,
-                    });
-                }
-                let revocations = locked
-                    .revocations
-                    .values()
-                    .filter(|revocation| {
-                        user_id
-                            .as_deref()
-                            .is_none_or(|want| revocation.user_id.as_deref() == Some(want))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
-                (peers, revocations)
-            };
-            respond_json(200, &ListResponse { peers, revocations })
-        }
+        ("GET", "/api/v1/peers") => handle_peer_list(state, config, query),
         _ => Ok(respond_text(404, "not found\n")),
     }
+}
+
+fn handle_peer_register<R: TrackerHttpRequest + ?Sized>(
+    state: &Arc<Mutex<TrackerState>>,
+    config: &TrackerServeConfig,
+    req: &mut R,
+) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
+    let mut buf = Vec::new();
+    let max = max_request_body_bytes();
+    req.body_reader()
+        .take((max as u64).saturating_add(1))
+        .read_to_end(&mut buf)
+        .context("read request body")?;
+    if buf.len() > max {
+        return Ok(respond_text(413, "payload too large\n"));
+    }
+
+    let reg: RegisterRequest =
+        serde_json::from_slice(&buf).context("parse register request json")?;
+    let proof_payload = register_proof_payload(&reg)?;
+    let peer_id = reg.peer_id.trim();
+    if peer_id.is_empty() {
+        return Ok(respond_text(400, "peer_id required\n"));
+    }
+    let peer_id: PeerId = match peer_id.parse() {
+        Ok(peer_id) => peer_id,
+        Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
+    };
+    let peer_id = peer_id.to_string();
+
+    let addrs = match normalize_register_addrs(reg.addrs) {
+        Ok(addrs) => addrs,
+        Err(message) => return Ok(respond_text(400, message)),
+    };
+    if let Err(message) = validate_register_meta(&reg.meta) {
+        return Ok(respond_text(400, message));
+    }
+
+    let now = OffsetDateTime::now_utc();
+    {
+        let mut locked = state.lock().unwrap();
+        prune_expired(&mut locked, now, config.ttl_sec);
+        let now_unix = now.unix_timestamp();
+        if effective_revocation(
+            &locked,
+            &peer_id,
+            reg.meta.as_ref().and_then(|meta| meta.device_id.as_deref()),
+            reg.meta.as_ref().and_then(|meta| meta.user_id.as_deref()),
+        )
+        .is_some()
+        {
+            return Ok(respond_text(403, "device is revoked\n"));
+        }
+        let verified_device = match reg.device_proof.as_ref() {
+            Some(proof) => match locked.verify_and_record_device_proof(
+                proof,
+                ACTION_REGISTER,
+                &proof_payload,
+                &peer_id,
+                now_unix,
+            ) {
+                Ok((public_key, _)) => Some(public_key),
+                Err(err) => {
+                    return Ok(respond_text(403, &format!("invalid device proof: {err}\n")));
+                }
+            },
+            None if config.require_device_enrollment => {
+                return Ok(respond_text(403, "signed device proof required\n"));
+            }
+            None => None,
+        };
+        let verified_public_key = verified_device.as_ref();
+
+        if let Some(public_key) = verified_public_key {
+            record_observed_device(
+                &mut locked,
+                peer_id.clone(),
+                ObservedDevice {
+                    public_key: public_key.clone(),
+                    device_id: reg.meta.as_ref().and_then(|meta| meta.device_id.clone()),
+                    user_id: reg.meta.as_ref().and_then(|meta| meta.user_id.clone()),
+                    retirement_protocol: reg.retirement_protocol,
+                    membership_protocol: reg.membership_protocol,
+                    membership_enforced: reg.membership_enforced,
+                    last_seen_unix: now_unix,
+                },
+            );
+        }
+
+        if config.require_device_enrollment {
+            let Some(enrolled) = locked.enrolled_devices.get(&peer_id) else {
+                if let Some(proof) = reg.device_proof.as_ref() {
+                    locked.mark_device_proof_completed(proof);
+                }
+                return Ok(respond_text(403, "device is not enrolled\n"));
+            };
+            if verified_public_key.map(Vec::as_slice) != Some(enrolled.public_key.as_slice())
+                || enrolled.device_id != reg.meta.as_ref().and_then(|meta| meta.device_id.clone())
+                || enrolled.user_id != reg.meta.as_ref().and_then(|meta| meta.user_id.clone())
+            {
+                return Ok(respond_text(403, "device enrollment binding mismatch\n"));
+            }
+        }
+
+        if !locked.peers.contains_key(&peer_id) && locked.peers.len() >= max_tracker_peers() {
+            return Ok(respond_text(429, "too many registered peers\n"));
+        }
+        let mut previous_capabilities = None;
+        if let Some(enrolled) = locked.enrolled_devices.get_mut(&peer_id)
+            && verified_public_key.map(Vec::as_slice) == Some(enrolled.public_key.as_slice())
+            && enrolled.device_id == reg.meta.as_ref().and_then(|meta| meta.device_id.clone())
+            && enrolled.user_id == reg.meta.as_ref().and_then(|meta| meta.user_id.clone())
+        {
+            let enrollment_changed = enrolled.retirement_protocol != reg.retirement_protocol
+                || enrolled.membership_protocol != reg.membership_protocol
+                || enrolled.membership_enforced != reg.membership_enforced;
+            if enrollment_changed {
+                previous_capabilities = Some((
+                    enrolled.retirement_protocol,
+                    enrolled.membership_protocol,
+                    enrolled.membership_enforced,
+                ));
+            }
+            enrolled.retirement_protocol = reg.retirement_protocol;
+            enrolled.membership_protocol = reg.membership_protocol;
+            enrolled.membership_enforced = reg.membership_enforced;
+        }
+        if let Some(previous) = previous_capabilities
+            && let Err(error) = locked.persist_security()
+        {
+            if let Some(enrolled) = locked.enrolled_devices.get_mut(&peer_id) {
+                enrolled.retirement_protocol = previous.0;
+                enrolled.membership_protocol = previous.1;
+                enrolled.membership_enforced = previous.2;
+            }
+            return Err(error);
+        }
+        locked.peers.insert(
+            peer_id.clone(),
+            PeerRecord {
+                addrs,
+                meta: reg.meta,
+                last_seen_unix: now.unix_timestamp(),
+            },
+        );
+        if let Some(proof) = reg.device_proof.as_ref() {
+            locked.mark_device_proof_completed(proof);
+        }
+    }
+
+    respond_json(
+        200,
+        &RegisterResponse {
+            ok: true,
+            ttl_sec: config.ttl_sec,
+        },
+    )
+}
+
+fn handle_peer_unregister<R: TrackerHttpRequest + ?Sized>(
+    state: &Arc<Mutex<TrackerState>>,
+    config: &TrackerServeConfig,
+    req: &mut R,
+) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
+    let unregister: UnregisterRequest = match read_device_json_request(
+        req,
+        "unregister request",
+        MAX_RETIREMENT_DEVICE_BODY_BYTES,
+    )? {
+        Ok(request) => request,
+        Err(response) => return Ok(response),
+    };
+    if unregister.device_proof.is_none()
+        && let Some(token) = config.token.as_deref()
+        && !is_authorized(req, token)
+    {
+        return Ok(respond_text(401, "unauthorized\n"));
+    }
+    let peer_id = unregister.peer_id.trim();
+    if peer_id.is_empty() {
+        return Ok(respond_text(400, "peer_id required\n"));
+    }
+    let peer_id: PeerId = match peer_id.parse() {
+        Ok(peer_id) => peer_id,
+        Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
+    };
+    let peer_id = peer_id.to_string();
+
+    let now = OffsetDateTime::now_utc();
+    let removed = {
+        let mut locked = state.lock().unwrap();
+        prune_expired(&mut locked, now, config.ttl_sec);
+        if let Some(proof) = unregister.device_proof.as_ref()
+            && locked
+                .completed_unregister_signatures
+                .get(&peer_id)
+                .is_some_and(|signature| constant_time_eq(signature, proof.signature.as_slice()))
+        {
+            return respond_json(
+                200,
+                &UnregisterResponse {
+                    ok: true,
+                    removed: false,
+                },
+            );
+        }
+        let payload = unregister_proof_payload(&peer_id)?;
+        let mut completed_replay = false;
+        let verified_public_key = match unregister.device_proof.as_ref() {
+            Some(proof) => match locked.verify_and_record_device_proof(
+                proof,
+                ACTION_UNREGISTER,
+                &payload,
+                &peer_id,
+                now.unix_timestamp(),
+            ) {
+                Ok((public_key, replay)) => {
+                    completed_replay = replay == DeviceProofReplay::CompletedReplay;
+                    Some(public_key)
+                }
+                Err(error) => {
+                    return Ok(respond_text(
+                        403,
+                        &format!("invalid device proof: {error}\n"),
+                    ));
+                }
+            },
+            None if config.require_device_enrollment => {
+                return Ok(respond_text(403, "signed device proof required\n"));
+            }
+            None => None,
+        };
+        if let Some(enrolled) = locked.enrolled_devices.get(&peer_id)
+            && verified_public_key.is_some()
+            && verified_public_key.as_deref() != Some(enrolled.public_key.as_slice())
+        {
+            return Ok(respond_text(403, "device enrollment key mismatch\n"));
+        }
+        if completed_replay {
+            return respond_json(
+                200,
+                &UnregisterResponse {
+                    ok: true,
+                    removed: false,
+                },
+            );
+        }
+        if locked.revocations.contains_key(&peer_id) {
+            let Some(proof) = unregister.device_proof.as_ref() else {
+                return Ok(respond_text(403, "device is revoked\n"));
+            };
+            locked.mark_device_proof_completed(proof);
+            return respond_json(
+                200,
+                &UnregisterResponse {
+                    ok: true,
+                    removed: false,
+                },
+            );
+        }
+
+        let previous_peer = locked.peers.remove(&peer_id);
+        let should_remove_enrollment =
+            verified_public_key.is_some() && locked.enrolled_devices.contains_key(&peer_id);
+        let previous_enrollment = should_remove_enrollment
+            .then(|| locked.enrolled_devices.remove(&peer_id))
+            .flatten();
+        let previous_observation = verified_public_key
+            .as_ref()
+            .and_then(|_| locked.observed_devices.remove(&peer_id));
+        let completed_signature_changed = previous_enrollment.is_some();
+        let previous_completed_signature = if completed_signature_changed {
+            Some(
+                locked.completed_unregister_signatures.insert(
+                    peer_id.clone(),
+                    unregister
+                        .device_proof
+                        .as_ref()
+                        .context("signed enrollment unregister proof disappeared")?
+                        .signature
+                        .clone(),
+                ),
+            )
+        } else {
+            None
+        };
+        if previous_enrollment.is_some()
+            && let Err(error) = locked.persist_security()
+        {
+            if let Some(previous_peer) = previous_peer.clone() {
+                locked.peers.insert(peer_id.clone(), previous_peer);
+            }
+            if let Some(previous_enrollment) = previous_enrollment.clone() {
+                locked
+                    .enrolled_devices
+                    .insert(peer_id.clone(), previous_enrollment);
+            }
+            if let Some(previous_observation) = previous_observation.clone() {
+                locked
+                    .observed_devices
+                    .insert(peer_id.clone(), previous_observation);
+            }
+            if completed_signature_changed {
+                match previous_completed_signature.flatten() {
+                    Some(previous) => {
+                        locked
+                            .completed_unregister_signatures
+                            .insert(peer_id.clone(), previous);
+                    }
+                    None => {
+                        locked.completed_unregister_signatures.remove(&peer_id);
+                    }
+                }
+            }
+            return Err(error);
+        }
+        if previous_observation.is_some() {
+            clear_pending_observation(&mut locked, &peer_id);
+        }
+        let removed = previous_peer.is_some()
+            || previous_enrollment.is_some()
+            || previous_observation.is_some();
+        if let Some(proof) = unregister.device_proof.as_ref() {
+            locked.mark_device_proof_completed(proof);
+        }
+        removed
+    };
+
+    respond_json(200, &UnregisterResponse { ok: true, removed })
+}
+
+fn handle_peer_authorize(
+    state: &Arc<Mutex<TrackerState>>,
+    config: &TrackerServeConfig,
+    query: Option<&str>,
+) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
+    let peer_id = match query.and_then(|query| query_get(query, "peer_id")) {
+        Some(peer_id) => urlencoding::decode(peer_id)
+            .context("decode membership peer_id")?
+            .into_owned(),
+        None => return Ok(respond_text(400, "peer_id required\n")),
+    };
+    let peer_id: PeerId = match peer_id.parse() {
+        Ok(peer_id) => peer_id,
+        Err(_) => return Ok(respond_text(400, "invalid peer_id\n")),
+    };
+    let peer_id = peer_id.to_string();
+    let locked = state.lock().unwrap();
+    let enrolled_device = locked.enrolled_devices.get(&peer_id);
+    let enrolled = enrolled_device.is_some();
+    let observed_device = locked.observed_devices.get(&peer_id);
+    let device_id = enrolled_device
+        .and_then(|device| device.device_id.clone())
+        .or_else(|| observed_device.and_then(|device| device.device_id.clone()));
+    let user_id = enrolled_device
+        .and_then(|device| device.user_id.clone())
+        .or_else(|| observed_device.and_then(|device| device.user_id.clone()));
+    let revocation =
+        effective_revocation(&locked, &peer_id, device_id.as_deref(), user_id.as_deref());
+    let revoked = revocation.is_some();
+    let active = !revoked && (!config.require_device_enrollment || enrolled);
+    respond_json(
+        200,
+        &MembershipResponse {
+            peer_id,
+            active,
+            enrolled,
+            revoked,
+            strict: config.require_device_enrollment,
+            device_id,
+            user_id,
+            revocation,
+        },
+    )
+}
+
+fn handle_peer_list(
+    state: &Arc<Mutex<TrackerState>>,
+    config: &TrackerServeConfig,
+    query: Option<&str>,
+) -> Result<tiny_http::Response<std::io::Cursor<Vec<u8>>>> {
+    let user_id = match query.and_then(|query| query_get(query, "user_id")) {
+        Some(user_id) => Some(
+            urlencoding::decode(user_id)
+                .context("decode user_id query")?
+                .into_owned(),
+        ),
+        None => None,
+    };
+    let now = OffsetDateTime::now_utc();
+
+    let (peers, revocations) = {
+        let mut locked = state.lock().unwrap();
+        prune_expired(&mut locked, now, config.ttl_sec);
+        let mut estimated_bytes = 0usize;
+        let mut peers = Vec::new();
+        for (peer_id, rec) in locked.peers.iter().filter(|(peer_id, rec)| {
+            effective_revocation_for_peer(&locked, peer_id).is_none()
+                && match (user_id.as_deref(), &rec.meta) {
+                    (None, _) => true,
+                    (Some(want), Some(meta)) => meta.user_id.as_deref() == Some(want),
+                    (Some(_), None) => false,
+                }
+        }) {
+            estimated_bytes = estimated_bytes
+                .saturating_add(peer_id.len())
+                .saturating_add(rec.addrs.iter().map(String::len).sum::<usize>())
+                .saturating_add(
+                    rec.meta
+                        .as_ref()
+                        .map(estimated_peer_meta_bytes)
+                        .unwrap_or_default(),
+                )
+                .saturating_add(128);
+            if estimated_bytes > MAX_TRACKER_RESPONSE_BODY_BYTES {
+                return Ok(respond_text(
+                    413,
+                    "tracker peer list exceeds the bounded response size; narrow user_id or reduce stale registrations\n",
+                ));
+            }
+            peers.push(PeerInfo {
+                peer_id: peer_id.clone(),
+                addrs: rec.addrs.clone(),
+                meta: rec.meta.clone(),
+                last_seen_unix: rec.last_seen_unix,
+            });
+        }
+        let revocations = locked
+            .revocations
+            .values()
+            .filter(|revocation| {
+                user_id
+                    .as_deref()
+                    .is_none_or(|want| revocation.user_id.as_deref() == Some(want))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        (peers, revocations)
+    };
+    respond_json(200, &ListResponse { peers, revocations })
 }
 
 fn handle_admin_enroll<R: TrackerHttpRequest + ?Sized>(

@@ -18,14 +18,14 @@
 | ID | 상태 | Owner | Verify command | 작업 항목 |
 | --- | --- | --- | --- | --- |
 | C1 | done | codex | `cargo test http_retry` | HTTP retry의 zero-attempt, retryable, non-retryable 계약을 고정하고 panic-free loop로 정리 |
-| C2 | todo | codex | `cargo test tracker` | tracker peer register/unregister/list/authorize를 동작 보존 handler로 추출 |
+| C2 | done | codex | `cargo test tracker` | tracker peer register/unregister/list/authorize를 동작 보존 handler로 추출 |
 | C3 | todo | codex | `scripts/check-release-gates.sh --manifest-mode full --work-id retry-tracker-maintainability` | canonical/full source gate와 공개 경계 검증 |
 | C4 | todo | codex | `scripts/release-version.sh --version v1.0.63 --profile daily-driver --gate none --work-id retry-tracker-maintainability` | v1.0.63 source/tag/assets/checksum/GLIBC 출고 |
 | C5 | todo | codex | `rr version && rr doctor && rr sync-status --json --with-tracker` | local canary와 관리 대상 peer 배포·상태 검증 |
 
 ## 완료/미완료/다음 액션
 
-- 완료: 작업 범위와 회귀 방지 검증 경계를 확정했다. HTTP retry의 zero-attempt, 즉시 실패, transient 복구, attempt budget과 상태 분류를 테스트로 고정하고 panic-free loop로 정리했다.
-- 미완료: C2-C5.
-- 다음 액션: tracker peer endpoint 구현을 독립 handler로 추출한다.
-- 검증 증거: `cargo test http_retry`(6 passed), `cargo clippy --all-targets -- -D warnings`.
+- 완료: 작업 범위와 회귀 방지 검증 경계를 확정했다. HTTP retry의 zero-attempt, 즉시 실패, transient 복구, attempt budget과 상태 분류를 테스트로 고정하고 panic-free loop로 정리했다. Tracker의 register/unregister/list/authorize endpoint를 독립 handler로 이동하고 dispatch와 인증 전처리는 유지했다.
+- 미완료: C3-C5.
+- 다음 액션: 전체 source/release gate를 실행하고 v1.0.63 release change를 준비한다.
+- 검증 증거: `cargo test http_retry`(6 passed), `cargo test tracker`(79 passed), `cargo clippy --all-targets -- -D warnings`.
