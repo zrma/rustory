@@ -4010,7 +4010,7 @@ mod tests {
             .insert_entries(&[entry("id-from-healthy-peer", 1, "echo healthy")])
             .unwrap();
 
-        let stalled_listeners = (0..4)
+        let stalled_listeners = (0..8)
             .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
             .collect::<Vec<_>>();
         let stalled_addrs = stalled_listeners
@@ -4059,7 +4059,7 @@ mod tests {
         let sync = sync_async(&peers, 100, local_db_path, cfg, false);
         tokio::pin!(sync);
 
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let result = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 tokio::select! {
                     result = &mut sync => break result,

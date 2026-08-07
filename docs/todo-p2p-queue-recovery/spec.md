@@ -25,7 +25,7 @@
 
 ## 완료/미완료/다음 액션
 
-- 완료: C1-C3. live entry/deletion probe와 개별 peer 재시도로 순차 head-of-line blocking을 재현했다. tracked relay listener가 빈 주소 목록으로 닫혀도 stale circuit을 철회하며, 네 개 stalled peer 뒤의 healthy peer가 한 timeout budget 안에 진행되는 회귀 테스트와 canonical full gate가 통과했다.
+- 완료: C1-C3. live entry/deletion probe와 개별 peer 재시도로 순차 head-of-line blocking을 재현했다. tracked relay listener가 빈 주소 목록으로 닫혀도 stale circuit을 철회하며, 여덟 개 stalled peer 뒤의 healthy peer가 두 timeout wave 뒤 진행되는 회귀 테스트와 full gate가 통과했다.
 - 미완료: C4-C5.
-- 다음 액션: 검증된 patch revision을 원격에 반영하고 동일 SHA CI를 확인한 뒤 daily-driver asset을 게시해 local canary와 관리 대상에 순차 배포한다.
+- 다음 액션: 검증된 patch revision을 원격에 반영하고 동일 SHA CI 뒤 daily-driver asset을 게시한다.
 - 검증 증거: `cargo test p2p::tests`, `cargo clippy --all-targets --all-features -- -D warnings`, `scripts/smoke_p2p_local.sh`, `scripts/check-release-gates.sh --manifest-mode full --work-id p2p-queue-recovery`.
