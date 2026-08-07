@@ -49,9 +49,9 @@ where
     F: FnMut(&ureq::Agent) -> std::result::Result<T, ureq::Error>,
 {
     let attempts = policy.attempts.max(1);
-    let mut last_err: Option<anyhow::Error> = None;
+    let mut attempt = 0;
 
-    for attempt in 0..attempts {
+    loop {
         let connect = exponential_duration(
             policy.connect_base,
             attempt as u32,
@@ -71,21 +71,18 @@ where
             Ok(v) => return Ok(v),
             Err(err) => {
                 let retryable = is_retryable_error(&err);
-                last_err = Some(anyhow::anyhow!(err));
-
                 if !retryable || attempt + 1 >= attempts {
-                    return Err(last_err.expect("last_err must be set"));
+                    return Err(anyhow::anyhow!(err));
                 }
 
                 let backoff = exponential_duration(policy.backoff_base, attempt as u32, None);
                 if backoff > Duration::from_millis(0) {
                     std::thread::sleep(backoff);
                 }
+                attempt += 1;
             }
         }
     }
-
-    Err(last_err.expect("attempts must be >= 1"))
 }
 
 fn is_retryable_error(err: &ureq::Error) -> bool {
@@ -106,8 +103,85 @@ fn is_retryable_error(err: &ureq::Error) -> bool {
 mod tests {
     use super::*;
 
+    fn test_policy(attempts: usize) -> RetryPolicy {
+        RetryPolicy {
+            attempts,
+            connect_base: Duration::ZERO,
+            connect_cap: Duration::ZERO,
+            read_base: Duration::ZERO,
+            read_cap: Duration::ZERO,
+            backoff_base: Duration::ZERO,
+            max_redirects: 0,
+        }
+    }
+
     #[test]
     fn tracker_requests_never_follow_redirects() {
         assert_eq!(RetryPolicy::tracker().max_redirects, 0);
+    }
+
+    #[test]
+    fn zero_attempts_still_executes_once() {
+        let mut calls = 0;
+        let error = request_with_retry(test_policy(0), |_| {
+            calls += 1;
+            Err::<(), _>(ureq::Error::StatusCode(500))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("http status: 500"));
+    }
+
+    #[test]
+    fn non_retryable_error_returns_immediately() {
+        let mut calls = 0;
+        let error = request_with_retry(test_policy(3), |_| {
+            calls += 1;
+            Err::<(), _>(ureq::Error::StatusCode(400))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("http status: 400"));
+    }
+
+    #[test]
+    fn retryable_error_can_recover_within_attempt_budget() {
+        let mut calls = 0;
+        let result = request_with_retry(test_policy(3), |_| {
+            calls += 1;
+            if calls < 3 {
+                Err(ureq::Error::StatusCode(500))
+            } else {
+                Ok("recovered")
+            }
+        });
+
+        assert_eq!(result.unwrap(), "recovered");
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn retryable_error_stops_at_attempt_budget() {
+        let mut calls = 0;
+        let error = request_with_retry(test_policy(2), |_| {
+            calls += 1;
+            Err::<(), _>(ureq::Error::StatusCode(429))
+        })
+        .unwrap_err();
+
+        assert_eq!(calls, 2);
+        assert!(error.to_string().contains("http status: 429"));
+    }
+
+    #[test]
+    fn retryability_matches_transient_http_contract() {
+        for status in [408, 429, 500, 599] {
+            assert!(is_retryable_error(&ureq::Error::StatusCode(status)));
+        }
+        for status in [400, 404, 600] {
+            assert!(!is_retryable_error(&ureq::Error::StatusCode(status)));
+        }
     }
 }
