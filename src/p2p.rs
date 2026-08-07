@@ -61,6 +61,7 @@ const MAX_PENDING_PUSH_MEMBERSHIP_CHECKS: usize = 4;
 const MAX_PENDING_PUSH_MEMBERSHIP_CHECKS_PER_PEER: usize = 1;
 const MAX_PENDING_UNKNOWN_PUSH_MEMBERSHIP_CHECKS: usize = 1;
 const MAX_TRACKER_ANNOUNCE_ADDRS: usize = 64;
+const MAX_CONCURRENT_PEER_SYNCS: usize = 4;
 const _: () = assert!(MAX_PENDING_PUSH_MEMBERSHIP_CHECKS > 1);
 const _: () = assert!(MAX_PENDING_PUSH_MEMBERSHIP_CHECKS <= MAX_PENDING_MEMBERSHIP_CHECKS);
 const _: () = assert!(MAX_PENDING_PUSH_MEMBERSHIP_CHECKS_PER_PEER == 1);
@@ -976,7 +977,12 @@ async fn serve_async(listen: Multiaddr, db_path: &str, cfg: ServeConfig) -> Resu
                         }
                         let had_relay_listener =
                             is_tracked_relay_listener || addresses.iter().any(is_relay_circuit_addr);
-                        if remove_known_listen_addrs(&mut known_addrs, &addresses, local_peer_id)
+                        if remove_closed_listener_addrs(
+                            &mut known_addrs,
+                            &addresses,
+                            local_peer_id,
+                            is_tracked_relay_listener,
+                        )
                             && !trackers.is_empty()
                         {
                             spawn_register_all(
@@ -1477,6 +1483,27 @@ fn remove_known_listen_addrs(
     removed
 }
 
+fn remove_closed_listener_addrs(
+    known_addrs: &mut HashSet<String>,
+    addrs: &[Multiaddr],
+    peer_id: PeerId,
+    is_tracked_relay_listener: bool,
+) -> bool {
+    let mut removed = remove_known_listen_addrs(known_addrs, addrs, peer_id);
+    if !is_tracked_relay_listener {
+        return removed;
+    }
+
+    let previous_len = known_addrs.len();
+    known_addrs.retain(|addr| {
+        addr.parse::<Multiaddr>()
+            .map(|addr| !is_relay_circuit_addr(&addr))
+            .unwrap_or(true)
+    });
+    removed |= known_addrs.len() != previous_len;
+    removed
+}
+
 fn insert_bounded_known_addr(known_addrs: &mut HashSet<String>, addr: String) -> bool {
     if known_addrs.contains(&addr) {
         return false;
@@ -1534,6 +1561,11 @@ struct SyncTargetParams<'a> {
     push_device_id: Option<&'a str>,
 }
 
+struct SyncTargetResult {
+    succeeded: bool,
+    last_err: Option<anyhow::Error>,
+}
+
 async fn sync_async(
     peers: &[String],
     limit: usize,
@@ -1563,39 +1595,40 @@ async fn sync_async(
         Some(
             cfg.device_id
                 .as_deref()
-                .context("device_id required for push")?,
+                .context("device_id required for push")?
+                .to_string(),
         )
     } else {
         None
     };
 
+    drop(store);
+
+    let results = futures::stream::iter(targets)
+        .map(|target| {
+            sync_target_with_timeout_async(
+                db_path,
+                &cfg,
+                limit,
+                push,
+                push_device_id.as_deref(),
+                target,
+            )
+        })
+        .buffer_unordered(MAX_CONCURRENT_PEER_SYNCS)
+        .collect::<Vec<_>>()
+        .await;
+
     let mut progress = crate::sync::SyncRunProgress::new();
     let mut last_err: Option<anyhow::Error> = None;
-    let peer_sync_timeout = cfg.request_retry_policy.timeout_cap;
-    for t in targets {
-        let peer_key = t.peer_key.clone();
-        if tokio::time::timeout(
-            peer_sync_timeout,
-            sync_target_async(
-                SyncTargetParams {
-                    store: &store,
-                    cfg: &cfg,
-                    limit,
-                    push,
-                    push_device_id,
-                },
-                t,
-                &mut progress,
-                &mut last_err,
-            ),
-        )
-        .await
-        .is_err()
-        {
-            let err = anyhow::anyhow!("p2p peer sync timeout after {peer_sync_timeout:?}");
+    for result in results {
+        if result.succeeded {
+            progress.mark_pull_ok();
+        } else {
             progress.mark_required_action_failed();
-            log_p2p_sync_failure("sync", &peer_key, &err);
-            last_err = Some(err);
+        }
+        if result.last_err.is_some() {
+            last_err = result.last_err;
         }
     }
 
@@ -1603,6 +1636,60 @@ async fn sync_async(
         Ok(())
     } else {
         Err(last_err.unwrap_or_else(|| anyhow::anyhow!("p2p sync failed")))
+    }
+}
+
+async fn sync_target_with_timeout_async(
+    db_path: &str,
+    cfg: &SyncConfig,
+    limit: usize,
+    push: bool,
+    push_device_id: Option<&str>,
+    target: SyncTarget,
+) -> SyncTargetResult {
+    let peer_key = target.peer_key.clone();
+    let store = match LocalStore::open(db_path) {
+        Ok(store) => store,
+        Err(err) => {
+            let err = err.context("open local store for peer sync");
+            log_p2p_sync_failure("sync", &peer_key, &err);
+            return SyncTargetResult {
+                succeeded: false,
+                last_err: Some(err),
+            };
+        }
+    };
+    let mut progress = crate::sync::SyncRunProgress::new();
+    let mut last_err = None;
+    let peer_sync_timeout = cfg.request_retry_policy.timeout_cap;
+
+    if tokio::time::timeout(
+        peer_sync_timeout,
+        sync_target_async(
+            SyncTargetParams {
+                store: &store,
+                cfg,
+                limit,
+                push,
+                push_device_id,
+            },
+            target,
+            &mut progress,
+            &mut last_err,
+        ),
+    )
+    .await
+    .is_err()
+    {
+        let err = anyhow::anyhow!("p2p peer sync timeout after {peer_sync_timeout:?}");
+        progress.mark_required_action_failed();
+        log_p2p_sync_failure("sync", &peer_key, &err);
+        last_err = Some(err);
+    }
+
+    SyncTargetResult {
+        succeeded: progress.is_success(),
+        last_err,
     }
 }
 
@@ -3298,6 +3385,24 @@ mod tests {
     }
 
     #[test]
+    fn remove_closed_listener_addrs_drops_tracked_relay_when_event_has_no_addresses() {
+        let relay_id = PeerId::random();
+        let peer_id = PeerId::random();
+        let direct: Multiaddr = "/ip4/192.0.2.10/tcp/1234".parse().unwrap();
+        let relay: Multiaddr =
+            format!("/ip4/192.0.2.20/tcp/4001/p2p/{relay_id}/p2p-circuit/p2p/{peer_id}")
+                .parse()
+                .unwrap();
+        let direct_full = ensure_p2p_suffix(direct, peer_id).to_string();
+        let relay_full = relay.to_string();
+        let mut known = HashSet::from([direct_full.clone(), relay_full.clone()]);
+
+        assert!(remove_closed_listener_addrs(&mut known, &[], peer_id, true,));
+        assert!(known.contains(&direct_full));
+        assert!(!known.contains(&relay_full));
+    }
+
+    #[test]
     fn dialable_tracker_addr_from_external_candidate_filters_unspecified_and_relay() {
         let peer_id = PeerId::random();
 
@@ -3905,10 +4010,17 @@ mod tests {
             .insert_entries(&[entry("id-from-healthy-peer", 1, "echo healthy")])
             .unwrap();
 
-        let stalled_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let stalled_port = stalled_listener.local_addr().unwrap().port();
-        let stalled_peer = PeerId::random();
-        let stalled_addr = format!("/ip4/127.0.0.1/tcp/{stalled_port}/p2p/{stalled_peer}");
+        let stalled_listeners = (0..4)
+            .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+            .collect::<Vec<_>>();
+        let stalled_addrs = stalled_listeners
+            .iter()
+            .map(|listener| {
+                let port = listener.local_addr().unwrap().port();
+                let peer = PeerId::random();
+                format!("/ip4/127.0.0.1/tcp/{port}/p2p/{peer}")
+            })
+            .collect::<Vec<_>>();
 
         let mut healthy_server = build_rustory_swarm(psk).unwrap();
         healthy_server
@@ -3939,12 +4051,15 @@ mod tests {
             },
             max_peers_per_tick: 0,
         };
-        let peers = vec![stalled_addr, healthy_addr];
+        let peers = stalled_addrs
+            .into_iter()
+            .chain([healthy_addr])
+            .collect::<Vec<_>>();
         let local_db_path = local_db.to_str().unwrap();
         let sync = sync_async(&peers, 100, local_db_path, cfg, false);
         tokio::pin!(sync);
 
-        let result = tokio::time::timeout(Duration::from_secs(5), async {
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
             loop {
                 tokio::select! {
                     result = &mut sync => break result,
@@ -3983,7 +4098,7 @@ mod tests {
         assert_eq!(got[0].entry_id, "id-from-healthy-peer");
         assert!(local.get_last_cursor(&healthy_peer.to_string()).unwrap() > 0);
 
-        drop(stalled_listener);
+        drop(stalled_listeners);
     }
 
     #[tokio::test(flavor = "current_thread")]
