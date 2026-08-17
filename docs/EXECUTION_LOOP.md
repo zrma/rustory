@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-09
+- Last Verified: 2026-08-17
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -31,9 +31,11 @@
 - 문서는 새 진입점, 안전 불변조건, 소유 경계, 결정 근거, 검증 증거처럼 코드만으로 드러나지 않는 판단 재료를 남긴다.
 - 에이전트는 문서가 현재 구현을 요약하길 기다리지 않고 관련 코드/스크립트/CLI help를 직접 확인한다.
 
-## GPT-5.6 project overlay
+## AI-first project overlay
 
-공통 모델, 프롬프트 예산, 권한, 지속 실행, 검증, 출력, Pro/PTC, 평가 기준은 루트 `AGENTS.md`의 `Agent Harness Baseline (GPT-5.6)`을 단일 기준으로 사용한다. 이 문서는 Rustory의 실행 순서와 증거 게이트만 소유하며 공통 기준을 복제하지 않는다.
+공통 stewardship, 권한, 지속 실행과 검증 기준은 루트 `AGENTS.md`의 `AI-first Core Contract`를,
+OpenAI 모델·프롬프트 지침은 `Capability Profile: openai-agent-guidance`를 단일 기준으로 사용한다.
+이 문서는 Rustory의 실행 순서와 증거 게이트만 소유하며 공통 기준을 복제하지 않는다.
 
 - Rustory 작업은 `docs/todo-*/spec.md`의 목표와 수용 기준, 실제 코드/스크립트/CLI help, `docs/REPO_MANIFEST.yaml`의 검증 명령으로 범위를 좁힌다.
 - 활성 OpenAI 통합 지점이 확인되지 않으면 runtime model, reasoning, Responses API, Pro mode, PTC, tool handler, schema를 추정해 추가하지 않는다.

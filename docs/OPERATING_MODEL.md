@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-09
+- Last Verified: 2026-08-17
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
@@ -49,14 +49,14 @@
 6. 동일 게이트 실패가 2회 반복되면 임의 재시도를 중단하고 `docs/ESCALATION_POLICY.md` 기준으로 사람에게 보고한다.
 7. `DEBUG_GATES_OVERRIDE` 계열 우회는 사람 승인 없이 사용하지 않는다.
 8. `scripts/check-doc-last-verified.sh` 실패 시 관련 문서 `Last Verified`를 갱신하고 재검증 전까지 출고/푸시를 진행하지 않는다.
-9. OpenAI 모델/API/프롬프트/에이전트 기준은 루트 `AGENTS.md`의 `Agent Harness Baseline (GPT-5.6)`을 따르고, 변경은 활성 통합 지점과 직접 연결된 prompt/harness 표면으로 좁힌다.
+9. 공통 에이전트 기준은 루트 `AGENTS.md`의 `AI-first Core Contract`를, OpenAI 모델/API/프롬프트 기준은 `Capability Profile: openai-agent-guidance`를 따르고, 변경은 활성 통합 지점과 직접 연결된 prompt/harness 표면으로 좁힌다.
 10. 위 조건에 걸리지 않는 구현/검증/문서화와 로컬 change 정리는 같은 턴에서 자율적으로 닫는다. 원격 push는 사용자 요청이 명시적으로 권한을 부여한 경우에만 수행한다.
 
 ## 전역 스킬 운영 원칙
 
 1. 전역 스킬은 `방법론(How)`만 소유하고, 레포별 사실/상태/경로는 `docs/`가 소유한다.
 2. 전역 스킬에는 레포 가드(특정 레포명/경로)와 환경 고정값(엔드포인트/계정)을 넣지 않는다.
-3. 반복 루프는 `iteration-loop`, 언어/도메인 검증은 `*-project-maintenance`로 분리해 중복을 피한다.
+3. 반복 실행 기준은 루트 `AGENTS.md`의 `AI-first Core Contract`, 언어/도메인 검증은 `*-project-maintenance`로 분리해 중복을 피한다.
 4. 스킬 승격/경계/오염 방지 상세 기준은 `docs/SKILL_OPERATING_GUIDE.md`를 단일 기준으로 따른다.
 
 ## 회귀 방지/지속 개선 루프

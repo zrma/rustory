@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-09
+- Last Verified: 2026-08-17
 
 이 문서는 전역 스킬과 레포 문서의 책임 경계를 분리해, 전역 오염 없이 재사용 가능한 스킬만 유지하기 위한 기준이다.
 
@@ -26,8 +26,8 @@
 
 ## 전역 스킬 계층
 
-1. 루프 계층: `iteration-loop`
-- 진행 신호 해석, 계획-구현-검증-문서화-정리 반복
+1. 루프 계층: repository `AI-first Core Contract`
+- 진행 신호 해석, 계획-구현-검증-문서화-정리 반복은 루트 `AGENTS.md`가 소유한다.
 
 2. 도메인 유지보수 계층: `rust-project-maintenance` (필요 시 `python/go/terraform-project-maintenance` 병행)
 - 언어/도메인별 검증 세트와 실패 보고 규약
