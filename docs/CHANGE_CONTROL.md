@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-07-26
+- Last Verified: 2026-09-05
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
@@ -39,7 +39,7 @@
 ## 표준 흐름
 
 1. 로컬 개발
-필요한 모듈에서 자유롭게 수정/검증한다. `jj` rebase/squash/split/force push는 필요 시 사용한다.
+필요한 모듈에서 자유롭게 수정/검증한다. `jj` rebase/squash/split/force push는 해당 history 변경에 대한 명시적 권한을 확인한 뒤 사용한다.
 비긴급 변경의 계획 스냅샷/질문 카드/ready 기준, 질문 카드 닫힘 상태, 완료 todo 위생 기준, quick manifest 사용 규칙은 `docs/EXECUTION_LOOP.md`의 `표준 사이클 > 1. 구현 + 테스트`를 단일 기준으로 따른다.
 권장 시작/기본 검증 경로(`scripts/start-work.sh --work-id <work-id>`, `scripts/run-manifest-checks.sh --mode quick --work-id <work-id>`)도 같은 기준 문서를 따른다.
 

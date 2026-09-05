@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-08-07
+- Last Verified: 2026-09-05
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-09-05 | `todo-ai-first-astra-adoption`에서 framework profile 갱신과 기존 문서 검토 기한 초과를 확인함 | model guidance는 공통 framework에 고정하고 native gate의 source identity와 운영 문서의 권한 경계를 함께 검증해야 한다. 검토일은 내용 확인 후 갱신하며 local 준비와 release publication은 구분한다. | AI-first 1.4.0 Astra profile을 immutable commit으로 준비하고 기존 overlay를 보존했다. 운영 문서 3개의 기준을 재확인하고 history 변경의 명시적 권한 조건을 분명히 했다. release pin과 publication은 후속 출고 단계다. | standalone/interface, quick manifest, `scripts/check.sh --fast`, publication boundary |
 | 2026-08-07 | `todo-p2p-queue-recovery`에서 일부 peer의 outbound queue가 수분 동안 줄지 않는 현상을 live entry와 deletion으로 재현함 | 피어별 timeout만으로는 여러 느린 피어의 예산이 직렬 합산되는 head-of-line blocking을 막을 수 없다. relay listener 종료 이벤트의 주소 목록이 비어 있을 수도 있으므로 listener identity를 기준으로 stale circuit을 철회하고, 독립 피어 작업은 작은 동시성 상한 안에서 진행해야 queue 회복 시간을 피어 수와 분리할 수 있다. | tracked relay listener가 닫히면 빈 주소 이벤트에서도 circuit 광고를 제거해 tracker를 갱신하고, peer별 SQLite connection과 bounded concurrency로 pull/push를 격리했다. | 빈 relay 종료 이벤트와 8개 stalled peer 회귀 테스트, P2P smoke와 full release gate, 동일 source CI, asset identity·호환성, 순차 runtime rollout, entry/deletion queue 완전 수렴과 운영 health |
 | 2026-08-07 | `todo-retry-tracker-maintainability`에서 HTTP retry와 tracker peer routing을 동작 보존 리팩터링으로 출고함 | 재시도 loop는 최소 1회 실행·즉시 실패·일시 오류 회복·예산 소진을 characterization test로 먼저 고정해야 제어 흐름 단순화가 정책 변경으로 번지지 않는다. 큰 HTTP router는 인증 전처리와 dispatch를 유지한 채 endpoint별 상태 전이만 handler로 이동하면 보안 경계를 흐리지 않고 검토 단위를 줄일 수 있다. | retry 불변식을 테스트로 고정하고 panic-free loop로 정리했으며 peer register/unregister/authorize/list 구현을 독립 handler로 추출했다. | focused test와 clippy, full release gate, 동일 SHA CI, 공개 자산 identity·호환성 검증, 순차 runtime rollout 후 doctor·tracker·pending health |
 | 2026-08-06 | `todo-ratatui-tui-migration`에서 수작업 terminal 렌더링을 Ratatui로 전환하고 출고 증거를 재현함 | terminal UI는 widget buffer 검증만으로 완료할 수 없다. 고정 크기 `TestBackend`로 레이아웃·스타일을 확인하고 실제 PTY에서 raw mode, cursor와 alternate screen 복원을 함께 검증해야 shell 표면 회귀를 잡을 수 있다. push webhook이 지연될 때도 동일 source SHA를 수동 실행할 수 있어야 CI 증거가 전달 경로 하나에 종속되지 않는다. | inline search는 Ratatui buffer를 기존 `/dev/tty` 수명에 연결하고 watch 화면은 fullscreen `Terminal`이 소유하도록 바꿨으며, 필수 workflow에 수동 dispatch 경로를 추가했다. | search·watch 집중 테스트, 설치된 release의 실제 PTY 종료/복원 smoke, full release gate, 동일 SHA의 CI·Docs Integrity·Release Gates |
