@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-08-17
+- Last Verified: 2026-09-08
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -46,6 +46,7 @@ OpenAI 모델·프롬프트 지침은 `Capability Profile: openai-agent-guidance
 1. 구현 + 테스트
 - `spec.md`의 `C1..Cn` 항목을 기준으로 구현한다.
 - 권장 시작 경로는 `scripts/start-work.sh --work-id <work-id>`로, todo 초기화(`spec.md`, `open-questions.md`)와 초기 게이트(readiness/open-questions/manifest quick)를 단일 명령으로 실행한다.
+- 초기화 성공과 schema PASS는 실제 요구사항 확정을 대신하지 않는다. 구현 전에 배경·목표의 기본 문구를 실제 문제와 관찰 가능한 결과로 구체화하고, 영향·제약·제외 범위를 기존 spec 안에 기록한다.
 - 작업 대상 라우팅은 `docs/HANDOFF.md`의 `work-id 라우팅 기준`을 따르며, 실제 todo 탐색 glob과 runner 자동 해석은 `docs/REPO_MANIFEST.yaml`, 대상 스크립트, CLI help를 확인한다.
 - 비긴급 변경은 구현 착수 전에 `scripts/check-todo-readiness.sh docs/todo-<work-id>`를 실행해 `spec/open-questions` 준비 상태를 확인한다.
 - `docs/todo-*` 관련 staged 변경(`spec.md`, `open-questions.md`, todo 삭제 증거 포함)은 `lefthook pre-commit`에서 `scripts/check-todo-readiness.sh`, `scripts/check-todo-closure.sh`를 선검증한다.
@@ -61,6 +62,7 @@ OpenAI 모델·프롬프트 지침은 `Capability Profile: openai-agent-guidance
 - 각 항목의 `Verify command`를 우선 실행하고, Rust/P2P 검증 명령은 `docs/REPO_MANIFEST.yaml`, `scripts/check.sh`, `docs/dev-playbook.md`에서 현재 기준을 확인한다.
 
 2. 검수 + 보완
+- 공통 `Change review` 계약에 따라 원래 spec의 immutable revision과 경로, 이후 spec 변경, diff와 evidence를 함께 대조한다. 완료 시 유지할 판단 근거는 소유 문서로 이관하며 native readiness·질문 스키마는 유지한다.
 - 피처 규모와 변경 위험도에 맞는 독립 리뷰를 수행하고 교차 검증한다.
 - 지적 사항을 반영한 뒤 관련 테스트를 재실행한다.
 
