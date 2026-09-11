@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-09-08
+- Last Verified: 2026-09-11
 
 이 문서는 구현 작업의 공통 실행 방법론(How)을 고정한다.
 피처별 구현 내용(What)은 각 작업의 `docs/todo-*/spec.md`에서 관리한다.
@@ -14,7 +14,7 @@
 - 다른 문서는 규칙을 복제하지 않고 소유 문서 링크로 참조한다.
 
 2. 네비게이션 우선
-- 작업 시작 경로는 `docs/HANDOFF.md -> docs/EXECUTION_LOOP.md -> docs/todo-*/spec.md`를 기본으로 유지한다.
+- 구현·변경 시작 경로는 `docs/HANDOFF.md -> docs/EXECUTION_LOOP.md -> docs/todo-*/spec.md`를 기본으로 유지한다.
 - 출고/푸시 경로는 `docs/HANDOFF.md -> docs/EXECUTION_LOOP.md -> docs/CHANGE_CONTROL.md`를 기본으로 유지한다.
 
 3. 최신성 관리

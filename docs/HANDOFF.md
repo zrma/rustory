@@ -2,16 +2,20 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-08-17
+- Last Verified: 2026-09-11
 
 이 문서는 `rustory` 루트에서 작업 시작 시 사용하는 단일 네비게이션 문서다.
 
 ## 무컨텍스트 읽기 순서 (forward-only)
 
-1. `docs/HANDOFF.md` (현재 문서): 어디로 이동할지 결정
-2. `docs/EXECUTION_LOOP.md`: 구현/검증 방법론 확인
-3. `docs/CHANGE_CONTROL.md`: 출고/푸시 strict 게이트 확인
-4. `docs/REPO_MANIFEST.yaml`: 진입점/검증 명령 선언과 동기화 확인
+적용되는 agent 지침과 권한·공개 경계는 항상 준수한다. 상세 문서는 요청에 필요한
+경로부터 읽는다. 설명·조사는 관련 source와 필요한 재현으로 답하며, 문서 탐색만을
+이유로 구현 절차나 전체 검사를 실행하지 않는다. 변경·출고의 기존 필수 gate는 유지한다.
+
+1. `docs/HANDOFF.md` (현재 문서): 요청에 따라 어디로 이동할지 결정
+2. 구현·변경 검증: `docs/EXECUTION_LOOP.md`에서 방법론 확인
+3. 출고·푸시: `docs/CHANGE_CONTROL.md`에서 strict 게이트 확인
+4. 진입점·검증 명령 확인: `docs/REPO_MANIFEST.yaml`에서 선언과 동기화 확인
 
 `docs/README.md`는 인덱스 전용 문서이며, 실행 순서/옵션 규칙의 단일 기준 문서는 아니다.
 
