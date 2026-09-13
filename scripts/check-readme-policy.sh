@@ -119,7 +119,6 @@ fi
 
 required_h2=(
   "## Quick Start"
-  "## Agent Navigation"
   "## Product Docs"
   "## Development"
 )
@@ -131,15 +130,10 @@ for heading in "${required_h2[@]}"; do
 done
 
 required_links=(
+  "docs/quickstart.md"
+  "docs/README.md"
   "docs/HANDOFF.md"
-  "docs/README_OPERATING_POLICY.md"
-  "docs/OPERATING_MODEL.md"
-  "docs/EXECUTION_LOOP.md"
   "docs/CHANGE_CONTROL.md"
-  "docs/IMPROVEMENT_LOOP.md"
-  "docs/ESCALATION_POLICY.md"
-  "docs/LESSONS_LOG.md"
-  "docs/REPO_MANIFEST.yaml"
   "AGENTS.md"
 )
 

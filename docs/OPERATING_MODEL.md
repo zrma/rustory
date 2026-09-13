@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-08-17
+- Last Verified: 2026-09-13
 
 이 문서는 현재 팀 운영 제약(1인 개발 + LLM 적극 활용)을 작업 규칙으로 고정한 기준 문서다.
 
@@ -26,7 +26,7 @@
 
 ## 문서 역할 분리 (AI-first)
 
-1. `README.md`는 저장소 인덱스(개요 + 최소 시작 링크)만 유지한다.
+1. `README.md`의 독자와 내용 범위는 [README 역할 정책](README_OPERATING_POLICY.md)을 따른다.
 2. 실행 규칙/가드레일은 `AGENTS.md`가 소유한다.
 3. `docs/*`는 네비게이션, 소유 경계, 안전 불변조건, 결정 근거, 검증 증거를 소유한다.
 4. 역할 분리 상세 기준은 `docs/README_OPERATING_POLICY.md`를 단일 기준으로 따른다.

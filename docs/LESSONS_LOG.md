@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-09-11
+- Last Verified: 2026-09-13
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-09-13 | `todo-reader-focused-docs`에서 공개 제품 안내와 개인 운영 인덱스의 역할을 대조함 | README는 사용자 온보딩을 우선하고 개발·agent 실행 절차는 소유 문서로 연결한다. 본문뿐 아니라 문구를 강제하는 문서 검사도 같은 역할 계약을 따라야 한다. | README와 docs 인덱스를 제품 문서 우선으로 정리하고 README_OPERATING_POLICY 및 check-readme-policy의 필수 탐색 링크를 조정했다. CLI·grid identity·권한·출고 검증은 유지한다. | 문서 정책·링크·인덱스와 script smoke, full release gate 검증 후 완료 근거를 확정한다. |
 | 2026-09-11 | `todo-ai-first-startup-routing`에서 초기 탐색 순서와 요청 범위를 대조함 | 상세 탐색 순서는 요청의 성격에 따라 적용하고, 설명·조사의 재현과 변경·출고의 필수 gate를 구별한다. | AI-first v1.7.1 pin과 생성 결과를 반영하고 HANDOFF 및 EXECUTION_LOOP의 시작 조건을 명확히 했다. 기존 profile·overlay·strict gate는 유지한다. 원래 기준은 `cdb45f63735f1e2c76464e9b3d8bb1eaf2a5cac2:docs/todo-ai-first-startup-routing/spec.md`에 있고, 유지할 계약은 generated artifact와 HANDOFF 및 EXECUTION_LOOP가 소유한다. | standalone/interface와 full release gate PASS. 완료 packet을 정리하고 최종 출고는 native safe-push gate로 검증한다. 실제 token·시간 절감은 미측정이다. |
 | 2026-09-10 | `todo-ai-first-shared-interface`에서 반복되는 framework assertion의 소유권을 점검함 | 공통 version, profile, generated header와 lock 정합성은 standalone checker가 소유하고 native gate는 제품 조건과 release-source 정책을 유지해야 갱신 시 중복 수정을 줄일 수 있다. | AI-first v1.7.0 release pin과 공통 checker 위임을 적용했다. 기존 profile과 overlay를 보존하며 optional workflow는 선택하지 않았다. 원래 완료 기준은 `cec8865092d30f97c7ed4d49f9d87a0452cd1a48:docs/todo-ai-first-shared-interface/spec.md`에 있다. 유지할 계약은 generated artifact와 native interface checker가 소유한다. | standalone/interface와 full release gate PASS. 완료 packet을 정리하고 최종 publication은 native safe-push gate로 검증한다. |
 | 2026-09-08 | `todo-ai-first-intent-review`에서 작업 기본 문구와 실제 의도의 차이를 대조함 | 초기화와 schema PASS만으로 실제 문제·기대 결과가 확정되지는 않는다. 원래 spec 기준선과 이후 수정, diff 및 evidence를 함께 리뷰해야 한다. | AI-first v1.6.0 release pin과 native assertion을 일치시키고 기존 스키마를 유지하며 start-work 안내와 실행 지침을 연결했다. 원래 기준선은 `41443352e31f:docs/todo-ai-first-intent-review/spec.md`이며 유지할 계약은 generated artifact와 `docs/EXECUTION_LOOP.md`가 소유한다. | standalone/interface, 실제 초기화·기존 파일 보존 fixture, native script smoke와 full release gate PASS. 검증 후 완료 packet을 정리했다. |
