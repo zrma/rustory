@@ -44,6 +44,18 @@ libp2p relay 기본값보다 큰 circuit/reservation/byte limit을 사용한다.
 운영 중 `Remote reported resource limit exceeded`가 반복되면 실제 relay 프로세스가 새 limit으로
 재시작됐는지 이 로그부터 확인한다.
 
+relay transport는 circuit/reservation quota보다 앞서 handshake 체류 시간과
+pending/established 연결 수를 제한한다. 현재 상한은 `src/p2p.rs`의
+`RELAY_HANDSHAKE_TIMEOUT`, `RELAY_MAX_*CONNECTIONS*`가 소유하며 circuit CLI
+옵션과 독립적이다. 이 한도는 프로세스 전체 메모리 상한을 보장하지 않는다.
+`relay health:`는 연결 현황과 수신 연결 거부/handshake 실패 누계를 주기적으로
+남긴다. TCP probe도 인증 없이 닫히므로 handshake 실패 증가만으로 공격을 판정하지 않는다.
+
+`--rate-limits`는 upstream의 peer별/IP별 rate limiter를 함께 켠다. NAT 또는
+sidecar 뒤에서 IP가 합쳐지는 배치는 실제 정상 사용량을 확인한 뒤 판단한다.
+연결 수 제한은 IP 대신 인증된 PeerId와 전체 연결 수에 적용한다. swarm key 보유는
+relay 접근을 허용하지만 tracker의 device revoke가 이 공유 키를 폐기하지는 않는다.
+
 P2P relay 주소는 `/ip4/...`, `/ip6/...`, `/dns4/...`, `/dns6/...` 형태로 넘길 수 있다.
 공개 relay는 `/dns4/rustory-relay.example.com/tcp/4001/p2p/<relay_peer_id>`처럼 DNS multiaddr을
 쓰는 편이 운영상 안전하다. `/ip4/100.64.0.0/10`, RFC1918 private IP, loopback 같은 literal relay

@@ -22,6 +22,7 @@ ctrlc = "3.5"
 futures = "0.3"
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "server", "server-auto", "service", "tokio"] }
+libp2p-connection-limits = "0.6"
 libp2p-core = "0.43"
 libp2p-dcutr = "0.14"
 libp2p-identify = "0.47"

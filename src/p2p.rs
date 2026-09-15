@@ -44,6 +44,10 @@ pub const DEFAULT_RELAY_MAX_CIRCUITS: usize = 256;
 pub const DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER: usize = 64;
 pub const DEFAULT_RELAY_MAX_CIRCUIT_DURATION_SEC: u64 = 15 * 60;
 pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
+const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const RELAY_MAX_PENDING_CONNECTIONS: u32 = 64;
+const RELAY_MAX_CONNECTIONS: u32 = 1024;
+const RELAY_MAX_CONNECTIONS_PER_PEER: u32 = 64;
 
 // request-response behaviour 내부 timeout은 request 상태 추적/정리를 위한 용도다.
 // pull/push는 attempt별 timeout을 별도로 구현하므로, 여기서 너무 작은 값을 두면
@@ -340,6 +344,7 @@ struct RustoryBehaviour {
 #[derive(libp2p_swarm::NetworkBehaviour)]
 #[behaviour(prelude = "libp2p_swarm::derive_prelude")]
 struct RelayServerBehaviour {
+    connection_limits: libp2p_connection_limits::Behaviour,
     relay: libp2p::relay::Behaviour,
     identify: libp2p::identify::Behaviour,
     ping: libp2p::ping::Behaviour,
@@ -466,6 +471,8 @@ fn build_relay_swarm_with_identity(
         .upgrade(Version::V1)
         .authenticate(noise_cfg)
         .multiplex(libp2p_mplex::Config::default())
+        // pnet부터 Noise/mplex까지 전체 연결 수립 시간을 제한한다.
+        .timeout(RELAY_HANDSHAKE_TIMEOUT)
         .boxed();
 
     let identify_cfg = libp2p::identify::Config::new(
@@ -475,6 +482,15 @@ fn build_relay_swarm_with_identity(
     .with_agent_version(format!("rustory/{}", crate::build_info::VERSION_DISPLAY));
 
     let behaviour = RelayServerBehaviour {
+        // circuit quota 이전의 자원도 제한한다. PeerId 제한은 Noise 인증 후 적용되며,
+        // IP별 제한을 사용하지 않아 NAT/sidecar 뒤의 서로 다른 peer를 합산하지 않는다.
+        connection_limits: libp2p_connection_limits::Behaviour::new(
+            libp2p_connection_limits::ConnectionLimits::default()
+                .with_max_pending_incoming(Some(RELAY_MAX_PENDING_CONNECTIONS))
+                .with_max_pending_outgoing(Some(RELAY_MAX_PENDING_CONNECTIONS))
+                .with_max_established(Some(RELAY_MAX_CONNECTIONS))
+                .with_max_established_per_peer(Some(RELAY_MAX_CONNECTIONS_PER_PEER)),
+        ),
         relay: libp2p::relay::Behaviour::new(local_peer_id, limits.to_libp2p_config()?),
         identify: libp2p::identify::Behaviour::new(identify_cfg),
         ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::new()),
@@ -518,8 +534,35 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
     swarm.listen_on(listen).context("listen_on")?;
     let local_peer_id = *swarm.local_peer_id();
 
+    let mut health_tick = tokio::time::interval(Duration::from_secs(60));
+    health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut denied_connections = 0u64;
+    let mut failed_handshakes = 0u64;
     loop {
-        match swarm.select_next_some().await {
+        let event = tokio::select! {
+            event = swarm.select_next_some() => event,
+            _ = health_tick.tick() => {
+                let info = swarm.network_info();
+                let counters = info.connection_counters();
+                // 거부마다 로그를 늘리지 않고 원인 조사에 필요한 집계만 일정 간격으로 남긴다.
+                eprintln!(
+                    "relay health: peers={} established={} pending_incoming={} pending_outgoing={} denied_total={} handshake_errors_total={}",
+                    info.num_peers(), counters.num_established(),
+                    counters.num_pending_incoming(), counters.num_pending_outgoing(),
+                    denied_connections, failed_handshakes,
+                );
+                continue;
+            }
+        };
+        match event {
+            SwarmEvent::IncomingConnectionError { error, .. } => match error {
+                libp2p_swarm::ListenError::Denied { .. } => {
+                    denied_connections = denied_connections.saturating_add(1);
+                }
+                _ => {
+                    failed_handshakes = failed_handshakes.saturating_add(1);
+                }
+            },
             SwarmEvent::NewListenAddr { address, .. } => {
                 // relay reservation 응답에는 "dial 가능한 relay 주소"가 최소 1개 필요하다.
                 // Swarm의 external address set이 비어 있으면 클라이언트가 reservation을 유효하게
@@ -4264,6 +4307,234 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].entry_id, entry.entry_id);
         assert_eq!(got[0].cmd, entry.cmd);
+    }
+
+    async fn relay_test_listener() -> (Swarm<RelayServerBehaviour>, Multiaddr) {
+        let mut relay = build_relay_swarm_with_identity(
+            libp2p::identity::Keypair::generate_ed25519(),
+            libp2p::pnet::PreSharedKey::new([1; 32]),
+            RelayLimits::default(),
+        )
+        .unwrap();
+        relay
+            .listen_on("/ip4/127.0.0.1/tcp/0".parse().unwrap())
+            .unwrap();
+        loop {
+            if let SwarmEvent::NewListenAddr { address, .. } = relay.select_next_some().await {
+                relay.add_external_address(address.clone());
+                return (relay, address);
+            }
+        }
+    }
+
+    async fn relay_test_event(
+        relay: &mut Swarm<RelayServerBehaviour>,
+        clients: &mut [Swarm<RustoryBehaviour>],
+    ) -> SwarmEvent<RelayServerBehaviourEvent> {
+        let mut clients = futures::stream::select_all(clients.iter_mut());
+        loop {
+            tokio::select! {
+                event = relay.select_next_some() => return event,
+                _ = clients.select_next_some(), if !clients.is_empty() => {},
+            }
+        }
+    }
+
+    fn assert_relay_connection_denied(error: libp2p_swarm::ListenError, limit: u32) {
+        let libp2p_swarm::ListenError::Denied { cause } = error else {
+            panic!("expected connection quota denial, got {error:?}");
+        };
+        let exceeded = cause
+            .downcast::<libp2p_connection_limits::Exceeded>()
+            .unwrap();
+        assert_eq!(exceeded.limit(), limit);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_pending_quota_and_timeout_release_capacity() {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut relay, addr) = relay_test_listener().await;
+            *relay.behaviour_mut().connection_limits.limits_mut() =
+                libp2p_connection_limits::ConnectionLimits::default()
+                    .with_max_pending_incoming(Some(1));
+            let port = addr
+                .iter()
+                .find_map(|p| match p {
+                    Protocol::Tcp(port) => Some(port),
+                    _ => None,
+                })
+                .unwrap();
+            // pnet nonce를 보내지 않고 TCP만 유지한다. 운영과 같은 timeout을 검사한다.
+            let stalled = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            loop {
+                if matches!(
+                    relay.select_next_some().await,
+                    SwarmEvent::IncomingConnection { .. }
+                ) {
+                    break;
+                }
+            }
+            let started = std::time::Instant::now();
+            let excess = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            loop {
+                if let SwarmEvent::IncomingConnectionError { error, .. } =
+                    relay.select_next_some().await
+                {
+                    assert_relay_connection_denied(error, 1);
+                    break;
+                }
+            }
+            loop {
+                if let SwarmEvent::IncomingConnectionError { error, .. } =
+                    relay.select_next_some().await
+                {
+                    assert!(matches!(error, libp2p_swarm::ListenError::Transport(_)));
+                    assert!(started.elapsed() >= Duration::from_secs(9));
+                    break;
+                }
+            }
+            drop((stalled, excess));
+            // 만료된 pending slot을 정상 peer가 재사용해 reservation을 만들 수 있어야 한다.
+            let mut clients =
+                [build_rustory_swarm(libp2p::pnet::PreSharedKey::new([1; 32])).unwrap()];
+            clients[0]
+                .listen_on(
+                    addr.with(Protocol::P2p(*relay.local_peer_id()))
+                        .with(Protocol::P2pCircuit),
+                )
+                .unwrap();
+            loop {
+                if matches!(
+                    relay_test_event(&mut relay, &mut clients).await,
+                    SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(
+                        libp2p::relay::Event::ReservationReqAccepted { .. }
+                    ))
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("pending quota/timeout recovery failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_authenticated_limits_use_peer_identity_and_total_count() {
+        tokio::time::timeout(Duration::from_secs(8), async {
+            let (mut relay, addr) = relay_test_listener().await;
+            *relay.behaviour_mut().connection_limits.limits_mut() =
+                libp2p_connection_limits::ConnectionLimits::default()
+                    .with_max_established(Some(2))
+                    .with_max_established_per_peer(Some(1));
+            let identity = libp2p::identity::Keypair::generate_ed25519();
+            let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
+            let mut clients = Vec::new();
+            // 같은 IP의 다른 peer는 허용하고, 동일 identity의 추가 연결과 총수 초과는 거부한다.
+            for (key, denied_limit) in [
+                (identity.clone(), None),
+                (identity, Some(1)),
+                (libp2p::identity::Keypair::generate_ed25519(), None),
+                (libp2p::identity::Keypair::generate_ed25519(), Some(2)),
+            ] {
+                let mut client = build_rustory_swarm_with_identity(key, psk).unwrap();
+                let peer_id = *client.local_peer_id();
+                client.dial(addr.clone()).unwrap();
+                clients.push(client);
+                loop {
+                    match relay_test_event(&mut relay, &mut clients).await {
+                        SwarmEvent::ConnectionEstablished { peer_id: got, .. } => {
+                            assert_eq!(got, peer_id);
+                            assert!(denied_limit.is_none());
+                            break;
+                        }
+                        SwarmEvent::IncomingConnectionError { error, .. } => {
+                            assert_relay_connection_denied(
+                                error,
+                                denied_limit.expect("valid peer denied"),
+                            );
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        })
+        .await
+        .expect("authenticated connection quota failed");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_wrong_swarm_key_is_rejected() {
+        tokio::time::timeout(Duration::from_secs(12), async {
+            let (mut relay, addr) = relay_test_listener().await;
+            let mut clients =
+                [build_rustory_swarm(libp2p::pnet::PreSharedKey::new([2; 32])).unwrap()];
+            clients[0].dial(addr).unwrap();
+            loop {
+                match relay_test_event(&mut relay, &mut clients).await {
+                    SwarmEvent::ConnectionEstablished { .. } => panic!("wrong swarm key accepted"),
+                    SwarmEvent::IncomingConnectionError { error, .. } => {
+                        assert!(matches!(error, libp2p_swarm::ListenError::Transport(_)));
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("wrong-key connection not rejected in time");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_circuit_transfers_ping() {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let (mut relay, addr) = relay_test_listener().await;
+            let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
+            let mut source = build_rustory_swarm(psk).unwrap();
+            let mut destination = build_rustory_swarm(psk).unwrap();
+            let destination_id = *destination.local_peer_id();
+            let circuit = addr
+                .with(Protocol::P2p(*relay.local_peer_id()))
+                .with(Protocol::P2pCircuit);
+            destination.listen_on(circuit.clone()).unwrap();
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {},
+                    event = destination.select_next_some() => {
+                        if matches!(event, SwarmEvent::NewListenAddr { .. }) { break; }
+                    }
+                }
+            }
+            source
+                .dial(circuit.with(Protocol::P2p(destination_id)))
+                .unwrap();
+            let mut relayed_connection = None;
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {},
+                    _ = destination.select_next_some() => {},
+                    event = source.select_next_some() => match event {
+                        SwarmEvent::ConnectionEstablished { connection_id, endpoint, peer_id, .. }
+                            if peer_id == destination_id => {
+                            assert!(endpoint.is_relayed());
+                            relayed_connection = Some(connection_id);
+                        }
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Ping(event))
+                            if event.peer == destination_id && event.result.is_ok() => {
+                                assert_eq!(relayed_connection, Some(event.connection));
+                                break;
+                            }
+                        _ => {},
+                    },
+                }
+            }
+        })
+        .await
+        .expect("relay circuit did not transfer ping bytes");
     }
 
     #[tokio::test(flavor = "current_thread")]
