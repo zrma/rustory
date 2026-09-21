@@ -425,7 +425,7 @@ fn build_rustory_swarm_with_identity(
         .authenticate(noise_cfg)
         .multiplex(crate::p2p_muxer::config())
         .map(|(peer, muxer), endpoint| {
-            crate::p2p_muxer::log_negotiated(&muxer, endpoint.is_relayed());
+            crate::p2p_muxer::log_negotiated(endpoint.is_relayed());
             (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer))
         })
         .boxed();
@@ -461,6 +461,7 @@ fn build_relay_swarm_with_identity(
     identity: libp2p::identity::Keypair,
     psk: libp2p::pnet::PreSharedKey,
     limits: RelayLimits,
+    stats: crate::p2p_muxer::NegotiationStats,
 ) -> Result<Swarm<RelayServerBehaviour>> {
     let local_public_key = identity.public();
     let local_peer_id = identity.public().to_peer_id();
@@ -477,8 +478,9 @@ fn build_relay_swarm_with_identity(
         .multiplex(crate::p2p_muxer::config())
         // pnet부터 Noise/multiplexer까지 전체 연결 수립 시간을 제한한다.
         .timeout(RELAY_HANDSHAKE_TIMEOUT)
-        .map(|(peer, muxer), _| {
-            crate::p2p_muxer::log_negotiated(&muxer, false);
+        .map(move |(peer, muxer), _| {
+            stats.record_yamux();
+            crate::p2p_muxer::log_negotiated(false);
             (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer))
         })
         .boxed();
@@ -538,7 +540,8 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
         limits.max_circuit_bytes,
         limits.rate_limits
     );
-    let mut swarm = build_relay_swarm_with_identity(identity, psk, limits)?;
+    let muxer_stats = crate::p2p_muxer::NegotiationStats::default();
+    let mut swarm = build_relay_swarm_with_identity(identity, psk, limits, muxer_stats.clone())?;
     swarm.listen_on(listen).context("listen_on")?;
     let local_peer_id = *swarm.local_peer_id();
 
@@ -554,10 +557,10 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
                 let counters = info.connection_counters();
                 // 거부마다 로그를 늘리지 않고 원인 조사에 필요한 집계만 일정 간격으로 남긴다.
                 eprintln!(
-                    "relay health: peers={} established={} pending_incoming={} pending_outgoing={} denied_total={} handshake_errors_total={}",
+                    "relay health: peers={} established={} pending_incoming={} pending_outgoing={} denied_total={} handshake_errors_total={} muxer_policy=yamux_only muxer_yamux_total={} muxer_mplex_total=0",
                     info.num_peers(), counters.num_established(),
                     counters.num_pending_incoming(), counters.num_pending_outgoing(),
-                    denied_connections, failed_handshakes,
+                    denied_connections, failed_handshakes, muxer_stats.yamux_total(),
                 );
                 continue;
             }
@@ -4322,6 +4325,7 @@ mod tests {
             libp2p::identity::Keypair::generate_ed25519(),
             libp2p::pnet::PreSharedKey::new([1; 32]),
             RelayLimits::default(),
+            crate::p2p_muxer::NegotiationStats::default(),
         )
         .unwrap();
         relay
@@ -4549,10 +4553,12 @@ mod tests {
     async fn p2p_relay_reservation_reports_relays_listen_addr() {
         let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
 
+        let stats = crate::p2p_muxer::NegotiationStats::default();
         let mut relay = build_relay_swarm_with_identity(
             libp2p::identity::Keypair::generate_ed25519(),
             psk,
             RelayLimits::default(),
+            stats.clone(),
         )
         .unwrap();
         relay
@@ -4619,6 +4625,7 @@ mod tests {
         })
         .await
         .expect("relay reservation timeout");
+        assert_eq!(stats.yamux_total(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4629,6 +4636,7 @@ mod tests {
             libp2p::identity::Keypair::generate_ed25519(),
             psk,
             RelayLimits::default(),
+            crate::p2p_muxer::NegotiationStats::default(),
         )
         .unwrap();
         relay

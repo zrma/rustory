@@ -206,6 +206,11 @@ daemon restart는 계속 시도한다. 이 때문에 이미 최신 버전이어�
   종료하고, 같은 설치 경로의 오래된 `rr daemon`/`rr p2p-serve`/`rr p2p-sync` 잔여 process를
   추가로 정리한 뒤 새 binary로 `rr daemon`을 다시 띄운다.
 
+재시작 메시지는 서비스 관리자 명령의 성공을 뜻한다. relay reservation이나 P2P sync의
+복구를 증명하지 않는다. 업데이트 후에는 새 daemon/child 실행 파일 identity, tracker의
+최근 상태, relay reservation 및 명시적 중계 동기화를 별도로 확인한다. 새 바이너리의
+운영체제 네트워크 권한이 미승인인 경우에도 재시작 자체는 성공할 수 있다.
+
 자동 재시작을 원하지 않으면 `--no-restart-daemon`을 사용한다. one-shot installer를
 `--install-daemon`과 함께 다시 실행하는 경우에도 service 파일을 갱신하고 시작 경로를 다시 밟으므로,
 systemd-user/launchd에서는 재시작되고 Linux systemd user bus가 없는 환경에서는 background fallback이

@@ -20,26 +20,32 @@
 - transport stack과 libp2p feature 조합은 `src/p2p.rs`와 `Cargo.toml`에서 확인한다.
 - payload size 오류나 batch 축소 동작은 `src/p2p_codec.rs`, `src/sync.rs`, 관련 테스트를 직접 확인한다.
 
-## 1.1.0 Yamux 전환
+## Yamux 전용 정책
 
-1.1.0은 Yamux를 우선 협상하고, 순차 업데이트 중인 1.0.x peer를 위해 mplex fallback을 유지한다.
-전환 설정의 소유 위치는 `src/p2p_muxer.rs`이며 직접 연결과 relay circuit 양쪽에 적용된다.
-저장 데이터, PSK/Noise 인증, PeerId 및 pull/push 메시지 형식은 이 전환으로 바뀌지 않는다.
+transport는 직접 연결과 relay circuit 모두 Yamux만 협상한다. 전환 버전인 1.1.0과는
+통신할 수 있지만 mplex-only 구버전과의 연결은 실패한다. 배포 전에 지원 대상 peer가
+Yamux를 지원하는지 확인한다. 저장 데이터, PSK/Noise 인증, PeerId와 pull/push 메시지
+형식은 유지한다. transport 정책의 소유 위치는 `src/p2p_muxer.rs`다.
 
-안전한 전환 순서는 relay 업데이트, 클라이언트 업데이트와 재연결, 실제 relay 동기화 확인이다.
+mplex fallback 제거는 종료된 작업 참조 누적 경로를 차단하기 위한 호환성 종료다.
+기기 retire/revoke를 대신하지 않는다. 공유 swarm key를 가진 클라이언트가 새 프로토콜을
+사용하는 경우의 relay 접근과 요청 단계의 기기 권한 검증은 별개 경계다.
+
 새 연결의 `p2p transport: muxer=yamux relayed=...` 로그로 선택 결과를 확인한다.
 `relayed=true`는 peer 사이의 relay circuit 내부 연결이며, relay 서버와 클라이언트 사이의
-기반 연결은 `relayed=false`다. 양쪽 경로를 확인해야 한다. 로그는 연결 성립 시점의 기록이며
-현재 활성 연결 전체를 나타내는 inventory는 아니다.
+기반 연결은 `relayed=false`다. 양쪽 경로와 실제 reservation/동기화를 확인한다.
+짧은 로그 구간이나 버전 보고만으로 모든 연결이 전환됐다고 판정하지 않는다.
 
-mplex의 종료된 작업 참조 누적 경로는 연결 quota만으로 막을 수 없다. mplex로 연결하는 구버전이
-남으면 이 경로도 남는다. 전체 업데이트 및 재연결을 확인하고, 동일 프로세스 내 메모리 추세와
-실제 reservation/동기화 성공을 관찰한 뒤에만 전환 완료로 판단한다. 버전 보고나 Pod Ready만으로
-완료를 판정하지 않는다. mplex 의존성 제거는 구버전 통신 지원 종료를 수반하므로 별도 호환성
-변경으로 다룬다. 이번 릴리스는 fallback을 유지하므로 1.1.0으로 시작한다.
+relay의 주기적 `relay health:` 로그는 `muxer_policy`, `muxer_yamux_total`,
+`muxer_mplex_total`을 함께 제공한다. 누계는 이 relay 프로세스의 transport 협상 완료 수로,
+이후 Swarm 연결 제한에서 거절되는 연결도 포함한다. 활성 연결 수나 구형 프로토콜 시도
+횟수는 아니다. 실패한 협상은 기존 `handshake_errors_total`에 포함되지만 그 원인을 모두
+mplex로 분류할 수 없다. 프로세스 교체 시 누계가 초기화되므로 같은 프로세스끼리 비교한다.
 
-전환 중 문제가 생기면 mplex를 지원하는 이전 바이너리로 되돌리고 기존 identity와 데이터를
-보존한다. rollback 후 reservation 재생성과 실제 동기화를 확인한다.
+운영 수집기는 사용 프로토콜과 프로세스 identity를 메모리 추세와 함께 보관해야 한다.
+통계 필드가 없는 이전 바이너리는 값 0이 아닌 관측 불가로 표시한다.
+문제 발생 시 기존 identity와 데이터를 보존하며 Yamux 지원 이전 바이너리로 되돌릴 수 있다.
+단, 1.1.0으로 rollback하면 mplex fallback과 기존 누적 경로도 다시 허용된다.
 
 ## 사용 예시
 ### 단계 2: tracker/relay + PSK(pnet) 기반
