@@ -12,6 +12,7 @@ mod libp2p;
 mod managed_logs;
 mod p2p;
 mod p2p_codec;
+mod p2p_muxer;
 mod retry;
 mod runtime_tasks;
 mod search;

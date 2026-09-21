@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-09-15
+- Last Verified: 2026-09-21
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-09-21 | `todo-yamux-migration`에서 장기 relay 회로 종료 후 mplex 작업 참조 누적을 재현함 | 동시 연결 quota와 작업 종료는 내부 multiplexer 참조 해제를 보장하지 않는다. 대체 구현은 구버전 협상과 실제 relay 전송을 함께 검증하고, 운영 완료는 프로세스별 메모리 추세로 별도 판단한다. | Yamux 우선 협상과 mplex 전환 fallback, 선택 결과 로그, 혼합 프로토콜 협상 및 반복 회로 시험을 추가했다. 전환/rollback과 구버전 지원 제거 조건은 `docs/p2p.md`가 소유한다. | 협상 4개·relay 6개 시험과 별도 2,000회 회로 시험 PASS. 구버전 바이너리 혼합 동기화와 전체 native gate PASS. 실제 배포/장기 메모리 관찰은 별도 검증한다. |
 | 2026-09-15 | `todo-ai-first-maintenance-release`에서 renderer 유지보수 patch의 소비 결과를 확인함 | renderer 내부 분리는 기존 profile·overlay와 생성된 지침 본문을 보존하는지 소비 경계에서 검증해야 한다. | signed v1.7.3 pin과 generated artifact를 갱신했다. 기존 profile·overlay·native gate·제품 동작은 유지한다. 원래 기준은 `0b8a12b0bac860229b16a2a32296f203938e3300:docs/todo-ai-first-maintenance-release/spec.md`에 있고 유지할 계약은 generated AGENTS 및 agent-harness가 소유한다. | standalone/interface·보호 파일 보존과 full native gate PASS. 완료 packet을 정리하고 최종 출고는 strict safe-push gate와 동일 SHA CI로 검증한다. |
 | 2026-09-15 | `todo-relay-connection-bounds`와 `todo-relay-hardening-release`에서 circuit quota 이전의 인증 미완료 연결 경계를 보완함 | pnet/Noise 접근 제어와 circuit quota는 handshake 체류 시간·연결 수 제한을 대신하지 않는다. 공유 IP 뒤의 peer는 인증된 identity로 구분하고, 연결 거부뿐 아니라 만료 후 회복과 실제 relay 데이터 전달도 검증한다. | transport timeout과 표준 connection-limits behaviour를 추가하고 주기적인 연결 집계를 남긴다. 이유와 잔여 메모리·공유 키 한계는 `docs/p2p.md`가 소유한다. | `cargo test p2p_relay`, full native gate PASS: pending 거부/만료/회복, PeerId별·전체 상한, 잘못된 key, circuit ping 및 로컬 동기화. v1.0.65의 source/tag와 다운로드한 macOS·Linux assets의 revision/checksum, 동일 source SHA의 CI·Docs Integrity·Release Gates를 확인했다. 운영 메모리 안정성은 제품 검사의 결론에 포함하지 않는다. |
 | 2026-09-14 | `todo-ai-first-cumulative-review`에서 중앙 설명과 실제 generated 지침의 전달 경로를 대조함 | 공통 리뷰 절차는 소비자가 읽는 generated artifact에 포함하고, 고정 범위·누적 finding·후발 지적의 기원을 근거로 추적한다. 지적 소멸과 연속 무지적만으로 완료를 판단하지 않는다. | signed v1.7.2 pin과 generated 지침을 갱신했다. 기존 profile·overlay·제품 동작·strict gate를 유지한다. 원래 기준은 `dadb931b11221942ca52fa830b505ae26b469359:docs/todo-ai-first-cumulative-review/spec.md`에 있고 유지할 계약은 generated AGENTS 및 agent-harness가 소유한다. | standalone/interface와 full native gate PASS. 완료 packet을 정리하고 최종 출고는 strict safe-push gate로 검증한다. 실제 리뷰 누락 감소 효과는 미측정이다. |

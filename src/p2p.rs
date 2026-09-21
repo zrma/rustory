@@ -423,7 +423,11 @@ fn build_rustory_swarm_with_identity(
     let transport = transport
         .upgrade(Version::V1)
         .authenticate(noise_cfg)
-        .multiplex(libp2p_mplex::Config::default())
+        .multiplex(crate::p2p_muxer::config())
+        .map(|(peer, muxer), endpoint| {
+            crate::p2p_muxer::log_negotiated(&muxer, endpoint.is_relayed());
+            (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer))
+        })
         .boxed();
 
     let identify_cfg = libp2p::identify::Config::new(
@@ -470,9 +474,13 @@ fn build_relay_swarm_with_identity(
     let transport = transport
         .upgrade(Version::V1)
         .authenticate(noise_cfg)
-        .multiplex(libp2p_mplex::Config::default())
-        // pnet부터 Noise/mplex까지 전체 연결 수립 시간을 제한한다.
+        .multiplex(crate::p2p_muxer::config())
+        // pnet부터 Noise/multiplexer까지 전체 연결 수립 시간을 제한한다.
         .timeout(RELAY_HANDSHAKE_TIMEOUT)
+        .map(|(peer, muxer), _| {
+            crate::p2p_muxer::log_negotiated(&muxer, false);
+            (peer, libp2p::core::muxing::StreamMuxerBox::new(muxer))
+        })
         .boxed();
 
     let identify_cfg = libp2p::identify::Config::new(
@@ -4856,5 +4864,66 @@ mod tests {
         assert!(!is_dcutr_direct_upgrade_noise(
             "Failed to connect to destination.: Relay has no reservation for destination."
         ));
+    }
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "장기 relay 회로 반복 시험: 명시적으로 단독 실행"]
+    async fn p2p_relay_circuit_churn() {
+        tokio::time::timeout(Duration::from_secs(180), async {
+            let (mut relay, addr) = relay_test_listener().await;
+            let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
+            let mut source = build_rustory_swarm(psk).unwrap();
+            let mut destination = build_rustory_swarm(psk).unwrap();
+            let destination_id = *destination.local_peer_id();
+            let circuit = addr
+                .with(Protocol::P2p(*relay.local_peer_id()))
+                .with(Protocol::P2pCircuit);
+            destination.listen_on(circuit.clone()).unwrap();
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {},
+                    event = destination.select_next_some() => {
+                        if matches!(event, SwarmEvent::NewListenAddr { .. }) { break; }
+                    }
+                }
+            }
+            for completed in 1..=2_000 {
+                source.dial(circuit.clone().with(Protocol::P2p(destination_id))).unwrap();
+                let mut connection = None;
+                loop {
+                    tokio::select! {
+                        _ = relay.select_next_some() => {},
+                        _ = destination.select_next_some() => {},
+                        event = source.select_next_some() => match event {
+                            SwarmEvent::ConnectionEstablished { connection_id, endpoint, peer_id, .. }
+                                if peer_id == destination_id && endpoint.is_relayed() => {
+                                    connection = Some(connection_id);
+                                },
+                            SwarmEvent::Behaviour(RustoryBehaviourEvent::Ping(event))
+                                if event.peer == destination_id && event.result.is_ok() => {
+                                    assert_eq!(connection, Some(event.connection));
+                                    break;
+                                },
+                            _ => {},
+                        }
+                    }
+                }
+                let connection = connection.unwrap();
+                assert!(source.close_connection(connection));
+                loop {
+                    tokio::select! {
+                        _ = relay.select_next_some() => {},
+                        _ = destination.select_next_some() => {},
+                        event = source.select_next_some() => {
+                            if matches!(event, SwarmEvent::ConnectionClosed {connection_id, ..}
+                                if connection_id == connection) { break; }
+                        }
+                    }
+                }
+                assert_eq!(relay.network_info().connection_counters().num_established(), 2);
+                if completed % 100 == 0 {
+                    eprintln!("relay churn: completed_circuits={completed} relay_connections=2");
+                }
+            }
+        }).await.expect("relay circuit churn timed out");
     }
 }
