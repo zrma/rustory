@@ -3,6 +3,15 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+// relay: 32 established + 8 pending per direction, each at most 4 MiB receive credit.
+// 수신 credit 예산이며 heap/RSS 상한은 아니다. 클라이언트 설정은 유지한다.
+pub(crate) const RELAY_MAX_STREAMS: usize = 16;
+pub(crate) const RELAY_RECEIVE_WINDOW_BYTES: usize = 4 * 1024 * 1024;
+
+pub(crate) fn relay_config() -> libp2p_yamux::Config {
+    libp2p_yamux::Config::bounded_v013(RELAY_MAX_STREAMS, RELAY_RECEIVE_WINDOW_BYTES)
+}
+
 pub(crate) fn config() -> libp2p_yamux::Config {
     libp2p_yamux::Config::default()
 }
@@ -51,6 +60,7 @@ mod tests {
         Transition,
         Legacy,
         YamuxOnly,
+        BoundedRelay,
     }
 
     type Observed = Arc<Mutex<Vec<&'static str>>>;
@@ -107,6 +117,10 @@ mod tests {
                 .boxed(),
             Mode::Legacy => transport
                 .multiplex(LegacyProtocol)
+                .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
+                .boxed(),
+            Mode::BoundedRelay => transport
+                .multiplex(relay_config())
                 .map(|(peer, muxer), _| (peer, StreamMuxerBox::new(muxer)))
                 .boxed(),
             Mode::YamuxOnly => transport
@@ -169,6 +183,117 @@ mod tests {
         })
         .await
         .expect("multiplexer negotiation timed out");
+    }
+
+    #[tokio::test]
+    async fn bounded_relay_connects_to_default_clients_in_both_directions() {
+        negotiate(Mode::BoundedRelay, Mode::YamuxOnly, true).await;
+        negotiate(Mode::YamuxOnly, Mode::BoundedRelay, true).await;
+    }
+
+    #[tokio::test]
+    async fn bounded_relay_stream_capacity_recovers_after_drop() {
+        use futures::{AsyncRead, AsyncWriteExt, future::poll_fn};
+        use libp2p_core::muxing::StreamMuxer;
+        use std::{pin::Pin, task::Poll};
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut listener = test_transport(
+                Mode::YamuxOnly,
+                Observed::default(),
+                NegotiationStats::default(),
+            );
+            listener
+                .listen_on(ListenerId::next(), "/ip4/127.0.0.1/tcp/0".parse().unwrap())
+                .unwrap();
+            let addr = loop {
+                if let TransportEvent::NewAddress { listen_addr, .. } =
+                    listener.select_next_some().await
+                {
+                    break listen_addr;
+                }
+            };
+            let mut dialer = test_transport(
+                Mode::BoundedRelay,
+                Observed::default(),
+                NegotiationStats::default(),
+            );
+            let dialing = dialer
+                .dial(
+                    addr,
+                    DialOpts {
+                        role: Endpoint::Dialer,
+                        port_use: PortUse::Reuse,
+                    },
+                )
+                .unwrap();
+            let accepting = async {
+                loop {
+                    if let TransportEvent::Incoming { upgrade, .. } =
+                        listener.select_next_some().await
+                    {
+                        break upgrade.await.unwrap().1;
+                    }
+                }
+            };
+            let (left, mut right) = futures::join!(dialing, accepting);
+            let mut left = left.unwrap().1;
+            let mut streams = Vec::new();
+            for _ in 0..RELAY_MAX_STREAMS {
+                streams.push(
+                    poll_fn(|cx| Pin::new(&mut left).poll_outbound(cx))
+                        .await
+                        .unwrap(),
+                );
+            }
+            // 닫은 stream의 용량을 반환받아 연결을 계속 사용할 수 있어야 한다.
+            drop(streams.pop());
+            let mut recovered = poll_fn(|cx| {
+                let _ = Pin::new(&mut right).poll(cx);
+                if let Poll::Ready(Err(error)) = Pin::new(&mut left).poll(cx) {
+                    panic!("muxer died after saturation: {error}");
+                }
+                Pin::new(&mut left).poll_outbound(cx)
+            })
+            .await
+            .unwrap();
+            // 회복한 stream에서 실제 데이터를 전달한다.
+            let sender = async {
+                recovered.write_all(b"recovered").await.unwrap();
+                recovered.flush().await.unwrap();
+            };
+            let receiver = async {
+                let mut inbound = poll_fn(|cx| {
+                    let _ = Pin::new(&mut left).poll(cx);
+                    Pin::new(&mut right).poll_inbound(cx)
+                })
+                .await
+                .unwrap();
+                let mut payload = [0; 9];
+                let mut offset = 0;
+                while offset < payload.len() {
+                    let count = poll_fn(|cx| {
+                        let _ = Pin::new(&mut left).poll(cx);
+                        let _ = Pin::new(&mut right).poll(cx);
+                        Pin::new(&mut inbound).poll_read(cx, &mut payload[offset..])
+                    })
+                    .await
+                    .unwrap();
+                    assert!(count > 0);
+                    offset += count;
+                }
+                assert_eq!(&payload, b"recovered");
+            };
+            futures::join!(sender, receiver);
+            // yamux는 상한 초과를 연결 오류로 처리한다. 재연결 호환성도 검증한다.
+            assert!(
+                poll_fn(|cx| Pin::new(&mut left).poll_outbound(cx))
+                    .await
+                    .is_err()
+            );
+        })
+        .await
+        .expect("bounded muxer did not recover");
+        negotiate(Mode::BoundedRelay, Mode::YamuxOnly, true).await;
     }
 
     #[test]

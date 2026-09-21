@@ -65,8 +65,8 @@ rr relay-serve --listen /ip4/0.0.0.0/tcp/4001
 실행하면 다음 형태의 주소를 출력한다.
 - `relay listen: /ip4/<ip>/tcp/<port>/p2p/<relay_peer_id>`
 
-`rr relay-serve`는 Rustory private swarm의 multi-machine backfill을 daily-driver 기본값으로 보고
-libp2p relay 기본값보다 큰 circuit/reservation/byte limit을 사용한다. 현재 값과 override 플래그는
+`rr relay-serve`는 소형 private swarm의 메모리 예산에 맞춘 connection/circuit/reservation
+한도와 backfill을 위한 duration/byte quota를 사용한다. 현재 값과 override 플래그는
 `rr relay-serve --help`와 `src/p2p.rs`가 소유한다. 시작 로그에는 `relay config: ...`가 출력되므로,
 운영 중 `Remote reported resource limit exceeded`가 반복되면 실제 relay 프로세스가 새 limit으로
 재시작됐는지 이 로그부터 확인한다.
@@ -77,6 +77,26 @@ pending/established 연결 수를 제한한다. 현재 상한은 `src/p2p.rs`의
 옵션과 독립적이다. 이 한도는 프로세스 전체 메모리 상한을 보장하지 않는다.
 `relay health:`는 연결 현황과 수신 연결 거부/handshake 실패 누계를 주기적으로
 남긴다. TCP probe도 인증 없이 닫히므로 handshake 실패 증가만으로 공격을 판정하지 않는다.
+
+relay는 Yamux 0.13을 유지하며 연결당 수신 credit를 4MiB, stream 수를 16개로
+제한한다. established 32개와 방향별 pending 8개를 합친 명목 수신 credit 예산은
+192MiB다. 이는 선할당 크기나 전체 RSS 상한이 아니다. Noise, socket, handler,
+allocator 등 나머지 메모리는 별도이며 실제 메모리 추세와 컨테이너 여유를 함께 확인한다.
+클라이언트의 기본 Yamux 설정은 유지한다.
+
+기본 회로 상한 8개는 한 목적지로 모여도 control stream 여유를 두기 위한 값이다.
+연결/예약/회로 한도에 도달하면 요청이 거절되어 재시도가 필요할 수 있다. 특히
+Yamux stream 상한 초과는 연결을 닫으므로 circuit 옵션만 크게 늘리지 않는다.
+예약이 사라지면 클라이언트의 relay 재예약과 실제 sync 회복까지 확인한다.
+
+`circuits_accepted_total`, `circuits_closed_total`은 프로세스 시작 이후의 회로 이벤트
+누계다. upstream은 circuit ID를 공개하지 않고 연결 종료 정리 이벤트도 포함하므로
+차이를 정확한 활성 회로 수로 단정하지 않는다. 동일 프로세스 내 구간별 증가량을
+연결 수 및 메모리와 함께 비교한다. 메트릭 저장용 peer/회로 목록은 만들지 않는다.
+
+upstream `libp2p-yamux`의 기존 설정 setter는 0.12로 전환되므로 사용하지 않는다.
+`vendor/libp2p-yamux/README.rustory.md`의 생성자 패치만 사용하며, upstream에
+동등한 0.13 설정 API가 생기면 제거한다.
 
 `--rate-limits`는 upstream의 peer별/IP별 rate limiter를 함께 켠다. NAT 또는
 sidecar 뒤에서 IP가 합쳐지는 배치는 실제 정상 사용량을 확인한 뒤 판단한다.

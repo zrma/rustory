@@ -8,6 +8,7 @@ Usage: scripts/check.sh [--fast|--no-smoke] [--acceptance] [--secret-scan]
 Runs the repository checks mirrored by CI:
   - cargo fmt --all --check
   - cargo test --workspace
+  - cargo test -p libp2p-yamux --lib
   - cargo clippy --workspace --all-targets -- -D warnings
   - python3 install/test_rustory.py
   - scripts/smoke_p2p_local.sh
@@ -61,6 +62,7 @@ rustory_require_cargo
 python3 .ai-first/check.py
 cargo fmt --all --check
 cargo test --workspace
+cargo test -p libp2p-yamux --lib
 cargo clippy --workspace --all-targets -- -D warnings
 python3 install/test_rustory.py
 

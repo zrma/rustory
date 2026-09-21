@@ -342,13 +342,13 @@ PY
 
 # 실제 예약·동기화 이후의 주기적 health가 협상 누계를 제공하는지 검증한다.
 # 초기 0 표본만으로는 누계 갱신 누락을 발견할 수 없다.
-echo "[6/6] verify cumulative relay muxer telemetry"
+echo "[6/6] verify cumulative relay muxer and circuit telemetry"
 for _ in $(seq 1 75); do
-  if grep -Eq 'relay health: .*muxer_policy=yamux_only muxer_yamux_total=[1-9][0-9]* muxer_mplex_total=0$' "$TMPDIR/relay.log"; then
+  if grep -Eq 'relay health: .*muxer_policy=yamux_only muxer_yamux_total=[1-9][0-9]* muxer_mplex_total=0 circuits_accepted_total=[1-9][0-9]* circuits_closed_total=[1-9][0-9]*$' "$TMPDIR/relay.log"; then
     echo "ok"
     exit 0
   fi
   sleep 1
 done
-echo "error: relay did not emit a positive Yamux negotiation count within 75 seconds" >&2
+echo "error: relay did not emit positive Yamux and circuit event counts within 75 seconds" >&2
 exit 1

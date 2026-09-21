@@ -35,6 +35,9 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: Yamux patch invariant
+        run: cargo test -p libp2p-yamux --lib
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 

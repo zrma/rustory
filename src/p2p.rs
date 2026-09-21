@@ -38,16 +38,16 @@ const PULL_RESP_DECODED_MAX_BYTES: u64 = PULL_RESP_MAX_BYTES * DECODED_MAX_MULTI
 const PUSH_REQ_DECODED_MAX_BYTES: u64 = PUSH_REQ_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 const PUSH_RESP_DECODED_MAX_BYTES: u64 = PUSH_RESP_MAX_BYTES * DECODED_MAX_MULTIPLIER;
 
-pub const DEFAULT_RELAY_MAX_RESERVATIONS: usize = 512;
-pub const DEFAULT_RELAY_MAX_RESERVATIONS_PER_PEER: usize = 64;
-pub const DEFAULT_RELAY_MAX_CIRCUITS: usize = 256;
-pub const DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER: usize = 64;
+pub const DEFAULT_RELAY_MAX_RESERVATIONS: usize = 32;
+pub const DEFAULT_RELAY_MAX_RESERVATIONS_PER_PEER: usize = 4;
+pub const DEFAULT_RELAY_MAX_CIRCUITS: usize = 8;
+pub const DEFAULT_RELAY_MAX_CIRCUITS_PER_PEER: usize = 4;
 pub const DEFAULT_RELAY_MAX_CIRCUIT_DURATION_SEC: u64 = 15 * 60;
 pub const DEFAULT_RELAY_MAX_CIRCUIT_BYTES: u64 = 64 * 1024 * 1024;
 const RELAY_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
-const RELAY_MAX_PENDING_CONNECTIONS: u32 = 64;
-const RELAY_MAX_CONNECTIONS: u32 = 1024;
-const RELAY_MAX_CONNECTIONS_PER_PEER: u32 = 64;
+const RELAY_MAX_PENDING_CONNECTIONS: u32 = 8;
+const RELAY_MAX_CONNECTIONS: u32 = 32;
+const RELAY_MAX_CONNECTIONS_PER_PEER: u32 = 8;
 
 // request-response behaviour 내부 timeout은 request 상태 추적/정리를 위한 용도다.
 // pull/push는 attempt별 timeout을 별도로 구현하므로, 여기서 너무 작은 값을 두면
@@ -475,7 +475,7 @@ fn build_relay_swarm_with_identity(
     let transport = transport
         .upgrade(Version::V1)
         .authenticate(noise_cfg)
-        .multiplex(crate::p2p_muxer::config())
+        .multiplex(crate::p2p_muxer::relay_config())
         // pnet부터 Noise/multiplexer까지 전체 연결 수립 시간을 제한한다.
         .timeout(RELAY_HANDSHAKE_TIMEOUT)
         .map(move |(peer, muxer), _| {
@@ -540,6 +540,14 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
         limits.max_circuit_bytes,
         limits.rate_limits
     );
+    eprintln!(
+        "relay transport limits: established={} per_peer={} pending_per_direction={} yamux_streams_per_connection={} yamux_receive_window_bytes={}",
+        RELAY_MAX_CONNECTIONS,
+        RELAY_MAX_CONNECTIONS_PER_PEER,
+        RELAY_MAX_PENDING_CONNECTIONS,
+        crate::p2p_muxer::RELAY_MAX_STREAMS,
+        crate::p2p_muxer::RELAY_RECEIVE_WINDOW_BYTES,
+    );
     let muxer_stats = crate::p2p_muxer::NegotiationStats::default();
     let mut swarm = build_relay_swarm_with_identity(identity, psk, limits, muxer_stats.clone())?;
     swarm.listen_on(listen).context("listen_on")?;
@@ -549,6 +557,8 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut denied_connections = 0u64;
     let mut failed_handshakes = 0u64;
+    let mut circuits_accepted = 0u64;
+    let mut circuits_closed = 0u64;
     loop {
         let event = tokio::select! {
             event = swarm.select_next_some() => event,
@@ -557,10 +567,11 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
                 let counters = info.connection_counters();
                 // 거부마다 로그를 늘리지 않고 원인 조사에 필요한 집계만 일정 간격으로 남긴다.
                 eprintln!(
-                    "relay health: peers={} established={} pending_incoming={} pending_outgoing={} denied_total={} handshake_errors_total={} muxer_policy=yamux_only muxer_yamux_total={} muxer_mplex_total=0",
+                    "relay health: peers={} established={} pending_incoming={} pending_outgoing={} denied_total={} handshake_errors_total={} muxer_policy=yamux_only muxer_yamux_total={} muxer_mplex_total=0 circuits_accepted_total={} circuits_closed_total={}",
                     info.num_peers(), counters.num_established(),
                     counters.num_pending_incoming(), counters.num_pending_outgoing(),
                     denied_connections, failed_handshakes, muxer_stats.yamux_total(),
+                    circuits_accepted, circuits_closed,
                 );
                 continue;
             }
@@ -593,7 +604,13 @@ async fn relay_serve_async(listen: Multiaddr, cfg: RelayServeConfig) -> Result<(
                     src_peer_id,
                     dst_peer_id,
                 }) => {
+                    circuits_accepted = circuits_accepted.saturating_add(1);
                     eprintln!("relay: circuit accepted: {src_peer_id} -> {dst_peer_id}");
+                }
+                RelayServerBehaviourEvent::Relay(libp2p::relay::Event::CircuitClosed {
+                    ..
+                }) => {
+                    circuits_closed = circuits_closed.saturating_add(1);
                 }
                 _ => {}
             },
@@ -4547,6 +4564,81 @@ mod tests {
         })
         .await
         .expect("relay circuit did not transfer ping bytes");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn p2p_relay_circuit_quota_recovers_without_dropping_other_circuits() {
+        async fn attempt(
+            relay: &mut Swarm<RelayServerBehaviour>,
+            destination: &mut Swarm<RustoryBehaviour>,
+            existing: &mut [Swarm<RustoryBehaviour>],
+            source: &mut Swarm<RustoryBehaviour>,
+            accepted: bool,
+        ) {
+            let mut existing = futures::stream::select_all(existing.iter_mut());
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {},
+                    _ = destination.select_next_some() => {},
+                    _ = existing.select_next_some(), if !existing.is_empty() => {},
+                    event = source.select_next_some() => match event {
+                        SwarmEvent::OutgoingConnectionError { error, .. } => {
+                            assert!(!accepted, "valid circuit failed: {error}");
+                            return;
+                        }
+                        SwarmEvent::Behaviour(RustoryBehaviourEvent::Ping(event))
+                            if event.peer == *destination.local_peer_id() && event.result.is_ok() => {
+                                assert!(accepted, "excess circuit was accepted");
+                                return;
+                            }
+                        _ => {},
+                    },
+                }
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let (mut relay, addr) = relay_test_listener().await;
+            let psk = libp2p::pnet::PreSharedKey::new([1; 32]);
+            let mut destination = build_rustory_swarm(psk).unwrap();
+            let circuit = addr.with(Protocol::P2p(*relay.local_peer_id())).with(Protocol::P2pCircuit);
+            destination.listen_on(circuit.clone()).unwrap();
+            loop {
+                tokio::select! {
+                    _ = relay.select_next_some() => {},
+                    event = destination.select_next_some() => {
+                        if matches!(event, SwarmEvent::NewListenAddr { .. }) { break; }
+                    }
+                }
+            }
+            let target = circuit.with(Protocol::P2p(*destination.local_peer_id()));
+            let mut sources = Vec::new();
+            for accepted in (0..DEFAULT_RELAY_MAX_CIRCUITS).map(|_| true).chain([false]) {
+                let mut source = build_rustory_swarm(psk).unwrap();
+                source.dial(target.clone()).unwrap();
+                attempt(&mut relay, &mut destination, &mut sources, &mut source, accepted).await;
+                if accepted { sources.push(source); }
+            }
+            let removed_peer = *sources.last().unwrap().local_peer_id();
+            drop(sources.pop());
+            loop {
+                let mut clients = futures::stream::select_all(sources.iter_mut());
+                tokio::select! {
+                    event = relay.select_next_some() => {
+                        if matches!(event, SwarmEvent::Behaviour(RelayServerBehaviourEvent::Relay(
+                            libp2p::relay::Event::CircuitClosed { src_peer_id, .. })) if src_peer_id == removed_peer) {
+                            break;
+                        }
+                    }
+                    _ = destination.select_next_some() => {},
+                    _ = clients.select_next_some() => {},
+                }
+            }
+            let mut replacement = build_rustory_swarm(psk).unwrap();
+            replacement.dial(target).unwrap();
+            attempt(&mut relay, &mut destination, &mut sources, &mut replacement, true).await;
+            // 목적지로 집중된 기존 회로들의 transport도 살아 있어야 한다.
+            assert_eq!(relay.network_info().connection_counters().num_established(), DEFAULT_RELAY_MAX_CIRCUITS as u32 + 1);
+        }).await.expect("relay quota did not recover");
     }
 
     #[tokio::test(flavor = "current_thread")]

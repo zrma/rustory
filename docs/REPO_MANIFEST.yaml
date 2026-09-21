@@ -56,6 +56,7 @@ repositories:
       - scripts/check-lessons-log-enforcement.sh --worktree
       - cargo fmt --all --check
       - cargo test --workspace
+      - cargo test -p libp2p-yamux --lib
       - cargo clippy --workspace --all-targets -- -D warnings
       - cargo test --no-default-features --workspace
       - cargo check --no-default-features --features import-hishtory
