@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-09-21
+- Last Verified: 2026-10-02
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-10-02 | `todo-ai-first-sol-adoption`에서 provider baseline과 native release-source 정책을 대조함 | family prompting의 Astra 관측 근거를 Sol 행동 실측과 구별하고 명시된 model 및 기존 제품 경계를 보존한다. | AI-first 1.8.0 release pin과 generated 지침을 적용했다. overlay·profile·제품 동작은 유지했다. 원래 기준은 `0d7b1f6fce9212b053d636463cb7a4ab95a49aaf:docs/todo-ai-first-sol-adoption/spec.md`에 있고 지속 계약은 선언/lock과 generated artifact가 소유한다. | standalone/interface, quick manifest, fast gate와 full release gate PASS. full manifest는 local check 21개를 실행했고 선택적·CI 전용 6개를 제외했다. 완료 packet을 제거했고 원격 출고와 같은 SHA CI는 별도 확인한다. Sol 행동 효과는 미측정이다. |
 | 2026-09-21 | `todo-relay-memory-budget`에서 stream 설정 변경이 구현 버전과 연결 종료 동작을 바꿀 수 있음을 확인 | 메모리 한도는 연결 수와 수신 credit를 함께 잡고, 상한 초과 거부뿐 아니라 용량 반환과 실제 통신 회복도 검증해야 한다. 이벤트 누계의 차이를 정확한 활성 회로 수로 가정하지 않는다. | 0.13 생성자만 추가한 vendor patch, relay 전용 예산, 회로 누계 및 smoke/CI 회귀 검증을 적용했다. 현재 계약: `docs/p2p.md`, `vendor/libp2p-yamux/README.rustory.md`. | 기본 462/minimal 444개 테스트, vendor invariant 2개, 8회로 포화·회복, 2,000회 churn, 실제 relay sync와 health, 전체 native gate 통과. 구현 snapshot: `f9df87931ec211895d7e3a5cb54a6e8d996e6263:docs/todo-relay-memory-budget/spec.md`. 장기 메모리 안정성은 운영 관측으로 별도 확인한다. |
 | 2026-09-21 | `todo-yamux-only-observation`에서 짧은 협상 로그 구간만으로 전환을 완료 처리할 수 없음을 확인 | 등록된 버전과 실제 모든 접속자의 transport는 다를 수 있다. 미지원 프로토콜을 설정에서 종료하고 프로세스별 누계를 메모리와 함께 관찰해야 한다. | mplex 의존성과 fallback 제거, Yamux 협상 누계 제공, 업데이트 재시작과 서비스 복구 판정의 차이를 문서화했다. | 양방향 legacy 협상 거부, 전환 peer 호환, 실제 relay 예약과 동기화, 실제 relay health 누계의 자동 스모크 검사와 전체 native gate. 구현 전 의도: `f53d51e82f8791bbc86ad70abb491d4cc4378246:docs/todo-yamux-only-observation/spec.md`; 현재 계약: `docs/p2p.md`, `docs/distribution.md`. |
 | 2026-09-21 | `todo-yamux-migration`에서 장기 relay 회로 종료 후 mplex 작업 참조 누적을 재현함 | 동시 연결 quota와 작업 종료는 내부 multiplexer 참조 해제를 보장하지 않는다. 대체 구현은 구버전 협상과 실제 relay 전송을 함께 검증하고, 운영 완료는 프로세스별 메모리 추세로 별도 판단한다. | Yamux 우선 협상과 mplex 전환 fallback, 선택 결과 로그, 혼합 프로토콜 협상 및 반복 회로 시험을 추가했다. 전환/rollback과 구버전 지원 제거 조건은 `docs/p2p.md`가 소유한다. 원래 기준은 `e168dde10b7e:docs/todo-yamux-migration/spec.md`에 보존하고 완료 packet을 정리했다. | 협상 4개·relay 6개 시험과 별도 2,000회 회로 시험 PASS. 구버전 바이너리 혼합 동기화와 전체 native gate PASS. 실제 배포/장기 메모리 관찰은 별도 검증한다. |
