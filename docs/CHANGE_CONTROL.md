@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-09-05
+- Last Verified: 2026-10-17
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
