@@ -87,7 +87,7 @@ change 작업은 첫 수정 전에 canonical workspace에서 `python3 .ai-first/
 `integrate --revision @ --remote <remote>`를 실행하고 push/SHA 확인 뒤 empty WC를 만든다.
 수동 출고 경로도 같은 통합 검사를 bookmark 이동 전에 실행한다. 정상 empty WC는
 잔여물이 아니다. 고유 결과를 durable history에 보존한 뒤 이번 사본의 등록과 실제 경로를
-회수하고 canonical root에서 `python3 .ai-first/vcs.py finish`가 성공해야 마감한다.
+회수하고 공유 Git hook의 임시 경로 참조를 native canonical 설치로 복구한 뒤 canonical root에서 `python3 .ai-first/vcs.py finish`가 성공해야 마감한다.
 기존 WIP·고유 history·tag/release는 보존하고 실패 상태는 이유·재개점과 함께 남긴다.
 
 일반 standalone은 생성물 무결성을 검사하며 이 로컬 lifecycle을 CI로 대체하지 않는다.
