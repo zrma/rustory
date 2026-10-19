@@ -108,12 +108,11 @@ describe_current_change() {
 
 verify_current_description_attribution() {
   local attribution=""
-  attribution="$(
-    sed -nE 's/^[[:space:]]*commit_attribution[[:space:]]*=[[:space:]]*"([^"]*)"[[:space:]]*$/\1/p' \
-      "$HOME/.codex/config.toml" | head -n 1
-  )"
-  if [[ -z "$attribution" ]]; then
-    fail "commit_attribution is not configured in $HOME/.codex/config.toml"
+  local attribution_file="${CODEX_HOME:-$HOME/.codex}/commit-attribution"
+  [[ -r "$attribution_file" ]] || fail "commit-attribution is missing"
+  attribution="$(cat "$attribution_file")"
+  if [[ -z "$attribution" || "$attribution" == *$'\n'* || "$attribution" == *$'\r'* ]]; then
+    fail "commit-attribution must contain one non-empty line"
   fi
 
   local trailer="Co-authored-by: $attribution"
@@ -345,6 +344,11 @@ if (( DRY_RUN == 0 )); then
 fi
 ok "jj describe updated with Codex attribution"
 
+if [[ -n "${AI_FIRST_VCS_SESSION:-}" ]]; then
+  run_argv jj git fetch --remote "$REMOTE"
+  run_argv python3 .ai-first/vcs.py integrate --revision @ --remote "$REMOTE"
+fi
+
 run_argv jj bookmark move "$BOOKMARK" --to @
 ok "bookmark moved: $BOOKMARK"
 
@@ -403,5 +407,10 @@ if (( DRY_RUN == 0 )); then
   fi
 fi
 
+run_argv jj new "$BOOKMARK"
+if (( DRY_RUN == 0 )); then
+  [[ "$(cd "$ROOT" && jj log -r @ --no-graph -T empty)" == true ]] || fail "new working copy is not empty"
+  [[ "$(cd "$ROOT" && jj log -r 'parents(@)' --no-graph -T commit_id)" == "$local_sha" ]] || fail "working-copy parent differs from the published candidate"
+fi
 run_argv jj st
 ok "finalize-and-push completed"

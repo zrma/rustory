@@ -206,6 +206,10 @@ if ! todo_workspace_load_config "$ROOT"; then
   fail "failed to load todo workspace config from docs/REPO_MANIFEST.yaml"
 fi
 
+if [[ -n "${AI_FIRST_VCS_SESSION:-}" ]]; then
+  run_argv python3 .ai-first/vcs.py resume
+fi
+
 ensure_todo_workspace "$WORK_ID" "$OWNER"
 
 TODO_REL="$(todo_workspace_rel_for_work_id "$WORK_ID")"

@@ -26,9 +26,6 @@ on:
       - ".github/workflows/release-gates.yml"
   workflow_dispatch:
 
-env:
-  AI_FIRST_VCS_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
-
 jobs:
   release-gates:
     runs-on: ubuntu-latest

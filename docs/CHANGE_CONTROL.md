@@ -78,14 +78,20 @@
 
 ## 선형 통합과 local closeout
 
-`vcs-closeout`의 generated runtime `.ai-first/vcs.py`가 선형 후보 이력과 명시적 작업
-마감을 검사한다. 일반 standalone/native gate는 history만 검사하며 종료할 때
-`python3 .ai-first/vcs.py --closeout`으로 empty working copy, expected parent, workspace,
-참조 없는 head, Git 등록과 task-owned 경로를 확인한다. 후보는 `--revision <revision>`으로
-고정하고 stale push를 merge로 우회하지 않는다. 기존 WIP와 고유 이력, tag/release는
-보존하며 검사는 자동 삭제하지 않는다. 임시 사본은 생성 시 소유 목록을 기록하고
-등록 해제와 실제 경로 회수를 별도로 확인한다. inherited 작업은 정확한 시작 ID로
-분류하며 정상적인 새 empty working copy를 잔여물로 취급하지 않는다.
+change 작업은 첫 수정 전에 canonical workspace에서 `python3 .ai-first/vcs.py start
+--state <private-session-file>`로 시작하고 같은 `AI_FIRST_VCS_SESSION`을 native helper에
+전달한다. `start-work.sh`는 기록을 resume한 뒤 기존 readiness를 수행한다. 새 VCS 사본은
+생성 전에 `python3 .ai-first/vcs.py own --path <new-task-copy>`로 등록한다.
+
+`finalize-and-push.sh`는 native gate와 attribution 뒤, bookmark 이동 전에 fetch와
+`integrate --revision @ --remote <remote>`를 실행하고 push/SHA 확인 뒤 empty WC를 만든다.
+수동 출고 경로도 같은 통합 검사를 bookmark 이동 전에 실행한다. 정상 empty WC는
+잔여물이 아니다. 고유 결과를 durable history에 보존한 뒤 이번 사본의 등록과 실제 경로를
+회수하고 canonical root에서 `python3 .ai-first/vcs.py finish`가 성공해야 마감한다.
+기존 WIP·고유 history·tag/release는 보존하고 실패 상태는 이유·재개점과 함께 남긴다.
+
+일반 standalone은 생성물 무결성을 검사하며 이 로컬 lifecycle을 CI로 대체하지 않는다.
+세션 없는 수동 helper와 디버그 dry-run의 기존 호환성은 유지한다. 도구는 자동 삭제하지 않는다.
 
 ## main 승격 후 정리 체크리스트
 
