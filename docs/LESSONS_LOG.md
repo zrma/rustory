@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-10-17
+- Last Verified: 2026-10-19
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-10-19 | `todo-vcs-closeout`의 공통 VCS 검사 도입 | 선형 이력 검사와 작업 종료 검사를 분리하고 WIP·등록·경로·고유 head를 각각 보존·검증한다. 정상 empty working copy는 잔여물이 아니다. | AI-first 1.9.1 source pin, generated runtime과 실제 후보 CI binding을 적용했다. 종료 계약은 `docs/CHANGE_CONTROL.md`가 소유하며 원래 기준은 `7a8f7036bcf9730f62d2cb8491ba439da3956951:docs/todo-vcs-closeout/spec.md`에 있다. 완료 packet은 제거한다. | source/standalone/interface와 full native release gate PASS. 삭제 마감 gate, 원격 same-SHA CI와 task-owned 사본 회수는 각 단계에서 별도 확인한다. 행동 개선 효과는 미측정이다. |
 | 2026-10-17 | `todo-ai-first-review-precision`에서 원래 요구와 generated 리뷰 지침을 대조함 | 테스트 기대값은 원래 계약에서 정하고 유지할 동작을 함께 확인한다. 같은 원인의 교정은 확정된 사실·의미·범위 안에서 관련 산출물에 적용하며 새 요구와 기존 누락을 구분한다. | AI-first 1.8.2 signed release pin과 generated 지침을 반영했다. 기존 Sol 보완·profile·overlay·native gate·제품 동작을 유지한다. 원래 기준은 `60177096762145aa97702fb3f3be7f7811989492:docs/todo-ai-first-review-precision/spec.md`이고 완료 packet은 제거했다. | source/render/standalone/interface, fast gate와 full publication gate PASS. 선택적·환경 조건의 skip과 원격 same-SHA CI는 별도 확인한다. 실제 재작업·시간·비용 효과는 미측정이다. |
 | 2026-10-17 | `todo-ai-first-sol-guidance`에서 공식 지침 보완과 native 검토 기한을 대조함 | source pin 갱신은 제품·권한 경계를 유지하며 운영 문서 freshness도 실제 절차와 대조한다. | AI-first 1.8.1 release pin과 generated 지침을 반영하고 만료된 운영 문서를 재검토했다. stale model 고정 안내를 현재 provider 지침으로 연결했다. 원래 기준은 `8a7780b80f36d60db066e5c5429de34fe31519ab:docs/todo-ai-first-sol-guidance/spec.md`이며 완료 packet은 제거했다. | source/standalone/interface, fast gate 및 full release gate PASS. 선택적·CI 전용 항목은 native 실행 범위와 구별하며 원격 same-SHA CI는 별도 확인한다. Sol 행동 효과는 미측정이다. |
 | 2026-10-02 | `todo-ai-first-sol-adoption`에서 provider baseline과 native release-source 정책을 대조함 | family prompting의 Astra 관측 근거를 Sol 행동 실측과 구별하고 명시된 model 및 기존 제품 경계를 보존한다. | AI-first 1.8.0 release pin과 generated 지침을 적용했다. overlay·profile·제품 동작은 유지했다. 원래 기준은 `0d7b1f6fce9212b053d636463cb7a4ab95a49aaf:docs/todo-ai-first-sol-adoption/spec.md`에 있고 지속 계약은 선언/lock과 generated artifact가 소유한다. | standalone/interface, quick manifest, fast gate와 full release gate PASS. full manifest는 local check 21개를 실행했고 선택적·CI 전용 6개를 제외했다. 완료 packet을 제거했고 원격 출고와 같은 SHA CI는 별도 확인한다. Sol 행동 효과는 미측정이다. |

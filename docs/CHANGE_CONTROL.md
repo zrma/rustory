@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, 릴리즈 담당자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-10-17
+- Last Verified: 2026-10-19
 
 이 문서는 1인 개발 + LLM 에이전트 중심 워크플로를 안전하게 운영하기 위한 출고 절차를 정의한다.
 
@@ -75,6 +75,17 @@
 
 4. 사후 점검(조건부)
 누락/실패/재작업이 있었으면 `docs/IMPROVEMENT_LOOP.md`를 따라 `docs/LESSONS_LOG.md`에 기록한다.
+
+## 선형 통합과 local closeout
+
+`vcs-closeout`의 generated runtime `.ai-first/vcs.py`가 선형 후보 이력과 명시적 작업
+마감을 검사한다. 일반 standalone/native gate는 history만 검사하며 종료할 때
+`python3 .ai-first/vcs.py --closeout`으로 empty working copy, expected parent, workspace,
+참조 없는 head, Git 등록과 task-owned 경로를 확인한다. 후보는 `--revision <revision>`으로
+고정하고 stale push를 merge로 우회하지 않는다. 기존 WIP와 고유 이력, tag/release는
+보존하며 검사는 자동 삭제하지 않는다. 임시 사본은 생성 시 소유 목록을 기록하고
+등록 해제와 실제 경로 회수를 별도로 확인한다. inherited 작업은 정확한 시작 ID로
+분류하며 정상적인 새 empty working copy를 잔여물로 취급하지 않는다.
 
 ## main 승격 후 정리 체크리스트
 
