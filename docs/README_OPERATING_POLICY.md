@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-10-17
+- Last Verified: 2026-11-17
 
 ## 목적
 

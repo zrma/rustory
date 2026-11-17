@@ -42,9 +42,6 @@ all-features = true
 name = "libp2p_yamux"
 path = "src/lib.rs"
 
-[dependencies.either]
-version = "1"
-
 [dependencies.futures]
 version = "0.3.30"
 
@@ -57,12 +54,8 @@ version = "2"
 [dependencies.tracing]
 version = "0.1.41"
 
-[dependencies.yamux012]
-version = "0.12.1"
-package = "yamux"
-
 [dependencies.yamux013]
-version = "0.13.3"
+version = "0.13.10"
 package = "yamux"
 
 [lints.clippy]

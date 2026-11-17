@@ -31,7 +31,6 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use either::Either;
 use futures::{prelude::*, ready};
 use libp2p_core::{
     muxing::{StreamMuxer, StreamMuxerEvent},
@@ -42,7 +41,7 @@ use thiserror::Error;
 /// A Yamux connection.
 #[derive(Debug)]
 pub struct Muxer<C> {
-    connection: Either<yamux012::Connection<C>, yamux013::Connection<C>>,
+    connection: yamux013::Connection<C>,
     /// Temporarily buffers inbound streams in case our node is
     /// performing backpressure on the remote.
     ///
@@ -71,7 +70,7 @@ where
     C: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     /// Create a new Yamux connection.
-    fn new(connection: Either<yamux012::Connection<C>, yamux013::Connection<C>>) -> Self {
+    fn new(connection: yamux013::Connection<C>) -> Self {
         Muxer {
             connection,
             inbound_stream_buffer: VecDeque::default(),
@@ -109,23 +108,13 @@ where
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Self::Substream, Self::Error>> {
-        let stream = match self.connection.as_mut() {
-            Either::Left(c) => ready!(c.poll_new_outbound(cx))
-                .map_err(|e| Error(Either::Left(e)))
-                .map(|s| Stream(Either::Left(s))),
-            Either::Right(c) => ready!(c.poll_new_outbound(cx))
-                .map_err(|e| Error(Either::Right(e)))
-                .map(|s| Stream(Either::Right(s))),
-        }?;
-        Poll::Ready(Ok(stream))
+        let stream = ready!(self.connection.poll_new_outbound(cx)).map_err(Error)?;
+        Poll::Ready(Ok(Stream(stream)))
     }
 
     #[tracing::instrument(level = "trace", name = "StreamMuxer::poll_close", skip(self, cx))]
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self.connection.as_mut() {
-            Either::Left(c) => c.poll_close(cx).map_err(|e| Error(Either::Left(e))),
-            Either::Right(c) => c.poll_close(cx).map_err(|e| Error(Either::Right(e))),
-        }
+        self.connection.poll_close(cx).map_err(Error)
     }
 
     #[tracing::instrument(level = "trace", name = "StreamMuxer::poll", skip(self, cx))]
@@ -159,7 +148,7 @@ where
 
 /// A stream produced by the yamux multiplexer.
 #[derive(Debug)]
-pub struct Stream(Either<yamux012::Stream, yamux013::Stream>);
+pub struct Stream(yamux013::Stream);
 
 impl AsyncRead for Stream {
     fn poll_read(
@@ -167,7 +156,7 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        either::for_both!(self.0.as_mut(), s => Pin::new(s).poll_read(cx, buf))
+        Pin::new(&mut self.0).poll_read(cx, buf)
     }
 
     fn poll_read_vectored(
@@ -175,7 +164,7 @@ impl AsyncRead for Stream {
         cx: &mut Context<'_>,
         bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<io::Result<usize>> {
-        either::for_both!(self.0.as_mut(), s => Pin::new(s).poll_read_vectored(cx, bufs))
+        Pin::new(&mut self.0).poll_read_vectored(cx, bufs)
     }
 }
 
@@ -185,7 +174,7 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        either::for_both!(self.0.as_mut(), s => Pin::new(s).poll_write(cx, buf))
+        Pin::new(&mut self.0).poll_write(cx, buf)
     }
 
     fn poll_write_vectored(
@@ -193,15 +182,15 @@ impl AsyncWrite for Stream {
         cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
     ) -> Poll<io::Result<usize>> {
-        either::for_both!(self.0.as_mut(), s => Pin::new(s).poll_write_vectored(cx, bufs))
+        Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        either::for_both!(self.0.as_mut(), s => Pin::new(s).poll_flush(cx))
+        Pin::new(&mut self.0).poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        either::for_both!(self.0.as_mut(), s => Pin::new(s).poll_close(cx))
+        Pin::new(&mut self.0).poll_close(cx)
     }
 }
 
@@ -210,158 +199,39 @@ where
     C: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     fn poll_inner(&mut self, cx: &mut Context<'_>) -> Poll<Result<Stream, Error>> {
-        let stream = match self.connection.as_mut() {
-            Either::Left(c) => ready!(c.poll_next_inbound(cx))
-                .ok_or(Error(Either::Left(yamux012::ConnectionError::Closed)))?
-                .map_err(|e| Error(Either::Left(e)))
-                .map(|s| Stream(Either::Left(s)))?,
-            Either::Right(c) => ready!(c.poll_next_inbound(cx))
-                .ok_or(Error(Either::Right(yamux013::ConnectionError::Closed)))?
-                .map_err(|e| Error(Either::Right(e)))
-                .map(|s| Stream(Either::Right(s)))?,
-        };
-
-        Poll::Ready(Ok(stream))
+        let stream = ready!(self.connection.poll_next_inbound(cx))
+            .ok_or(Error(yamux013::ConnectionError::Closed))?
+            .map_err(Error)?;
+        Poll::Ready(Ok(Stream(stream)))
     }
 }
 
 /// The yamux configuration.
 #[derive(Debug, Clone)]
-pub struct Config(Either<Config012, Config013>);
+pub struct Config(yamux013::Config);
 
 impl Default for Config {
     fn default() -> Self {
-        Self(Either::Right(Config013::default()))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Config012 {
-    inner: yamux012::Config,
-    mode: Option<yamux012::Mode>,
-}
-
-impl Default for Config012 {
-    fn default() -> Self {
-        let mut inner = yamux012::Config::default();
-        // For conformity with mplex, read-after-close on a multiplexed
-        // connection is never permitted and not configurable.
-        inner.set_read_after_close(false);
-        Self { inner, mode: None }
-    }
-}
-
-/// The window update mode determines when window updates are
-/// sent to the remote, giving it new credit to send more data.
-pub struct WindowUpdateMode(yamux012::WindowUpdateMode);
-
-impl WindowUpdateMode {
-    /// The window update mode whereby the remote is given
-    /// new credit via a window update whenever the current
-    /// receive window is exhausted when data is received,
-    /// i.e. this mode cannot exert back-pressure from application
-    /// code that is slow to read from a substream.
-    ///
-    /// > **Note**: The receive buffer may overflow with this
-    /// > strategy if the receiver is too slow in reading the
-    /// > data from the buffer. The maximum receive buffer
-    /// > size must be tuned appropriately for the desired
-    /// > throughput and level of tolerance for (temporarily)
-    /// > slow receivers.
-    #[deprecated(note = "Use `WindowUpdateMode::on_read` instead.")]
-    pub fn on_receive() -> Self {
-        #[allow(deprecated)]
-        WindowUpdateMode(yamux012::WindowUpdateMode::OnReceive)
-    }
-
-    /// The window update mode whereby the remote is given new
-    /// credit only when the current receive window is exhausted
-    /// when data is read from the substream's receive buffer,
-    /// i.e. application code that is slow to read from a substream
-    /// exerts back-pressure on the remote.
-    ///
-    /// > **Note**: If the receive window of a substream on
-    /// > both peers is exhausted and both peers are blocked on
-    /// > sending data before reading from the stream, a deadlock
-    /// > occurs. To avoid this situation, reading from a substream
-    /// > should never be blocked on writing to the same substream.
-    ///
-    /// > **Note**: With this strategy, there is usually no point in the
-    /// > receive buffer being larger than the window size.
-    pub fn on_read() -> Self {
-        WindowUpdateMode(yamux012::WindowUpdateMode::OnRead)
+        let mut config = yamux013::Config::default();
+        config.set_read_after_close(false);
+        Self(config)
     }
 }
 
 impl Config {
-    /// Constructs Yamux 0.13 with bounded streams and aggregate receive credit.
-    /// Unlike the legacy setters, this constructor never selects Yamux 0.12.
+    /// Constructs Yamux with bounded streams and aggregate receive credit.
     pub fn bounded_v013(max_streams: usize, max_receive_window: usize) -> Self {
-        let mut cfg = Config013::default();
-        cfg.0.set_max_num_streams(max_streams);
-        cfg.0.set_max_connection_receive_window(Some(max_receive_window));
-        Self(Either::Right(cfg))
-    }
-
-    /// Creates a new `YamuxConfig` in client mode, regardless of whether
-    /// it will be used for an inbound or outbound upgrade.
-    #[deprecated(note = "Will be removed with the next breaking release.")]
-    pub fn client() -> Self {
-        Self(Either::Left(Config012 {
-            mode: Some(yamux012::Mode::Client),
-            ..Default::default()
-        }))
-    }
-
-    /// Creates a new `YamuxConfig` in server mode, regardless of whether
-    /// it will be used for an inbound or outbound upgrade.
-    #[deprecated(note = "Will be removed with the next breaking release.")]
-    pub fn server() -> Self {
-        Self(Either::Left(Config012 {
-            mode: Some(yamux012::Mode::Server),
-            ..Default::default()
-        }))
-    }
-
-    /// Sets the size (in bytes) of the receive window per substream.
-    #[deprecated(
-        note = "Will be replaced in the next breaking release with a connection receive window size limit."
-    )]
-    pub fn set_receive_window_size(&mut self, num_bytes: u32) -> &mut Self {
-        self.set(|cfg| cfg.set_receive_window(num_bytes))
-    }
-
-    /// Sets the maximum size (in bytes) of the receive buffer per substream.
-    #[deprecated(note = "Will be removed with the next breaking release.")]
-    pub fn set_max_buffer_size(&mut self, num_bytes: usize) -> &mut Self {
-        self.set(|cfg| cfg.set_max_buffer_size(num_bytes))
+        let mut config = Self::default();
+        config.set_max_num_streams(max_streams);
+        config
+            .0
+            .set_max_connection_receive_window(Some(max_receive_window));
+        config
     }
 
     /// Sets the maximum number of concurrent substreams.
     pub fn set_max_num_streams(&mut self, num_streams: usize) -> &mut Self {
-        self.set(|cfg| cfg.set_max_num_streams(num_streams))
-    }
-
-    /// Sets the window update mode that determines when the remote
-    /// is given new credit for sending more data.
-    #[deprecated(
-        note = "`WindowUpdate::OnRead` is the default. `WindowUpdate::OnReceive` breaks backpressure, is thus not recommended, and will be removed in the next breaking release. Thus this method becomes obsolete and will be removed with the next breaking release."
-    )]
-    pub fn set_window_update_mode(&mut self, mode: WindowUpdateMode) -> &mut Self {
-        self.set(|cfg| cfg.set_window_update_mode(mode.0))
-    }
-
-    fn set(&mut self, f: impl FnOnce(&mut yamux012::Config) -> &mut yamux012::Config) -> &mut Self {
-        let cfg012 = match self.0.as_mut() {
-            Either::Left(c) => &mut c.inner,
-            Either::Right(_) => {
-                self.0 = Either::Left(Config012::default());
-                &mut self.0.as_mut().unwrap_left().inner
-            }
-        };
-
-        f(cfg012);
-
+        self.0.set_max_num_streams(num_streams);
         self
     }
 }
@@ -384,17 +254,7 @@ where
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
     fn upgrade_inbound(self, io: C, _: Self::Info) -> Self::Future {
-        let connection = match self.0 {
-            Either::Left(Config012 { inner, mode }) => Either::Left(yamux012::Connection::new(
-                io,
-                inner,
-                mode.unwrap_or(yamux012::Mode::Server),
-            )),
-            Either::Right(Config013(cfg)) => {
-                Either::Right(yamux013::Connection::new(io, cfg, yamux013::Mode::Server))
-            }
-        };
-
+        let connection = yamux013::Connection::new(io, self.0, yamux013::Mode::Server);
         future::ready(Ok(Muxer::new(connection)))
     }
 }
@@ -408,50 +268,21 @@ where
     type Future = future::Ready<Result<Self::Output, Self::Error>>;
 
     fn upgrade_outbound(self, io: C, _: Self::Info) -> Self::Future {
-        let connection = match self.0 {
-            Either::Left(Config012 { inner, mode }) => Either::Left(yamux012::Connection::new(
-                io,
-                inner,
-                mode.unwrap_or(yamux012::Mode::Client),
-            )),
-            Either::Right(Config013(cfg)) => {
-                Either::Right(yamux013::Connection::new(io, cfg, yamux013::Mode::Client))
-            }
-        };
-
+        let connection = yamux013::Connection::new(io, self.0, yamux013::Mode::Client);
         future::ready(Ok(Muxer::new(connection)))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Config013(yamux013::Config);
-
-impl Default for Config013 {
-    fn default() -> Self {
-        let mut cfg = yamux013::Config::default();
-        // For conformity with mplex, read-after-close on a multiplexed
-        // connection is never permitted and not configurable.
-        cfg.set_read_after_close(false);
-        Self(cfg)
     }
 }
 
 /// The Yamux [`StreamMuxer`] error type.
 #[derive(Debug, Error)]
 #[error(transparent)]
-pub struct Error(Either<yamux012::ConnectionError, yamux013::ConnectionError>);
+pub struct Error(yamux013::ConnectionError);
 
 impl From<Error> for io::Error {
     fn from(err: Error) -> Self {
         match err.0 {
-            Either::Left(err) => match err {
-                yamux012::ConnectionError::Io(e) => e,
-                e => io::Error::new(io::ErrorKind::Other, e),
-            },
-            Either::Right(err) => match err {
-                yamux013::ConnectionError::Io(e) => e,
-                e => io::Error::new(io::ErrorKind::Other, e),
-            },
+            yamux013::ConnectionError::Io(error) => error,
+            error => io::Error::other(error),
         }
     }
 }
@@ -459,23 +290,22 @@ impl From<Error> for io::Error {
 #[cfg(test)]
 mod test {
     use super::*;
-    #[test]
-    fn bounded_config_keeps_v013() {
-        assert!(matches!(Config::bounded_v013(16, 4 * 1024 * 1024), Config(Either::Right(_))));
-    }
+    use futures::{executor::block_on, io::Cursor, task::noop_waker_ref};
 
     #[test]
-    fn config_set_switches_to_v012() {
-        // By default we use yamux v0.13. Thus we provide the benefits of yamux v0.13 to all users
-        // that do not depend on any of the behaviors (i.e. configuration options) of v0.12.
-        let mut cfg = Config::default();
+    fn bounded_config_limits_open_streams() {
+        let config = Config::bounded_v013(1, yamux013::DEFAULT_CREDIT as usize);
+        let mut muxer =
+            block_on(config.upgrade_outbound(Cursor::new(Vec::<u8>::new()), "/yamux/1.0.0"))
+                .unwrap();
+        let mut context = Context::from_waker(noop_waker_ref());
+
+        let Poll::Ready(Ok(_stream)) = Pin::new(&mut muxer).poll_outbound(&mut context) else {
+            panic!("the configured stream should open");
+        };
         assert!(matches!(
-            cfg,
-            Config(Either::Right(Config013(yamux013::Config { .. })))
+            Pin::new(&mut muxer).poll_outbound(&mut context),
+            Poll::Ready(Err(_))
         ));
-
-        // In case a user makes any configurations, use yamux v0.12 instead.
-        cfg.set_max_num_streams(42);
-        assert!(matches!(cfg, Config(Either::Left(Config012 { .. }))));
     }
 }
