@@ -1,5 +1,7 @@
 # Rustory
 
+[Español](README.es-ES.md)
+
 <p align="center">
   <img src="docs/assets/rustory-mark.svg" width="360" alt="두 개의 양피지 기록이 붉은 실로 연결된 Rustory 로고">
 </p>
