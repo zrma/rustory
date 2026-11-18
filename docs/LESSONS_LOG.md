@@ -2,7 +2,7 @@
 
 - Audience: Rustory 유지보수자, LLM 에이전트
 - Owner: Rustory
-- Last Verified: 2026-10-19
+- Last Verified: 2026-11-18
 
 반복 가능한 실수 방지 규칙을 누적하는 공개 로그다. 작성 규칙은 `docs/IMPROVEMENT_LOOP.md`를 따른다.
 
@@ -13,6 +13,7 @@
 
 | Date | Trigger | Lesson | Applied Change | Verification |
 | --- | --- | --- | --- | --- |
+| 2026-11-18 | AI-first 갱신 (`todo-ai-first-update-verification`) | 고정한 원본의 생성 검사와 소비 저장소의 독립 검사가 확인하는 범위를 각각 기록한다. | v1.10.3 pin과 추적 생성물을 갱신했다. | framework check, standalone 검사와 native 출고 gate. |
 | 2026-10-19 | `todo-local-vcs-flow` 및 `todo-local-vcs-hook-guard`의 로컬 agent 작업 연결 | 종료 명령만 두면 시작 상태와 새 사본의 소유권을 놓칠 수 있다. 같은 private 세션으로 시작·선형 통합·사본 회수 후 마감을 연결하고 package prepare가 바꾼 공유 Git hook의 임시 경로 참조도 제거해야 한다. | native start/finalize adapter, empty WC 검증과 로컬 VCS runtime을 연결하고 공통 CI 후보 binding을 제거했다. 운영 계약은 `docs/CHANGE_CONTROL.md`, hook guard 기준은 `2d8d4ab699442c6497aeeb4e59aa71637b4e45e6:docs/todo-local-vcs-hook-guard/spec.md`, 원래 기준은 `d9498a94045a56e318891400225c87c040d1aa41:docs/todo-local-vcs-flow/spec.md`가 소유하며 완료 packet은 제거한다. | real jj/Git lifecycle 회귀 및 full native gate로 검증한다. 원격 SHA·사본 회수는 출고 단계에서 별도 확인하며 장기 행동 개선 효과는 미측정이다. |
 | 2026-10-19 | `todo-vcs-closeout`의 공통 VCS 검사 도입 | 선형 이력 검사와 작업 종료 검사를 분리하고 WIP·등록·경로·고유 head를 각각 보존·검증한다. 정상 empty working copy는 잔여물이 아니다. | AI-first 1.9.1 source pin, generated runtime과 실제 후보 CI binding을 적용했다. 종료 계약은 `docs/CHANGE_CONTROL.md`가 소유하며 원래 기준은 `7a8f7036bcf9730f62d2cb8491ba439da3956951:docs/todo-vcs-closeout/spec.md`에 있다. 완료 packet은 제거한다. | source/standalone/interface와 full native release gate PASS. 삭제 마감 gate, 원격 same-SHA CI와 task-owned 사본 회수는 각 단계에서 별도 확인한다. 행동 개선 효과는 미측정이다. |
 | 2026-10-17 | `todo-ai-first-review-precision`에서 원래 요구와 generated 리뷰 지침을 대조함 | 테스트 기대값은 원래 계약에서 정하고 유지할 동작을 함께 확인한다. 같은 원인의 교정은 확정된 사실·의미·범위 안에서 관련 산출물에 적용하며 새 요구와 기존 누락을 구분한다. | AI-first 1.8.2 signed release pin과 generated 지침을 반영했다. 기존 Sol 보완·profile·overlay·native gate·제품 동작을 유지한다. 원래 기준은 `60177096762145aa97702fb3f3be7f7811989492:docs/todo-ai-first-review-precision/spec.md`이고 완료 packet은 제거했다. | source/render/standalone/interface, fast gate와 full publication gate PASS. 선택적·환경 조건의 skip과 원격 same-SHA CI는 별도 확인한다. 실제 재작업·시간·비용 효과는 미측정이다. |
